@@ -44,7 +44,7 @@ public class TimerGaugeTest {
     @Test
     public void testBasicUsage() {
         ManualClock clock = new ManualClock(42_000_000);
-        TimerGauge gauge = new TimerGauge(clock);
+        TimerGauge gauge = new TimerGauge(clock, View.UPDATE_INTERVAL_SECONDS);
 
         gauge.update();
         assertThat(gauge.getValue(), is(0L));
@@ -60,7 +60,7 @@ public class TimerGaugeTest {
     @Test
     public void testUpdateWithoutMarkingEnd() {
         ManualClock clock = new ManualClock(42_000_000);
-        TimerGauge gauge = new TimerGauge(clock);
+        TimerGauge gauge = new TimerGauge(clock, View.UPDATE_INTERVAL_SECONDS);
 
         gauge.markStart();
         clock.advanceTime(SLEEP, TimeUnit.MILLISECONDS);
@@ -82,5 +82,42 @@ public class TimerGaugeTest {
         gauge.markEnd();
 
         assertThat(gauge.getValue(), is(0L));
+    }
+
+    @Test
+    public void testLargerTimespan() {
+        ManualClock clock = new ManualClock(42_000_000);
+        TimerGauge gauge = new TimerGauge(clock, 2 * View.UPDATE_INTERVAL_SECONDS);
+
+        gauge.markStart();
+        clock.advanceTime(SLEEP, TimeUnit.MILLISECONDS);
+        gauge.markEnd();
+        gauge.update();
+
+        assertThat(gauge.getValue(), is(SLEEP / View.UPDATE_INTERVAL_SECONDS));
+
+        gauge.update();
+        // One sleep in 2 intervals
+        assertThat(gauge.getValue(), is(SLEEP / (View.UPDATE_INTERVAL_SECONDS * 2)));
+
+        // One sleep in each interval
+
+        gauge.markStart();
+        clock.advanceTime(SLEEP, TimeUnit.MILLISECONDS);
+        gauge.markEnd();
+        gauge.update();
+
+        gauge.markStart();
+        clock.advanceTime(SLEEP, TimeUnit.MILLISECONDS);
+        gauge.markEnd();
+        gauge.update();
+
+        assertThat(gauge.getValue(), is(SLEEP / (View.UPDATE_INTERVAL_SECONDS)));
+
+        // Check that the getMaxSingleMeasurement can go down after an update
+        gauge.markStart();
+        clock.advanceTime(SLEEP / 2, TimeUnit.MILLISECONDS);
+        gauge.markEnd();
+        gauge.update();
     }
 }
