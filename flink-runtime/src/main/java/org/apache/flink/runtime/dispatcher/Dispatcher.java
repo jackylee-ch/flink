@@ -24,6 +24,7 @@ import org.apache.flink.api.common.operators.ResourceSpec;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.blob.BlobServer;
 import org.apache.flink.runtime.checkpoint.Checkpoints;
@@ -359,6 +360,7 @@ public abstract class Dispatcher extends PermanentlyFencedRpcEndpoint<Dispatcher
     }
 
     private CompletableFuture<Acknowledge> internalSubmitJob(JobGraph jobGraph) {
+        applyParallelismOverrides(jobGraph);
         log.info("Submitting job {} ({}).", jobGraph.getJobID(), jobGraph.getName());
 
         final CompletableFuture<Acknowledge> persistAndRunFuture =
@@ -992,5 +994,21 @@ public abstract class Dispatcher extends PermanentlyFencedRpcEndpoint<Dispatcher
 
     public CompletableFuture<Void> onRemovedJobGraph(JobID jobId) {
         return CompletableFuture.runAsync(() -> terminateJob(jobId), getMainThreadExecutor());
+    }
+
+    private void applyParallelismOverrides(JobGraph jobGraph) {
+        Map<String, String> overrides = configuration.get(PipelineOptions.PARALLELISM_OVERRIDES);
+        for (JobVertex vertex : jobGraph.getVertices()) {
+            String override = overrides.get(vertex.getID().toHexString());
+            if (override != null) {
+                int overrideParallelism = Integer.parseInt(override);
+                log.info(
+                        "Changing job vertex {} parallelism from {} to {}",
+                        vertex.getID(),
+                        vertex.getParallelism(),
+                        overrideParallelism);
+                vertex.setParallelism(overrideParallelism);
+            }
+        }
     }
 }
