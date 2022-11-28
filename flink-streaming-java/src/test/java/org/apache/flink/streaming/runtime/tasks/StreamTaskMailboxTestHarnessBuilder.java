@@ -46,6 +46,7 @@ import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.runtime.partitioner.BroadcastPartitioner;
 import org.apache.flink.streaming.runtime.partitioner.ForwardPartitioner;
+import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 import org.apache.flink.streaming.runtime.streamrecord.StreamElementSerializer;
 import org.apache.flink.util.function.FunctionWithException;
 
@@ -84,6 +85,8 @@ public class StreamTaskMailboxTestHarnessBuilder<OUT> {
     protected final ArrayList<Integer> inputChannelsPerGate = new ArrayList<>();
 
     private boolean setupCalled = false;
+
+    private StreamPartitioner<?> partitioner = new BroadcastPartitioner<>();
 
     public StreamTaskMailboxTestHarnessBuilder(
             FunctionWithException<Environment, ? extends StreamTask<OUT, ?>, Exception> taskFactory,
@@ -227,11 +230,7 @@ public class StreamTaskMailboxTestHarnessBuilder<OUT> {
                         0, null, null, (StreamOperator<?>) null, null, SourceStreamTask.class);
         StreamEdge streamEdge =
                 new StreamEdge(
-                        sourceVertexDummy,
-                        targetVertexDummy,
-                        gateIndex + 1,
-                        new BroadcastPartitioner<>(),
-                        null);
+                        sourceVertexDummy, targetVertexDummy, gateIndex + 1, partitioner, null);
 
         inPhysicalEdges.add(streamEdge);
         streamMockEnvironment.addInputGate(inputGates[gateIndex].getInputGate());
@@ -304,7 +303,7 @@ public class StreamTaskMailboxTestHarnessBuilder<OUT> {
             StreamOperatorFactory<?> factory, OperatorID operatorID) {
         checkState(!setupCalled, "This harness was already setup.");
         return setupOperatorChain(operatorID, factory)
-                .finishForSingletonOperatorChain(outputSerializer);
+                .finishForSingletonOperatorChain(outputSerializer, partitioner);
     }
 
     public StreamConfigChainer<StreamTaskMailboxTestHarnessBuilder<OUT>> setupOperatorChain(
@@ -344,6 +343,12 @@ public class StreamTaskMailboxTestHarnessBuilder<OUT> {
     public StreamTaskMailboxTestHarnessBuilder<OUT> setTaskStateSnapshot(
             long checkpointId, TaskStateSnapshot snapshot) {
         taskStateSnapshots = Collections.singletonMap(checkpointId, snapshot);
+        return this;
+    }
+
+    public StreamTaskMailboxTestHarnessBuilder<OUT> setOutputPartitioner(
+            StreamPartitioner partitioner) {
+        this.partitioner = partitioner;
         return this;
     }
 

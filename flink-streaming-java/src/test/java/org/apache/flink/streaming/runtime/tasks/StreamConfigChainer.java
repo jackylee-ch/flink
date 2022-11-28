@@ -32,6 +32,7 @@ import org.apache.flink.streaming.api.operators.SimpleOperatorFactory;
 import org.apache.flink.streaming.api.operators.StreamOperator;
 import org.apache.flink.streaming.api.operators.StreamOperatorFactory;
 import org.apache.flink.streaming.runtime.partitioner.BroadcastPartitioner;
+import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 
 import java.util.Collections;
 import java.util.HashMap;
@@ -184,6 +185,11 @@ public class StreamConfigChainer<OWNER> {
     }
 
     public <OUT> OWNER finishForSingletonOperatorChain(TypeSerializer<OUT> outputSerializer) {
+        return finishForSingletonOperatorChain(outputSerializer, new BroadcastPartitioner<>());
+    }
+
+    public <OUT> OWNER finishForSingletonOperatorChain(
+            TypeSerializer<OUT> outputSerializer, StreamPartitioner<?> partitioner) {
 
         checkState(chainIndex == 0, "Use finishForSingletonOperatorChain");
         checkState(headConfig == tailConfig);
@@ -211,12 +217,7 @@ public class StreamConfigChainer<OWNER> {
                         SourceStreamTask.class);
 
         outEdgesInOrder.add(
-                new StreamEdge(
-                        sourceVertexDummy,
-                        targetVertexDummy,
-                        0,
-                        new BroadcastPartitioner<>(),
-                        null));
+                new StreamEdge(sourceVertexDummy, targetVertexDummy, 0, partitioner, null));
 
         headConfig.setVertexID(0);
         headConfig.setNumberOfOutputs(1);

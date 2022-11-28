@@ -75,6 +75,8 @@ import org.apache.flink.streaming.api.operators.StreamTaskStateInitializerImpl;
 import org.apache.flink.streaming.runtime.io.RecordWriterOutput;
 import org.apache.flink.streaming.runtime.io.StreamInputProcessor;
 import org.apache.flink.streaming.runtime.partitioner.ConfigurableStreamPartitioner;
+import org.apache.flink.streaming.runtime.partitioner.ForwardPartitioner;
+import org.apache.flink.streaming.runtime.partitioner.RescalePartitioner;
 import org.apache.flink.streaming.runtime.partitioner.StreamPartitioner;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
 import org.apache.flink.streaming.runtime.streamstatus.StreamStatusMaintainer;
@@ -1345,6 +1347,8 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                         environment.getUserCodeClassLoader().asClassLoader());
 
         for (int i = 0; i < outEdgesInOrder.size(); i++) {
+            replaceForwardPartitionerIfConsumerParallelismDoesNotMatch(
+                    environment, outEdgesInOrder.get(i));
             StreamEdge edge = outEdgesInOrder.get(i);
             recordWriters.add(
                     createRecordWriter(
@@ -1355,6 +1359,13 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
                             edge.getBufferTimeout()));
         }
         return recordWriters;
+    }
+
+    private static void replaceForwardPartitionerIfConsumerParallelismDoesNotMatch(
+            Environment environment, StreamEdge streamOutput) {
+        if (streamOutput.getPartitioner() instanceof ForwardPartitioner) {
+            streamOutput.setPartitioner(new RescalePartitioner<>());
+        }
     }
 
     @SuppressWarnings("unchecked")
