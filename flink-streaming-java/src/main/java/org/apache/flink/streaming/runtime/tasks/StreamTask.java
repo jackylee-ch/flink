@@ -1348,7 +1348,7 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
 
         for (int i = 0; i < outEdgesInOrder.size(); i++) {
             replaceForwardPartitionerIfConsumerParallelismDoesNotMatch(
-                    environment, outEdgesInOrder.get(i));
+                    environment, outEdgesInOrder.get(i), i);
             StreamEdge edge = outEdgesInOrder.get(i);
             recordWriters.add(
                     createRecordWriter(
@@ -1362,8 +1362,10 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>> extends Ab
     }
 
     private static void replaceForwardPartitionerIfConsumerParallelismDoesNotMatch(
-            Environment environment, StreamEdge streamOutput) {
-        if (streamOutput.getPartitioner() instanceof ForwardPartitioner) {
+            Environment environment, StreamEdge streamOutput, int outputIndex) {
+        if (streamOutput.getPartitioner() instanceof ForwardPartitioner
+                && environment.getWriter(outputIndex).getNumberOfSubpartitions()
+                        != environment.getTaskInfo().getNumberOfParallelSubtasks()) {
             streamOutput.setPartitioner(new RescalePartitioner<>());
         }
     }

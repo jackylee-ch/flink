@@ -54,6 +54,7 @@ import org.apache.flink.runtime.io.network.api.writer.RecordWriter;
 import org.apache.flink.runtime.io.network.api.writer.RecordWriterDelegate;
 import org.apache.flink.runtime.io.network.api.writer.ResultPartitionWriter;
 import org.apache.flink.runtime.io.network.api.writer.SingleRecordWriter;
+import org.apache.flink.runtime.io.network.partition.MockResultPartitionWriter;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.jobgraph.tasks.AbstractInvokable;
 import org.apache.flink.runtime.metrics.TimerGauge;
@@ -1798,27 +1799,16 @@ public class StreamTaskTest extends TestLogger {
                                     .getChannelSelector()
                             instanceof ForwardPartitioner);
 
-            // Change consumer parallelism
-            // This will be changed in fb482fe39844efda33a4c05858903f5b64e158a3
-            //            harness.streamTask.configuration.setVertexNonChainedOutputs(
-            //                    List.of(
-            //                            new NonChainedOutput(
-            //                                    false,
-            //                                    0,
-            //                                    // Set a different consumer parallelism to force
-            // trigger
-            //                                    // replacing the ForwardPartitioner
-            //                                    42,
-            //                                    100,
-            //                                    1000,
-            //                                    false,
-            //                                    new IntermediateDataSetID(),
-            //                                    new OutputTag<>("output",
-            // IntegerTypeInfo.INT_TYPE_INFO),
-            //                                    // Use forward partitioner
-            //                                    new ForwardPartitioner<>(),
-            //                                    ResultPartitionType.PIPELINED)));
-            //            harness.streamTask.configuration.serializeAllConfigs();
+            // Simulate changed downstream task parallelism (1->2)
+            List<ResultPartitionWriter> newOutputs = new ArrayList<>();
+            newOutputs.add(
+                    new MockResultPartitionWriter() {
+                        @Override
+                        public int getNumberOfSubpartitions() {
+                            return 2;
+                        }
+                    });
+            harness.streamMockEnvironment.setOutputs(newOutputs);
 
             // Re-create outputs
             recordWriterDelegate =
