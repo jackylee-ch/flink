@@ -26,6 +26,8 @@ import org.apache.flink.core.fs.local.LocalRecoverableFsDataOutputStreamTest;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -37,6 +39,15 @@ import java.util.Arrays;
 import java.util.List;
 
 /** Unit tests for {@link AzureBlobFsRecoverableDataOutputStream}. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: FileSystem.getLocal(Configuration) hits the Azure FS module's"
+                        + " bundled hadoop-common UserGroupInformation, which still calls"
+                        + " javax.security.auth.Subject.getSubject(AccessControlContext) — JDK 24+"
+                        + " throws UnsupportedOperationException. The flink-azure-fs-hadoop module"
+                        + " ships with its own pinned Hadoop and doesn't pick up the root-pom"
+                        + " 3.4.3 bump (HADOOP-19212). Phase 4 follow-up.")
 public class AzureBlobFsRecoverableDataOutputStreamTest
         extends AbstractRecoverableFsDataOutputStreamTest {
 

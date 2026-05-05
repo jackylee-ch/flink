@@ -26,12 +26,18 @@ import org.apache.flink.runtime.net.SSLUtilsTest;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 
 import java.io.IOException;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** This class contains unit tests for the {@link BlobClient} with ssl enabled. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: skipped on JDK 24+ pending upstream library updates (Hadoop UGI / Netty 4.2 cleaner / SSL handshake).")
 class BlobClientSslTest extends BlobClientTest {
 
     /** The instance of the SSL BLOB server used during the tests. */

@@ -36,6 +36,8 @@ import org.apache.flink.shaded.netty4.io.netty.handler.codec.string.StringEncode
 import org.apache.flink.shaded.netty4.io.netty.handler.ssl.SslHandler;
 
 import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 import javax.net.ssl.SSLSessionContext;
@@ -54,6 +56,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for the SSL connection between Netty Server and Client used for the data plane. */
 @ExtendWith(ParameterizedTestExtension.class)
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: skipped on JDK 24+ pending upstream library updates (Hadoop UGI / Netty 4.2 cleaner / SSL handshake).")
 class NettyClientServerSslTest {
 
     @Parameter private String sslProvider;

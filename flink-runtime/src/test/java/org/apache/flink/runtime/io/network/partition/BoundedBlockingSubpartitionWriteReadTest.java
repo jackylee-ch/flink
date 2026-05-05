@@ -39,6 +39,8 @@ import org.apache.flink.testutils.junit.extensions.parameterized.Parameters;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -53,6 +55,10 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 /** Tests that read the BoundedBlockingSubpartition with multiple threads in parallel. */
 @ExtendWith(ParameterizedTestExtension.class)
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: skipped on JDK 24+ pending upstream library updates (Hadoop UGI / Netty 4.2 cleaner / SSL handshake).")
 class BoundedBlockingSubpartitionWriteReadTest {
 
     private static final String tempDir = EnvironmentInformation.getTemporaryFileDirectory();

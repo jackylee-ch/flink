@@ -26,11 +26,21 @@ import org.apache.flink.util.OperatingSystem;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
 /** Integration tests for the {@link FlinkSecurityManager}. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: FlinkSecurityManager rides on java.lang.SecurityManager, which JDK"
+                        + " 24 made permanently disabled (JEP-486). The exit-intercept path can"
+                        + " no longer take effect, so the assertion (expected exit 222 / 0) does"
+                        + " not hold. Phase 4 follow-up — see also FLINK-36902 upstream which"
+                        + " removes FlinkSecurityManager entirely.")
 class FlinkSecurityManagerITCase {
 
     @BeforeEach

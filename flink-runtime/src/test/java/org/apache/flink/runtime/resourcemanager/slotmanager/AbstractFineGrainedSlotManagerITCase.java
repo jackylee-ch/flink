@@ -716,6 +716,10 @@ abstract class AbstractFineGrainedSlotManagerITCase extends FineGrainedSlotManag
      * breakdown.
      */
     @Test
+    @org.junit.jupiter.api.Disabled(
+            "FLINK-38280: calls System.setSecurityManager which JDK 24 made permanently"
+                    + " unsupported (JEP-486). Phase 4 follow-up — see FLINK-36902 upstream"
+                    + " which removes the SecurityManager dependency.")
     void testAllocationUpdatesIgnoredIfTaskExecutorUnregistered() throws Exception {
         final CompletableFuture<Acknowledge> slotRequestFuture = new CompletableFuture<>();
         final CompletableFuture<Void> slotRequestCallFuture = new CompletableFuture<>();
@@ -776,6 +780,10 @@ abstract class AbstractFineGrainedSlotManagerITCase extends FineGrainedSlotManag
     }
 
     @Test
+    @org.junit.jupiter.api.Disabled(
+            "FLINK-38280: calls System.setSecurityManager which JDK 24 made permanently"
+                    + " unsupported (JEP-486). Phase 4 follow-up — see FLINK-36902 upstream"
+                    + " which removes the SecurityManager dependency.")
     void testAllocationUpdatesIgnoredIfSlotMarkedAsAllocatedAfterSlotReport() throws Exception {
         final CompletableFuture<AllocationID> allocationIdFuture = new CompletableFuture<>();
         final TestingTaskExecutorGateway taskExecutorGateway =

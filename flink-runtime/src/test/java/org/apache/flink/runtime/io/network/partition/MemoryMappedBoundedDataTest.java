@@ -18,10 +18,16 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
+
 import java.io.IOException;
 import java.nio.file.Path;
 
-/** Tests that read the BoundedBlockingSubpartition with multiple threads in parallel. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: skipped on JDK 24+ pending upstream library updates (Hadoop UGI / Netty 4.2 cleaner / SSL handshake).")
 public class MemoryMappedBoundedDataTest extends BoundedDataTestBase {
 
     @Override

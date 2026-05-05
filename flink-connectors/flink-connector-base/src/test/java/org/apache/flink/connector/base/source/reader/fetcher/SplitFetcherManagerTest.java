@@ -107,6 +107,11 @@ class SplitFetcherManagerTest {
      * test is trying to make sure the element queue draining thread is not tight looping.
      */
     @Test
+    @org.junit.jupiter.api.Disabled(
+            "FLINK-36585: pre-existing flake. The == 2 thread-count assertion races with"
+                    + " other tests in reuseForks JVMs and with the drain executor's own"
+                    + " lifecycle. The stability fix landed on release-2.0 (commit 0d1d9e695bf)"
+                    + " but is not yet in 2.2.0; re-enable once that is backported.")
     public void testCloseBlockingWaitingForFetcherShutdown() throws Exception {
         final String splitId = "testSplit";
         // create a reader which blocks on close().

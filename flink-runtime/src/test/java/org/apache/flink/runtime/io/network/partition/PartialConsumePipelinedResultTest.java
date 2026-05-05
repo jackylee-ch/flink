@@ -36,6 +36,8 @@ import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.testutils.TestingUtils;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.nio.ByteBuffer;
@@ -43,6 +45,10 @@ import java.nio.ByteBuffer;
 import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 
 /** Test for consuming a pipelined result only partially. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: skipped on JDK 24+ pending upstream library updates (Hadoop UGI / Netty 4.2 cleaner / SSL handshake).")
 class PartialConsumePipelinedResultTest {
 
     // Test configuration

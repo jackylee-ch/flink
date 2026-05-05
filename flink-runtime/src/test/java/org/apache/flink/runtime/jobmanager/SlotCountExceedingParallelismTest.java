@@ -46,10 +46,6 @@ import java.util.BitSet;
 import static org.apache.flink.configuration.ConfigurationUtils.getIntConfigOption;
 import static org.apache.flink.runtime.util.JobVertexConnectionUtils.connectNewDataSetAsInput;
 
-/**
- * Tests that Flink can execute jobs with a higher parallelism than available number of slots. This
- * effectively tests that Flink can execute jobs with blocking results in a staged fashion.
- */
 public class SlotCountExceedingParallelismTest extends TestLogger {
 
     // Test configuration

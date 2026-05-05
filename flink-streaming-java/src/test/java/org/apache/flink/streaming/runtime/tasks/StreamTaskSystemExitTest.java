@@ -83,6 +83,13 @@ import static org.mockito.Mockito.mock;
  * exit is enabled inside relevant methods that can call user-defined functions in {@code
  * StreamTask}.
  */
+@org.junit.jupiter.api.condition.DisabledForJreRange(
+        min = org.junit.jupiter.api.condition.JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: relies on FlinkSecurityManager / java.lang.SecurityManager which"
+                        + " JEP-486 made permanently disabled in JDK 24. The exit-intercept path"
+                        + " can't take effect, so all 4 system-exit assertions fail. Phase 4"
+                        + " follow-up — see FLINK-36902 upstream which removes the dependency.")
 class StreamTaskSystemExitTest {
     private static final int TEST_EXIT_CODE = 123;
     private SecurityManager originalSecurityManager;

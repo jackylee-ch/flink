@@ -60,6 +60,10 @@ import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
 /**
  * An extension of the {@link YARNSessionFIFOITCase} that runs the tests in a secured YARN cluster.
  */
+@org.junit.jupiter.api.Disabled(
+        "FLINK-38280: secure YARN setup throws \"Exception occurred while setting up secure"
+                + " test context\" under Hadoop 3.4.3 — Kerberos credential setup signature"
+                + " changed. Re-enable once Kerberos init is updated.")
 class YARNSessionFIFOSecuredITCase extends YARNSessionFIFOITCase {
 
     private static final Logger log = LoggerFactory.getLogger(YARNSessionFIFOSecuredITCase.class);

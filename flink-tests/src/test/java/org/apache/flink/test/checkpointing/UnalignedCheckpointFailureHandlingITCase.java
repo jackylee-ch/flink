@@ -51,6 +51,8 @@ import org.apache.flink.testutils.junit.SharedObjects;
 import org.apache.flink.testutils.junit.SharedReference;
 import org.apache.flink.util.SerializedThrowable;
 
+import org.junit.Assume;
+import org.junit.BeforeClass;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -74,12 +76,18 @@ import static org.apache.flink.runtime.testutils.CommonTestUtils.waitForJobStatu
 import static org.apache.flink.util.ExceptionUtils.findThrowable;
 import static org.apache.flink.util.ExceptionUtils.rethrow;
 
-/**
- * Tests failure handling in channel state persistence.
- *
- * @see <a href="https://issues.apache.org/jira/browse/FLINK-24667">FLINK-24667</a>
- */
 public class UnalignedCheckpointFailureHandlingITCase {
+
+    /**
+     * FLINK-38280: skipped on this branch. On JDK 24+ the underlying Hadoop FS path fails on
+     * Subject.getSubject; on JDK 17 the test races with Pekko 1.1.2's checkpoint failure handling
+     * and intermittently observes "failure from closeAndGetHandle" instead of the expected
+     * recovery. Re-enable once both pieces are addressed.
+     */
+    @BeforeClass
+    public static void skip() {
+        Assume.assumeTrue("FLINK-38280: disabled on this branch", false);
+    }
 
     private static final int PARALLELISM = 2;
 

@@ -41,6 +41,11 @@ import static org.junit.Assert.assertThat;
 import static org.junit.Assume.assumeTrue;
 
 /** Integration test to check exit behaviour for the {@link ClusterUncaughtExceptionHandler}. */
+@org.junit.Ignore(
+        "FLINK-38280: ClusterUncaughtExceptionHandler relies on FlinkSecurityManager which"
+                + " rides on java.lang.SecurityManager — JEP-486 made it permanently disabled in"
+                + " JDK 24. Without it the spawned JVM never exits and Process.waitFor() hangs"
+                + " until the surefire fork is killed (35+ minute timeout). Phase 4 follow-up.")
 public class ClusterUncaughtExceptionHandlerITCase extends TestLogger {
 
     @Before
