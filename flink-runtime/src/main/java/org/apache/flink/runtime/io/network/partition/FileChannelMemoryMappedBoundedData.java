@@ -18,10 +18,9 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import org.apache.flink.core.memory.MemoryUtils;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.util.IOUtils;
-
-import org.apache.flink.shaded.netty4.io.netty.util.internal.PlatformDependent;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -152,8 +151,11 @@ final class FileChannelMemoryMappedBoundedData implements BoundedData {
     public void close() throws IOException {
         IOUtils.closeQuietly(fileChannel);
 
+        // FLINK-38280: use Unsafe.invokeCleaner directly. Netty 4.2's CleanerJava25
+        // (under JDK 25) refuses to clean mapped buffers it did not allocate, so the
+        // previous PlatformDependent.freeDirectBuffer path throws on close.
         for (ByteBuffer bb : memoryMappedRegions) {
-            PlatformDependent.freeDirectBuffer(bb);
+            MemoryUtils.unmap(bb);
         }
         memoryMappedRegions.clear();
 

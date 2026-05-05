@@ -25,10 +25,10 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionManager;
 import org.apache.flink.shaded.netty4.io.netty.bootstrap.Bootstrap;
 import org.apache.flink.shaded.netty4.io.netty.bootstrap.ServerBootstrap;
 import org.apache.flink.shaded.netty4.io.netty.channel.EventLoopGroup;
+import org.apache.flink.shaded.netty4.io.netty.util.concurrent.EventExecutor;
 
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.Field;
 import java.net.InetAddress;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -67,41 +67,38 @@ class NettyConnectionManagerTest {
             // Client event loop group
             Bootstrap boostrap = connectionManager.getClient().getBootstrap();
             EventLoopGroup group = boostrap.config().group();
-
-            Field f = group.getClass().getSuperclass().getSuperclass().getDeclaredField("children");
-            f.setAccessible(true);
-            Object[] eventExecutors = (Object[]) f.get(group);
-
-            assertThat(eventExecutors).hasSize(numberOfSlots);
+            assertThat(countExecutors(group)).isEqualTo(numberOfSlots);
         }
 
         {
             // Server event loop group
             ServerBootstrap bootstrap = connectionManager.getServer().getBootstrap();
             EventLoopGroup group = bootstrap.config().group();
-
-            Field f = group.getClass().getSuperclass().getSuperclass().getDeclaredField("children");
-            f.setAccessible(true);
-            Object[] eventExecutors = (Object[]) f.get(group);
-
-            assertThat(eventExecutors).hasSize(numberOfSlots);
+            assertThat(countExecutors(group)).isEqualTo(numberOfSlots);
         }
 
         {
             // Server child event loop group
             ServerBootstrap bootstrap = connectionManager.getServer().getBootstrap();
             EventLoopGroup group = bootstrap.childGroup();
-
-            Field f = group.getClass().getSuperclass().getSuperclass().getDeclaredField("children");
-            f.setAccessible(true);
-            Object[] eventExecutors = (Object[]) f.get(group);
-
-            assertThat(eventExecutors).hasSize(numberOfSlots);
+            assertThat(countExecutors(group)).isEqualTo(numberOfSlots);
         }
     }
 
     private NettyConnectionManager createNettyConnectionManager(NettyConfig config) {
         return new NettyConnectionManager(
                 new ResultPartitionManager(), new TaskEventDispatcher(), config, true);
+    }
+
+    /**
+     * Counts the EventExecutors in an EventLoopGroup via its public {@code Iterable} contract,
+     * avoiding reflection on the {@code children} field that was removed in Netty 4.2.
+     */
+    private static int countExecutors(EventLoopGroup group) {
+        int count = 0;
+        for (EventExecutor ignored : group) {
+            count++;
+        }
+        return count;
     }
 }

@@ -129,6 +129,22 @@ public class MemoryUtils {
     }
 
     /**
+     * Releases the native resources backing a top-level direct or memory-mapped {@link ByteBuffer}.
+     *
+     * <p>Equivalent to {@code sun.misc.Unsafe.invokeCleaner(buffer)} (added in JDK 9). Unlike the
+     * Netty {@code PlatformDependent.freeDirectBuffer} path, this works on mapped buffers under JDK
+     * 25, where Netty's {@code CleanerJava25} refuses to clean buffers it did not itself allocate.
+     * Throws on slices or duplicates — only call on buffers obtained directly from {@link
+     * java.nio.channels.FileChannel#map} or {@code ByteBuffer.allocateDirect}.
+     */
+    public static void unmap(ByteBuffer buffer) {
+        if (buffer == null || !buffer.isDirect()) {
+            return;
+        }
+        UNSAFE.invokeCleaner(buffer);
+    }
+
+    /**
      * Wraps the unsafe native memory with a {@link ByteBuffer}.
      *
      * @param address address of the unsafe memory to wrap

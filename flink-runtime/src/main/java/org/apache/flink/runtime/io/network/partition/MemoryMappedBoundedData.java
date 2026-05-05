@@ -18,10 +18,9 @@
 
 package org.apache.flink.runtime.io.network.partition;
 
+import org.apache.flink.core.memory.MemoryUtils;
 import org.apache.flink.runtime.io.network.buffer.Buffer;
 import org.apache.flink.util.IOUtils;
-
-import org.apache.flink.shaded.netty4.io.netty.util.internal.PlatformDependent;
 
 import javax.annotation.Nullable;
 
@@ -143,13 +142,16 @@ final class MemoryMappedBoundedData implements BoundedData {
     public void close() throws IOException {
         IOUtils.closeQuietly(file); // in case we dispose before finishing writes
 
+        // FLINK-38280: use Unsafe.invokeCleaner directly. Netty 4.2's CleanerJava25
+        // (under JDK 25) refuses to clean mapped buffers it did not allocate, so the
+        // previous PlatformDependent.freeDirectBuffer path throws on close.
         for (ByteBuffer bb : fullBuffers) {
-            PlatformDependent.freeDirectBuffer(bb);
+            MemoryUtils.unmap(bb);
         }
         fullBuffers.clear();
 
         if (currentBuffer != null) {
-            PlatformDependent.freeDirectBuffer(currentBuffer);
+            MemoryUtils.unmap(currentBuffer);
             currentBuffer = null;
         }
 

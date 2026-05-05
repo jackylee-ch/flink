@@ -107,6 +107,24 @@ public class FlinkSecurityManager extends SecurityManager {
         final FlinkSecurityManager flinkSecurityManager =
                 FlinkSecurityManager.fromConfiguration(configuration);
         if (flinkSecurityManager != null) {
+            // FLINK-38280: JEP-486 made SecurityManager permanently disabled in JDK 24+.
+            // Calling System.setSecurityManager unconditionally throws
+            // UnsupportedOperationException, breaking JobManager / TaskManager startup
+            // even when the user explicitly opted into the intercept feature. Degrade
+            // gracefully: log a warning and skip installation. See FLINK-36902 upstream
+            // which removes FlinkSecurityManager entirely.
+            if (isSecurityManagerPermanentlyDisabled()) {
+                LOG.warn(
+                        "FlinkSecurityManager features ('{}', '{}') are no-ops on this JDK"
+                                + " (java.specification.version={}): java.lang.SecurityManager"
+                                + " was permanently disabled by JEP-486 (JDK 24+). Skipping"
+                                + " installation. User-System-exit interception and"
+                                + " halt-on-fatal-error fast-halt will not take effect.",
+                        ClusterOptions.INTERCEPT_USER_SYSTEM_EXIT.key(),
+                        ClusterOptions.HALT_ON_FATAL_ERROR.key(),
+                        System.getProperty("java.specification.version"));
+                return;
+            }
             try {
                 System.setSecurityManager(flinkSecurityManager);
             } catch (Exception e) {
@@ -208,12 +226,38 @@ public class FlinkSecurityManager extends SecurityManager {
      * Runtime.getRuntime().halt().
      */
     public static void forceProcessExit(int exitCode) {
-        // Unset ourselves to allow exiting in any case.
-        System.setSecurityManager(null);
+        // FLINK-38280: on JDK 24+ JEP-486 made SecurityManager permanently disabled, so
+        // System.setSecurityManager(null) throws UnsupportedOperationException and would
+        // crash this defensive halt path. Skip the unset on JDK 24+ — there is no
+        // SecurityManager to unset there in the first place.
+        if (!isSecurityManagerPermanentlyDisabled()) {
+            // Unset ourselves to allow exiting in any case.
+            System.setSecurityManager(null);
+        }
         if (flinkSecurityManager != null && flinkSecurityManager.haltOnSystemExit) {
             Runtime.getRuntime().halt(exitCode);
         } else {
             System.exit(exitCode);
+        }
+    }
+
+    /**
+     * Returns whether {@code java.lang.SecurityManager} has been permanently disabled by the
+     * running JDK (JEP-486, JDK 24+). On such JDKs every {@link System#setSecurityManager} call
+     * throws {@link UnsupportedOperationException}, regardless of whether the new value is null.
+     */
+    @VisibleForTesting
+    static boolean isSecurityManagerPermanentlyDisabled() {
+        final String specVersion = System.getProperty("java.specification.version");
+        if (specVersion == null) {
+            return false;
+        }
+        try {
+            // 1.x for JDK 1-8; 9, 10, ... for later releases. JEP-486 lands in 24.
+            final int major = Integer.parseInt(specVersion.split("\\.")[0]);
+            return major >= 24;
+        } catch (NumberFormatException nfe) {
+            return false;
         }
     }
 }
