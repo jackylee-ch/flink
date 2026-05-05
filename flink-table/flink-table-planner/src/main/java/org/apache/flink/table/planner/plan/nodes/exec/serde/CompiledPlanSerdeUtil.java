@@ -161,6 +161,10 @@ public class CompiledPlanSerdeUtil {
         registerSerializers(module);
         registerDeserializers(module);
         registerMixins(module);
+        // FLINK-38280: re-inject the ExecNodeBase.context field that Jackson 2.20's
+        // @JsonTypeInfo(visible=true) regression no longer populates. Must run after
+        // subtype registration so every ExecNode subclass gets the wrapped deserializer.
+        module.setDeserializerModifier(new ExecNodeBeanDeserializerModifier());
 
         return module;
     }

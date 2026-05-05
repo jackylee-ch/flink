@@ -18,6 +18,7 @@
 
 package org.apache.flink.table.planner.plan.nodes.exec;
 
+import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.dag.Transformation;
 import org.apache.flink.configuration.Configuration;
@@ -69,6 +70,15 @@ public abstract class ExecNodeBase<T> implements ExecNode<T> {
     @JacksonInject("isDeserialize")
     private boolean isCompiled;
 
+    /**
+     * Independent backing for {@link #getId()}. We deliberately keep this separate from the {@link
+     * #context} field because Jackson 2.20 introduced a regression with
+     * {@code @JsonTypeInfo(visible=true)} and same-named {@code @JsonProperty} constructor
+     * parameters (FLINK-38280): the {@code context} parameter is null when deserialized. The id is
+     * read from the JSON's {@code "id"} property independently and is therefore always available.
+     */
+    private final int id;
+
     private final String description;
 
     private final LogicalType outputType;
@@ -82,9 +92,15 @@ public abstract class ExecNodeBase<T> implements ExecNode<T> {
 
     private @Nullable transient OpFusionCodegenSpecGenerator fusionCodegenSpecGenerator;
 
-    /** Holds the context information (id, name, version) as deserialized from a JSON plan. */
+    /**
+     * Holds the context information (id, name, version) as deserialized from a JSON plan.
+     *
+     * <p>May be {@code null} immediately after a Jackson 2.20+ deserialization due to FLINK-38280;
+     * in that case it is rehydrated by {@code ExecNodeBeanDeserializerModifier} before the
+     * deserialization call returns to the caller.
+     */
     @JsonProperty(value = FIELD_NAME_TYPE, access = JsonProperty.Access.WRITE_ONLY)
-    private final ExecNodeContext context;
+    private @Nullable ExecNodeContext context;
 
     /**
      * Retrieves the default context from the {@link ExecNodeMetadata} annotation to be serialized
@@ -117,7 +133,10 @@ public abstract class ExecNodeBase<T> implements ExecNode<T> {
             List<InputProperty> inputProperties,
             LogicalType outputType,
             String description) {
-        this.context = checkNotNull(context).withId(id);
+        this.id = id;
+        // Tolerate a null `context` so that the Jackson 2.20 regression (FLINK-38280) does not
+        // NPE the @JsonCreator path before ExecNodeBeanDeserializerModifier can rehydrate it.
+        this.context = (context == null) ? null : context.withId(id);
         this.persistedConfig = persistedConfig == null ? new Configuration() : persistedConfig;
         this.inputProperties = checkNotNull(inputProperties);
         this.outputType = checkNotNull(outputType);
@@ -126,7 +145,23 @@ public abstract class ExecNodeBase<T> implements ExecNode<T> {
 
     @Override
     public final int getId() {
-        return context.getId();
+        return id;
+    }
+
+    /**
+     * Re-populates {@link #context} after Jackson 2.20+ polymorphic deserialization (FLINK-38280).
+     *
+     * <p>Two regression modes are observed in Jackson 2.20: (1) the {@code @JsonCreator} parameter
+     * is null because the visible discriminator is no longer surfaced to the bean; (2) the
+     * {@code @JsonProperty(WRITE_ONLY)} field is set <em>after</em> the constructor with an {@link
+     * ExecNodeContext} created via the {@code String}-arg {@code @JsonCreator}, which always leaves
+     * {@link ExecNodeContext}'s {@code id} null — overwriting whatever the constructor stored. We
+     * therefore unconditionally re-assemble {@code context} from the just-parsed type token plus
+     * the {@code id} field that {@link #getId()} reports.
+     */
+    @Internal
+    public final void rehydrateContext(ExecNodeContext freshContext) {
+        this.context = checkNotNull(freshContext).withId(id);
     }
 
     @Override
