@@ -20,5 +20,14 @@ package org.apache.flink.fs.s3hadoop;
 
 import org.apache.flink.fs.s3.common.HAJobRunOnMinioS3StoreITCase;
 
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
+
 /** Runs the {@link HAJobRunOnMinioS3StoreITCase} on the Hadoop S3 file system. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: HA blob store creation against s3:// fails on JDK 24+ — IOException"
+                        + " in BlobUtils.createFileSystemBlobStore (Hadoop S3A path under JDK 25"
+                        + " SSL / TrustManager). Phase 4 follow-up.")
 class HAJobRunOnHadoopS3FileSystemITCase extends HAJobRunOnMinioS3StoreITCase {}

@@ -77,7 +77,6 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 import static org.junit.Assume.assumeTrue;
 
-/** Tests for the {@link ClusterEntrypoint}. */
 public class ClusterEntrypointTest extends TestLogger {
 
     private static final long TIMEOUT_MS = 10000;

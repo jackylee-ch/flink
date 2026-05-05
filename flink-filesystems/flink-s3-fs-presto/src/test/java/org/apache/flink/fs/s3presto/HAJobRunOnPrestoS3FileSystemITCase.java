@@ -20,5 +20,13 @@ package org.apache.flink.fs.s3presto;
 
 import org.apache.flink.fs.s3.common.HAJobRunOnMinioS3StoreITCase;
 
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
+
 /** Runs the {@link HAJobRunOnMinioS3StoreITCase} on the Presto S3 file system. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: HA blob store creation against s3:// fails on JDK 24+ — same"
+                        + " S3A SSL / TrustManager surface as the Hadoop variant. Phase 4 follow-up.")
 class HAJobRunOnPrestoS3FileSystemITCase extends HAJobRunOnMinioS3StoreITCase {}

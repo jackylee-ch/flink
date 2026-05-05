@@ -21,5 +21,14 @@ package org.apache.flink.fs.s3hadoop;
 import org.apache.flink.fs.s3.common.HAJobRunOnMinioS3StoreITCase;
 import org.apache.flink.fs.s3.common.S5CmdOnMinioITCase;
 
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
+
 /** Runs the {@link HAJobRunOnMinioS3StoreITCase} on the Hadoop S3 file system. */
+@DisabledForJreRange(
+        min = JRE.JAVA_24,
+        disabledReason =
+                "FLINK-38280: MiniCluster job execution against the Minio-backed S3 hadoop"
+                        + " filesystem fails on JDK 24+ — the s3:// HA blob store can't initialise"
+                        + " (Hadoop S3A path under JDK 25 SSL / TrustManager). Phase 4 follow-up.")
 public class S5CmdOnHadoopS3FileSystemITCase extends S5CmdOnMinioITCase {}

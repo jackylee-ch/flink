@@ -26,6 +26,8 @@ import org.apache.flink.core.fs.local.LocalRecoverableFsDataOutputStreamTest;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileSystem;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -37,6 +39,12 @@ import java.util.Arrays;
 import java.util.List;
 
 /** Unit tests for {@link AzureBlobFsRecoverableDataOutputStream}. */
+// FLINK-38280: This test calls FileSystem.getLocal(...) which goes through
+// UserGroupInformation.getCurrentUser() → Subject.getSubject(AccessControlContext). The
+// production Azure FS path uses the *shaded* hadoop-common 3.4.3 (HADOOP-19212 migrated UGI to
+// the JDK 25 Subject API), but this test pulls in unshaded hadoop-common 3.3.4 transitively
+// through the test classpath, where Subject.getSubject is removed in JDK 24+.
+@DisabledForJreRange(min = JRE.JAVA_24)
 public class AzureBlobFsRecoverableDataOutputStreamTest
         extends AbstractRecoverableFsDataOutputStreamTest {
 

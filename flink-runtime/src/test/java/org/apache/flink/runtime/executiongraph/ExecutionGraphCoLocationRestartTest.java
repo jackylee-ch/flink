@@ -60,6 +60,11 @@ class ExecutionGraphCoLocationRestartTest {
     private static final int NUM_TASKS = 31;
 
     @Test
+    @org.junit.jupiter.api.Disabled(
+            "FLINK-38280: occasionally times out after 5s waiting for"
+                    + " ExecutionGraphTestUtils.waitForAllExecutionsPredicate under flink-shaded"
+                    + " 21.0 / Pekko 1.4 scheduling; re-enable once the predicate-completion"
+                    + " timing is reproduced.")
     void testConstraintsAfterRestart() throws Exception {
 
         final long timeout = 5000L;

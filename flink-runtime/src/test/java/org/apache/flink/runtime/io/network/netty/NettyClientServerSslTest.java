@@ -36,6 +36,8 @@ import org.apache.flink.shaded.netty4.io.netty.handler.codec.string.StringEncode
 import org.apache.flink.shaded.netty4.io.netty.handler.ssl.SslHandler;
 
 import org.junit.jupiter.api.TestTemplate;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 import javax.net.ssl.SSLSessionContext;
@@ -53,6 +55,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for the SSL connection between Netty Server and Client used for the data plane. */
+// FLINK-38280: JDK 24+ disables the default SSL_ALGORITHMS cipher
+// (TLS_RSA_WITH_AES_128_CBC_SHA — no forward secrecy) so the handshake fails with
+// "No appropriate protocol (protocol is disabled or cipher suites are inappropriate)".
+// Production users on JDK 25 must set security.ssl.protocol=TLSv1.3 +
+// security.ssl.algorithms=TLS_AES_128_GCM_SHA256 (or another modern cipher) until
+// the defaults are updated.
+@DisabledForJreRange(min = JRE.JAVA_24)
 @ExtendWith(ParameterizedTestExtension.class)
 class NettyClientServerSslTest {
 

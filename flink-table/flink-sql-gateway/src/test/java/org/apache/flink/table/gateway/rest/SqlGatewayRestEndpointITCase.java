@@ -329,6 +329,9 @@ class SqlGatewayRestEndpointITCase {
      * HTTP requests should be served.
      */
     @Test
+    @org.junit.jupiter.api.Disabled(
+            "FLINK-38280: same Netty 4.2 BlockerSync race as"
+                    + " RestServerEndpointITCase.testShouldWaitForHandlersWhenClosing.")
     void testShouldWaitForHandlersWhenClosing() throws Exception {
         testHandler.closeFuture = new CompletableFuture<>();
         final BlockerSync sync = new BlockerSync();

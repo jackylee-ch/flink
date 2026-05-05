@@ -21,7 +21,6 @@ package org.apache.flink.runtime.io.network.partition;
 import java.io.IOException;
 import java.nio.file.Path;
 
-/** Tests that read the BoundedBlockingSubpartition with multiple threads in parallel. */
 public class FileChannelMemoryMappedBoundedDataTest extends BoundedDataTestBase {
 
     @Override

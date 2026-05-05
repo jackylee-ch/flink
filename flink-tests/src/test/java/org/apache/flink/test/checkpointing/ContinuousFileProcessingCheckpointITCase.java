@@ -58,7 +58,6 @@ import java.util.Set;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
-/** Test checkpointing while sourcing a continuous file processor. */
 public class ContinuousFileProcessingCheckpointITCase extends StreamFaultToleranceTestBase {
 
     private static final int NO_OF_FILES = 5;

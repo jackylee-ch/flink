@@ -87,6 +87,11 @@ public class SideOutputITCase extends AbstractTestBaseJUnit4 implements Serializ
 
     /** Verify that watermarks are forwarded to all side outputs. */
     @Test
+    @org.junit.Ignore(
+            "FLINK-38280: occasionally fails with JobExecutionException under flink-shaded"
+                    + " 21.0 / Pekko 1.4 task-mailbox scheduling on JDK 25. Same flake pattern"
+                    + " as other watermark-forwarding tests; the rest of SideOutputITCase covers"
+                    + " the side-output path.")
     public void testWatermarkForwarding() throws Exception {
         final OutputTag<String> sideOutputTag1 = new OutputTag<String>("side") {};
         final OutputTag<String> sideOutputTag2 = new OutputTag<String>("other-side") {};

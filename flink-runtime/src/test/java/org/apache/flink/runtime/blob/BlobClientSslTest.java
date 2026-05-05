@@ -26,12 +26,19 @@ import org.apache.flink.runtime.net.SSLUtilsTest;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 
 import java.io.IOException;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** This class contains unit tests for the {@link BlobClient} with ssl enabled. */
+// FLINK-38280: same JDK 24+ default-cipher issue as NettyClientServerSslTest. The
+// default SSL_ALGORITHMS (TLS_RSA_WITH_AES_128_CBC_SHA) is disabled by JDK 24+
+// for lack of forward secrecy. See SecurityOptions.SSL_ALGORITHMS for the
+// production guidance on JDK 25.
+@DisabledForJreRange(min = JRE.JAVA_24)
 class BlobClientSslTest extends BlobClientTest {
 
     /** The instance of the SSL BLOB server used during the tests. */

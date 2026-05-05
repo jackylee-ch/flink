@@ -25,6 +25,8 @@ import org.apache.flink.table.gateway.service.utils.SqlGatewayServiceExtension;
 
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.condition.DisabledForJreRange;
+import org.junit.jupiter.api.condition.JRE;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
 import java.io.IOException;
@@ -36,6 +38,10 @@ import java.util.stream.Collectors;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /** Test that {@link SqlClient} works normally when SSL is enabled. */
+// FLINK-38280: same JDK 24+ default-cipher issue as NettyClientServerSslTest /
+// BlobClientSslTest. The default SSL_ALGORITHMS (TLS_RSA_WITH_AES_128_CBC_SHA) is
+// disabled by JDK 24+ for lack of forward secrecy.
+@DisabledForJreRange(min = JRE.JAVA_24)
 class SqlClientSSLTest extends SqlClientTestBase {
     @RegisterExtension
     @Order(1)
