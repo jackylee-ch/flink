@@ -20,7 +20,10 @@
 function test_module() {
     module="$FLINK_PYTHON_DIR/pyflink/$1"
     echo "test module $module"
-    pytest --durations=20 ${module} $2
+    # Exclude generated protobuf modules that match the test_*.py discovery
+    # pattern but aren't test files (they fail to collect under newer
+    # protobuf runtimes). See Phase 1.5c in jdk25_performance branch notes.
+    pytest --durations=20 --ignore-glob='**/test_*_pb2.py' ${module} $2
     if [[ $? -ne 0 ]]; then
         echo "test module $module failed"
         exit 1

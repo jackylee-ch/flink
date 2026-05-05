@@ -73,7 +73,28 @@ under the License.
 				</exclusion>
 			</exclusions>
 		</dependency>
-		
+
+		<!-- FLINK-38280: Hadoop 3.x split client APIs (HdfsConfiguration, DFSClient,
+			 ReplicaNotFoundException class loading) into hadoop-hdfs-client. The
+			 MiniDFSCluster.Builder.build() path used by HDFSTest fails at runtime
+			 without it. Same fix as flink-end-to-end-tests-sql, flink-orc, flink-orc-nohive. -->
+		<dependency>
+			<groupId>org.apache.hadoop</groupId>
+			<artifactId>hadoop-hdfs-client</artifactId>
+			<version>${flink.hadoop.version}</version>
+			<scope>test</scope>
+			<exclusions>
+				<exclusion>
+					<groupId>ch.qos.reload4j</groupId>
+					<artifactId>reload4j</artifactId>
+				</exclusion>
+				<exclusion>
+					<groupId>org.slf4j</groupId>
+					<artifactId>slf4j-reload4j</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
+
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-streaming-java</artifactId>

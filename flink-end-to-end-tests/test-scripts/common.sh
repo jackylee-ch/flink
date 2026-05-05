@@ -513,12 +513,24 @@ function check_logs_for_non_empty_out_files {
   echo "Checking for non-empty .out files..."
   # exclude reflective access warnings as these are expected (and currently unavoidable) on Java 9
   # exclude message about JAVA_TOOL_OPTIONS being set (https://bugs.openjdk.java.net/browse/JDK-8039152)
-  if grep -ri -v \
+  # JDK 24+ JEP-498 (deprecated sun.misc.Unsafe::objectFieldOffset) and JEP-472 (restricted
+  # System::loadLibrary) print warnings on stderr from Pekko / Netty that we cannot suppress
+  # without bumping those libraries; ignore them in the .out content check.
+  # NB: '-h' suppresses the "filename:" prefix that grep -r adds for multi-file input;
+  # without it, empty lines in .out files become "filename:" (non-empty) and pass the
+  # subsequent 'grep "."' check, falsely flagging the file as non-empty.
+  if grep -rhi -v \
     -e "WARNING: An illegal reflective access" \
     -e "WARNING: Illegal reflective access"\
     -e "WARNING: Please consider reporting"\
     -e "WARNING: Use --illegal-access"\
     -e "WARNING: All illegal access"\
+    -e "WARNING: A terminally deprecated method in sun.misc.Unsafe"\
+    -e "WARNING: sun.misc.Unsafe::objectFieldOffset"\
+    -e "WARNING: A restricted method in java.lang.System"\
+    -e "WARNING: java.lang.System::loadLibrary"\
+    -e "WARNING: Use --enable-native-access=ALL-UNNAMED"\
+    -e "WARNING: Restricted methods will be blocked in a future release"\
     -e "Picked up JAVA_TOOL_OPTIONS"\
     $FLINK_LOG_DIR/*.out\
    | grep "." \

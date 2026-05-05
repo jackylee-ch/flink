@@ -114,6 +114,27 @@ under the License.
 			<artifactId>flink-architecture-tests-test</artifactId>
 			<scope>test</scope>
 		</dependency>
+
+		<!-- FLINK-38280: Hadoop 3.x split client APIs (HdfsDataOutputStream$SyncFlag,
+			 HdfsConfiguration, DFSClient) into hadoop-hdfs-client. Same fix as
+			 flink-orc/pom.xml — pin the client artifact explicitly so the ORC
+			 writer path resolves at runtime. -->
+		<dependency>
+			<groupId>org.apache.hadoop</groupId>
+			<artifactId>hadoop-hdfs-client</artifactId>
+			<version>${flink.hadoop.version}</version>
+			<scope>test</scope>
+			<exclusions>
+				<exclusion>
+					<groupId>ch.qos.reload4j</groupId>
+					<artifactId>reload4j</artifactId>
+				</exclusion>
+				<exclusion>
+					<groupId>org.slf4j</groupId>
+					<artifactId>slf4j-reload4j</artifactId>
+				</exclusion>
+			</exclusions>
+		</dependency>
 	</dependencies>
 
 	<profiles>

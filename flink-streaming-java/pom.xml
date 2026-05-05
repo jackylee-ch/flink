@@ -173,8 +173,14 @@ under the License.
 		</profile>
 		<profile>
 			<id>java21</id>
+			<!--
+			    Bounded to JDK 21-23: JEP-486 in JDK 24 permanently disables
+			    the SecurityManager and rejects -Djava.security.manager=allow
+			    at VM startup. StreamTaskSystemExitTest is expected to fail
+			    on JDK 24+; remediation tracked under Phase 2 (G').
+			-->
 			<activation>
-				<jdk>[21,)</jdk>
+				<jdk>[21,24)</jdk>
 			</activation>
 
 			<properties>

@@ -87,6 +87,17 @@
             </exclusions>
         </dependency>
 
+        <!-- FLINK-38280: Hadoop 3.x split client APIs (HdfsConfiguration, DFSClient) into
+             hadoop-hdfs-client. hadoop-hdfs (server) no longer brings them transitively, so
+             MiniDFSCluster.Builder.build() fails at runtime with NoClassDefFoundError on
+             HdfsConfiguration. Pin the client artifact explicitly. -->
+        <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-hdfs-client</artifactId>
+            <scope>test</scope>
+            <version>${flink.hadoop.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.apache.hadoop</groupId>
             <artifactId>hadoop-hdfs</artifactId>

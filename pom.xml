@@ -112,7 +112,7 @@ under the License.
 	<properties>
 		<project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 		<project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-		<flink.hadoop.version>2.10.2</flink.hadoop.version>
+		<flink.hadoop.version>3.4.3</flink.hadoop.version>
 		<flink.XmxMax>3072m</flink.XmxMax>
 		<!-- XmxMax / forkCountITCase -->
 		<flink.XmxITCase>1536m</flink.XmxITCase>
@@ -127,12 +127,12 @@ under the License.
 		<flink.forkCountUnitTest>4</flink.forkCountUnitTest>
 		<flink.reuseForks>true</flink.reuseForks>
 		<flink.surefire.baseArgLine>-XX:+UseG1GC -Xms256m -XX:+IgnoreUnrecognizedVMOptions ${surefire.module.config}</flink.surefire.baseArgLine>
-		<flink.shaded.version>20.0</flink.shaded.version>
-		<flink.shaded.jackson.version>2.18.2</flink.shaded.jackson.version>
-		<flink.shaded.jsonpath.version>2.9.0</flink.shaded.jsonpath.version>
+		<flink.shaded.version>21.0</flink.shaded.version>
+		<flink.shaded.jackson.version>2.20.1</flink.shaded.jackson.version>
+		<flink.shaded.jsonpath.version>2.10.0</flink.shaded.jsonpath.version>
 		<flink.markBundledAsOptional>true</flink.markBundledAsOptional>
-		<source.java.version>11</source.java.version>
-		<target.java.version>17</target.java.version>
+		<source.java.version>25</source.java.version>
+		<target.java.version>25</target.java.version>
 		<slf4j.version>1.7.36</slf4j.version>
 		<log4j.version>2.24.3</log4j.version>
 		<!-- Overwrite default values from parent pom.
@@ -355,13 +355,13 @@ under the License.
 			<dependency>
 				<groupId>org.apache.flink</groupId>
 				<artifactId>flink-shaded-asm-9</artifactId>
-				<version>9.6-${flink.shaded.version}</version>
+				<version>9.9.1-${flink.shaded.version}</version>
 			</dependency>
 
 			<dependency>
 				<groupId>org.apache.flink</groupId>
 				<artifactId>flink-shaded-guava</artifactId>
-				<version>33.4.0-jre-${flink.shaded.version}</version>
+				<version>33.5.0-jre-${flink.shaded.version}</version>
 			</dependency>
 
 			<dependency>
@@ -379,13 +379,13 @@ under the License.
 			<dependency>
 				<groupId>org.apache.flink</groupId>
 				<artifactId>flink-shaded-netty</artifactId>
-				<version>4.1.100.Final-${flink.shaded.version}</version>
+				<version>4.2.6.Final-${flink.shaded.version}</version>
 			</dependency>
 
 			<dependency>
 				<groupId>org.apache.flink</groupId>
 				<artifactId>flink-shaded-netty-tcnative-dynamic</artifactId>
-				<version>2.0.62.Final-${flink.shaded.version}</version>
+				<version>2.0.74.Final-${flink.shaded.version}</version>
 				<scope>test</scope>
 			</dependency>
 
@@ -1139,6 +1139,13 @@ under the License.
 				<module>flink-tests-java17</module>
 			</modules>
 
+			<properties>
+				<!-- Align target.java.version with the compiler-plugin source/target so the
+				     maven-enforcer-plugin requireJavaVersion rule [${target.java.version}.*,)
+				     evaluates against 17, not the root default. -->
+				<target.java.version>17</target.java.version>
+			</properties>
+
 			<build>
 				<plugins>
 					<plugin>
@@ -1185,6 +1192,12 @@ under the License.
 
 		<profile>
 			<id>java21-target</id>
+
+			<properties>
+				<!-- Align target.java.version (read by maven-enforcer-plugin requireJavaVersion). -->
+				<target.java.version>21</target.java.version>
+			</properties>
+
 			<build>
 				<plugins>
 					<plugin>
@@ -1241,6 +1254,12 @@ under the License.
 
 		<profile>
 			<id>java25-target</id>
+
+			<properties>
+				<!-- Align target.java.version (read by maven-enforcer-plugin requireJavaVersion). -->
+				<target.java.version>25</target.java.version>
+			</properties>
+
 			<build>
 				<plugins>
 					<plugin>
@@ -1633,6 +1652,8 @@ under the License.
 						<exclude>**/.*/**</exclude>
 						<exclude>**/*.prefs</exclude>
 						<exclude>**/*.log</exclude>
+						<!-- Internal planning/spec/report docs (fork-only, not source code). -->
+						<exclude>docs/superpowers/**</exclude>
 						<!-- External web libraries. -->
 						<exclude>docs/**/jquery*</exclude>
 						<exclude>docs/**/bootstrap*</exclude>
