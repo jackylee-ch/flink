@@ -68,11 +68,42 @@ runs:
           fi
         done
 
+    - name: "Install JDK 25 (Zulu) when needed"
+      if: ${{ inputs.jdk_version == '25' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # The chesnay/flink-ci docker image only ships JDK 8/11/17/21. Layer Zulu 25 on top
+        # for the new JDK 25 GHA lane (FLINK-38280 Phase 2). Idempotent across re-runs.
+        JDK25_DIR=/opt/zulu25
+        ZULU_TARBALL=zulu25.34.17-ca-jdk25.0.3-linux_x64.tar.gz
+        ZULU_TOPDIR=zulu25.34.17-ca-jdk25.0.3-linux_x64
+        if [ ! -d "$JDK25_DIR" ]; then
+          TMP="$(mktemp -d)"
+          curl -fsSL \
+            "https://cdn.azul.com/zulu/bin/${ZULU_TARBALL}" \
+            -o "$TMP/zulu25.tar.gz"
+          sudo mkdir -p /opt
+          sudo tar -xzf "$TMP/zulu25.tar.gz" -C /opt
+          sudo mv "/opt/${ZULU_TOPDIR}" "$JDK25_DIR"
+          rm -rf "$TMP"
+        fi
+        echo "JAVA_HOME_25_X64=$JDK25_DIR" >> "${GITHUB_ENV}"
+        "$JDK25_DIR/bin/java" -version
+
     - name: "Set JDK version to ${{ inputs.jdk_version }}"
       shell: bash
       run: |
-        echo "JAVA_HOME=$JAVA_HOME_${{ inputs.jdk_version }}_X64" >> "${GITHUB_ENV}"
-        echo "PATH=$JAVA_HOME_${{ inputs.jdk_version }}_X64/bin:$PATH" >> "${GITHUB_ENV}"
+        # When jdk_version=25 the previous step exported JAVA_HOME_25_X64 into GITHUB_ENV;
+        # GitHub doesn't propagate vars across steps via $JAVA_HOME_25_X64 expansion in this
+        # block, so we read from the env this step inherits.
+        if [ "${{ inputs.jdk_version }}" = "25" ]; then
+          JDK_ROOT="${JAVA_HOME_25_X64:-/opt/zulu25}"
+        else
+          JDK_ROOT="$(eval echo \$JAVA_HOME_${{ inputs.jdk_version }}_X64)"
+        fi
+        echo "JAVA_HOME=$JDK_ROOT" >> "${GITHUB_ENV}"
+        echo "PATH=$JDK_ROOT/bin:$PATH" >> "${GITHUB_ENV}"
 
     - name: "Setup Maven package cache"
       if: ${{ inputs.maven_repo_folder != '' }}

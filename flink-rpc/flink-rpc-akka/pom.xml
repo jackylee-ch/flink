@@ -37,7 +37,7 @@ under the License.
 	</description>
 
 	<properties>
-		<pekko.version>1.1.2</pekko.version>
+		<pekko.version>1.4.0</pekko.version>
 	</properties>
 
 	<dependencies>
@@ -90,10 +90,20 @@ under the License.
 			<version>${pekko.version}</version>
 			<optional>${flink.markBundledAsOptional}</optional>
 		</dependency>
+		<!-- FLINK-38523: Pekko 1.4.0 requires the modular Netty 4.2 API
+			 (io.netty.channel.MultiThreadIoEventLoopGroup, etc.). All seven
+			 netty-* modules brought in by pekko-remote need to converge to
+			 4.2.6.Final; that override is in the dependencyManagement block
+			 below. The unshaded io.netty classes are bundled into this
+			 module's jar and relocated via the shade rule below. -->
 		<dependency>
 			<groupId>io.netty</groupId>
-			<artifactId>netty-all</artifactId>
-			<scope>test</scope>
+			<artifactId>netty-handler</artifactId>
+			<optional>${flink.markBundledAsOptional}</optional>
+		</dependency>
+		<dependency>
+			<groupId>io.netty</groupId>
+			<artifactId>netty-transport</artifactId>
 			<optional>${flink.markBundledAsOptional}</optional>
 		</dependency>
 
@@ -125,6 +135,18 @@ under the License.
 
 	<dependencyManagement>
 		<dependencies>
+			<!-- FLINK-38523: override the root pom's netty-bom 4.1.100.Final
+				 with 4.2.6.Final so all seven netty-* modules brought in by
+				 pekko-remote 1.4.0 converge. This is local to flink-rpc-akka;
+				 the global Netty 4.2 migration (upstream FLINK-38912) stays
+				 deferred. -->
+			<dependency>
+				<groupId>io.netty</groupId>
+				<artifactId>netty-bom</artifactId>
+				<version>4.2.6.Final</version>
+				<type>pom</type>
+				<scope>import</scope>
+			</dependency>
 			<dependency>
 				<!-- Overwrite parent dependency management -->
 				<groupId>org.scala-lang</groupId>

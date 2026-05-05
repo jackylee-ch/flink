@@ -32,8 +32,25 @@ jobs:
     name: "Default (Java 17)"
     uses: ./.github/workflows/template.flink-ci.yml
     with:
+      # FLINK-38280: workflow-caller-id disambiguates the build-artifacts upload name
+      # from ci-jdk25; otherwise the JDK 25 tar.gz (compiled at target=25, class
+      # file v69) silently overwrites the JDK 17 artifact and JDK 17 test jobs
+      # try to load v69 classes on a JDK 17 surefire fork.
+      workflow-caller-id: jdk17
       environment: 'PROFILE="-Dinclude_hadoop_aws -Djdk17 -Pjava17-target"'
       jdk_version: 17
+    secrets:
+      s3_bucket: ${{ secrets.IT_CASE_S3_BUCKET }}
+      s3_access_key: ${{ secrets.IT_CASE_S3_ACCESS_KEY }}
+      s3_secret_key: ${{ secrets.IT_CASE_S3_SECRET_KEY }}
+  ci-jdk25:
+    name: "JDK 25"
+    needs: pre-compile-checks
+    uses: ./.github/workflows/template.flink-ci.yml
+    with:
+      workflow-caller-id: jdk25
+      environment: 'PROFILE="-Dinclude_hadoop_aws -Djdk25 -Pjava25-target"'
+      jdk_version: 25
     secrets:
       s3_bucket: ${{ secrets.IT_CASE_S3_BUCKET }}
       s3_access_key: ${{ secrets.IT_CASE_S3_ACCESS_KEY }}

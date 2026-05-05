@@ -127,6 +127,10 @@ jobs:
     name: "Test packaging/licensing"
     needs: compile
     runs-on: ubuntu-24.04
+    # FLINK-38280: JDK 24+ is upstream-blocked on Hadoop 3.5 (HADOOP-19097) and
+    # Netty 4.2's CleanerJava25 / restricted-method policy. We exercise compile +
+    # tests on JDK 25 best-effort while iteration continues.
+    continue-on-error: ${{ inputs.jdk_version == 25 }}
     container:
       image: chesnay/flink-ci:java_8_11_17_21_maven_386_jammy
       # --init makes the process in the container being started as an init process which will clean up any daemon processes during shutdown
@@ -167,6 +171,8 @@ jobs:
     name: "Test (module: ${{ matrix.module }})"
     needs: compile
     runs-on: ubuntu-24.04
+    # FLINK-38280: see packaging job comment.
+    continue-on-error: ${{ inputs.jdk_version == 25 }}
     container:
       image: chesnay/flink-ci:java_8_11_17_21_maven_386_jammy
       # --init makes the process in the container being started as an init process which will clean up any daemon processes during shutdown
@@ -291,6 +297,8 @@ jobs:
     needs: compile
     # the end to end tests are not executed in Flink's CI Docker container due to problems when running Docker-in-Docker
     runs-on: ubuntu-24.04
+    # FLINK-38280: see packaging job comment.
+    continue-on-error: ${{ inputs.jdk_version == 25 }}
     timeout-minutes: 310
     env:
       # timeout in minutes - this environment variable is required by uploading_watchdog.sh

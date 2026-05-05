@@ -36,6 +36,13 @@ under the License.
 		<fs.azure.sdk.version>1.16.0</fs.azure.sdk.version>
 		<fs.jackson.core.version>2.9.4</fs.jackson.core.version>
 		<jetty.version>9.3.24.v20180605</jetty.version>
+		<!-- FLINK-38280: override flink-filesystems' fs.hadoopshaded.version (3.3.4) to
+			 3.4.3 just for this module so the bundled Hadoop carries HADOOP-19212 —
+			 UserGroupInformation now uses the JDK 25 Subject API instead of the removed
+			 Subject.getSubject(AccessControlContext). The global property stays at 3.3.4
+			 because flink-s3-fs-hadoop depends on the AWS SDK V1 S3A API that
+			 Hadoop 3.4 removed (upstream PR #27026 / FLINK-30975 contains that migration). -->
+		<fs.hadoopshaded.version>3.4.3</fs.hadoopshaded.version>
 	</properties>
 
 	<dependencies>

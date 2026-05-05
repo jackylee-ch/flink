@@ -34,6 +34,12 @@ under the License.
 	<packaging>pom</packaging>
 
 	<properties>
+		<!-- Most of the bundled-Hadoop file system modules (s3-fs-hadoop, oss-fs-hadoop,
+			 fs-hadoop-shaded) are pinned to 3.3.4. Bumping to 3.4.x globally breaks
+			 flink-s3-fs-hadoop because Hadoop 3.4 migrated S3A from AWS SDK V1 to V2
+			 (upstream PR #27026 / FLINK-30975 contains the codebase migration). The
+			 flink-azure-fs-hadoop module overrides this to 3.4.3 locally so Azure Blob
+			 FS picks up HADOOP-19212 — needed for JDK 25 UserGroupInformation. -->
 		<fs.hadoopshaded.version>3.3.4</fs.hadoopshaded.version>
 	</properties>
 
