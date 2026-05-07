@@ -41,5 +41,6 @@ under the License.
 		<module>flink-statebackend-changelog</module>
 		<module>flink-statebackend-common</module>
         <module>flink-statebackend-forst</module>
+        <module>flink-statebackend-forst-rs</module>
     </modules>
 </project>
