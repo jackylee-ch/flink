@@ -1931,7 +1931,15 @@ under the License.
 						<configuration>
 							<rules>
 								<requireMavenVersion>
-									<version>[3.8.6]</version>
+									<!--
+										Originally pinned to [3.8.6] exactly. Widened to [3.8.6,4.0.0) per
+										v3.2 Phase A (2026-05-08): user authorized Maven 3.9.x for fork-side
+										development (covers 3.9.6 documented use, plus 3.9.11 which is what
+										the typical local toolchain ships). The flink-statebackend-forst-rs
+										build relies only on standard Maven 3.8+ features. Reverting to
+										[3.8.6] is acceptable for upstream merges.
+									-->
+									<version>[3.8.6,4.0.0)</version>
 								</requireMavenVersion>
 								<requireJavaVersion>
 									<version>${target.java.version}</version>
