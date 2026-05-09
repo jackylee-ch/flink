@@ -3,10 +3,10 @@
 # cdylib or the community ForSt cdylib, using a freshly compiled classpath
 # from the bench source — no Maven, no toolchain dance.
 #
-# Usage:  ./run-jmh-3way.sh (forst-rs|forst)
+# Usage:  ./run-jmh-3way.sh (forst-rs|forst-rs-ffm|forst)
 #
 # Env overrides:
-#   FORST_RS_LIB    cdylib for the "forst-rs" variant
+#   FORST_RS_LIB    cdylib for the "forst-rs" / "forst-rs-ffm" variants
 #   FORST_LIB       cdylib for the "forst" (community) variant
 #   JAVA_HOME       JDK 25+ home (auto-detected from /Library/Java/...)
 #   BENCH_WARMUP_S  warmup duration per workload (default 6)
@@ -15,14 +15,14 @@ set -euo pipefail
 
 VARIANT="${1:-forst-rs}"
 case "$VARIANT" in
-  forst-rs)
+  forst-rs|forst-rs-ffm)
     LIB="${FORST_RS_LIB:-/Users/lijunqing/Code/stczwd/ForSt/target/release/libforst_rs_ffi.dylib}"
     ;;
   forst)
     LIB="${FORST_LIB:-/tmp/forstjni-community.dylib}"
     ;;
   *)
-    echo "Usage: $0 (forst-rs|forst)" >&2
+    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst)" >&2
     exit 2
     ;;
 esac
@@ -77,6 +77,26 @@ case "$VARIANT" in
     )
     MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCompareBenchmark"
     ;;
+  forst-rs-ffm)
+    # The FFM bench depends on the production ForStRsLinker + FrsDb/Cf/Iterator
+    # wrappers under src/main, plus FrsStatus / FrsBackendException. Compile
+    # them all together into a dedicated output dir; the bench has zero JNI
+    # surface (no fake org.forstdb.RocksDB shim needed), but it DOES need
+    # --enable-native-access for Linker.nativeLinker().
+    MAIN_SRC="$SCRIPT_DIR/src/main/java"
+    SRC_DIR="$SCRIPT_DIR/src/test/java"
+    OUT_DIR="$SCRIPT_DIR/target/jmh-classes-forst-rs-ffm"
+    SRCS=(
+      "$MAIN_SRC/org/apache/flink/state/forstrs/FrsStatus.java"
+      "$MAIN_SRC/org/apache/flink/state/forstrs/FrsBackendException.java"
+      "$MAIN_SRC/org/apache/flink/state/forstrs/ffm/ForStRsLinker.java"
+      "$MAIN_SRC/org/apache/flink/state/forstrs/ffm/FrsDb.java"
+      "$MAIN_SRC/org/apache/flink/state/forstrs/ffm/FrsCfHandle.java"
+      "$MAIN_SRC/org/apache/flink/state/forstrs/ffm/FrsIterator.java"
+      "$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStRsFfmBenchmark.java"
+    )
+    MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStRsFfmBenchmark"
+    ;;
   forst)
     SRC_DIR="$SCRIPT_DIR/src/test/java-community"
     OUT_DIR="$SCRIPT_DIR/target/jmh-classes-community"
@@ -93,8 +113,20 @@ case "$VARIANT" in
 esac
 
 mkdir -p "$OUT_DIR"
+# FFM (Arena, Linker, MemorySegment, ...) became stable only in JDK 22, so the
+# FFM bench cannot target --release 21 (it would require --enable-preview on a
+# JDK 21 toolchain). Compile it at the JVM's native release; the JNI-shim and
+# community variants stay at 21 to match the rest of the Flink build.
+case "$VARIANT" in
+  forst-rs-ffm)
+    JAVAC_RELEASE=()
+    ;;
+  *)
+    JAVAC_RELEASE=(--release 21)
+    ;;
+esac
 echo "[compile] javac -> $OUT_DIR"
-"$JAVA_HOME/bin/javac" --release 21 -d "$OUT_DIR" "${SRCS[@]}"
+"$JAVA_HOME/bin/javac" ${JAVAC_RELEASE[@]+"${JAVAC_RELEASE[@]}"} -d "$OUT_DIR" "${SRCS[@]}"
 
 WARMUP="${BENCH_WARMUP_S:-6}"
 MEASURE="${BENCH_MEASURE_S:-25}"
@@ -115,13 +147,27 @@ case "$VARIANT" in
     ;;
 esac
 
+# Library-path system property differs by variant:
+#   - JNI-shim variants (forst-rs, forst): -Dorg.forstdb.libpath (consumed by
+#     the org.forstdb.RocksDB static initializer to System.load(LIB))
+#   - FFM variant: -Dforstrs.native.libpath (consumed by ForStRsLinker to
+#     SymbolLookup.libraryLookup(LIB, arena))
+case "$VARIANT" in
+  forst-rs-ffm)
+    LIB_PROP=(-Dforstrs.native.libpath="$LIB")
+    ;;
+  *)
+    LIB_PROP=(-Dorg.forstdb.libpath="$LIB")
+    ;;
+esac
+
 echo "[run] variant=$VARIANT lib=$LIB main=$MAIN_CLASS"
 RESULT_FILE="/tmp/jmh-results-$VARIANT.txt"
 "$JAVA_HOME/bin/java" \
   --enable-native-access=ALL-UNNAMED \
   ${JVM_EXTRA[@]+"${JVM_EXTRA[@]}"} \
   -Xms256m -Xmx2g \
-  -Dorg.forstdb.libpath="$LIB" \
+  "${LIB_PROP[@]}" \
   -Dbench.warmup.s="$WARMUP" \
   -Dbench.measure.s="$MEASURE" \
   -cp "$OUT_DIR" \

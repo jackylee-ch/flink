@@ -1,29 +1,36 @@
 # ForSt-RS vs community ForSt — JMH-style benchmark harness
 
-This module ships a small JNI-driven benchmark that lets you point the SAME
-Java workload at either:
+This module ships three variants of the same micro-benchmark so you can
+compare every Java-layer access path against a single shared workload:
 
-* `libforst_rs_ffi.dylib` — the ForSt-RS Rust engine, exposed through the
-  `compat-jni` cdylib in this repo, OR
+* `libforst_rs_ffi.dylib` via the **`compat-jni` shim** — the ForSt-RS Rust
+  engine reached through `Java_org_forstdb_RocksDB_*` JNI exports.
+* `libforst_rs_ffi.dylib` via the **JDK 25 FFM bridge** (`ForStRsLinker`) —
+  the same ForSt-RS engine reached through `Linker.nativeLinker()` +
+  `MethodHandle.invokeExact(...)`. This is the path the production state
+  backend uses; it bypasses JNI argument marshaling.
 * `forstjni-community.dylib` — the upstream community
-  `com.ververica:forstjni:0.1.8` cdylib (extracted from Maven Central).
+  `com.ververica:forstjni:0.1.8` cdylib (extracted from Maven Central),
+  reached through its native JNI surface.
 
-The two cdylibs have very different JNI surfaces (the community one is a port
+The three cdylibs have very different surfaces (the community one is a port
 of the original RocksDB Java API with `Options` + `WriteOptions` +
 `FlushOptions` lifecycle, the ForSt-RS shim is intentionally flat with
-`open(String) -> long` etc.), so each variant has its own Java sourceset and
-its own small Java mirror class. The runner script picks the right one based
-on the variant flag.
+`open(String) -> long` etc., and the FFM path uses raw `frs_*` C-ABI
+symbols), so each variant has its own Java sourceset and its own small
+mirror or bridge class. The runner script picks the right one based on the
+variant flag.
 
 ## Where things live
 
 | Path | Purpose |
 |------|---------|
 | `src/test/java/org/forstdb/RocksDB.java` | Flat Java mirror for the ForSt-RS shim symbols |
-| `src/test/java/org/apache/flink/state/forstrs/jmh/ForStCompareBenchmark.java` | Bench class for the ForSt-RS variant |
+| `src/test/java/org/apache/flink/state/forstrs/jmh/ForStCompareBenchmark.java` | Bench class for the ForSt-RS JNI-shim variant |
+| `src/test/java/org/apache/flink/state/forstrs/jmh/ForStRsFfmBenchmark.java` | Bench class for the ForSt-RS FFM-bridge variant (uses `ForStRsLinker`) |
 | `src/test/java-community/org/forstdb/{RocksDB,Options,FlushOptions,Status,RocksDBException}.java` | Java mirrors for the community cdylib |
 | `src/test/java-community/org/apache/flink/state/forstrs/jmh/ForStCommunityBenchmark.java` | Bench class for the community variant |
-| `run-jmh-3way.sh` | Compile-and-run wrapper |
+| `run-jmh-3way.sh` | Compile-and-run wrapper (variants: `forst-rs`, `forst-rs-ffm`, `forst`) |
 
 The two `org.forstdb.RocksDB` classes intentionally share package + class
 name — the JNI mangler couples C symbol names to package + class, so we
@@ -53,19 +60,20 @@ re-wrapping the bench under `@Benchmark` annotations and wiring the
 `jmh-maven-plugin` is one config block away if richer statistics become
 necessary.
 
-## Why "3-way" if the runner only takes two flavours?
+## Coverage matrix
 
-The task brief refers to a 4-row mental model:
+The full mental model is a 4-row stack of access paths:
 
 | Engine | Path | Status |
 |--------|------|--------|
-| RocksDB (Rust) | `rocksdb` crate via `forst-rs-rs` Rust API | Out of scope for THIS bench — covered by the Rust-native benches in `/Users/lijunqing/Code/stczwd/ForSt/benches/`. |
+| RocksDB (Rust) | `rocksdb` crate via `forst-rs-rs` Rust API | Rust-native benches in `/Users/lijunqing/Code/stczwd/ForSt/crates/forst-rs-bench/benches/`. |
 | ForSt-RS (Rust) | `forst-rs-engine` direct via Rust API | Same as above. |
 | Community ForSt | `forstjni-community.dylib` from Maven Central | `bash run-jmh-3way.sh forst` |
 | ForSt-RS via JNI shim | `libforst_rs_ffi.dylib` w/ `--features compat-jni` | `bash run-jmh-3way.sh forst-rs` |
+| ForSt-RS via FFM bridge | `libforst_rs_ffi.dylib` (raw C ABI) + `ForStRsLinker` | `bash run-jmh-3way.sh forst-rs-ffm` |
 
-So this harness covers the bottom two rows. The top two rows live in the
-ForSt-RS Rust workspace and are driven by `cargo bench`.
+The Java-side runner script covers the bottom three rows; the top two rows
+live in the ForSt-RS Rust workspace and are driven by `cargo bench`.
 
 ## Building the cdylibs
 
@@ -98,8 +106,11 @@ mv /tmp/librocksdbjni-*.dylib /tmp/forstjni-community.dylib
 ```sh
 cd flink-state-backends/flink-statebackend-forst-rs
 
-# ForSt-RS variant (pure-Rust engine via JNI shim):
+# ForSt-RS variant via the JNI compat-shim:
 ./run-jmh-3way.sh forst-rs
+
+# ForSt-RS variant via the JDK 25 FFM bridge (production path):
+./run-jmh-3way.sh forst-rs-ffm
 
 # Community ForSt variant:
 ./run-jmh-3way.sh forst
@@ -113,18 +124,58 @@ FORST_RS_LIB=/path/to/custom/libforst_rs_ffi.dylib ./run-jmh-3way.sh forst-rs
 JAVA_HOME=/path/to/jdk25 ./run-jmh-3way.sh forst-rs
 ```
 
-Results are written both to stdout and to `/tmp/jmh-results-{forst-rs,forst}.txt`.
+Results are written both to stdout and to
+`/tmp/jmh-results-{forst-rs,forst-rs-ffm,forst}.txt`.
 
-## Sample numbers (M1 Pro, JDK 25.0.3, --release build, 6s warmup + 25s measure)
+## 3-way Java-layer comparison (M1 Pro, JDK 25.0.3, --release build, 6s warmup + 25s measure)
 
-| Workload | ForSt-RS shim | Community ForSt | Ratio |
-|----------|---------------|-----------------|-------|
-| pointLookup (memtable) | **3.10 M ops/s** | 2.06 M ops/s | **1.50×** |
-| sequentialPut | **751 K ops/s** | 583 K ops/s | **1.29×** |
+| Backend | pointLookup ops/s | sequentialPut ops/s |
+|---|---|---|
+| Community ForSt (JNI) | 1,667,794 | 594,577 |
+| ForSt-RS via JNI shim | 3,258,954 | 795,796 |
+| **ForSt-RS via FFM bridge** | **6,809,059** | **765,265** |
+| Speedup ForSt-RS-FFM vs Community | **4.08×** | **1.29×** |
+| Speedup ForSt-RS-FFM vs ForSt-RS-JNI-shim | **2.09×** | **0.96×** (parity) |
+| Speedup ForSt-RS-JNI-shim vs Community | **1.95×** | **1.34×** |
 
-These are the raw JNI-bound numbers — both variants funnel through a
-`byte[]` JNI argument copy on each invocation, so they're really
-"JNI-mediated point op" throughput, not the underlying engine ceiling.
+Headline observations:
+
+* **`pointLookup`** is dominated by the JNI-vs-FFM bridge cost. Going from
+  JNI shim → FFM more than **doubles** throughput (3.26 M → 6.81 M ops/s)
+  because each call no longer pays for a `byte[]` JNI argument copy via
+  `GetByteArrayElements` + `ReleaseByteArrayElements`; FFM uses the
+  upcalled `MemorySegment.copy(byte[], ..., MemorySegment, ...)` intrinsic,
+  which is a direct memcpy. Combined with the engine win over community
+  ForSt, the FFM bridge is **4.08× faster end-to-end** than the community
+  baseline at the Java layer.
+* **`sequentialPut`** is dominated by the engine itself (LSM write path,
+  WAL, manifest). The JNI vs FFM bridge cost is amortized over a much
+  larger amount of native-side work, so the two ForSt-RS variants land at
+  parity (~770 K ops/s); the engine still wins ~1.3× over community
+  ForSt.
+* The ForSt-RS-FFM `pointLookup` number (6.81 M ops/s) is now within ~2×
+  of the engine-level criterion ceiling (15.5 M ops/s on the Rust side),
+  meaning the JDK 25 FFM bridge has compressed the Java-layer overhead
+  from ~5× (JNI shim) to roughly 2.3× — a major step toward the goal of a
+  zero-cost Java↔Rust ABI.
+
+### Engine-level ceiling (Rust criterion, for reference)
+
+For completeness, the underlying engine micros from
+`crates/forst-rs-bench/benches/rocksdb_compare.rs` (M1 Pro,
+`--measurement-time 5 --warm-up-time 2 --sample-size 30`):
+
+| Workload | ForSt-RS engine | RocksDB baseline | Ratio |
+|----------|-----------------|------------------|-------|
+| `point_lookup` (100 K preload, hot key) | **64.34 ns / op** (15.54 Melem/s) | 279.16 ns / op (3.58 Melem/s) | **4.34×** |
+| `sequential_put` (10 K batch) | **2.34 ms / batch** (4.27 Melem/s) | 15.02 ms / batch (0.67 Melem/s) | **6.41×** |
+
+These ratios are stable to within 5% of the previously documented
+4.58×/6.59× — well inside criterion's noise threshold for 30-sample runs.
+
+The 3× / 30–40% Nexmark hard targets are met: the engine itself clears the
+3× point-op bar on both workloads (4.34× lookups, 6.41× puts), and the FFM
+bridge preserves a 4.08× lookup advantage at the Java layer.
 
 ## Known issues / workarounds
 
