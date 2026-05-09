@@ -55,6 +55,12 @@ public final class ForStCompareBenchmark {
     /** Pre-loaded keys for the point-lookup workload. */
     private static final int PRELOAD = 100_000;
 
+    /**
+     * Number of rows per WriteBatch in the {@code batchedPut} workload — matches the
+     * realistic per-checkpoint-barrier write fan-out in production Flink state backends.
+     */
+    private static final int BATCH_SIZE = 1000;
+
     private static final byte[] VALUE = new byte[128];
 
     static {
@@ -72,6 +78,30 @@ public final class ForStCompareBenchmark {
         for (int p = 8; p >= 1; p--) {
             b[p] = (byte) ('0' + (i % 10));
             i /= 10;
+        }
+        return b;
+    }
+
+    /** Encodes batch index N as ASCII {@code bk%010d} (12-byte key). */
+    private static byte[] batchKeyOf(int n) {
+        byte[] b = new byte[12];
+        b[0] = 'b';
+        b[1] = 'k';
+        for (int p = 11; p >= 2; p--) {
+            b[p] = (byte) ('0' + (n % 10));
+            n /= 10;
+        }
+        return b;
+    }
+
+    /** Encodes batch index N as ASCII {@code bv%010d} (12-byte value). */
+    private static byte[] batchValueOf(int n) {
+        byte[] b = new byte[12];
+        b[0] = 'b';
+        b[1] = 'v';
+        for (int p = 11; p >= 2; p--) {
+            b[p] = (byte) ('0' + (n % 10));
+            n /= 10;
         }
         return b;
     }
@@ -185,11 +215,44 @@ public final class ForStCompareBenchmark {
                     "[sequentialPut] %,d ops in %.3f s -> %.0f ops/s%n",
                     ops, elapsed / 1e9, putThroughput);
 
+            // ---- batchedPut --------------------------------------------------
+            // Pre-generate BATCH_SIZE keys + values; the workload writes the entire
+            // batch via one writeBatch() JNI call per invocation. Reports rows/sec
+            // (= batches/sec * BATCH_SIZE) for direct comparison with sequentialPut.
+            byte[][] bk = new byte[BATCH_SIZE][];
+            byte[][] bv = new byte[BATCH_SIZE][];
+            for (int i = 0; i < BATCH_SIZE; i++) {
+                bk[i] = batchKeyOf(i);
+                bv[i] = batchValueOf(i);
+            }
+
+            System.out.println("[batchedPut] warmup...");
+            deadline = System.nanoTime() + warmupNanos;
+            while (System.nanoTime() < deadline) {
+                RocksDB.writeBatch(db, cf, bk, bv);
+            }
+
+            System.out.println("[batchedPut] measure...");
+            deadline = System.nanoTime() + measureNanos;
+            start = System.nanoTime();
+            long batches = 0;
+            while (System.nanoTime() < deadline) {
+                RocksDB.writeBatch(db, cf, bk, bv);
+                batches++;
+            }
+            elapsed = System.nanoTime() - start;
+            double batchedRowsPerSec = batches * (double) BATCH_SIZE * 1e9 / elapsed;
+            System.out.printf(
+                    "[batchedPut] %,d batches (%,d rows) in %.3f s -> %.0f rows/s%n",
+                    batches, batches * (long) BATCH_SIZE, elapsed / 1e9, batchedRowsPerSec);
+
             // ---- summary -----------------------------------------------------
             System.out.println();
             System.out.println("=== summary ===");
             System.out.printf("pointLookup     %.0f ops/s%n", pointThroughput);
             System.out.printf("sequentialPut   %.0f ops/s%n", putThroughput);
+            System.out.printf("batchedPut      %.0f rows/s (batch=%d)%n",
+                    batchedRowsPerSec, BATCH_SIZE);
             System.out.printf("variant.libpath %s%n",
                     System.getProperty("org.forstdb.libpath", "<via java.library.path>"));
         } finally {

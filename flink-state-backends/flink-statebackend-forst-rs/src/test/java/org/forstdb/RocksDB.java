@@ -99,4 +99,11 @@ public class RocksDB {
             byte[] val,
             int valOff,
             int valLen);
+
+    // Batch ops — the shim exports BOTH batchPut and writeBatch as aliases for
+    // the same underlying frs_batch_put engine call. Walks keys[i] / values[i]
+    // in lock-step; arrays MUST have equal length or an exception is thrown.
+    public static native void batchPut(long handle, long cfHandle, byte[][] keys, byte[][] values);
+
+    public static native void writeBatch(long handle, long cfHandle, byte[][] keys, byte[][] values);
 }

@@ -123,4 +123,11 @@ public class RocksDB {
 
     public static native void delete(
             long handle, long writeOptionsHandle, byte[] key, int keyOff, int keyLen, long cfHandle);
+
+    /**
+     * Maps to {@code _Java_org_forstdb_RocksDB_write0(JJJ)V}: applies a {@link WriteBatch} to the
+     * DB under the supplied {@link WriteOptions}. Single overload — {@code write1} is the
+     * {@code WriteBatchWithIndex} cousin which we do not bind.
+     */
+    public static native void write0(long handle, long writeOptionsHandle, long writeBatchHandle);
 }

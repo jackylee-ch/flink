@@ -87,6 +87,9 @@ public final class ForStRsLinker {
     private final MethodHandle frsGet;
     private final MethodHandle frsDelete;
 
+    // --- 3b. Batch ops ---
+    private final MethodHandle frsBatchPut;
+
     // --- 4. Memory management ---
     private final MethodHandle frsBytesFree;
 
@@ -213,6 +216,26 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG)); // key_len
+
+        // 3b. Batch ops — frs_batch_put takes parallel arrays of native
+        // pointers (uint8_t* const*) and sizes (size_t*). Critical mode is NOT
+        // applicable here because we pass arrays-of-pointers into-native, which
+        // must live in native memory anyway (the byte[] addresses inside a
+        // Java [B[] array can't be pinned simultaneously). Caller stages the
+        // four arrays via the {@link #batchPut(FrsDb, FrsCfHandle, MemorySegment,
+        // MemorySegment, MemorySegment, MemorySegment, long)} overload.
+        this.frsBatchPut =
+                bind(
+                        "frs_batch_put",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // keys (uint8_t* const*)
+                                ValueLayout.ADDRESS, // key_lens (size_t*)
+                                ValueLayout.ADDRESS, // values (uint8_t* const*)
+                                ValueLayout.ADDRESS, // value_lens (size_t*)
+                                ValueLayout.JAVA_LONG)); // count (size_t)
 
         // 4. Memory management — bound critical because every get/lookup_kv path
         // calls frs_bytes_free on its 24-byte FrsBytes out struct, which is now
@@ -483,6 +506,100 @@ public final class ForStRsLinker {
     /** Returns the value for {@code key} or {@code null} if absent. */
     public byte[] get(FrsDb db, FrsCfHandle cf, byte[] key) {
         return getInternal(frsGet, "frs_get", db, cf, key);
+    }
+
+    /**
+     * Batched put — writes {@code count} key/value pairs in one engine call.
+     *
+     * <p>The four "parallel array" segments must be laid out in native memory:
+     *
+     * <ul>
+     *   <li>{@code keyPtrs}: {@code count} {@code uint8_t*} entries — each pointer
+     *       targets a key buffer whose size is the matching {@code keyLens[i]}.
+     *   <li>{@code keyLens}: {@code count} {@code size_t} entries (8 bytes each).
+     *   <li>{@code valuePtrs}: {@code count} {@code uint8_t*} entries.
+     *   <li>{@code valueLens}: {@code count} {@code size_t} entries.
+     * </ul>
+     *
+     * <p>The key/value buffers themselves can live anywhere (native or pinned heap)
+     * as long as the pointers inside {@code keyPtrs} / {@code valuePtrs} remain
+     * valid for the duration of this call. Hot path callers (e.g. JMH bench) stage
+     * everything once into a long-lived native arena and never copy.
+     */
+    public void batchPut(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keyPtrs,
+            MemorySegment keyLens,
+            MemorySegment valuePtrs,
+            MemorySegment valueLens,
+            long count) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsBatchPut.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyPtrs,
+                                    keyLens,
+                                    valuePtrs,
+                                    valueLens,
+                                    count);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_batch_put threw: " + t.getMessage());
+        }
+        check(rc, "frs_batch_put");
+    }
+
+    /**
+     * Convenience overload — stages {@code keys} / {@code values} into a fresh
+     * confined arena and forwards to {@link #batchPut(FrsDb, FrsCfHandle,
+     * MemorySegment, MemorySegment, MemorySegment, MemorySegment, long)}. The
+     * staging cost (one alloc + N+N copies) makes this UNSUITABLE for benchmarking;
+     * use the segment overload with pre-staged buffers for the hot path.
+     */
+    public void batchPut(FrsDb db, FrsCfHandle cf, byte[][] keys, byte[][] values) {
+        if (keys.length != values.length) {
+            throw new IllegalArgumentException(
+                    "keys.length (" + keys.length + ") != values.length (" + values.length + ")");
+        }
+        int count = keys.length;
+        if (count == 0) {
+            return;
+        }
+        try (Arena local = Arena.ofConfined()) {
+            // Stage keys + values payloads into native memory so that their pointers
+            // remain stable for the duration of the downcall.
+            MemorySegment keyPtrs = local.allocate((long) count * ValueLayout.ADDRESS.byteSize());
+            MemorySegment keyLens = local.allocate((long) count * ValueLayout.JAVA_LONG.byteSize());
+            MemorySegment valPtrs = local.allocate((long) count * ValueLayout.ADDRESS.byteSize());
+            MemorySegment valLens = local.allocate((long) count * ValueLayout.JAVA_LONG.byteSize());
+            for (int i = 0; i < count; i++) {
+                byte[] k = keys[i];
+                byte[] v = values[i];
+                MemorySegment ks = local.allocate(k.length == 0 ? 1 : k.length);
+                MemorySegment vs = local.allocate(v.length == 0 ? 1 : v.length);
+                if (k.length > 0) {
+                    MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
+                }
+                if (v.length > 0) {
+                    MemorySegment.copy(v, 0, vs, ValueLayout.JAVA_BYTE, 0, v.length);
+                }
+                keyPtrs.set(ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), ks);
+                valPtrs.set(ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), vs);
+                keyLens.set(
+                        ValueLayout.JAVA_LONG,
+                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
+                        (long) k.length);
+                valLens.set(
+                        ValueLayout.JAVA_LONG,
+                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
+                        (long) v.length);
+            }
+            batchPut(db, cf, keyPtrs, keyLens, valPtrs, valLens, count);
+        }
     }
 
     /** Deletes {@code key} from the column family. No-op if absent. */

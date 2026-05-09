@@ -118,6 +118,8 @@ case "$VARIANT" in
       "$SRC_DIR/org/forstdb/RocksDB.java"
       "$SRC_DIR/org/forstdb/Options.java"
       "$SRC_DIR/org/forstdb/FlushOptions.java"
+      "$SRC_DIR/org/forstdb/WriteOptions.java"
+      "$SRC_DIR/org/forstdb/WriteBatch.java"
       "$SRC_DIR/org/forstdb/Status.java"
       "$SRC_DIR/org/forstdb/RocksDBException.java"
       "$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCommunityBenchmark.java"
