@@ -18,20 +18,37 @@
 
 package org.apache.flink.state.forstrs;
 
+import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
+import org.apache.flink.runtime.state.DefaultOperatorStateBackendBuilder;
 import org.apache.flink.runtime.state.OperatorStateBackend;
 import org.apache.flink.runtime.state.StateBackend;
+import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
+import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
+
+import java.lang.foreign.Arena;
 
 /**
- * SKELETON {@link StateBackend} backed by ForSt-RS via JDK 25 FFM.
+ * {@link StateBackend} backed by ForSt-RS via JDK 25 FFM.
  *
- * <p>v3.2 Phase-A MVP scope: this class exists and is SPI-discoverable; it does NOT yet implement
- * {@code createKeyedStateBackend} or {@code createOperatorStateBackend}. Those land in subsequent
- * Phase-D L4 (Async v2) and L5 (Sync v1) units per {@code
- * docs/superpowers/planning/v3.2/reports/B1_pr_split_plan.md}.
+ * <p><b>v3.2 Phase-D L5 status.</b> This backend exposes:
+ *
+ * <ul>
+ *   <li>{@link #createKeyedStateBackend(KeyedStateBackendParameters)} — currently throws because
+ *       the simpler {@link ForStRsKeyedStateBackend} stepping-stone does <i>not</i> implement
+ *       {@link CheckpointableKeyedStateBackend} (no snapshot / key-group / savepoint plumbing
+ *       yet). Use {@link #createBasicKeyedBackend(TypeSerializer)} for proof-of-concept and unit
+ *       tests until the L5 sync-v1 / L6 rescaling work lands.
+ *   <li>{@link #createOperatorStateBackend(OperatorStateBackendParameters)} — delegates to Flink's
+ *       {@link DefaultOperatorStateBackendBuilder}, which is the standard pattern for backends
+ *       whose operator state is just a serialized bytestream rather than a KV store.
+ * </ul>
  *
  * @see ForStRsOptions
- * @see org.apache.flink.state.forstrs.ffm.ForStRsLinker
+ * @see ForStRsLinker
+ * @see ForStRsKeyedStateBackend
  */
 public class ForStRsStateBackend implements StateBackend {
 
@@ -45,16 +62,59 @@ public class ForStRsStateBackend implements StateBackend {
     @Override
     public <K> CheckpointableKeyedStateBackend<K> createKeyedStateBackend(
             StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
+        // ForStRsKeyedStateBackend (Phase-D L5 stepping stone) does not yet implement the full
+        // CheckpointableKeyedStateBackend surface (snapshot, key-groups, savepoint, applyToAllKeys
+        // — ~25 methods). Tests should call createBasicKeyedBackend directly until L5/L6 lands.
         throw new UnsupportedOperationException(
-                "ForStRsStateBackend.createKeyedStateBackend is not yet implemented "
-                        + "(v3.2 Phase-D L4/L5 work; current state is Phase-A MVP skeleton).");
+                "ForStRsStateBackend.createKeyedStateBackend returning a "
+                        + "CheckpointableKeyedStateBackend is a Phase-D L5/L6 follow-up. "
+                        + "Use ForStRsStateBackend.createBasicKeyedBackend(keySerializer) for the "
+                        + "stepping-stone proof-of-concept that wires the 5 state types end-to-end.");
     }
 
     @Override
     public OperatorStateBackend createOperatorStateBackend(
             StateBackend.OperatorStateBackendParameters parameters) throws Exception {
-        throw new UnsupportedOperationException(
-                "ForStRsStateBackend.createOperatorStateBackend is not yet implemented "
-                        + "(v3.2 Phase-D L4/L5 work; current state is Phase-A MVP skeleton).");
+        // ForSt-RS does not store operator state itself — it is a key-value store. Operator state
+        // is a serialized bytestream that Flink's default builder handles directly.
+        return new DefaultOperatorStateBackendBuilder(
+                        Thread.currentThread().getContextClassLoader(),
+                        parameters.getEnv().getExecutionConfig(),
+                        /* asynchronousSnapshots= */ true,
+                        parameters.getStateHandles(),
+                        parameters.getCancelStreamRegistry())
+                .build();
     }
+
+    /**
+     * Phase-D L5 stepping-stone factory: opens an in-memory ForSt-RS engine and returns a
+     * {@link ForStRsKeyedStateBackend} bound to it. The returned backend owns the underlying
+     * {@link Arena}, {@link ForStRsLinker}, {@link FrsDb} and default {@link FrsCfHandle}; closing
+     * it releases all of them.
+     *
+     * <p>This entry-point is provided because {@link #createKeyedStateBackend(KeyedStateBackendParameters)}
+     * cannot yet return a {@link ForStRsKeyedStateBackend} — that class does not implement the
+     * {@link CheckpointableKeyedStateBackend} contract. Once snapshot / key-group / savepoint
+     * plumbing is wired in Phase-D L5/L6 the two factory methods will collapse into one.
+     */
+    public <K> ForStRsKeyedStateBackend<K> createBasicKeyedBackend(
+            TypeSerializer<K> keySerializer) {
+        Arena arena = Arena.ofShared();
+        try {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            FrsDb db = linker.dbOpenMemory(arena);
+            FrsCfHandle cf;
+            try {
+                cf = linker.dbDefaultCf(db, arena);
+            } catch (RuntimeException e) {
+                db.close();
+                throw e;
+            }
+            return new ForStRsKeyedStateBackend<>(arena, linker, db, cf, keySerializer);
+        } catch (RuntimeException e) {
+            arena.close();
+            throw e;
+        }
+    }
+
 }
