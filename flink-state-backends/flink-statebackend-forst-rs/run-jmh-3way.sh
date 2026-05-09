@@ -1,19 +1,23 @@
 #!/usr/bin/env bash
-# Drives the ForStCompareBenchmark harness against either the ForSt-RS shim
-# cdylib or the community ForSt cdylib, using a freshly compiled classpath
-# from the bench source — no Maven, no toolchain dance.
+# Drives the ForStCompareBenchmark harness against the ForSt-RS shim cdylib,
+# the community ForSt cdylib, the FFM bridge, or the canonical RocksDB-via-JNI
+# Maven artifact, using a freshly compiled classpath from the bench source —
+# no Maven build of the surrounding Flink module, no toolchain dance.
 #
-# Usage:  ./run-jmh-3way.sh (forst-rs|forst-rs-ffm|forst)
+# Usage:  ./run-jmh-3way.sh (forst-rs|forst-rs-ffm|forst|rocksdb-jni)
 #
 # Env overrides:
-#   FORST_RS_LIB    cdylib for the "forst-rs" / "forst-rs-ffm" variants
-#   FORST_LIB       cdylib for the "forst" (community) variant
-#   JAVA_HOME       JDK 25+ home (auto-detected from /Library/Java/...)
-#   BENCH_WARMUP_S  warmup duration per workload (default 6)
-#   BENCH_MEASURE_S measurement duration per workload (default 25)
+#   FORST_RS_LIB        cdylib for the "forst-rs" / "forst-rs-ffm" variants
+#   FORST_LIB           cdylib for the "forst" (community) variant
+#   ROCKSDB_JNI_VERSION rocksdbjni Maven version (default 8.11.4)
+#   JAVA_HOME           JDK 25+ home (auto-detected from /Library/Java/...)
+#   BENCH_WARMUP_S      warmup duration per workload (default 6)
+#   BENCH_MEASURE_S     measurement duration per workload (default 25)
 set -euo pipefail
 
 VARIANT="${1:-forst-rs}"
+ROCKSDB_JNI_VERSION="${ROCKSDB_JNI_VERSION:-8.11.4}"
+ROCKSDB_JNI_JAR="${HOME}/.m2/repository/org/rocksdb/rocksdbjni/${ROCKSDB_JNI_VERSION}/rocksdbjni-${ROCKSDB_JNI_VERSION}.jar"
 case "$VARIANT" in
   forst-rs|forst-rs-ffm)
     LIB="${FORST_RS_LIB:-/Users/lijunqing/Code/stczwd/ForSt/target/release/libforst_rs_ffi.dylib}"
@@ -21,14 +25,24 @@ case "$VARIANT" in
   forst)
     LIB="${FORST_LIB:-/tmp/forstjni-community.dylib}"
     ;;
+  rocksdb-jni)
+    # rocksdbjni bundles its native library inside the jar; no external dylib
+    # required. We just need the jar on the classpath.
+    LIB="$ROCKSDB_JNI_JAR"
+    ;;
   *)
-    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst)" >&2
+    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst|rocksdb-jni)" >&2
     exit 2
     ;;
 esac
 
 if [ ! -f "$LIB" ]; then
-  echo "Library not found: $LIB" >&2
+  if [ "$VARIANT" = rocksdb-jni ]; then
+    echo "rocksdbjni jar not found: $LIB" >&2
+    echo "Try:  mvn -q dependency:get -Dartifact=org.rocksdb:rocksdbjni:${ROCKSDB_JNI_VERSION}" >&2
+  else
+    echo "Library not found: $LIB" >&2
+  fi
   exit 1
 fi
 
@@ -110,6 +124,17 @@ case "$VARIANT" in
     )
     MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCommunityBenchmark"
     ;;
+  rocksdb-jni)
+    # The canonical org.rocksdb:rocksdbjni Maven artifact ships the full Java
+    # API + the bundled librocksdbjni-<platform> blob inside one jar. We just
+    # compile the bench against the jar and put the jar on the runtime cp.
+    SRC_DIR="$SCRIPT_DIR/src/test/java-rocksdb"
+    OUT_DIR="$SCRIPT_DIR/target/jmh-classes-rocksdb-jni"
+    SRCS=(
+      "$SRC_DIR/org/apache/flink/state/forstrs/jmh/RocksDbJniBenchmark.java"
+    )
+    MAIN_CLASS="org.apache.flink.state.forstrs.jmh.RocksDbJniBenchmark"
+    ;;
 esac
 
 mkdir -p "$OUT_DIR"
@@ -125,8 +150,21 @@ case "$VARIANT" in
     JAVAC_RELEASE=(--release 21)
     ;;
 esac
+# The rocksdb-jni variant needs the rocksdbjni jar both at compile time and
+# at runtime so the bundled native library + RocksDB Java API are available.
+JAVAC_CP_ARGS=()
+RUNTIME_CP="$OUT_DIR"
+case "$VARIANT" in
+  rocksdb-jni)
+    JAVAC_CP_ARGS=(-cp "$ROCKSDB_JNI_JAR")
+    RUNTIME_CP="$OUT_DIR:$ROCKSDB_JNI_JAR"
+    ;;
+esac
+
 echo "[compile] javac -> $OUT_DIR"
-"$JAVA_HOME/bin/javac" ${JAVAC_RELEASE[@]+"${JAVAC_RELEASE[@]}"} -d "$OUT_DIR" "${SRCS[@]}"
+"$JAVA_HOME/bin/javac" ${JAVAC_RELEASE[@]+"${JAVAC_RELEASE[@]}"} \
+  ${JAVAC_CP_ARGS[@]+"${JAVAC_CP_ARGS[@]}"} \
+  -d "$OUT_DIR" "${SRCS[@]}"
 
 WARMUP="${BENCH_WARMUP_S:-6}"
 MEASURE="${BENCH_MEASURE_S:-25}"
@@ -152,9 +190,14 @@ esac
 #     the org.forstdb.RocksDB static initializer to System.load(LIB))
 #   - FFM variant: -Dforstrs.native.libpath (consumed by ForStRsLinker to
 #     SymbolLookup.libraryLookup(LIB, arena))
+#   - rocksdb-jni variant: no system property — RocksDB.loadLibrary() extracts
+#     and dlopen's the platform-bundled native lib from inside the jar.
 case "$VARIANT" in
   forst-rs-ffm)
     LIB_PROP=(-Dforstrs.native.libpath="$LIB")
+    ;;
+  rocksdb-jni)
+    LIB_PROP=()
     ;;
   *)
     LIB_PROP=(-Dorg.forstdb.libpath="$LIB")
@@ -167,10 +210,10 @@ RESULT_FILE="/tmp/jmh-results-$VARIANT.txt"
   --enable-native-access=ALL-UNNAMED \
   ${JVM_EXTRA[@]+"${JVM_EXTRA[@]}"} \
   -Xms256m -Xmx2g \
-  "${LIB_PROP[@]}" \
+  ${LIB_PROP[@]+"${LIB_PROP[@]}"} \
   -Dbench.warmup.s="$WARMUP" \
   -Dbench.measure.s="$MEASURE" \
-  -cp "$OUT_DIR" \
+  -cp "$RUNTIME_CP" \
   "$MAIN_CLASS" 2>&1 | tee "$RESULT_FILE"
 
 echo

@@ -62,6 +62,11 @@ public final class ForStRsLinker {
                     ValueLayout.JAVA_LONG.withName("len"),
                     ValueLayout.JAVA_LONG.withName("capacity"));
 
+    // ValueLayout.ADDRESS_UNALIGNED and ValueLayout.JAVA_LONG_UNALIGNED are
+    // used to read the FrsBytes out struct when it lives in a heap byte[24]
+    // segment (which only guarantees 1-byte alignment). Strict-alignment reads
+    // through ValueLayout.ADDRESS would throw on a heap-byte-array view.
+
     private final Linker linker;
     private final SymbolLookup lookup;
 
@@ -170,9 +175,14 @@ public final class ForStRsLinker {
                         "frs_cf_close",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
-        // 3. Point ops
+        // 3. Point ops — bound with Linker.Option.critical(true) so that we can
+        // pass MemorySegment.ofArray(byte[]) heap segments directly. The Linker
+        // pins the underlying byte[] for the duration of the call (no copy)
+        // instead of allocating a per-call native staging buffer; this matches
+        // the JNI GetByteArrayElements pin semantics and eliminates the
+        // dominant per-op overhead the original confined-Arena path imposed.
         this.frsPut =
-                bind(
+                bindCritical(
                         "frs_put",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -184,7 +194,7 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG)); // value_len
 
         this.frsGet =
-                bind(
+                bindCritical(
                         "frs_get",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -195,7 +205,7 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out FrsBytes*
 
         this.frsDelete =
-                bind(
+                bindCritical(
                         "frs_delete",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -204,9 +214,11 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG)); // key_len
 
-        // 4. Memory management
+        // 4. Memory management — bound critical because every get/lookup_kv path
+        // calls frs_bytes_free on its 24-byte FrsBytes out struct, which is now
+        // a heap segment passed via MemorySegment.ofArray(byte[24]).
         this.frsBytesFree =
-                bind(
+                bindCritical(
                         "frs_bytes_free",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
 
@@ -231,8 +243,9 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out_seq (u64*)
 
         // 6. Delta-Join lookup + iterator
+        // frsLookupKv is hot — same critical-mode binding as frsGet.
         this.frsLookupKv =
-                bind(
+                bindCritical(
                         "frs_lookup_kv",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -300,6 +313,30 @@ public final class ForStRsLinker {
                                         new IllegalStateException(
                                                 "symbol not found in cdylib: " + name));
         return linker.downcallHandle(sym, descriptor);
+    }
+
+    /**
+     * Binds {@code name} as a downcall handle in <em>critical</em> mode (JDK 22+: {@link
+     * Linker.Option#critical(boolean) critical(true)}). Critical-mode handles can accept heap
+     * {@link MemorySegment}s such as {@link MemorySegment#ofArray(byte[])}; the linker pins the
+     * underlying primitive array for the duration of the native call instead of forcing the caller
+     * to stage bytes through a per-call native arena. This eliminates two {@code Arena.allocate}
+     * + {@code MemorySegment.copy} pairs per put/get, making the FFM bridge competitive with the
+     * JNI {@code GetByteArrayElements} pin path.
+     *
+     * <p>Use only on hot point-op symbols ({@code frs_put}, {@code frs_get}, {@code frs_delete},
+     * {@code frs_lookup_kv}) — critical mode disables the JVM's safepoint mechanism for the
+     * duration of the call, so the native function MUST return promptly and MUST NOT block.
+     */
+    private MethodHandle bindCritical(String name, FunctionDescriptor descriptor) {
+        MemorySegment sym =
+                lookup.find(name)
+                        .orElseThrow(
+                                () ->
+                                        new IllegalStateException(
+                                                "symbol not found in cdylib: " + name));
+        // allowHeapAccess=true so MemorySegment.ofArray(byte[]) is acceptable.
+        return linker.downcallHandle(sym, descriptor, Linker.Option.critical(true));
     }
 
     // ------------------------------------------------------------------
@@ -416,29 +453,31 @@ public final class ForStRsLinker {
     // 3. Point ops
     // ------------------------------------------------------------------
 
-    /** Writes a key/value pair. */
+    /**
+     * Writes a key/value pair.
+     *
+     * <p>Hot path: the key/value arrays are passed directly to the critical-mode {@code frs_put}
+     * downcall handle via {@link MemorySegment#ofArray(byte[])}. The Linker pins both arrays for
+     * the duration of the native call instead of staging them through a per-call native arena.
+     */
     public void put(FrsDb db, FrsCfHandle cf, byte[] key, byte[] value) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keySeg = local.allocate(key.length);
-            MemorySegment.copy(key, 0, keySeg, ValueLayout.JAVA_BYTE, 0, key.length);
-            MemorySegment valSeg = local.allocate(value.length);
-            MemorySegment.copy(value, 0, valSeg, ValueLayout.JAVA_BYTE, 0, value.length);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsPut.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        keySeg,
-                                        (long) key.length,
-                                        valSeg,
-                                        (long) value.length);
-            } catch (Throwable t) {
-                throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
-            }
-            check(rc, "frs_put");
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        MemorySegment valSeg = MemorySegment.ofArray(value);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsPut.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySeg,
+                                    (long) key.length,
+                                    valSeg,
+                                    (long) value.length);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
         }
+        check(rc, "frs_put");
     }
 
     /** Returns the value for {@code key} or {@code null} if absent. */
@@ -448,21 +487,17 @@ public final class ForStRsLinker {
 
     /** Deletes {@code key} from the column family. No-op if absent. */
     public void delete(FrsDb db, FrsCfHandle cf, byte[] key) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keySeg = local.allocate(key.length);
-            MemorySegment.copy(key, 0, keySeg, ValueLayout.JAVA_BYTE, 0, key.length);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsDelete.invokeExact(
-                                        db.handle(), cf.handle(), keySeg, (long) key.length);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_delete threw: " + t.getMessage());
-            }
-            check(rc, "frs_delete");
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDelete.invokeExact(
+                                    db.handle(), cf.handle(), keySeg, (long) key.length);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_delete threw: " + t.getMessage());
         }
+        check(rc, "frs_delete");
     }
 
     // ------------------------------------------------------------------
@@ -675,34 +710,43 @@ public final class ForStRsLinker {
     // Helpers
     // ------------------------------------------------------------------
 
-    /** Shared Get/LookupKv helper: marshals the key, reads the FrsBytes, frees the buffer. */
+    /**
+     * Shared Get/LookupKv helper: marshals the key, reads the FrsBytes, frees the buffer.
+     *
+     * <p>Hot path optimization: both the key buffer and the small (24-byte) {@code FrsBytes} out
+     * struct are heap-allocated and passed via {@link MemorySegment#ofArray(byte[])} to the
+     * critical-mode handle, eliminating any per-call native allocation. The pointer + length we
+     * read back from the heap-byte-array view use unaligned address/long layouts (alignment 1)
+     * because a {@code byte[]} only guarantees 1-byte alignment.
+     */
     private byte[] getInternal(MethodHandle mh, String fn, FrsDb db, FrsCfHandle cf, byte[] key) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keySeg = local.allocate(key.length);
-            MemorySegment.copy(key, 0, keySeg, ValueLayout.JAVA_BYTE, 0, key.length);
-            MemorySegment outBytes = local.allocate(FRS_BYTES_LAYOUT);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                mh.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        keySeg,
-                                        (long) key.length,
-                                        outBytes);
-            } catch (Throwable t) {
-                throw new FrsBackendException(FrsStatus.PANIC, fn + " threw: " + t.getMessage());
-            }
-            check(rc, fn);
-
-            long dataAddr = outBytes.get(ValueLayout.ADDRESS, 0).address();
-            long len = outBytes.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
-            if (dataAddr == 0L) {
-                return null; // not found
-            }
-            return copyAndFreeRaw(outBytes, dataAddr, len, fn + "/free");
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
+        byte[] outBytesArr = new byte[24];
+        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            mh.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySeg,
+                                    (long) key.length,
+                                    outBytes);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, fn + " threw: " + t.getMessage());
         }
+        check(rc, fn);
+
+        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
+        long len =
+                outBytes.get(
+                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        if (dataAddr == 0L) {
+            return null; // not found
+        }
+        return copyAndFreeRaw(outBytes, dataAddr, len, fn + "/free");
     }
 
     /** Reads a non-null FrsBytes payload, copies to byte[], and frees the native buffer. */

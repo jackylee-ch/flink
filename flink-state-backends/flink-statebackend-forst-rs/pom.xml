@@ -100,6 +100,20 @@ under the License.
 			<scope>test</scope>
 		</dependency>
 
+		<!--
+			Canonical RocksDB JNI binding, used by the rocksdb-jni JMH variant
+			(see src/test/java-rocksdb/.../RocksDbJniBenchmark.java) for the
+			Java-layer baseline that mirrors the Rust criterion rocksdb_compare
+			bench. The artifact bundles the platform native library, so no
+			external dylib path is required.
+		-->
+		<dependency>
+			<groupId>org.rocksdb</groupId>
+			<artifactId>rocksdbjni</artifactId>
+			<version>8.11.4</version>
+			<scope>test</scope>
+		</dependency>
+
 	</dependencies>
 
 </project>
