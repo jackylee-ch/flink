@@ -92,11 +92,58 @@ public final class ForStCommunityBenchmark {
         final long measureNanos =
                 Long.parseLong(System.getProperty("bench.measure.s", "25")) * 1_000_000_000L;
 
+        // Match the FFM bench's bench.preset semantics so that ForSt-RS-tuned vs
+        // community-tuned numbers can be compared head-to-head. Each preset
+        // pushes the same memtable / bg-thread budget into the community
+        // Options handle via the legacy RocksDB JNI setters.
+        final String preset = System.getProperty("bench.preset", "default");
+        long writeBufferSize = 0L;
+        int maxWriteBufferNumber = 0;
+        int maxBackgroundCompactions = 0;
+        int maxBackgroundFlushes = 0;
+        switch (preset) {
+            case "A":
+                writeBufferSize = 256L * 1024L * 1024L;
+                maxWriteBufferNumber = 8;
+                maxBackgroundCompactions = 4;
+                maxBackgroundFlushes = 4;
+                break;
+            case "B":
+                writeBufferSize = 512L * 1024L * 1024L;
+                maxWriteBufferNumber = 4;
+                maxBackgroundCompactions = 8;
+                maxBackgroundFlushes = 8;
+                break;
+            case "default":
+            default:
+                break;
+        }
+        System.out.printf(
+                "[setup] preset=%s write_buffer_size=%d max_write_buffer_number=%d "
+                        + "max_background_compactions=%d max_background_flushes=%d%n",
+                preset,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                maxBackgroundCompactions,
+                maxBackgroundFlushes);
+
         Path tmp = Files.createTempDirectory("forst-community-bench-");
         long opt = 0L, db = 0L, flushOpt = 0L, writeOpt = 0L, writeBatch = 0L;
         try {
             opt = Options.newOptions();
             Options.setCreateIfMissing(opt, true);
+            if (writeBufferSize > 0) {
+                Options.setWriteBufferSize(opt, writeBufferSize);
+            }
+            if (maxWriteBufferNumber > 0) {
+                Options.setMaxWriteBufferNumber(opt, maxWriteBufferNumber);
+            }
+            if (maxBackgroundCompactions > 0) {
+                Options.setMaxBackgroundCompactions(opt, maxBackgroundCompactions);
+            }
+            if (maxBackgroundFlushes > 0) {
+                Options.setMaxBackgroundFlushes(opt, maxBackgroundFlushes);
+            }
             db = RocksDB.open(opt, tmp.toString());
             if (db == 0L) {
                 throw new IllegalStateException("community RocksDB.open returned 0");
@@ -235,6 +282,7 @@ public final class ForStCommunityBenchmark {
                     batchedRowsPerSec, BATCH_SIZE);
             System.out.printf("variant.libpath %s%n",
                     System.getProperty("org.forstdb.libpath", "<via java.library.path>"));
+            System.out.printf("bench.preset    %s%n", preset);
         } finally {
             try {
                 if (writeBatch != 0L) {

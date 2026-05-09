@@ -209,4 +209,71 @@ class ForStRsLinkerExtendedTest {
             }
         }
     }
+
+    /**
+     * Round-trips put/get through the tuned-config in-memory engine. Mirrors
+     * Preset A from the JMH bench: 256 MiB memtable budget × 8 buffers, default
+     * 4/4 background threads. Proves the new {@link
+     * ForStRsLinker#dbOpenMemoryTuned(Arena, long, long, long, long)} method
+     * is wired end-to-end through {@code frs_db_open_memory_tuned}.
+     */
+    @Test
+    void dbOpenMemoryTunedPresetARoundTrip() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db =
+                            linker.dbOpenMemoryTuned(
+                                    arena,
+                                    256L * 1024L * 1024L, // write_buffer_size = 256 MiB
+                                    8L, // max_write_buffer_number
+                                    4L, // max_background_compactions
+                                    4L); // max_background_flushes
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[] key = utf8("tuned-key");
+                byte[] value = utf8("tuned-value");
+                assertNull(linker.get(db, cf, key));
+                linker.put(db, cf, key, value);
+                assertArrayEquals(value, linker.get(db, cf, key));
+            }
+        }
+    }
+
+    /**
+     * Passing {@code 0} for every knob falls back to the engine defaults; the
+     * resulting handle still survives a basic put/get round-trip and a clean
+     * close. Covers the per-knob "skip setter when zero" branch in
+     * {@code frs_db_open_memory_tuned}.
+     */
+    @Test
+    void dbOpenMemoryTunedZeroKnobsUsesDefaults() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemoryTuned(arena, 0L, 0L, 0L, 0L);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[] key = utf8("zero-key");
+                byte[] value = utf8("zero-value");
+                linker.put(db, cf, key, value);
+                assertArrayEquals(value, linker.get(db, cf, key));
+            }
+        }
+    }
+
+    /**
+     * An out-of-range memtable size (1 byte, far below the 4 KiB
+     * {@code MIN_WRITE_BUFFER_SIZE} floor enforced by
+     * {@code EngineOptionsBuilder::try_build}) must surface as a clean
+     * {@link FrsBackendException} carrying the {@code INVALID_ARGUMENT}
+     * status, not a JVM panic / crash.
+     */
+    @Test
+    void dbOpenMemoryTunedRejectsUndersizedBuffer() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            assertThrows(
+                    FrsBackendException.class,
+                    () -> linker.dbOpenMemoryTuned(arena, 1L, 0L, 0L, 0L));
+        }
+    }
 }

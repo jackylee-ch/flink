@@ -106,6 +106,43 @@ public final class ForStRsFfmBenchmark {
         final long measureNanos =
                 Long.parseLong(System.getProperty("bench.measure.s", "25")) * 1_000_000_000L;
 
+        // Write-path tuning preset (R-loop write-path tuning, 2026-05-10):
+        //   - "default" (or unset): legacy frs_db_open_memory with 64 MiB memtable, 3 buffers
+        //   - "A": 256 MiB memtable × 8 buffers, default 4/2 bg threads (2 GiB budget)
+        //   - "B": 512 MiB memtable × 4 buffers, 8/8 bg threads (more compaction parallelism)
+        // The four longs feed straight into frs_db_open_memory_tuned; 0 = engine default.
+        final String preset = System.getProperty("bench.preset", "default");
+        long writeBufferSize = 0L;
+        long maxWriteBufferNumber = 0L;
+        long maxBackgroundCompactions = 0L;
+        long maxBackgroundFlushes = 0L;
+        switch (preset) {
+            case "A":
+                writeBufferSize = 256L * 1024L * 1024L;
+                maxWriteBufferNumber = 8L;
+                maxBackgroundCompactions = 4L;
+                maxBackgroundFlushes = 4L;
+                break;
+            case "B":
+                writeBufferSize = 512L * 1024L * 1024L;
+                maxWriteBufferNumber = 4L;
+                maxBackgroundCompactions = 8L;
+                maxBackgroundFlushes = 8L;
+                break;
+            case "default":
+            default:
+                // leave all zero — uses frs_db_open_memory legacy defaults below.
+                break;
+        }
+        System.out.printf(
+                "[setup] preset=%s write_buffer_size=%d max_write_buffer_number=%d "
+                        + "max_background_compactions=%d max_background_flushes=%d%n",
+                preset,
+                writeBufferSize,
+                maxWriteBufferNumber,
+                maxBackgroundCompactions,
+                maxBackgroundFlushes);
+
         // A shared Arena owns the cdylib symbol lookup for the lifetime of the process — its
         // close() unloads the library and invalidates every MemorySegment we obtained.
         try (Arena arena = Arena.ofShared()) {
@@ -113,7 +150,17 @@ public final class ForStRsFfmBenchmark {
             FrsDb db = null;
             FrsCfHandle cf = null;
             try {
-                db = linker.dbOpenMemory(arena);
+                if ("default".equals(preset)) {
+                    db = linker.dbOpenMemory(arena);
+                } else {
+                    db =
+                            linker.dbOpenMemoryTuned(
+                                    arena,
+                                    writeBufferSize,
+                                    maxWriteBufferNumber,
+                                    maxBackgroundCompactions,
+                                    maxBackgroundFlushes);
+                }
                 cf = linker.dbDefaultCf(db, arena);
 
                 // Pre-load 100k entries for the point-lookup workload (matches sister bench).
@@ -243,6 +290,7 @@ public final class ForStRsFfmBenchmark {
                         batchedRowsPerSec, BATCH_SIZE);
                 System.out.printf("variant.libpath %s%n",
                         System.getProperty("forstrs.native.libpath", "<via java.library.path>"));
+                System.out.printf("bench.preset    %s%n", preset);
             } finally {
                 // CF must close before DB, DB must close before Arena (which owns the symbol lookup).
                 try {

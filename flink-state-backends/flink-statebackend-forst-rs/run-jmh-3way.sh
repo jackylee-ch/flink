@@ -170,6 +170,7 @@ echo "[compile] javac -> $OUT_DIR"
 
 WARMUP="${BENCH_WARMUP_S:-6}"
 MEASURE="${BENCH_MEASURE_S:-25}"
+PRESET="${BENCH_PRESET:-default}"
 
 # JVM tuning per variant. The community cdylib was built against an older
 # JDK and crashes inside G1's GC barrier when it receives compressed oops
@@ -206,8 +207,8 @@ case "$VARIANT" in
     ;;
 esac
 
-echo "[run] variant=$VARIANT lib=$LIB main=$MAIN_CLASS"
-RESULT_FILE="/tmp/jmh-results-$VARIANT.txt"
+echo "[run] variant=$VARIANT preset=$PRESET lib=$LIB main=$MAIN_CLASS"
+RESULT_FILE="/tmp/jmh-results-$VARIANT-$PRESET.txt"
 "$JAVA_HOME/bin/java" \
   --enable-native-access=ALL-UNNAMED \
   ${JVM_EXTRA[@]+"${JVM_EXTRA[@]}"} \
@@ -215,6 +216,7 @@ RESULT_FILE="/tmp/jmh-results-$VARIANT.txt"
   ${LIB_PROP[@]+"${LIB_PROP[@]}"} \
   -Dbench.warmup.s="$WARMUP" \
   -Dbench.measure.s="$MEASURE" \
+  -Dbench.preset="$PRESET" \
   -cp "$RUNTIME_CP" \
   "$MAIN_CLASS" 2>&1 | tee "$RESULT_FILE"
 

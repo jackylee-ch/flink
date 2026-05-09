@@ -73,6 +73,7 @@ public final class ForStRsLinker {
     // --- 1. Lifecycle ---
     private final MethodHandle frsDbOpen;
     private final MethodHandle frsDbOpenMemory;
+    private final MethodHandle frsDbOpenMemoryTuned;
     private final MethodHandle frsDbOpenFromCheckpoint;
     private final MethodHandle frsDbClose;
 
@@ -132,6 +133,23 @@ public final class ForStRsLinker {
                 bind(
                         "frs_db_open_memory",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        // Performance-tuning sibling of frs_db_open_memory: 4 size_t knobs +
+        // out_handle. Each knob may be 0, in which case the engine keeps its
+        // built-in default for that field (see frs_db_open_memory_tuned doc
+        // in lib.rs); out-of-range values flow through EngineOptionsBuilder
+        // .try_build() and surface as FRS_STATUS_INVALID_ARGUMENT rather
+        // than panicking.
+        this.frsDbOpenMemoryTuned =
+                bind(
+                        "frs_db_open_memory_tuned",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_LONG, // write_buffer_size
+                                ValueLayout.JAVA_LONG, // max_write_buffer_number
+                                ValueLayout.JAVA_LONG, // max_background_compactions
+                                ValueLayout.JAVA_LONG, // max_background_flushes
+                                ValueLayout.ADDRESS)); // out_handle
 
         this.frsDbOpenFromCheckpoint =
                 bind(
@@ -377,6 +395,50 @@ public final class ForStRsLinker {
                     FrsStatus.PANIC, "frs_db_open_memory threw: " + t.getMessage());
         }
         check(rc, "frs_db_open_memory");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    /**
+     * Opens an in-memory ForSt-RS engine with caller-supplied write-path tuning knobs.
+     *
+     * <p>This is the JMH-bench / write-pressure-test counterpart to {@link #dbOpenMemory(Arena)}:
+     * the four parameters map 1:1 onto {@code EngineOptions.write_buffer_size},
+     * {@code max_write_buffer_number}, {@code max_background_compactions} and
+     * {@code max_background_flushes}. Any parameter passed as {@code 0} keeps the engine's
+     * built-in default for that field; out-of-range values flow through
+     * {@code EngineOptionsBuilder::try_build} on the Rust side and surface as
+     * {@link FrsStatus#INVALID_ARGUMENT}, not a JVM panic.
+     *
+     * <p>Recommended sustained-write presets (R-loop write-path tuning, 2026-05-10):
+     *
+     * <ul>
+     *   <li>Preset A: {@code (256 MiB, 8, 4, 4)} — 2 GiB total memtable budget, default-ish bg
+     *   <li>Preset B: {@code (512 MiB, 4, 8, 8)} — same total memtable, more bg parallelism
+     * </ul>
+     */
+    public FrsDb dbOpenMemoryTuned(
+            Arena arena,
+            long writeBufferSize,
+            long maxWriteBufferNumber,
+            long maxBackgroundCompactions,
+            long maxBackgroundFlushes) {
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDbOpenMemoryTuned.invokeExact(
+                                    writeBufferSize,
+                                    maxWriteBufferNumber,
+                                    maxBackgroundCompactions,
+                                    maxBackgroundFlushes,
+                                    outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_open_memory_tuned threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_memory_tuned");
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
     }

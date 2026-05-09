@@ -56,5 +56,29 @@ public class Options {
 
     public static native void setCreateIfMissing(long handle, boolean flag);
 
+    /**
+     * Maps to {@code _Java_org_forstdb_Options_setWriteBufferSize}. Memtable budget per CF in
+     * bytes; mirrors {@code EngineOptions.write_buffer_size} on the ForSt-RS side.
+     */
+    public static native void setWriteBufferSize(long handle, long writeBufferSize);
+
+    /**
+     * Maps to {@code _Java_org_forstdb_Options_setMaxWriteBufferNumber}. Concurrent immutable
+     * memtables per CF; mirrors {@code EngineOptions.max_write_buffer_number}.
+     */
+    public static native void setMaxWriteBufferNumber(long handle, int maxWriteBufferNumber);
+
+    /**
+     * Maps to {@code _Java_org_forstdb_Options_setMaxBackgroundCompactions}. Mirrors
+     * {@code EngineOptions.max_background_compactions}.
+     */
+    public static native void setMaxBackgroundCompactions(long handle, int maxBackgroundCompactions);
+
+    /**
+     * Maps to {@code _Java_org_forstdb_Options_setMaxBackgroundFlushes}. Mirrors
+     * {@code EngineOptions.max_background_flushes}.
+     */
+    public static native void setMaxBackgroundFlushes(long handle, int maxBackgroundFlushes);
+
     public static native void disposeInternal(long handle);
 }
