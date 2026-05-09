@@ -68,6 +68,7 @@ public final class ForStRsLinker {
     // --- 1. Lifecycle ---
     private final MethodHandle frsDbOpen;
     private final MethodHandle frsDbOpenMemory;
+    private final MethodHandle frsDbOpenFromCheckpoint;
     private final MethodHandle frsDbClose;
 
     // --- 2. CF management ---
@@ -123,6 +124,14 @@ public final class ForStRsLinker {
                 bind(
                         "frs_db_open_memory",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        this.frsDbOpenFromCheckpoint =
+                bind(
+                        "frs_db_open_from_checkpoint",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // target_dir (c_char*)
+                                ValueLayout.ADDRESS)); // out_handle
 
         this.frsDbClose =
                 bind(
@@ -326,6 +335,28 @@ public final class ForStRsLinker {
             throw new FrsBackendException(FrsStatus.PANIC, "frs_db_open threw: " + t.getMessage());
         }
         check(rc, "frs_db_open");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    /**
+     * Opens an engine by restoring its state from a checkpoint directory previously produced by
+     * {@link #createCheckpoint(FrsDb, String)}. The checkpoint directory must contain
+     * {@code CHECKPOINT.blob} and every SST file the manifest references. The engine is opened with
+     * {@code db_path = targetDir}: subsequent reads/writes operate directly on the checkpoint
+     * files. Caller closes via {@link FrsDb#close()}.
+     */
+    public FrsDb dbOpenFromCheckpoint(Arena arena, String targetDir) {
+        MemorySegment dirSeg = allocateCString(arena, targetDir);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsDbOpenFromCheckpoint.invokeExact(dirSeg, outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_open_from_checkpoint threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_from_checkpoint");
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
     }

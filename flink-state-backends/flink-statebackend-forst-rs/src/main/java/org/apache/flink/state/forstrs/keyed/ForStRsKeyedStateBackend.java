@@ -22,10 +22,12 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.ffm.FrsIterator;
 import org.apache.flink.state.forstrs.state.ForStRsAggregatingState;
 import org.apache.flink.state.forstrs.state.ForStRsListState;
 import org.apache.flink.state.forstrs.state.ForStRsMapState;
@@ -36,8 +38,14 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.Map;
+import java.util.NoSuchElementException;
+import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Phase-D L5 stepping-stone keyed-state backend backed by ForSt-RS.
@@ -313,6 +321,167 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         return count;
     }
 
+    // ------------------------------------------------------------------
+    // Phase-D L5 simplified snapshot / restore + key-iteration surface
+    // ------------------------------------------------------------------
+
+    /**
+     * Phase-D L5 simplified snapshot API: writes a checkpoint of the current engine state into
+     * {@code targetDir} (which must not yet exist) and returns the same path.
+     *
+     * <p>The full Flink {@code snapshot(checkpointId, timestamp, factory, options)} signature on
+     * {@code CheckpointableKeyedStateBackend} returns a {@code RunnableFuture<SnapshotResult>}; that
+     * surface depends on {@code CheckpointStreamFactory} / {@code KeyedStateHandle} plumbing not
+     * wired in this stepping stone. The simplified API here is enough for the snapshot+restore
+     * round-trip tests and for documenting what the L6 hand-off needs to wrap.
+     *
+     * @throws IllegalStateException if this backend has already been {@link #close() closed}
+     */
+    public Path snapshot(Path targetDir) {
+        if (closed) {
+            throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
+        }
+        linker.createCheckpoint(db, targetDir.toString());
+        return targetDir;
+    }
+
+    /**
+     * Phase-D L5 restore counterpart to {@link #snapshot(Path)}. Opens a fresh {@link FrsDb} from a
+     * checkpoint directory written by {@link #snapshot(Path)} (or any other call to
+     * {@link ForStRsLinker#createCheckpoint(FrsDb, String)}) and returns a new backend instance
+     * pointing at the restored state.
+     *
+     * <p>The supplied {@code linker} and {@code arena} are <i>borrowed</i> — they are not closed by
+     * the returned backend (which is constructed with {@code ownsResources=false} for the arena +
+     * linker but takes ownership of the database and default CF it creates internally). Callers can
+     * keep using the same {@link Arena}/{@link ForStRsLinker} across snapshot+restore boundaries.
+     *
+     * <p>NOTE: the underlying engine opens the checkpoint directory <i>in place</i> — i.e. its
+     * {@code db_path} is set to {@code snapshotDir}. Subsequent writes mutate the checkpoint files
+     * directly. Copy the directory beforehand if you need to preserve the original snapshot.
+     */
+    public static <K> ForStRsKeyedStateBackend<K> restoreFromSnapshot(
+            ForStRsLinker linker,
+            Arena arena,
+            Path snapshotDir,
+            TypeSerializer<K> keySerializer) {
+        FrsDb restored = linker.dbOpenFromCheckpoint(arena, snapshotDir.toString());
+        FrsCfHandle cf;
+        try {
+            cf = linker.dbDefaultCf(restored, arena);
+        } catch (RuntimeException e) {
+            restored.close();
+            throw e;
+        }
+        // ownsResources=false: arena+linker are caller-owned and must outlive the returned
+        // backend. close() will still release the FrsDb and FrsCfHandle that we just opened.
+        return new RestoredForStRsKeyedStateBackend<>(arena, linker, restored, cf, keySerializer);
+    }
+
+    /**
+     * Returns an {@link Iterator} over every distinct key present under the given {@code stateName}.
+     * Iteration order is the underlying ForSt-RS scan order (lexicographic over serialized keys);
+     * callers should not rely on a stable ordering. Each key is materialized lazily by
+     * deserializing the K-bytes embedded in the composite ForSt key.
+     *
+     * <p><b>Decoding.</b> Composite keys produced by this backend follow the layout
+     * {@code "k/" || serialize(K) || "/" || stateName.bytes || "/" [ || serialize(UK) ]}. To recover
+     * K we scan with prefix {@code "k/"} and, for each composite key, locate the tail marker
+     * {@code "/" || stateName.bytes || "/"} after the {@code "k/"} prefix. Everything between
+     * {@code "k/"} (offset 2) and that marker is treated as {@code serialize(K)} and fed back through
+     * {@link TypeSerializer#deserialize}. Map-state entries (which add a user-key suffix) and
+     * value/list/reducing/aggregating entries (which have no suffix) both yield the same K, and
+     * duplicates are filtered via a {@link LinkedHashSet}.
+     *
+     * <p><b>Limits.</b> If {@code serialize(K)} can itself contain the byte sequence
+     * {@code "/" || stateName || "/"} the heuristic above could be ambiguous. We bias toward the
+     * <i>last</i> occurrence of the marker so that map-state user-key suffixes never confuse the
+     * boundary. For the typical Flink {@link org.apache.flink.api.common.typeutils.base.StringSerializer}
+     * (length-prefixed UTF-8) and primitive serializers this is unambiguous.
+     */
+    public Iterator<K> keys(String stateName) {
+        if (closed) {
+            throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
+        }
+        byte[] nameBytes = stateName.getBytes(StandardCharsets.UTF_8);
+        byte[] tailMarker = new byte[1 + nameBytes.length + 1];
+        tailMarker[0] = (byte) '/';
+        System.arraycopy(nameBytes, 0, tailMarker, 1, nameBytes.length);
+        tailMarker[tailMarker.length - 1] = (byte) '/';
+
+        // Deduplicate keys (map-state entries can produce many composite keys per K).
+        Set<K> seen = new LinkedHashSet<>();
+        DataInputDeserializer in = new DataInputDeserializer();
+        Arena local = Arena.ofShared();
+        try {
+            FrsIterator iter = linker.prefixLookupOpen(db, defaultCf, KEYED_NS_MARKER, local);
+            try {
+                while (true) {
+                    ForStRsLinker.IteratorEntry entry = linker.iteratorNext(iter);
+                    if (entry == null) {
+                        break;
+                    }
+                    byte[] composite = entry.key();
+                    int markerOffset =
+                            findLastSubsequence(composite, KEYED_NS_MARKER.length, tailMarker);
+                    if (markerOffset < 0) {
+                        // Composite key does not encode this stateName — skip.
+                        continue;
+                    }
+                    int kStart = KEYED_NS_MARKER.length;
+                    int kLen = markerOffset - kStart;
+                    if (kLen < 0) {
+                        continue;
+                    }
+                    byte[] kBytes = new byte[kLen];
+                    System.arraycopy(composite, kStart, kBytes, 0, kLen);
+                    in.setBuffer(kBytes);
+                    K decoded;
+                    try {
+                        decoded = keySerializer.deserialize(in);
+                    } catch (IOException ioe) {
+                        // Skip composite keys that don't deserialize cleanly under the configured
+                        // key serializer rather than aborting the whole scan.
+                        continue;
+                    }
+                    seen.add(decoded);
+                }
+            } finally {
+                iter.close();
+            }
+        } finally {
+            local.close();
+        }
+        return new ImmutableKeyIterator<>(seen.iterator());
+    }
+
+    /**
+     * Convenience over {@link #keys(String)} that, for every key {@code k} present under
+     * {@code stateName}, transiently {@link #setCurrentKey(Object) sets the current key} to
+     * {@code k} and invokes {@code action}. The original current key is restored on completion (or
+     * cleared if none was set). Useful for "scan + apply" use-cases like windowing eviction or
+     * timer-style traversal.
+     */
+    public void applyToAllKeys(String stateName, Function<K, ?> action) {
+        if (closed) {
+            throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
+        }
+        K previous = this.currentKey;
+        try {
+            Iterator<K> iter = keys(stateName);
+            while (iter.hasNext()) {
+                K k = iter.next();
+                setCurrentKey(k);
+                action.apply(k);
+            }
+        } finally {
+            // Restore prior current-key binding so callers see no observable mutation.
+            if (previous != null) {
+                setCurrentKey(previous);
+            }
+        }
+    }
+
     /** Returns the linker — exposed so tests can issue lower-level FFM calls if needed. */
     public ForStRsLinker getLinker() {
         return linker;
@@ -468,5 +637,101 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             }
         }
         return true;
+    }
+
+    /**
+     * Returns the highest index {@code i >= fromInclusive} such that
+     * {@code data[i .. i+needle.length] == needle}, or {@code -1} when no such index exists. Picking
+     * the last occurrence biases {@link #keys(String)} toward the value/list/map separator that sits
+     * at the end of the K-segment — even if the K-segment itself happens to contain the same byte
+     * pattern.
+     */
+    private static int findLastSubsequence(byte[] data, int fromInclusive, byte[] needle) {
+        if (needle.length == 0 || data.length < needle.length) {
+            return -1;
+        }
+        int last = -1;
+        outer:
+        for (int i = fromInclusive; i + needle.length <= data.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (data[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            last = i;
+        }
+        return last;
+    }
+
+    /** Read-only iterator wrapper that hides {@link Iterator#remove()}. */
+    private static final class ImmutableKeyIterator<E> implements Iterator<E> {
+        private final Iterator<E> delegate;
+
+        ImmutableKeyIterator(Iterator<E> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return delegate.hasNext();
+        }
+
+        @Override
+        public E next() {
+            if (!delegate.hasNext()) {
+                throw new NoSuchElementException();
+            }
+            return delegate.next();
+        }
+    }
+
+    /**
+     * Variant of {@link ForStRsKeyedStateBackend} produced by
+     * {@link #restoreFromSnapshot(ForStRsLinker, Arena, Path, TypeSerializer)}. It owns the
+     * <i>database</i> and the <i>default CF</i> it was constructed with — but not the
+     * arena/linker, which are owned by the caller. This split lets a single arena+linker straddle a
+     * snapshot+restore boundary.
+     */
+    private static final class RestoredForStRsKeyedStateBackend<K>
+            extends ForStRsKeyedStateBackend<K> {
+
+        RestoredForStRsKeyedStateBackend(
+                Arena arena,
+                ForStRsLinker linker,
+                FrsDb db,
+                FrsCfHandle defaultCf,
+                TypeSerializer<K> keySerializer) {
+            super(arena, linker, db, defaultCf, keySerializer, /* ownsResources= */ false);
+        }
+
+        @Override
+        public void close() throws IOException {
+            // Release the per-state cache via the parent (ownsResources=false on the parent skips
+            // the FFM-resource teardown), then explicitly close the FrsDb + default-CF that this
+            // restored instance brought online — the arena+linker are caller-owned.
+            super.close();
+            Throwable first = null;
+            try {
+                getDefaultCf().close();
+            } catch (Throwable t) {
+                first = t;
+            }
+            try {
+                getDb().close();
+            } catch (Throwable t) {
+                if (first == null) {
+                    first = t;
+                }
+            }
+            if (first != null) {
+                if (first instanceof RuntimeException re) {
+                    throw re;
+                }
+                if (first instanceof Error err) {
+                    throw err;
+                }
+                throw new IOException("RestoredForStRsKeyedStateBackend close failed", first);
+            }
+        }
     }
 }
