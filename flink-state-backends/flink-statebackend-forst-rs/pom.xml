@@ -78,6 +78,28 @@ under the License.
 			<scope>test</scope>
 		</dependency>
 
+		<!--
+			JMH is declared in test scope so that the bench harness under
+			src/test/java/org/apache/flink/state/forstrs/jmh/ can pick up
+			@Benchmark annotations if we ever wire the JMH maven plugin in.
+			The ForStCompareBenchmark.java currently runs as a plain main()
+			driven by run-jmh-3way.sh — JMH itself is not strictly required
+			to execute the bench, but having the deps available makes the
+			JMH-plugin path one config block away.
+		-->
+		<dependency>
+			<groupId>org.openjdk.jmh</groupId>
+			<artifactId>jmh-core</artifactId>
+			<version>1.37</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.openjdk.jmh</groupId>
+			<artifactId>jmh-generator-annprocess</artifactId>
+			<version>1.37</version>
+			<scope>test</scope>
+		</dependency>
+
 	</dependencies>
 
 </project>
