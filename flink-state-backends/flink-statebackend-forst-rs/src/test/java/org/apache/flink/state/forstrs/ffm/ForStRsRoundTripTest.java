@@ -27,12 +27,12 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /**
- * End-to-end FFM round-trip: open in-memory ForSt-RS engine via JDK 25 FFM,
- * put and get a value, close. Proves Phase-A Flink-side bootstrap is functional.
+ * End-to-end FFM round-trip: open in-memory ForSt-RS engine via JDK 25 FFM, put and get a value,
+ * close. Proves Phase-A Flink-side bootstrap is functional.
  *
- * <p>Requires the system property {@code forstrs.native.libpath} pointing to
- * {@code libforst_rs_ffi.{dylib,so,dll}}. Surefire is configured to pass this
- * at module level — see module pom.xml.
+ * <p>Requires the system property {@code forstrs.native.libpath} pointing to {@code
+ * libforst_rs_ffi.{dylib,so,dll}}. Surefire is configured to pass this at module level — see module
+ * pom.xml.
  */
 class ForStRsRoundTripTest {
 

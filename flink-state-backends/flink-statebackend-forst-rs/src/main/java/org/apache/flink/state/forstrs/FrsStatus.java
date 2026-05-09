@@ -19,8 +19,7 @@
 package org.apache.flink.state.forstrs;
 
 /**
- * Mirrors the FRS_STATUS_* int codes from
- * {@code crates/forst-rs-ffi/src/lib.rs} (lines 60–95).
+ * Mirrors the FRS_STATUS_* int codes from {@code crates/forst-rs-ffi/src/lib.rs} (lines 60–95).
  * Stable ABI: ordinal does not matter; the int code does.
  */
 public enum FrsStatus {

@@ -25,13 +25,13 @@ import org.apache.flink.configuration.ConfigOptions;
 public final class ForStRsOptions {
 
     /** Optional override for the cdylib path (defaults to System.loadLibrary). */
-    public static final ConfigOption<String> NATIVE_LIB_PATH = ConfigOptions
-            .key("state.backend.forstrs.native-lib-path")
-            .stringType()
-            .noDefaultValue()
-            .withDescription(
-                    "Absolute path to libforst_rs_ffi.{dylib,so,dll}. "
-                            + "If unset, java.library.path is used via System.loadLibrary.");
+    public static final ConfigOption<String> NATIVE_LIB_PATH =
+            ConfigOptions.key("state.backend.forstrs.native-lib-path")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Absolute path to libforst_rs_ffi.{dylib,so,dll}. "
+                                    + "If unset, java.library.path is used via System.loadLibrary.");
 
     private ForStRsOptions() {
         // utility class

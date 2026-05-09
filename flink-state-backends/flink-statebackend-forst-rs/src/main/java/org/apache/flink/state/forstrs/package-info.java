@@ -19,8 +19,8 @@
 /**
  * Public API for the ForSt-RS state backend.
  *
- * <p>Entry point: {@link org.apache.flink.state.forstrs.ForStRsStateBackend}.
- * Configuration: {@link org.apache.flink.state.forstrs.ForStRsOptions}.
- * SPI factory: {@link org.apache.flink.state.forstrs.ForStRsStateBackendFactory}.
+ * <p>Entry point: {@link org.apache.flink.state.forstrs.ForStRsStateBackend}. Configuration: {@link
+ * org.apache.flink.state.forstrs.ForStRsOptions}. SPI factory: {@link
+ * org.apache.flink.state.forstrs.ForStRsStateBackendFactory}.
  */
 package org.apache.flink.state.forstrs;

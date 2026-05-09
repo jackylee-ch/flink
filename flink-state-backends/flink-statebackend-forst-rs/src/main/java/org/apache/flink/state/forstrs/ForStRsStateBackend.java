@@ -25,11 +25,10 @@ import org.apache.flink.runtime.state.StateBackend;
 /**
  * SKELETON {@link StateBackend} backed by ForSt-RS via JDK 25 FFM.
  *
- * <p>v3.2 Phase-A MVP scope: this class exists and is SPI-discoverable;
- * it does NOT yet implement {@code createKeyedStateBackend} or
- * {@code createOperatorStateBackend}. Those land in subsequent
- * Phase-D L4 (Async v2) and L5 (Sync v1) units per
- * {@code docs/superpowers/planning/v3.2/reports/B1_pr_split_plan.md}.
+ * <p>v3.2 Phase-A MVP scope: this class exists and is SPI-discoverable; it does NOT yet implement
+ * {@code createKeyedStateBackend} or {@code createOperatorStateBackend}. Those land in subsequent
+ * Phase-D L4 (Async v2) and L5 (Sync v1) units per {@code
+ * docs/superpowers/planning/v3.2/reports/B1_pr_split_plan.md}.
  *
  * @see ForStRsOptions
  * @see org.apache.flink.state.forstrs.ffm.ForStRsLinker

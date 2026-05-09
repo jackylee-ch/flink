@@ -20,45 +20,50 @@ package org.apache.flink.state.forstrs.lookup;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.ForStRsLinker.IteratorEntry;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.ffm.FrsIterator;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.functions.AsyncTableFunction;
 import org.apache.flink.table.functions.FunctionContext;
 
 import java.lang.foreign.Arena;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
 /**
  * Embedded local-lookup function for Flink Delta Join (G-C).
  *
- * <p>Replaces the Fluss-backed lookup path: instead of an RPC to a remote
- * Fluss tablet server, this function performs a synchronous in-process
- * lookup against an embedded ForSt-RS instance reached through JDK 25
- * FFM. The returned {@link CompletableFuture} is completed inline (no
- * thread pool) because a local KV lookup is sub-microsecond and async
- * scheduling overhead would dominate.
+ * <p>Replaces the Fluss-backed lookup path: instead of an RPC to a remote Fluss tablet server, this
+ * function performs a synchronous in-process lookup against an embedded ForSt-RS instance reached
+ * through JDK 25 FFM. The returned {@link CompletableFuture} is completed inline (no thread pool)
+ * because a local KV lookup is sub-microsecond and async scheduling overhead would dominate.
  *
- * <p>Reference: {@code docs/design/2.13_deltajoin_localization.md}
- * (architectural invariant 5: "DeltaJoin = embedded library, not a service").
+ * <p>Reference: {@code docs/design/2.13_deltajoin_localization.md} (architectural invariant 5:
+ * "DeltaJoin = embedded library, not a service").
  *
  * <h2>Lifecycle</h2>
- * The function expects an externally-managed {@link FrsDb} + {@link FrsCfHandle}
- * pair (typically owned by the {@link org.apache.flink.state.forstrs.ForStRsStateBackend}
- * for the operator's keyed-state CF, or by a dedicated lookup-CF). The function
- * does NOT close them on {@link #close()} — the owning state backend does.
+ *
+ * <p>The function expects an externally-managed {@link FrsDb} + {@link FrsCfHandle} pair (typically
+ * owned by the {@link org.apache.flink.state.forstrs.ForStRsStateBackend} for the operator's
+ * keyed-state CF, or by a dedicated lookup-CF). The function does NOT close them on {@link
+ * #close()} — the owning state backend does.
  *
  * <h2>Key encoding</h2>
- * The {@code keyEncoder} converts a probing {@link RowData} into the bytes used
- * as the ForSt-RS key. The encoding must match what the upstream operator wrote
- * via the same state backend; otherwise lookups will miss.
+ *
+ * <p>The {@code keyEncoder} converts a probing {@link RowData} into the bytes used as the ForSt-RS
+ * key. The encoding must match what the upstream operator wrote via the same state backend;
+ * otherwise lookups will miss.
  *
  * <h2>Status</h2>
- * Phase-A skeleton: open / closeable, single-key {@link #eval(CompletableFuture, RowData)}
- * returns a single decoded value (or null). Multi-row prefix scans land in a
- * follow-up unit when the underlying iterator FFI is wired into
- * {@link ForStRsLinker}.
+ *
+ * <p>Phase-A skeleton: open / closeable, single-key {@link #eval(CompletableFuture, RowData)}
+ * dispatches through {@link ForStRsLinker#lookupKv} (the dedicated Delta-Join exact-match path).
+ * Multi-row prefix scans are exposed via {@link #evalPrefix(CompletableFuture, byte[])}.
  */
 @Internal
 public class ForStRsLocalLookupFunction extends AsyncTableFunction<RowData> {
@@ -90,17 +95,39 @@ public class ForStRsLocalLookupFunction extends AsyncTableFunction<RowData> {
     }
 
     /**
-     * Async lookup invoked by Flink Delta Join. Completes the future inline
-     * because the lookup is local and sub-microsecond.
+     * Async lookup invoked by Flink Delta Join. Completes the future inline because the lookup is
+     * local and sub-microsecond.
      */
     public void eval(CompletableFuture<RowData> resultFuture, RowData probe) {
         try {
             byte[] key = keyEncoder.apply(probe);
-            byte[] value = linker.get(db, cf, key);
+            byte[] value = linker.lookupKv(db, cf, key);
             if (value == null) {
                 resultFuture.complete(null);
             } else {
                 resultFuture.complete(valueDecoder.apply(value));
+            }
+        } catch (Throwable t) {
+            resultFuture.completeExceptionally(t);
+        }
+    }
+
+    /**
+     * Prefix-scan variant for multi-row lookups (e.g. Delta-Join's "all rows with build-side join
+     * key K"). Materializes every row whose key has {@code prefix} as a byte prefix, decodes via
+     * the configured {@code valueDecoder}, and completes {@code resultFuture} inline with the
+     * collection. Sub-microsecond locally; no thread-pool hop.
+     */
+    public void evalPrefix(CompletableFuture<Collection<RowData>> resultFuture, byte[] prefix) {
+        try (Arena arena = Arena.ofConfined()) {
+            FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena);
+            try (iter) {
+                List<RowData> out = new ArrayList<>();
+                IteratorEntry entry;
+                while ((entry = linker.iteratorNext(iter)) != null) {
+                    out.add(valueDecoder.apply(entry.value()));
+                }
+                resultFuture.complete(out);
             }
         } catch (Throwable t) {
             resultFuture.completeExceptionally(t);

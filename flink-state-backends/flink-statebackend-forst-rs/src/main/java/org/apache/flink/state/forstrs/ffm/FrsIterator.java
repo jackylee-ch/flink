@@ -21,23 +21,30 @@ package org.apache.flink.state.forstrs.ffm;
 import java.lang.foreign.MemorySegment;
 
 /**
- * Opaque ForSt-RS database handle. Wraps a {@code FrsDb} pointer (raw {@code *mut c_void} from the
- * C ABI). Use try-with-resources to ensure {@code frs_db_close} runs.
+ * Opaque ForSt-RS iterator handle. Wraps a {@code FrsIterator} pointer (raw {@code *mut c_void}
+ * from the C ABI). Use try-with-resources to ensure the matching {@code frs_iterator_close} or
+ * {@code frs_prefix_lookup_close} runs.
+ *
+ * <p>{@code prefix} flag determines which close symbol is invoked at the close site. Both ABIs
+ * alias the same impl in Rust, but exposing both keeps the Java side honest about the semantics
+ * requested by the caller.
  */
-public final class FrsDb implements AutoCloseable {
+public final class FrsIterator implements AutoCloseable {
 
     private final ForStRsLinker linker;
     private MemorySegment handle;
+    private final boolean prefix;
     private boolean closed = false;
 
-    FrsDb(ForStRsLinker linker, MemorySegment handle) {
+    FrsIterator(ForStRsLinker linker, MemorySegment handle, boolean prefix) {
         this.linker = linker;
         this.handle = handle;
+        this.prefix = prefix;
     }
 
     public MemorySegment handle() {
         if (closed) {
-            throw new IllegalStateException("FrsDb already closed");
+            throw new IllegalStateException("FrsIterator already closed");
         }
         return handle;
     }
@@ -45,7 +52,7 @@ public final class FrsDb implements AutoCloseable {
     @Override
     public void close() {
         if (!closed) {
-            linker.dbClose(handle);
+            linker.iteratorClose(handle, prefix);
             closed = true;
             handle = MemorySegment.NULL;
         }
