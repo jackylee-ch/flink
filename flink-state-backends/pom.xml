@@ -41,6 +41,26 @@ under the License.
 		<module>flink-statebackend-changelog</module>
 		<module>flink-statebackend-common</module>
         <module>flink-statebackend-forst</module>
-        <module>flink-statebackend-forst-rs</module>
     </modules>
+
+    <profiles>
+        <!--
+            flink-statebackend-forst-rs requires JDK 25 (FFM API: Linker.nativeLinker(),
+            Linker.Option.critical(true), MemorySegment.ofArray on heap segments).
+            Auto-activate when running JDK >= 25 so JDK 17 build lanes (Default Compile,
+            Pre-compile QA) skip this module entirely instead of failing with
+            "source release 25 requires target release 25". Explicit opt-in via
+            -Pforst-rs-jdk25 also works for JDK 17 hosts that have a JDK 25 toolchain
+            wired separately.
+        -->
+        <profile>
+            <id>forst-rs-jdk25</id>
+            <activation>
+                <jdk>[25,)</jdk>
+            </activation>
+            <modules>
+                <module>flink-statebackend-forst-rs</module>
+            </modules>
+        </profile>
+    </profiles>
 </project>

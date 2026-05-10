@@ -131,8 +131,14 @@ under the License.
 		<flink.shaded.jackson.version>2.20.1</flink.shaded.jackson.version>
 		<flink.shaded.jsonpath.version>2.10.0</flink.shaded.jsonpath.version>
 		<flink.markBundledAsOptional>true</flink.markBundledAsOptional>
-		<source.java.version>25</source.java.version>
-		<target.java.version>25</target.java.version>
+		<!-- Default Flink build targets JDK 17 (matches upstream).
+		     The `flink-statebackend-forst-rs` module requires JDK 25 (FFM API)
+		     and is auto-included in a JDK-25-activated profile under
+		     flink-state-backends/pom.xml; that module locally pins source/target=25.
+		     CI: `Default (Java 17) / Compile` lane stays green; `ci-forst-rs.yml`
+		     runs JDK 25 and picks up the forst-rs module. -->
+		<source.java.version>17</source.java.version>
+		<target.java.version>17</target.java.version>
 		<slf4j.version>1.7.36</slf4j.version>
 		<log4j.version>2.24.3</log4j.version>
 		<!-- Overwrite default values from parent pom.

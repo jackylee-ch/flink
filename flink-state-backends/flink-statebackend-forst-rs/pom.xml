@@ -36,6 +36,19 @@ under the License.
 	<packaging>jar</packaging>
 
 	<properties>
+		<!--
+			Pin source/target=25 unconditionally for this module. The parent
+			Flink build defaults to Java 17 (parent pom.xml line 134-135);
+			we override here because FFM (Linker.nativeLinker(),
+			Linker.Option.critical(true)) is JDK 25+ only. The auto-activated
+			forst-rs-jdk25 profile in flink-state-backends/pom.xml ensures
+			this module is only included in the reactor when JDK >= 25, so
+			these settings never collide with a JDK 17 build.
+		-->
+		<source.java.version>25</source.java.version>
+		<target.java.version>25</target.java.version>
+		<maven.compiler.source>25</maven.compiler.source>
+		<maven.compiler.target>25</maven.compiler.target>
 		<forstrs.native.libpath>${user.home}/Code/stczwd/ForSt/target/release/libforst_rs_ffi.dylib</forstrs.native.libpath>
 		<surefire.module.config><!--
 			FFM API requires opt-in for native access in JDK 22+.
