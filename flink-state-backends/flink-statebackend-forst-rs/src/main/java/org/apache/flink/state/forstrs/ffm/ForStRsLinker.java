@@ -91,6 +91,14 @@ public final class ForStRsLinker {
     // --- 3b. Batch ops ---
     private final MethodHandle frsBatchPut;
 
+    // C1: zero-copy batch_put via Arrow C Data Interface. The native side
+    // takes an FFI_ArrowArray + FFI_ArrowSchema pair (key | value | op_type)
+    // and dispatches DIRECTLY into the memtable's columnar storage with no
+    // intermediate WriteBatch allocation. See `frs_batch_put_arrow` in
+    // `crates/forst-rs-ffi/src/lib.rs` and `DbImpl::batch_put_arrow` in
+    // `crates/forst-rs-engine/src/db.rs`.
+    private final MethodHandle frsBatchPutArrow;
+
     // --- 4. Memory management ---
     private final MethodHandle frsBytesFree;
 
@@ -255,6 +263,25 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // value_lens (size_t*)
                                 ValueLayout.JAVA_LONG)); // count (size_t)
 
+        // C1: zero-copy batch_put via Arrow C Data Interface.
+        // Native signature:
+        //   int frs_batch_put_arrow(
+        //       FrsDb handle, FrsCfHandle cf,
+        //       FFI_ArrowArray*  array,
+        //       FFI_ArrowSchema* schema);
+        // The native side takes ownership of *array / *schema (and zeroes the
+        // originals per the Arrow C Data Interface contract), so the caller
+        // does not need to free them after the call returns.
+        this.frsBatchPutArrow =
+                bind(
+                        "frs_batch_put_arrow",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // array (FFI_ArrowArray*)
+                                ValueLayout.ADDRESS)); // schema (FFI_ArrowSchema*)
+
         // 4. Memory management — bound critical because every get/lookup_kv path
         // calls frs_bytes_free on its 24-byte FrsBytes out struct, which is now
         // a heap segment passed via MemorySegment.ofArray(byte[24]).
@@ -361,9 +388,9 @@ public final class ForStRsLinker {
      * Linker.Option#critical(boolean) critical(true)}). Critical-mode handles can accept heap
      * {@link MemorySegment}s such as {@link MemorySegment#ofArray(byte[])}; the linker pins the
      * underlying primitive array for the duration of the native call instead of forcing the caller
-     * to stage bytes through a per-call native arena. This eliminates two {@code Arena.allocate}
-     * + {@code MemorySegment.copy} pairs per put/get, making the FFM bridge competitive with the
-     * JNI {@code GetByteArrayElements} pin path.
+     * to stage bytes through a per-call native arena. This eliminates two {@code Arena.allocate} +
+     * {@code MemorySegment.copy} pairs per put/get, making the FFM bridge competitive with the JNI
+     * {@code GetByteArrayElements} pin path.
      *
      * <p>Use only on hot point-op symbols ({@code frs_put}, {@code frs_get}, {@code frs_delete},
      * {@code frs_lookup_kv}) — critical mode disables the JVM's safepoint mechanism for the
@@ -403,12 +430,12 @@ public final class ForStRsLinker {
      * Opens an in-memory ForSt-RS engine with caller-supplied write-path tuning knobs.
      *
      * <p>This is the JMH-bench / write-pressure-test counterpart to {@link #dbOpenMemory(Arena)}:
-     * the four parameters map 1:1 onto {@code EngineOptions.write_buffer_size},
-     * {@code max_write_buffer_number}, {@code max_background_compactions} and
-     * {@code max_background_flushes}. Any parameter passed as {@code 0} keeps the engine's
-     * built-in default for that field; out-of-range values flow through
-     * {@code EngineOptionsBuilder::try_build} on the Rust side and surface as
-     * {@link FrsStatus#INVALID_ARGUMENT}, not a JVM panic.
+     * the four parameters map 1:1 onto {@code EngineOptions.write_buffer_size}, {@code
+     * max_write_buffer_number}, {@code max_background_compactions} and {@code
+     * max_background_flushes}. Any parameter passed as {@code 0} keeps the engine's built-in
+     * default for that field; out-of-range values flow through {@code
+     * EngineOptionsBuilder::try_build} on the Rust side and surface as {@link
+     * FrsStatus#INVALID_ARGUMENT}, not a JVM panic.
      *
      * <p>Recommended sustained-write presets (R-loop write-path tuning, 2026-05-10):
      *
@@ -463,10 +490,10 @@ public final class ForStRsLinker {
 
     /**
      * Opens an engine by restoring its state from a checkpoint directory previously produced by
-     * {@link #createCheckpoint(FrsDb, String)}. The checkpoint directory must contain
-     * {@code CHECKPOINT.blob} and every SST file the manifest references. The engine is opened with
-     * {@code db_path = targetDir}: subsequent reads/writes operate directly on the checkpoint
-     * files. Caller closes via {@link FrsDb#close()}.
+     * {@link #createCheckpoint(FrsDb, String)}. The checkpoint directory must contain {@code
+     * CHECKPOINT.blob} and every SST file the manifest references. The engine is opened with {@code
+     * db_path = targetDir}: subsequent reads/writes operate directly on the checkpoint files.
+     * Caller closes via {@link FrsDb#close()}.
      */
     public FrsDb dbOpenFromCheckpoint(Arena arena, String targetDir) {
         MemorySegment dirSeg = allocateCString(arena, targetDir);
@@ -576,17 +603,17 @@ public final class ForStRsLinker {
      * <p>The four "parallel array" segments must be laid out in native memory:
      *
      * <ul>
-     *   <li>{@code keyPtrs}: {@code count} {@code uint8_t*} entries — each pointer
-     *       targets a key buffer whose size is the matching {@code keyLens[i]}.
+     *   <li>{@code keyPtrs}: {@code count} {@code uint8_t*} entries — each pointer targets a key
+     *       buffer whose size is the matching {@code keyLens[i]}.
      *   <li>{@code keyLens}: {@code count} {@code size_t} entries (8 bytes each).
      *   <li>{@code valuePtrs}: {@code count} {@code uint8_t*} entries.
      *   <li>{@code valueLens}: {@code count} {@code size_t} entries.
      * </ul>
      *
-     * <p>The key/value buffers themselves can live anywhere (native or pinned heap)
-     * as long as the pointers inside {@code keyPtrs} / {@code valuePtrs} remain
-     * valid for the duration of this call. Hot path callers (e.g. JMH bench) stage
-     * everything once into a long-lived native arena and never copy.
+     * <p>The key/value buffers themselves can live anywhere (native or pinned heap) as long as the
+     * pointers inside {@code keyPtrs} / {@code valuePtrs} remain valid for the duration of this
+     * call. Hot path callers (e.g. JMH bench) stage everything once into a long-lived native arena
+     * and never copy.
      */
     public void batchPut(
             FrsDb db,
@@ -616,11 +643,10 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Convenience overload — stages {@code keys} / {@code values} into a fresh
-     * confined arena and forwards to {@link #batchPut(FrsDb, FrsCfHandle,
-     * MemorySegment, MemorySegment, MemorySegment, MemorySegment, long)}. The
-     * staging cost (one alloc + N+N copies) makes this UNSUITABLE for benchmarking;
-     * use the segment overload with pre-staged buffers for the hot path.
+     * Convenience overload — stages {@code keys} / {@code values} into a fresh confined arena and
+     * forwards to {@link #batchPut(FrsDb, FrsCfHandle, MemorySegment, MemorySegment, MemorySegment,
+     * MemorySegment, long)}. The staging cost (one alloc + N+N copies) makes this UNSUITABLE for
+     * benchmarking; use the segment overload with pre-staged buffers for the hot path.
      */
     public void batchPut(FrsDb db, FrsCfHandle cf, byte[][] keys, byte[][] values) {
         if (keys.length != values.length) {
@@ -664,15 +690,49 @@ public final class ForStRsLinker {
         }
     }
 
+    /**
+     * C1 zero-copy batch_put via the Arrow C Data Interface.
+     *
+     * <p>The caller pre-builds an Arrow {@code RecordBatch} with the canonical schema {@code key:
+     * Binary, value: Binary nullable, op_type: UInt8} and exports it to two native segments via
+     * Arrow-Java's {@code Data.exportArray} (or any equivalent Arrow C Data Interface producer).
+     * Both pointers MUST point to the standard {@code FFI_ArrowArray} / {@code FFI_ArrowSchema}
+     * layouts.
+     *
+     * <p>The native side takes ownership of {@code *array} and {@code *schema} per the Arrow C Data
+     * Interface contract: it reads them, then zeroes the originals so the caller does NOT have to
+     * free them — release callbacks are invalidated in-place.
+     *
+     * <p>This bypasses the legacy {@link #batchPut} path's per-row {@code Vec<u8>} allocation in
+     * WriteBatch + the subsequent {@code Vec<&[u8]>} re-borrow in {@code db.batch_write}.
+     * Engine-level micro-bench shows ~1.8× speedup vs the WriteBatch path on the 1000-row Put-only
+     * workload (see {@code crates/forst-rs-bench/benches/batch_put_arrow_vs_write_batch.rs}).
+     *
+     * @param db database handle
+     * @param cf column family handle
+     * @param arrayPtr pointer to a populated {@code FFI_ArrowArray} (caller-owned alloc; contents
+     *     are consumed by this call)
+     * @param schemaPtr pointer to a populated {@code FFI_ArrowSchema} (caller-owned alloc; contents
+     *     are consumed by this call)
+     */
+    public void batchPutArrow(
+            FrsDb db, FrsCfHandle cf, MemorySegment arrayPtr, MemorySegment schemaPtr) {
+        int rc;
+        try {
+            rc = (int) frsBatchPutArrow.invokeExact(db.handle(), cf.handle(), arrayPtr, schemaPtr);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_batch_put_arrow threw: " + t.getMessage());
+        }
+        check(rc, "frs_batch_put_arrow");
+    }
+
     /** Deletes {@code key} from the column family. No-op if absent. */
     public void delete(FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
         int rc;
         try {
-            rc =
-                    (int)
-                            frsDelete.invokeExact(
-                                    db.handle(), cf.handle(), keySeg, (long) key.length);
+            rc = (int) frsDelete.invokeExact(db.handle(), cf.handle(), keySeg, (long) key.length);
         } catch (Throwable t) {
             throw new FrsBackendException(FrsStatus.PANIC, "frs_delete threw: " + t.getMessage());
         }
@@ -908,11 +968,7 @@ public final class ForStRsLinker {
             rc =
                     (int)
                             mh.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    outBytes);
+                                    db.handle(), cf.handle(), keySeg, (long) key.length, outBytes);
         } catch (Throwable t) {
             throw new FrsBackendException(FrsStatus.PANIC, fn + " threw: " + t.getMessage());
         }
