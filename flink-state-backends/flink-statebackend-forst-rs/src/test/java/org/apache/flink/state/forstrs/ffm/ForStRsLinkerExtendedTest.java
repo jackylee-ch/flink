@@ -276,4 +276,51 @@ class ForStRsLinkerExtendedTest {
                     () -> linker.dbOpenMemoryTuned(arena, 1L, 0L, 0L, 0L));
         }
     }
+
+    /**
+     * P5 — TTL compaction filter factory stub: open returns a non-zero handle, dispose accepts it
+     * silently, and a successive open hands out a different handle (the per-process counter must
+     * advance).
+     *
+     * <p>The factory is a placeholder — TTL expirations are not actually enforced. See the doc
+     * comment on {@link ForStRsLinker#newCompactionFilterFactory(long, long, int)}.
+     */
+    @Test
+    void testCompactionFilterFactoryStub() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+
+            // Typical Flink keyed-state TTL request: 60s, query-time-after-1000-entries,
+            // Value state.
+            long h1 =
+                    linker.newCompactionFilterFactory(
+                            60_000L, 1000L, ForStRsLinker.STATE_TYPE_VALUE);
+            assertTrue(h1 != 0L, "factory handle must be non-zero (Java would NPE on 0)");
+
+            // Second factory: distinct handle so a backend instantiating one factory per CF
+            // can keep them apart.
+            long h2 =
+                    linker.newCompactionFilterFactory(
+                            300_000L, 0L, ForStRsLinker.STATE_TYPE_LIST);
+            assertTrue(h2 != 0L);
+            assertTrue(h2 != h1, "successive handles must be distinct: " + h1 + " == " + h2);
+
+            // Dispose path is a no-op but must not throw on a freshly-issued handle.
+            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(h1));
+            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(h2));
+
+            // Idempotent on 0.
+            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(0L));
+
+            // Negative handles are rejected (caller bug, not silently swallowed).
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> linker.disposeCompactionFilterFactory(-1L));
+
+            // Out-of-range stateType is rejected at construction time.
+            assertThrows(
+                    IllegalArgumentException.class,
+                    () -> linker.newCompactionFilterFactory(60_000L, 1000L, 99));
+        }
+    }
 }
