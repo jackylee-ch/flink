@@ -278,49 +278,58 @@ class ForStRsLinkerExtendedTest {
     }
 
     /**
-     * P5 — TTL compaction filter factory stub: open returns a non-zero handle, dispose accepts it
-     * silently, and a successive open hands out a different handle (the per-process counter must
-     * advance).
-     *
-     * <p>The factory is a placeholder — TTL expirations are not actually enforced. See the doc
-     * comment on {@link ForStRsLinker#newCompactionFilterFactory(long, long, int)}.
+     * TTL compaction filter — engine-side enforcement. The native binding accepts (db, cf, ttl_ms,
+     * state_type, timestamp_offset) and installs a {@code FlinkTtlCompactionFilter} on the CF. The
+     * filter activates at the next flush + compaction; this test only verifies the handle plumbing
+     * path (no-throw on valid inputs, IAE on invalid). Engine-level expiry semantics are covered by
+     * Rust-side tests in {@code crates/forst-rs-engine/src/compaction_filter.rs}.
      */
     @Test
-    void testCompactionFilterFactoryStub() {
+    void testSetCompactionFilterTtl() {
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
 
-            // Typical Flink keyed-state TTL request: 60s, query-time-after-1000-entries,
-            // Value state.
-            long h1 =
-                    linker.newCompactionFilterFactory(
-                            60_000L, 1000L, ForStRsLinker.STATE_TYPE_VALUE);
-            assertTrue(h1 != 0L, "factory handle must be non-zero (Java would NPE on 0)");
+                // Typical Flink keyed-state TTL request: 60s, Value state, no offset.
+                assertDoesNotThrow(
+                        () ->
+                                linker.setCompactionFilterTtl(
+                                        db, cf, 60_000L, ForStRsLinker.STATE_TYPE_VALUE, 0L));
 
-            // Second factory: distinct handle so a backend instantiating one factory per CF
-            // can keep them apart.
-            long h2 =
-                    linker.newCompactionFilterFactory(
-                            300_000L, 0L, ForStRsLinker.STATE_TYPE_LIST);
-            assertTrue(h2 != 0L);
-            assertTrue(h2 != h1, "successive handles must be distinct: " + h1 + " == " + h2);
+                // Re-applying a different filter on the same CF replaces the prior one
+                // (engine-side semantics).
+                assertDoesNotThrow(
+                        () ->
+                                linker.setCompactionFilterTtl(
+                                        db, cf, 300_000L, ForStRsLinker.STATE_TYPE_LIST, 0L));
 
-            // Dispose path is a no-op but must not throw on a freshly-issued handle.
-            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(h1));
-            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(h2));
+                // Disabled state-type is a no-op pass-through (kept for API symmetry with
+                // FlinkCompactionFilter.StateType.Disabled).
+                assertDoesNotThrow(
+                        () ->
+                                linker.setCompactionFilterTtl(
+                                        db, cf, 0L, ForStRsLinker.STATE_TYPE_DISABLED, 0L));
 
-            // Idempotent on 0.
-            assertDoesNotThrow(() -> linker.disposeCompactionFilterFactory(0L));
+                // Out-of-range stateType is rejected at the Java boundary, before the JNI hop.
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () -> linker.setCompactionFilterTtl(db, cf, 60_000L, 99, 0L));
 
-            // Negative handles are rejected (caller bug, not silently swallowed).
-            assertThrows(
-                    IllegalArgumentException.class,
-                    () -> linker.disposeCompactionFilterFactory(-1L));
+                // Negative ttl rejected (FFI signature is u64; negative would underflow).
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                linker.setCompactionFilterTtl(
+                                        db, cf, -1L, ForStRsLinker.STATE_TYPE_VALUE, 0L));
 
-            // Out-of-range stateType is rejected at construction time.
-            assertThrows(
-                    IllegalArgumentException.class,
-                    () -> linker.newCompactionFilterFactory(60_000L, 1000L, 99));
+                // Negative offset rejected (FFI signature is usize).
+                assertThrows(
+                        IllegalArgumentException.class,
+                        () ->
+                                linker.setCompactionFilterTtl(
+                                        db, cf, 60_000L, ForStRsLinker.STATE_TYPE_VALUE, -1L));
+            }
         }
     }
 }

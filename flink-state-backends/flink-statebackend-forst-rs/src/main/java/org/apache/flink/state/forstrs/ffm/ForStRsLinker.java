@@ -116,6 +116,9 @@ public final class ForStRsLinker {
     private final MethodHandle frsPrefixLookupOpen;
     private final MethodHandle frsPrefixLookupClose;
 
+    // --- 7. TTL compaction filter ---
+    private final MethodHandle frsCfSetCompactionFilterTtl;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -371,6 +374,20 @@ public final class ForStRsLinker {
                 bind(
                         "frs_prefix_lookup_close",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        // 7. TTL compaction filter — Flink-shaped per-CF filter that drops entries
+        // older than ttl_ms. Engine-side enforcement runs at flush + L0→L1 compaction;
+        // see crates/forst-rs-engine/src/compaction_filter.rs.
+        this.frsCfSetCompactionFilterTtl =
+                bind(
+                        "frs_cf_set_compaction_filter_ttl",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.JAVA_LONG, // ttl_ms (u64)
+                                ValueLayout.JAVA_INT, // state_type (i32)
+                                ValueLayout.JAVA_LONG)); // timestamp_offset (usize)
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -1032,99 +1049,68 @@ public final class ForStRsLinker {
     public record IteratorEntry(byte[] key, byte[] value) {}
 
     // ------------------------------------------------------------------
-    // 7. P5 — TTL compaction filter factory (placeholder / stub)
+    // 7. TTL compaction filter — Flink-shaped per-CF filter
     //
-    // The FFM bridge does NOT bind these into any C ABI export — there is
-    // no `frs_compaction_filter_*` function on the Rust side. They are
-    // pure Java-side handle accumulators that exist purely so the
-    // ForStRsLinker public surface mirrors what a Flink keyed-state TTL
-    // path would request. The Rust storage layer currently has no
-    // compaction-filter trait, so even if we *did* bind a native function,
-    // expirations would not actually take effect.
+    // The engine binds a per-CF FlinkTtlCompactionFilter (Disabled/Value/List)
+    // that drops expired entries at flush + L0→L1 compaction time. Apply it
+    // immediately after CF creation by calling
+    // {@link #setCompactionFilterTtl(FrsDb, FrsCfHandle, long, int, long)}.
+    // Once set, the filter cannot be removed without dropping/recreating the CF.
     //
-    // Operational note: TTL state will accumulate without compaction-time
-    // expiration on this build. Operators should either provision a
-    // larger state budget, manage TTL externally, or wait for the
-    // forst-rs-storage crate to gain a `CompactionFilter` trait (tracked
-    // separately).
-    //
-    // The JNI shim (libforstjni surface) DOES expose
-    // `Java_org_forstdb_FlinkCompactionFilter_*` symbols with identical
-    // accept-but-ignore semantics so existing community Flink jobs that
-    // call `new FlinkCompactionFilterFactory(...)` continue to load and
-    // construct without `UnsatisfiedLinkError`. See
-    // `crates/forst-rs-ffi/src/compat_jni.rs` (search "P5 —
-    // FlinkCompactionFilter").
+    // The JNI compat shim (libforstjni surface) carries
+    // {@code Java_org_forstdb_FlinkCompactionFilter_*} symbols that record
+    // configure() calls but cannot reliably wire factory→holder→CF without
+    // Java-side cooperation. Production paths must use this FFM API instead.
     // ------------------------------------------------------------------
 
-    /** State-type ordinals; mirror the {@code FlinkCompactionFilter.StateType} enum. */
+    /** State-type ordinals; mirror {@code FlinkCompactionFilter.StateType} (and Rust). */
     public static final int STATE_TYPE_DISABLED = 0;
 
     public static final int STATE_TYPE_VALUE = 1;
     public static final int STATE_TYPE_LIST = 2;
 
     /**
-     * Per-process counter handing out monotonically increasing factory handles. Starts at 1 so
-     * "0 means null" continues to hold across the FFM bridge. Not thread-safe in the strictest
-     * sense (we use a plain long with synchronized accessors below) — Flink instantiates one
-     * factory per CF on the main thread, so the contention is negligible.
-     */
-    private static long nextCompactionFilterFactoryHandle = 1L;
-
-    private static final Object COMPACTION_FILTER_FACTORY_LOCK = new Object();
-
-    /**
-     * Allocates an opaque TTL compaction-filter factory handle. The returned long is non-zero and
-     * must be disposed via {@link #disposeCompactionFilterFactory(long)} when the keyed-state
-     * backend tears down.
+     * Installs an engine-side TTL compaction filter on {@code cf}. Subsequent flushes and
+     * compactions on this CF will drop entries whose recorded timestamp + {@code ttlMs} is older
+     * than the current wall clock. The filter is engine-managed; releasing the CF (via {@link
+     * FrsCfHandle#close()}) tears it down.
      *
-     * <p><b>TTL is not enforced.</b> The state engine has no compaction-filter hook today, so
-     * expirations never run. The arguments are accepted and recorded for forward-compatibility
-     * with the keyed-state lifecycle, but no value is read out of them by any native code.
+     * <p>Value semantics ({@code stateType == STATE_TYPE_VALUE}): a single timestamp prefix on the
+     * value bytes; if expired the entry is dropped. List semantics ({@code STATE_TYPE_LIST}): the
+     * filter inspects each list element. {@code STATE_TYPE_DISABLED} is a no-op (kept for API
+     * symmetry so callers can pass through whatever ordinal Flink configured without branching).
      *
-     * @param ttlMs time-to-live in milliseconds; values &lt; 0 are clamped to 0
-     * @param queryTimeAfterN entries-between-clock-reads heuristic; values &lt; 0 are clamped to 0
-     * @param stateType one of {@link #STATE_TYPE_DISABLED}, {@link #STATE_TYPE_VALUE}, {@link
-     *     #STATE_TYPE_LIST}
-     * @return a non-zero opaque handle; pass back to {@link
-     *     #disposeCompactionFilterFactory(long)} on close
+     * <p>The {@code timestampOffset} parameter is the byte offset within the encoded value where
+     * the 8-byte big-endian millisecond timestamp lives; pass {@code 0} unless your serializer
+     * pads.
+     *
+     * @throws FrsBackendException if the native call returns a non-OK status (e.g. closed db or
+     *     unknown {@code stateType})
      */
-    public long newCompactionFilterFactory(long ttlMs, long queryTimeAfterN, int stateType) {
-        // Defensive validation — these fields are never read out, but if a caller
-        // ever wires them into a real implementation we want the contract documented.
+    public void setCompactionFilterTtl(
+            FrsDb db, FrsCfHandle cf, long ttlMs, int stateType, long timestampOffset) {
         if (stateType < STATE_TYPE_DISABLED || stateType > STATE_TYPE_LIST) {
             throw new IllegalArgumentException(
                     "stateType must be 0/1/2 (Disabled/Value/List); got " + stateType);
         }
-        // ttlMs and queryTimeAfterN: clamping a negative to 0 is documented in the
-        // method Javadoc; we accept any non-negative long here.
-        long clampedTtl = Math.max(0L, ttlMs);
-        long clampedQty = Math.max(0L, queryTimeAfterN);
-        // Force the parameters into the bookkeeping so the JIT can't elide them
-        // entirely (helps with debugger inspection during development).
-        long sum = clampedTtl + clampedQty + stateType;
-        synchronized (COMPACTION_FILTER_FACTORY_LOCK) {
-            long h = nextCompactionFilterFactoryHandle++;
-            // Mix `sum` into nothing observable but ensure it's referenced.
-            if (sum < 0L) {
-                throw new AssertionError("clamped values must be non-negative");
-            }
-            return h;
+        if (ttlMs < 0L) {
+            throw new IllegalArgumentException("ttlMs must be non-negative; got " + ttlMs);
         }
-    }
-
-    /**
-     * Releases an opaque compaction-filter factory handle. Idempotent on 0; double-disposing a
-     * non-zero handle is safe because nothing on the Java or native side actually owns memory
-     * keyed by the value.
-     */
-    public void disposeCompactionFilterFactory(long handle) {
-        // No-op: the handle is just a numeric token. Method exists for API symmetry
-        // with the eventual real implementation and so callers can match their
-        // `try-with-resources` patterns.
-        if (handle < 0L) {
+        if (timestampOffset < 0L) {
             throw new IllegalArgumentException(
-                    "compaction filter factory handle cannot be negative: " + handle);
+                    "timestampOffset must be non-negative; got " + timestampOffset);
         }
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsCfSetCompactionFilterTtl.invokeExact(
+                                    db.handle(), cf.handle(), ttlMs, stateType, timestampOffset);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_cf_set_compaction_filter_ttl threw: " + t.getMessage());
+        }
+        check(rc, "frs_cf_set_compaction_filter_ttl");
     }
 }
