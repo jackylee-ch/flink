@@ -117,17 +117,20 @@ jobs:
           maven-version: 3.9.6
 
       - name: Download cdylib artifact
+        # Land outside the repo workspace so apache-rat doesn't scan
+        # the binary cdylib (would fail with "Files with unapproved
+        # licenses: native-libs/libforst_rs_ffi.d").
         uses: actions/download-artifact@v4
         with:
           name: libforst_rs_ffi
-          path: native-libs
+          path: /tmp/native-libs
 
       - name: Resolve cdylib absolute path
         id: cdylib
         run: |
           set -e
           for ext in so dylib dll; do
-            CAND=$(ls native-libs/libforst_rs_ffi.${ext} 2>/dev/null || true)
+            CAND=$(ls /tmp/native-libs/libforst_rs_ffi.${ext} 2>/dev/null || true)
             if [ -n "$CAND" ]; then
               ABS=$(realpath "$CAND")
               echo "lib_path=$ABS" >> "$GITHUB_OUTPUT"
