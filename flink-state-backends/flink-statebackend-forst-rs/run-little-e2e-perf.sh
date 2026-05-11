@@ -173,6 +173,12 @@ echo "Events: $EVENTS   Warmups: $WARMUPS"
 echo "CDylib: $CDYLIB"
 echo ""
 
+# Per-variant runs are non-fatal: if variant 2 (community forstjni) fails
+# due to an upstream API mismatch (e.g. com.ververica:forstjni:0.1.8's
+# RocksDB.loadLibrary() not matching flink-statebackend-forst's expected
+# signature), we still want variants 1, 3, 4 to produce numbers. set +e
+# is scoped to the variant loop; the rest of the script remains strict.
+set +e
 run_variant() {
     local label="$1"
     local backend="$2"
@@ -186,6 +192,10 @@ run_variant() {
         -cp "$CP" \
         org.apache.flink.state.forstrs.perf.LittleE2EPerfBench \
         --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "VARIANT_FAILED label='$label' backend=$backend exit_code=$rc"
+    fi
 }
 
 run_variant "rocksdb" rocksdb
@@ -193,6 +203,7 @@ run_variant "forst (community libforstjni)" forst
 run_variant "forst (libforstjni -> libforst_rs_ffi swap)" forst \
     "-Djava.library.path=$LIBSWAP_DIR"
 run_variant "forst-rs" forst-rs
+set -e
 
 echo ""
 echo "=== done ==="
