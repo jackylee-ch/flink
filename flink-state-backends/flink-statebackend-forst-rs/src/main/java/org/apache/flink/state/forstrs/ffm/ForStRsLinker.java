@@ -119,6 +119,15 @@ public final class ForStRsLinker {
     // --- 7. TTL compaction filter ---
     private final MethodHandle frsCfSetCompactionFilterTtl;
 
+    // --- 8. MVCC snapshot + versioned reads + incremental checkpoint (B-Prod-P2) ---
+    private final MethodHandle frsDbSnapshot;
+    private final MethodHandle frsDbReleaseSnapshot;
+    private final MethodHandle frsGetAt;
+    private final MethodHandle frsIteratorOpenAt;
+    private final MethodHandle frsCreateIncrementalCheckpointAt;
+    private final MethodHandle frsDbOpenFromIncremental;
+    private final MethodHandle frsDbIncrementalCheckpointResultFree;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -388,6 +397,74 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG, // ttl_ms (u64)
                                 ValueLayout.JAVA_INT, // state_type (i32)
                                 ValueLayout.JAVA_LONG)); // timestamp_offset (usize)
+
+        // 8. MVCC snapshot + versioned reads + incremental checkpoint (B-Prod-P2)
+        this.frsDbSnapshot =
+                bind(
+                        "frs_db_snapshot",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS)); // out_snapshot (FrsSnapshot*)
+
+        this.frsDbReleaseSnapshot =
+                bind(
+                        "frs_db_release_snapshot",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS)); // snapshot (FrsSnapshot)
+
+        // get_at is hot like get/lookup_kv — bound critical so heap-byte-array
+        // segments work without per-call native staging.
+        this.frsGetAt =
+                bindCritical(
+                        "frs_get_at",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // snapshot
+                                ValueLayout.ADDRESS, // key ptr
+                                ValueLayout.JAVA_LONG, // key_len
+                                ValueLayout.ADDRESS)); // out FrsBytes*
+
+        this.frsIteratorOpenAt =
+                bind(
+                        "frs_iterator_open_at",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // snapshot
+                                ValueLayout.ADDRESS)); // out_iter
+
+        this.frsCreateIncrementalCheckpointAt =
+                bind(
+                        "frs_create_incremental_checkpoint_at",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // snapshot
+                                ValueLayout.JAVA_LONG, // checkpoint_id (u64)
+                                ValueLayout.JAVA_LONG, // base_checkpoint_id (u64)
+                                ValueLayout.ADDRESS)); // out (FrsIncrementalCheckpointResult*)
+
+        this.frsDbOpenFromIncremental =
+                bind(
+                        "frs_db_open_from_incremental",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // target_dir (c_char*)
+                                ValueLayout.ADDRESS, // base_manifest (c_char*)
+                                ValueLayout.ADDRESS, // sst_files (c_char* const*)
+                                ValueLayout.JAVA_LONG, // sst_file_count (size_t)
+                                ValueLayout.ADDRESS)); // out_handle
+
+        this.frsDbIncrementalCheckpointResultFree =
+                bind(
+                        "frs_db_incremental_checkpoint_result_free",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -1112,5 +1189,217 @@ public final class ForStRsLinker {
                     "frs_cf_set_compaction_filter_ttl threw: " + t.getMessage());
         }
         check(rc, "frs_cf_set_compaction_filter_ttl");
+    }
+
+    // ------------------------------------------------------------------
+    // 8. MVCC snapshot + versioned reads + incremental checkpoint (B-Prod-P2)
+    //
+    // These map onto the engine surface added in B-Prod-P2 Tasks 2.1-2.4 and
+    // give Flink's snapshot strategy the FFM API it needs:
+    //
+    //   * dbSnapshot / dbReleaseSnapshot — capture / release a snapshot
+    //     pinned at the current sequence number (per spec §10.0 ABI lifetime
+    //     contract).
+    //   * getAt — versioned point-lookup at the snapshot.
+    //   * iteratorOpenAt — versioned forward iterator at the snapshot.
+    //   * createIncrementalCheckpointAt + dbOpenFromIncremental — capture +
+    //     restore an incremental checkpoint pinned at the snapshot.
+    // ------------------------------------------------------------------
+
+    /**
+     * Captures a snapshot at the engine's current sequence number. Caller MUST close the returned
+     * {@link FrsSnapshot} (try-with-resources is the canonical pattern) so the engine's compaction
+     * can advance past the snapshot's seq.
+     */
+    public FrsSnapshot dbSnapshot(FrsDb db, Arena arena) {
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsDbSnapshot.invokeExact(db.handle(), outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_snapshot threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_snapshot");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsSnapshot(this, db, handle);
+    }
+
+    /**
+     * Internal: invoked by {@link FrsSnapshot#close()}. Public callers should close the snapshot
+     * directly; this entry point exists so {@code FrsSnapshot} can route the close through the
+     * linker without exposing the method handle.
+     *
+     * <p>Idempotency is enforced by {@code FrsSnapshot} on the Java side; this method assumes the
+     * snapshot is non-null and not yet closed (the wrapper checks before invoking).
+     */
+    void dbReleaseSnapshot(FrsDb db, FrsSnapshot snapshot) {
+        if (snapshot == null || snapshot.isClosed()) {
+            return;
+        }
+        int rc;
+        try {
+            rc = (int) frsDbReleaseSnapshot.invokeExact(db.handle(), snapshot.handle());
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_release_snapshot threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_release_snapshot");
+    }
+
+    /**
+     * Versioned point-lookup: returns the value visible at {@code snapshot}'s sequence number, or
+     * {@code null} if no version is visible (or the latest visible version is a tombstone).
+     */
+    public byte[] getAt(FrsDb db, FrsCfHandle cf, FrsSnapshot snapshot, byte[] key) {
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
+        byte[] outBytesArr = new byte[24];
+        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsGetAt.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    snapshot.handle(),
+                                    keySeg,
+                                    (long) key.length,
+                                    outBytes);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_get_at threw: " + t.getMessage());
+        }
+        if (rc == FrsStatus.NOT_FOUND.code()) {
+            return null;
+        }
+        check(rc, "frs_get_at");
+        // Heap byte[24] only guarantees 1-byte alignment; use unaligned reads
+        // (mirrors `getInternal` for the non-snapshot Get path).
+        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
+        long len =
+                outBytes.get(
+                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        if (dataAddr == 0L) {
+            // Defensive: native should have returned NOT_FOUND already, but
+            // honor the same hit/miss convention as Get.
+            return null;
+        }
+        return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_at/free");
+    }
+
+    /**
+     * Opens a forward iterator that yields the latest version of each user-key with {@code seq &lt;=
+     * snapshot.seq}. Drive it with {@link #iteratorNext(FrsIterator)} and release with
+     * {@link FrsIterator#close()} (uses the standard non-prefix close path).
+     */
+    public FrsIterator iteratorOpenAt(FrsDb db, FrsCfHandle cf, FrsSnapshot snapshot, Arena arena) {
+        MemorySegment outIter = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsIteratorOpenAt.invokeExact(
+                                    db.handle(), cf.handle(), snapshot.handle(), outIter);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_iterator_open_at threw: " + t.getMessage());
+        }
+        check(rc, "frs_iterator_open_at");
+        MemorySegment handle = outIter.get(ValueLayout.ADDRESS, 0);
+        return new FrsIterator(this, handle, false);
+    }
+
+    /**
+     * Captures an incremental checkpoint at {@code snapshot}, returning the manifest path + new vs
+     * shared SST file lists. Caller MUST eventually call {@link
+     * #dbIncrementalCheckpointResultFree(MemorySegment)} on {@code resultPtr} to reclaim the inner
+     * allocations (manifest_path C string + the two FrsLiveFileList boxes).
+     *
+     * <p>{@code resultPtr} must point to a 32-byte caller-allocated buffer matching the C layout:
+     *
+     * <pre>
+     * struct FrsIncrementalCheckpointResult {
+     *     char*               manifest_path;        // 8
+     *     FrsLiveFileList*    new_ssts;             // 8
+     *     FrsLiveFileList*    shared_ssts;          // 8
+     *     int                 flush_done_eventfd;   // 4 + 4 padding
+     * };
+     * </pre>
+     */
+    public void createIncrementalCheckpointAt(
+            FrsDb db,
+            FrsSnapshot snapshot,
+            long checkpointId,
+            long baseCheckpointId,
+            MemorySegment resultPtr) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsCreateIncrementalCheckpointAt.invokeExact(
+                                    db.handle(),
+                                    snapshot.handle(),
+                                    checkpointId,
+                                    baseCheckpointId,
+                                    resultPtr);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_create_incremental_checkpoint_at threw: " + t.getMessage());
+        }
+        check(rc, "frs_create_incremental_checkpoint_at");
+    }
+
+    /**
+     * Releases the inner allocations of an {@link FrsIncrementalCheckpointResult}-shaped struct
+     * previously populated by {@link #createIncrementalCheckpointAt}. Idempotent on the native
+     * side; no-op for a NULL pointer.
+     */
+    public void dbIncrementalCheckpointResultFree(MemorySegment resultPtr) {
+        int rc;
+        try {
+            rc = (int) frsDbIncrementalCheckpointResultFree.invokeExact(resultPtr);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_incremental_checkpoint_result_free threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_incremental_checkpoint_result_free");
+    }
+
+    /**
+     * Opens a fresh DB whose state is reconstructed from a manifest blob and a list of SST file
+     * paths. The native side hardlinks (or copies) each {@code sstFiles} entry into {@code
+     * targetDir}, then opens the DB from the persisted manifest. Caller closes via {@link
+     * FrsDb#close()}.
+     */
+    public FrsDb dbOpenFromIncremental(
+            Arena arena, String targetDir, String baseManifest, java.util.List<String> sstFiles) {
+        MemorySegment targetSeg = allocateCString(arena, targetDir);
+        MemorySegment manifestSeg = allocateCString(arena, baseManifest);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        long count = sstFiles.size();
+        try (Arena local = Arena.ofConfined()) {
+            // Allocate `count` pointer slots and a per-path C string in `local`.
+            MemorySegment paths = local.allocate(count * ValueLayout.ADDRESS.byteSize());
+            for (int i = 0; i < count; i++) {
+                MemorySegment p = allocateCString(local, sstFiles.get(i));
+                paths.set(ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), p);
+            }
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsDbOpenFromIncremental.invokeExact(
+                                        targetSeg, manifestSeg, paths, count, outHandle);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_db_open_from_incremental threw: " + t.getMessage());
+            }
+            check(rc, "frs_db_open_from_incremental");
+        }
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
     }
 }
