@@ -164,14 +164,9 @@ class ForStRsAsyncValueStateTest {
                                                     // and continuation both bind to the same
                                                     // captured key without depending on the
                                                     // shared delegate's currentKey field.
-                                                    ForStRsAsyncValueState<Integer, Integer>
-                                                            state =
-                                                                    backend
-                                                                            .<Integer>
-                                                                                    getAsyncValueState(
-                                                                                            "ctr",
-                                                                                            IntSerializer
-                                                                                                    .INSTANCE);
+                                                    ForStRsAsyncValueState<Integer, Integer> state =
+                                                            backend.<Integer>getAsyncValueState(
+                                                                    "ctr", IntSerializer.INSTANCE);
                                                     // Chain each iteration off the previous so
                                                     // get-then-put on the same key is observed
                                                     // as a single atomic step before the next

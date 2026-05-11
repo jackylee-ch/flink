@@ -33,21 +33,21 @@ import java.util.function.Function;
  *
  * <ol>
  *   <li><b>Implicit (current-key)</b>: {@link #value()} / {@link #update(Object)} / {@link
- *       #clear()} capture {@linkplain ForStRsKeyedStateBackend#getCurrentKey backend.getCurrentKey()}
- *       at the moment of the API call. Caller is responsible for ensuring no other thread is
- *       concurrently mutating the backend's current key (i.e., this is the natural mode for
- *       single-threaded operator code that issues async ops).
+ *       #clear()} capture {@linkplain ForStRsKeyedStateBackend#getCurrentKey
+ *       backend.getCurrentKey()} at the moment of the API call. Caller is responsible for ensuring
+ *       no other thread is concurrently mutating the backend's current key (i.e., this is the
+ *       natural mode for single-threaded operator code that issues async ops).
  *   <li><b>Explicit-key</b>: {@link #value(Object)} / {@link #update(Object, Object)} / {@link
  *       #clear(Object)} accept the key directly. This is the recommended mode for chained
- *       continuations (e.g., {@code state.value(k).thenCompose(v -> state.update(k, v + 1))})
- *       and for thread-pool submitters where a stable key is captured ahead of time.
+ *       continuations (e.g., {@code state.value(k).thenCompose(v -> state.update(k, v + 1))}) and
+ *       for thread-pool submitters where a stable key is captured ahead of time.
  * </ol>
  *
  * <p><b>Worker-thread safety.</b> The underlying L5 delegate is single-threaded by design — its
- * {@code setCurrentKey}/{@code buildPrefix} use shared mutable buffers. To make the async API
- * safe under cross-key parallelism, every worker-thread step (set-key + state-fetch + op)
- * synchronises on the {@linkplain ForStRsKeyedStateBackend backend}. Per-key serialisation is
- * still provided by {@link PerKeyFuturesChain}; the lock just protects the shared-buffer window.
+ * {@code setCurrentKey}/{@code buildPrefix} use shared mutable buffers. To make the async API safe
+ * under cross-key parallelism, every worker-thread step (set-key + state-fetch + op) synchronises
+ * on the {@linkplain ForStRsKeyedStateBackend backend}. Per-key serialisation is still provided by
+ * {@link PerKeyFuturesChain}; the lock just protects the shared-buffer window.
  *
  * @param <K> backend key type
  * @param <T> state value type
@@ -71,7 +71,9 @@ public final class ForStRsAsyncValueState<K, T> {
         this.chain = chain;
     }
 
-    /** Implicit-key {@link ForStRsValueState#value()} — captures {@code backend.getCurrentKey()}. */
+    /**
+     * Implicit-key {@link ForStRsValueState#value()} — captures {@code backend.getCurrentKey()}.
+     */
     public CompletableFuture<T> value() {
         K k = backend.getCurrentKey();
         if (k == null) {

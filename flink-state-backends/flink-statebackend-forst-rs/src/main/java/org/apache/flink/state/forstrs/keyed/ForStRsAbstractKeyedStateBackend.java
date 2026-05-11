@@ -55,6 +55,7 @@ import org.apache.flink.state.forstrs.async.ForStRsAsyncReducingState;
 import org.apache.flink.state.forstrs.async.ForStRsAsyncValueState;
 import org.apache.flink.state.forstrs.async.PerKeyFuturesChain;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
 import java.io.IOException;
 import java.util.List;
@@ -253,8 +254,79 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     public <T extends HeapPriorityQueueElement & PriorityComparable<? super T> & Keyed<?>>
             KeyGroupedInternalPriorityQueue<T> create(
                     String stateName, TypeSerializer<T> byteOrderedElementSerializer) {
-        throw new UnsupportedOperationException(
-                "ForStRsAbstractKeyedStateBackend.create (priority queue) is implemented in B-Prod-P5 (timer-service)");
+        return createInternalPriorityQueue(stateName, byteOrderedElementSerializer);
+    }
+
+    /**
+     * B-Prod-P9 — Spec §6f. Returns a {@link ForStRsKeyGroupedInternalPriorityQueue} backed by the
+     * delegate L5 backend's engine handles. The queue stores entries under {@code "q/" || stateName
+     * || "/" || kg(2B BE) || ts(8B BE) || serialize(T)} (sign-flipped 8B BE timestamps so
+     * big-endian lex order matches signed-numerical order). The "current key group" is sourced from
+     * the Flink {@link InternalKeyContext}, and the timestamp is extracted via reflection on a
+     * {@code getTimestamp() : long} accessor — which {@link
+     * org.apache.flink.streaming.api.operators.InternalTimer} provides natively.
+     *
+     * <p>If {@code T} doesn't expose {@code getTimestamp() : long}, callers may pass the queue
+     * factory a custom {@link java.util.function.ToLongFunction} via the lower-level constructor
+     * directly; this convenience entry-point uses reflection so it can satisfy the {@code
+     * AbstractKeyedStateBackend.create} override without API churn.
+     */
+    public <T extends HeapPriorityQueueElement>
+            ForStRsKeyGroupedInternalPriorityQueue<T> createInternalPriorityQueue(
+                    String stateName, TypeSerializer<T> elementSerializer) {
+        java.util.function.ToLongFunction<T> tsExtractor = reflectiveTimestampExtractor();
+        return new ForStRsKeyGroupedInternalPriorityQueue<>(
+                delegate.getLinker(),
+                delegate.getDb(),
+                delegate.getDefaultCf(),
+                delegate.getArena(),
+                stateName,
+                elementSerializer,
+                tsExtractor,
+                this::getCurrentKeyGroupIndex,
+                getKeyGroupRange());
+    }
+
+    /**
+     * Reflectively reads {@code getTimestamp() : long} on the element. Cached via static {@code
+     * java.lang.invoke.MethodHandle}-style closure inside the lambda — first-call cost is a single
+     * reflective lookup; subsequent calls go through the captured {@link java.lang.reflect.Method}.
+     */
+    private static <T> java.util.function.ToLongFunction<T> reflectiveTimestampExtractor() {
+        return new java.util.function.ToLongFunction<T>() {
+            private volatile java.lang.reflect.Method getTimestampMethod;
+
+            @Override
+            public long applyAsLong(T t) {
+                java.lang.reflect.Method m = getTimestampMethod;
+                if (m == null) {
+                    try {
+                        m = t.getClass().getMethod("getTimestamp");
+                    } catch (NoSuchMethodException e) {
+                        throw new UnsupportedOperationException(
+                                "Element type "
+                                        + t.getClass().getName()
+                                        + " has no getTimestamp() method; pass an explicit"
+                                        + " ToLongFunction via the queue ctor instead.",
+                                e);
+                    }
+                    getTimestampMethod = m;
+                }
+                try {
+                    Object out = m.invoke(t);
+                    if (out instanceof Long l) {
+                        return l;
+                    }
+                    if (out instanceof Number n) {
+                        return n.longValue();
+                    }
+                    throw new IllegalStateException("getTimestamp() returned non-numeric: " + out);
+                } catch (ReflectiveOperationException e) {
+                    throw new RuntimeException(
+                            "getTimestamp() invocation failed: " + e.getMessage(), e);
+                }
+            }
+        };
     }
 
     @Override

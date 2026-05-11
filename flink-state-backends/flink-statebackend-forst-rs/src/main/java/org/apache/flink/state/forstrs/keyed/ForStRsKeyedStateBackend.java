@@ -493,6 +493,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
+     * Returns the {@link Arena} that owns this backend's FFM resources. Exposed so co-resident
+     * helpers (e.g. priority queues, B-Prod-P9) can attach short-lived FFM allocations to the same
+     * lifetime instead of creating a parallel arena.
+     */
+    public Arena getArena() {
+        return arena;
+    }
+
+    /**
      * Releases all per-state-cache entries. When this backend was constructed with {@code
      * ownsResources=true}, also closes (in order) the default CF, the database, and the Arena that
      * owns the linker's symbol lookup.
