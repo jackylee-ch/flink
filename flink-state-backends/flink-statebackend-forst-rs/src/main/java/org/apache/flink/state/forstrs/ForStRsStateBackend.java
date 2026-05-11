@@ -22,6 +22,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackendBuilder;
+import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.OperatorStateBackend;
 import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
@@ -29,6 +30,7 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.keyed.ForStRsAbstractKeyedStateBackend;
 import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
+import org.apache.flink.state.forstrs.keyed.ForStRsRestoreOperation;
 import org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
@@ -37,6 +39,7 @@ import java.io.File;
 import java.lang.foreign.Arena;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Map;
 import java.util.UUID;
 
@@ -90,10 +93,38 @@ public class ForStRsStateBackend implements StateBackend {
         ForStRsLinker linker = null;
         FrsDb db = null;
         FrsCfHandle cf = null;
+        // Shared SST registry — populated by restore (if any) and consumed by the snapshot
+        // strategy so previously-uploaded SSTs are reused across post-restore checkpoints.
+        ForStRsSstRegistry sstRegistry = new ForStRsSstRegistry();
         try {
             linker = new ForStRsLinker(arena);
+
+            // ---------------- Restore path (Part D — Flink-coordinator restore) ----------------
+            // If Flink is launching this backend with a non-empty restored-state collection (job
+            // restart-from-checkpoint, restart-from-savepoint, or rescaling), drive the existing
+            // ForStRsRestoreOperation to materialize the engine on disk before opening it. The
+            // restore op handles both the fast no-rescaling path and the rescaling kg-redistribute
+            // path; non-ForSt-RS handle types (e.g. savepoint handles from another backend) are
+            // rejected with a typed exception that surfaces back to the JM.
+            Collection<KeyedStateHandle> restoredHandles = parameters.getStateHandles();
             String storageUri = options.storageUri();
-            if (storageUri != null && !storageUri.isEmpty()) {
+            boolean useRestore =
+                    restoredHandles != null
+                            && !restoredHandles.isEmpty()
+                            && (storageUri == null || storageUri.isEmpty());
+
+            if (useRestore) {
+                ForStRsRestoreOperation restoreOp =
+                        new ForStRsRestoreOperation(
+                                linker,
+                                arena,
+                                localDbPath,
+                                parameters.getKeyGroupRange(),
+                                sstRegistry);
+                ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
+                db = restored.getDb();
+                cf = restored.getDefaultCf();
+            } else if (storageUri != null && !storageUri.isEmpty()) {
                 String cacheDir = options.cacheDir();
                 if (cacheDir == null || cacheDir.isEmpty()) {
                     // Fall back to a per-backend cache subdirectory next to the local DB path.
@@ -107,10 +138,11 @@ public class ForStRsStateBackend implements StateBackend {
                                 options.opendalConfigJson(),
                                 cacheDir,
                                 options.cacheCapacityBytes());
+                cf = linker.dbDefaultCf(db, arena);
             } else {
                 db = linker.dbOpen(arena, localDbPath.toString());
+                cf = linker.dbDefaultCf(db, arena);
             }
-            cf = linker.dbDefaultCf(db, arena);
 
             TypeSerializer<K> keySerializer = parameters.getKeySerializer();
             ForStRsKeyedStateBackend<K> delegate =
@@ -130,8 +162,8 @@ public class ForStRsStateBackend implements StateBackend {
 
             // Wire the snapshot strategy so Flink-triggered checkpoints have somewhere to go.
             // We use the single-CF "default" map (cfId=0) which matches the SingleCfRouter
-            // default routing — ForStRsSstRegistry is per-backend (no cross-task sharing in v1).
-            ForStRsSstRegistry sstRegistry = new ForStRsSstRegistry();
+            // default routing. The SST registry is reused from the restore path so SSTs already
+            // materialised on disk are recognised as shared and not re-uploaded next checkpoint.
             ForStRsSnapshotStrategy strategy =
                     new ForStRsSnapshotStrategy(
                             linker,

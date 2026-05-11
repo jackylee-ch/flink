@@ -44,8 +44,9 @@ import org.apache.flink.runtime.state.Keyed;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.SavepointResources;
+import org.apache.flink.runtime.state.SnapshotExecutionType;
 import org.apache.flink.runtime.state.SnapshotResult;
-import org.apache.flink.runtime.state.SnapshotStrategy;
+import org.apache.flink.runtime.state.SnapshotStrategyRunner;
 import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StateSnapshotTransformer.StateSnapshotTransformFactory;
 import org.apache.flink.runtime.state.UncompressedStreamCompressionDecorator;
@@ -66,7 +67,6 @@ import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
-import java.util.concurrent.FutureTask;
 import java.util.concurrent.RunnableFuture;
 import java.util.stream.Stream;
 
@@ -270,25 +270,19 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                             + "setSnapshotStrategy(...) — wire the strategy via the builder or"
                             + " test setup");
         }
-        // Sync phase: capture engine snapshot + manifest (must be fast — runs on task thread).
-        ForStRsSnapshotResources resources = snapshotStrategy.syncPrepareResources(checkpointId);
-        // Build the async-phase supplier; wrap it in a FutureTask so the caller can run() it on
-        // the snapshot executor of their choice (Flink's SnapshotStrategyRunner usually).
-        SnapshotStrategy.SnapshotResultSupplier<KeyedStateHandle> supplier =
-                snapshotStrategy.asyncSnapshot(
-                        resources, checkpointId, timestamp, streamFactory, checkpointOptions);
-        FutureTask<SnapshotResult<KeyedStateHandle>> task =
-                new FutureTask<>(() -> supplier.get(getCancelStreamRegistry()));
-        return task;
-    }
-
-    /**
-     * Returns the cancel-stream registry that snapshot-strategy uploads should register their
-     * cancellable streams with. The base class has the field as protected; expose via a getter so
-     * the supplier can use it without reaching into super.cancelStreamRegistry directly.
-     */
-    private CloseableRegistry getCancelStreamRegistry() {
-        return cancelStreamRegistry;
+        // Drive the snapshot through Flink's canonical SnapshotStrategyRunner so the returned
+        // RunnableFuture is wrapped in an AsyncSnapshotCallable that:
+        //   * registers cancellation hooks on cancelStreamRegistry (for checkpoint abort),
+        //   * properly invokes resources.release() via cleanupProvidedResources(), and
+        //   * matches the contract Flink's CheckpointAsyncExecutor expects to drive with .run().
+        // Execution type ASYNCHRONOUS = the returned future is not pre-run; Flink's coordinator
+        // schedules .run() on its async snapshot executor.
+        return new SnapshotStrategyRunner<>(
+                        "ForStRs-incremental-snapshot",
+                        snapshotStrategy,
+                        cancelStreamRegistry,
+                        SnapshotExecutionType.ASYNCHRONOUS)
+                .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
     }
 
     @Override
