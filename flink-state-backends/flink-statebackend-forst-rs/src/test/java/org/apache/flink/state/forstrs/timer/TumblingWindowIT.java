@@ -58,12 +58,12 @@ class TumblingWindowIT {
 
     /**
      * Scaled-down realistic counts. Spec asks 1M events / 100k keys / 5s windows; the production
-     * scale is exercised in JMH benches, but the IT here uses 5_000 / 500 / 5s because each
-     * {@code peek}/{@code poll} on the FFM-backed engine opens a fresh prefix-scan iterator (~2ms
-     * per call on the test machine), so a 1M-fire drain would dominate IT wall-time. The scaled
-     * values still validate the same correctness invariant — ratios are preserved — and the per-op
-     * cost matches the production path. A future task can flip the constants up once we add a
-     * batched bulk-poll FFI call.
+     * scale is exercised in JMH benches, but the IT here uses 5_000 / 500 / 5s because each {@code
+     * peek}/{@code poll} on the FFM-backed engine opens a fresh prefix-scan iterator (~2ms per call
+     * on the test machine), so a 1M-fire drain would dominate IT wall-time. The scaled values still
+     * validate the same correctness invariant — ratios are preserved — and the per-op cost matches
+     * the production path. A future task can flip the constants up once we add a batched bulk-poll
+     * FFI call.
      */
     private static final int EVENTS = 5_000;
 

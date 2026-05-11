@@ -165,6 +165,10 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbOpenFromIncremental;
     private final MethodHandle frsDbIncrementalCheckpointResultFree;
 
+    // --- 9. State import / export migration (B-Prod-P10, spec §6g) ---
+    private final MethodHandle frsCfExport;
+    private final MethodHandle frsDbCreateCfFromImport;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -535,6 +539,32 @@ public final class ForStRsLinker {
                 bind(
                         "frs_db_incremental_checkpoint_result_free",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        // 9. State import / export migration (B-Prod-P10, spec §6g).
+        //
+        // The native side writes a single self-describing blob
+        // (`EXPORT.frsblob`) under `export_dir` — see
+        // crates/forst-rs-ffi/src/lib.rs::frs_cf_export and
+        // crates/forst-rs-engine/src/db.rs::cf_export for the on-disk
+        // format. The import side creates a fresh CF and replays the blob.
+        this.frsCfExport =
+                bind(
+                        "frs_cf_export",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS)); // export_dir (c_char*)
+
+        this.frsDbCreateCfFromImport =
+                bind(
+                        "frs_db_create_cf_from_import",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // name (c_char*)
+                                ValueLayout.ADDRESS, // import_dir (c_char*)
+                                ValueLayout.ADDRESS)); // out_cf
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -1596,5 +1626,75 @@ public final class ForStRsLinker {
         }
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
+    }
+
+    // ------------------------------------------------------------------
+    // 9. State import / export migration (B-Prod-P10, spec §6g)
+    //
+    // Cross-job state transfer: dump every (key, value) row in a CF to
+    // a self-describing blob under `exportDir`, ship the directory to
+    // another job, and reconstitute it as a brand-new CF on the consumer
+    // side. The native blob format and atomicity contract live in
+    // crates/forst-rs-engine/src/db.rs (search for FRSEXP01 / cf_export
+    // / create_cf_from_import).
+    //
+    // The Java surface is tiny on purpose: two methods that thread
+    // strings through the standard `allocateCString` helper and box the
+    // returned CF handle. Higher-level orchestration (e.g. shipping the
+    // export directory across nodes) lives in
+    // {@code org.apache.flink.state.forstrs.migration.ForStRsStateMigration}.
+    // ------------------------------------------------------------------
+
+    /**
+     * Exports every live (key, value) row from {@code cf} to a single self-describing blob ({@code
+     * EXPORT.frsblob}) under {@code exportDir}. The directory is created if it does not exist.
+     * Concurrent writers to {@code cf} are not blocked, but only writes committed before this call
+     * took the underlying scan are guaranteed to appear in the export (snapshot-at-call-time
+     * semantics, mirroring RocksDB's {@code ExportColumnFamily}).
+     *
+     * @throws FrsBackendException if the native call returns a non-OK status
+     */
+    public void cfExport(FrsDb db, FrsCfHandle cf, String exportDir) {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment dirSeg = allocateCString(local, exportDir);
+            int rc;
+            try {
+                rc = (int) frsCfExport.invokeExact(db.handle(), cf.handle(), dirSeg);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_cf_export threw: " + t.getMessage());
+            }
+            check(rc, "frs_cf_export");
+        }
+    }
+
+    /**
+     * Creates a brand-new column family with name {@code name} and seeds it with every row from
+     * {@code importDir/EXPORT.frsblob}. Returns a {@link FrsCfHandle} the caller MUST close.
+     *
+     * <p>The original CF name embedded in the blob is intentionally ignored — Flink callers
+     * commonly re-namespace state when migrating jobs, and the explicit-name signature mirrors
+     * RocksDB's {@code ImportColumnFamily(new_name, metadata)}. Importing under a name that already
+     * exists in {@code db} returns {@link FrsStatus#INVALID_ARGUMENT}.
+     *
+     * @throws FrsBackendException if the blob is missing, the magic header doesn't match, the CF
+     *     name is already in use, or the underlying replay puts fail
+     */
+    public FrsCfHandle dbCreateCfFromImport(FrsDb db, Arena arena, String name, String importDir) {
+        MemorySegment outCf = arena.allocate(ValueLayout.ADDRESS);
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment nameSeg = allocateCString(local, name);
+            MemorySegment dirSeg = allocateCString(local, importDir);
+            int rc;
+            try {
+                rc = (int) frsDbCreateCfFromImport.invokeExact(db.handle(), nameSeg, dirSeg, outCf);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_db_create_cf_from_import threw: " + t.getMessage());
+            }
+            check(rc, "frs_db_create_cf_from_import");
+        }
+        MemorySegment cfHandle = outCf.get(ValueLayout.ADDRESS, 0);
+        return new FrsCfHandle(this, cfHandle);
     }
 }

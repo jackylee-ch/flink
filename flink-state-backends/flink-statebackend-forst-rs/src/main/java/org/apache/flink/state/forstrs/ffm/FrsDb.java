@@ -42,6 +42,16 @@ public final class FrsDb implements AutoCloseable {
         return handle;
     }
 
+    /**
+     * Returns the {@link ForStRsLinker} that produced this handle. Exposed so higher-level helpers
+     * (e.g. {@code ForStRsStateMigration}) can route additional FFM calls through the same linker
+     * without requiring a separate constructor parameter. Package callers should prefer the
+     * existing convenience methods on {@link ForStRsLinker} where they exist.
+     */
+    public ForStRsLinker linker() {
+        return linker;
+    }
+
     @Override
     public void close() {
         if (!closed) {

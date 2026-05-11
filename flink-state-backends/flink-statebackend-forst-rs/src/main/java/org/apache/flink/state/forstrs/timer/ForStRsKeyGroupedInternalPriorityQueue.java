@@ -33,7 +33,6 @@ import org.apache.flink.util.CloseableIterator;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
-// IOException retained for encode/decodeElement which use serializer methods that declare it.
 import java.nio.charset.StandardCharsets;
 import java.util.Collection;
 import java.util.LinkedHashSet;
