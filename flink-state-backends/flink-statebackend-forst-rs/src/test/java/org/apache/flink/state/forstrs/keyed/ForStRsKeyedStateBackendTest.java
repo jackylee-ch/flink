@@ -96,7 +96,8 @@ class ForStRsKeyedStateBackendTest {
 
             backend.setCurrentKey("a");
             ForStRsMapState<String, String> state =
-                    backend.getMapState("attrs", StringSerializer.INSTANCE, StringSerializer.INSTANCE);
+                    backend.getMapState(
+                            "attrs", StringSerializer.INSTANCE, StringSerializer.INSTANCE);
             state.put("k", "v");
 
             assertEquals("v", state.get("k"));
@@ -143,14 +144,12 @@ class ForStRsKeyedStateBackendTest {
                 new ForStRsStateBackend().createBasicKeyedBackend(StringSerializer.INSTANCE)) {
 
             backend.setCurrentKey("a");
-            ForStRsListState<String> aState =
-                    backend.getListState("l", StringSerializer.INSTANCE);
+            ForStRsListState<String> aState = backend.getListState("l", StringSerializer.INSTANCE);
             aState.add("a-1");
             aState.add("a-2");
 
             backend.setCurrentKey("b");
-            ForStRsListState<String> bState =
-                    backend.getListState("l", StringSerializer.INSTANCE);
+            ForStRsListState<String> bState = backend.getListState("l", StringSerializer.INSTANCE);
             assertTrue(drain(bState.get()).isEmpty(), "key 'b' must start empty");
             bState.add("b-1");
 
@@ -212,8 +211,7 @@ class ForStRsKeyedStateBackendTest {
 
             backend.getValueState("v", IntSerializer.INSTANCE).update(42);
             backend.getListState("l", StringSerializer.INSTANCE).add("x");
-            backend
-                    .getMapState("m", StringSerializer.INSTANCE, IntSerializer.INSTANCE)
+            backend.getMapState("m", StringSerializer.INSTANCE, IntSerializer.INSTANCE)
                     .put("hits", 7);
 
             assertEquals(
@@ -224,8 +222,7 @@ class ForStRsKeyedStateBackendTest {
                     drain(backend.getListState("l", StringSerializer.INSTANCE).get()));
             assertEquals(
                     Integer.valueOf(7),
-                    backend
-                            .getMapState("m", StringSerializer.INSTANCE, IntSerializer.INSTANCE)
+                    backend.getMapState("m", StringSerializer.INSTANCE, IntSerializer.INSTANCE)
                             .get("hits"));
 
             assertTrue(backend.numKeyValueStateEntries() >= 3);
@@ -316,8 +313,8 @@ class ForStRsKeyedStateBackendTest {
             ForStRsAggregatingState<Integer, long[], Double> state =
                     backend.getAggregatingState(
                             "avg",
-                            org.apache.flink.api.common.typeutils.base.array.LongPrimitiveArraySerializer
-                                    .INSTANCE,
+                            org.apache.flink.api.common.typeutils.base.array
+                                    .LongPrimitiveArraySerializer.INSTANCE,
                             mean);
             state.add(2);
             state.add(4);
@@ -331,10 +328,8 @@ class ForStRsKeyedStateBackendTest {
         try (ForStRsKeyedStateBackend<String> backend =
                 new ForStRsStateBackend().createBasicKeyedBackend(StringSerializer.INSTANCE)) {
             backend.setCurrentKey("a");
-            ForStRsValueState<Integer> first =
-                    backend.getValueState("v", IntSerializer.INSTANCE);
-            ForStRsValueState<Integer> second =
-                    backend.getValueState("v", IntSerializer.INSTANCE);
+            ForStRsValueState<Integer> first = backend.getValueState("v", IntSerializer.INSTANCE);
+            ForStRsValueState<Integer> second = backend.getValueState("v", IntSerializer.INSTANCE);
             assertTrue(first == second, "same key + state-name must return the cached instance");
 
             backend.setCurrentKey("b");

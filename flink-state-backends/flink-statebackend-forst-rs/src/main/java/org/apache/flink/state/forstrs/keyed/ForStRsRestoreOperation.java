@@ -48,10 +48,10 @@ import java.util.Map;
  * <p>Implements three flows per spec §9:
  *
  * <ol>
- *   <li><b>No-rescaling fast path</b> ({@code handles.size() == 1 &amp;&amp; handle.kgRange == target})
- *       — download manifest + each SST listed in the {@link ForStRsIncrementalKeyedStateHandle}, then
- *       call {@link ForStRsLinker#dbOpenFromIncremental} to materialize the engine state directly
- *       from those local files. (Tasks 4.1 + 4.2.)
+ *   <li><b>No-rescaling fast path</b> ({@code handles.size() == 1 &amp;&amp; handle.kgRange ==
+ *       target}) — download manifest + each SST listed in the {@link
+ *       ForStRsIncrementalKeyedStateHandle}, then call {@link ForStRsLinker#dbOpenFromIncremental}
+ *       to materialize the engine state directly from those local files. (Tasks 4.1 + 4.2.)
  *   <li><b>Strict-SST-presence check</b> — every {@link HandleAndLocalPath} entry in the handle's
  *       shared + private state lists must download successfully. A missing or unopenable handle
  *       throws {@link ForStRsCheckpointRestoreException} carrying the offending local path + the
@@ -59,8 +59,8 @@ import java.util.Map;
  *   <li><b>Rescaling path</b> — if {@code handles.size() != 1} or the source range is not exactly
  *       the target range, each input handle is opened in turn into a temporary engine, and for
  *       every key-group in the target range the source iterator is replayed into a freshly-opened
- *       target engine using the kg-prefixed composite-key encoding produced by
- *       {@link ForStRsKeyGroupedSerializer}. (Task 4.3.)
+ *       target engine using the kg-prefixed composite-key encoding produced by {@link
+ *       ForStRsKeyGroupedSerializer}. (Task 4.3.)
  * </ol>
  *
  * <p>The operation is callable in two forms: {@link #restore(Collection)} returns a freshly-opened
@@ -133,7 +133,7 @@ public class ForStRsRestoreOperation {
      * Performs the restore using the chosen strategy (fast path vs. rescaling).
      *
      * @param handles state handles produced by a prior snapshot (one per source subtask).
-     *                Empty/null collection ⇒ open a fresh empty engine at {@link #targetDir}.
+     *     Empty/null collection ⇒ open a fresh empty engine at {@link #targetDir}.
      */
     public RestoreResult restore(Collection<KeyedStateHandle> handles) throws IOException {
         ensureTargetDirEmpty();
@@ -157,8 +157,7 @@ public class ForStRsRestoreOperation {
         }
 
         boolean fastPath =
-                incHandles.size() == 1
-                        && incHandles.get(0).getKeyGroupRange().equals(targetRange);
+                incHandles.size() == 1 && incHandles.get(0).getKeyGroupRange().equals(targetRange);
 
         if (fastPath) {
             return restoreNoRescaling(incHandles.get(0));
@@ -228,10 +227,7 @@ public class ForStRsRestoreOperation {
         }
 
         return new RestoreResult(
-                db,
-                defaultCf,
-                new LinkedHashMap<>(handle.getCfMap()),
-                handle.getCheckpointId());
+                db, defaultCf, new LinkedHashMap<>(handle.getCfMap()), handle.getCheckpointId());
     }
 
     /**
@@ -369,8 +365,8 @@ public class ForStRsRestoreOperation {
         }
     }
 
-    private OpenSourceDb openSingleHandleAt(
-            ForStRsIncrementalKeyedStateHandle handle, Path subDir) throws IOException {
+    private OpenSourceDb openSingleHandleAt(ForStRsIncrementalKeyedStateHandle handle, Path subDir)
+            throws IOException {
         // Reuse the no-rescaling path by temporarily pointing targetDir at subDir.
         ForStRsRestoreOperation singleOp =
                 new ForStRsRestoreOperation(

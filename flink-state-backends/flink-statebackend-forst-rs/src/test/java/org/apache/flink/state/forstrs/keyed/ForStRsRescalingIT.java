@@ -48,28 +48,28 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Rescaling + strict-restore integration tests for {@link ForStRsRestoreOperation}
- * (B-Prod-P4 Tasks 4.5 + 4.6).
+ * Rescaling + strict-restore integration tests for {@link ForStRsRestoreOperation} (B-Prod-P4 Tasks
+ * 4.5 + 4.6).
  *
- * <p>The tests build kg-prefixed source DBs by hand (the keyed-backend's full kg-prefixed
- * encoding is wired in P3+; here we construct keys exactly as the spec §6 layout requires
- * — {@code kg(2B BE) || payload}) so the rescaling restore's kg-prefix iteration works
- * end-to-end without depending on the higher-level ForStRsAbstractKeyedStateBackend wiring.
+ * <p>The tests build kg-prefixed source DBs by hand (the keyed-backend's full kg-prefixed encoding
+ * is wired in P3+; here we construct keys exactly as the spec §6 layout requires — {@code kg(2B BE)
+ * || payload}) so the rescaling restore's kg-prefix iteration works end-to-end without depending on
+ * the higher-level ForStRsAbstractKeyedStateBackend wiring.
  *
  * <p>Test plan:
  *
  * <ul>
- *   <li>{@code rescaleFourToEight} — snapshot a job that owns kgRange=[0,3] writing 4 keys
- *       (one per kg), then restore as parallelism=8 by splitting that single source handle
- *       into 8 target sub-ranges; verify each kg lands in the correct target subtask DB.
- *   <li>{@code rescaleEightToFour} — converse of the above; snapshot 8 source subtasks
- *       (one per kg in [0,7]), restore as a single parallelism-4 subtask owning [0,3];
- *       verify only the relevant kgs (0..3) are present in the restored DB.
- *   <li>{@code roundTripFourToEightToFour} — full restart loop ensuring rescaling preserves
- *       all originally-written keys after a 4 → 8 → 4 round-trip.
- *   <li>{@code missingSstFailsStrictRestore} (Task 4.6) — delete an uploaded SST handle
- *       (simulated by clearing the registry-backed handle's bytes); the restore must throw
- *       {@link ForStRsCheckpointRestoreException} carrying the offending path.
+ *   <li>{@code rescaleFourToEight} — snapshot a job that owns kgRange=[0,3] writing 4 keys (one per
+ *       kg), then restore as parallelism=8 by splitting that single source handle into 8 target
+ *       sub-ranges; verify each kg lands in the correct target subtask DB.
+ *   <li>{@code rescaleEightToFour} — converse of the above; snapshot 8 source subtasks (one per kg
+ *       in [0,7]), restore as a single parallelism-4 subtask owning [0,3]; verify only the relevant
+ *       kgs (0..3) are present in the restored DB.
+ *   <li>{@code roundTripFourToEightToFour} — full restart loop ensuring rescaling preserves all
+ *       originally-written keys after a 4 → 8 → 4 round-trip.
+ *   <li>{@code missingSstFailsStrictRestore} (Task 4.6) — delete an uploaded SST handle (simulated
+ *       by clearing the registry-backed handle's bytes); the restore must throw {@link
+ *       ForStRsCheckpointRestoreException} carrying the offending path.
  * </ul>
  */
 class ForStRsRescalingIT {
@@ -102,7 +102,10 @@ class ForStRsRescalingIT {
                 assertArrayEquals(
                         expectedValue,
                         got,
-                        "rescale 4→8: kg=" + kg + " must land in target [kg,kg]; got=" + java.util.Arrays.toString(got));
+                        "rescale 4→8: kg="
+                                + kg
+                                + " must land in target [kg,kg]; got="
+                                + java.util.Arrays.toString(got));
                 res.getDefaultCf().close();
                 res.getDb().close();
             }
@@ -117,7 +120,8 @@ class ForStRsRescalingIT {
                             new ForStRsSstRegistry());
             ForStRsRestoreOperation.RestoreResult empty = opEmpty.restore(List.of(source));
             byte[] got = linker.get(empty.getDb(), empty.getDefaultCf(), kgPrefixedKey(4, "k"));
-            assertEquals(0, got == null ? 0 : got.length, "kg=4 should not exist in restored target");
+            assertEquals(
+                    0, got == null ? 0 : got.length, "kg=4 should not exist in restored target");
             empty.getDefaultCf().close();
             empty.getDb().close();
         }
@@ -182,7 +186,8 @@ class ForStRsRescalingIT {
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
 
-            // Phase A: parallelism=4, kgs [0..3] split as 2 subtasks ([0,1] and [2,3]) — write 4 keys.
+            // Phase A: parallelism=4, kgs [0..3] split as 2 subtasks ([0,1] and [2,3]) — write 4
+            // keys.
             ForStRsIncrementalKeyedStateHandle phaseA0 =
                     snapshotKgRange(linker, arena, tmp.resolve("phaseA0"), 0, 1);
             ForStRsIncrementalKeyedStateHandle phaseA1 =
@@ -235,7 +240,8 @@ class ForStRsRescalingIT {
 
             // Replace the first shared SST handle with one whose openInputStream yields 0 bytes —
             // simulates an SST that was deleted from remote storage between snapshot and restore.
-            assertTrue(source.getSharedState().size() >= 1, "snapshot must produce >= 1 shared SST");
+            assertTrue(
+                    source.getSharedState().size() >= 1, "snapshot must produce >= 1 shared SST");
             HandleAndLocalPath broken = source.getSharedState().get(0);
             ForStRsIncrementalKeyedStateHandle bad =
                     new ForStRsIncrementalKeyedStateHandle(
@@ -258,7 +264,8 @@ class ForStRsRescalingIT {
 
             ForStRsCheckpointRestoreException thrown =
                     assertThrows(
-                            ForStRsCheckpointRestoreException.class, () -> op.restore(List.of(bad)));
+                            ForStRsCheckpointRestoreException.class,
+                            () -> op.restore(List.of(bad)));
             assertNotNull(thrown.getMissingPath(), "exception must carry the missing path");
             assertEquals(
                     broken.getLocalPath(),
@@ -273,8 +280,8 @@ class ForStRsRescalingIT {
     // ------------------------------------------------------------------
 
     /**
-     * Snapshots a fresh source DB seeded with one key per kg in the inclusive range
-     * {@code [startKg, endKg]} using kg-prefixed keys per spec §6.
+     * Snapshots a fresh source DB seeded with one key per kg in the inclusive range {@code
+     * [startKg, endKg]} using kg-prefixed keys per spec §6.
      */
     private static ForStRsIncrementalKeyedStateHandle snapshotKgRange(
             ForStRsLinker linker, Arena arena, Path srcDir, int startKg, int endKg)

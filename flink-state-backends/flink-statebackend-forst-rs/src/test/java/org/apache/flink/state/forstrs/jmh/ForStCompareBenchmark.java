@@ -27,28 +27,25 @@ import java.util.Comparator;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * 3-way comparison harness: this class benchmarks the {@link RocksDB} flat JNI
- * surface against any cdylib that provides matching {@code
- * Java_org_forstdb_RocksDB_*} symbols. By swapping {@code -Dorg.forstdb.libpath=}
- * on the command line, the same byte-code drives either:
+ * 3-way comparison harness: this class benchmarks the {@link RocksDB} flat JNI surface against any
+ * cdylib that provides matching {@code Java_org_forstdb_RocksDB_*} symbols. By swapping {@code
+ * -Dorg.forstdb.libpath=} on the command line, the same byte-code drives either:
  *
  * <ul>
- *   <li>{@code libforst_rs_ffi.dylib} — the ForSt-RS Rust engine via the
- *       compat-JNI shim (this repo).</li>
- *   <li>{@code forstjni-community.dylib} — the upstream community ForSt JNI.
- *       NOTE: the community library does <b>not</b> expose flat
- *       {@code open(String)} / {@code put(JJ[BII[BII)V} symbols, it expects
- *       Options + DBOptions + ColumnFamilyDescriptor lifecycle. Running this
- *       bench against the community cdylib will therefore {@code
- *       UnsatisfiedLinkError}; see {@code JMH_BENCHMARK.md} for details.</li>
+ *   <li>{@code libforst_rs_ffi.dylib} — the ForSt-RS Rust engine via the compat-JNI shim (this
+ *       repo).
+ *   <li>{@code forstjni-community.dylib} — the upstream community ForSt JNI. NOTE: the community
+ *       library does <b>not</b> expose flat {@code open(String)} / {@code put(JJ[BII[BII)V}
+ *       symbols, it expects Options + DBOptions + ColumnFamilyDescriptor lifecycle. Running this
+ *       bench against the community cdylib will therefore {@code UnsatisfiedLinkError}; see {@code
+ *       JMH_BENCHMARK.md} for details.
  * </ul>
  *
- * <p>The class is structured so that each "benchmark" is a static method
- * returning {@code long ops} — the harness in {@link #main(String[])} drives
- * the warmup/measurement loop. JMH annotations are intentionally absent so the
- * file compiles against a stock JDK 25 install with zero extra dependencies;
- * the same logic could be wrapped in {@code @Benchmark}-annotated stubs if a
- * full JMH-maven build is desired.
+ * <p>The class is structured so that each "benchmark" is a static method returning {@code long ops}
+ * — the harness in {@link #main(String[])} drives the warmup/measurement loop. JMH annotations are
+ * intentionally absent so the file compiles against a stock JDK 25 install with zero extra
+ * dependencies; the same logic could be wrapped in {@code @Benchmark}-annotated stubs if a full
+ * JMH-maven build is desired.
  */
 public final class ForStCompareBenchmark {
 
@@ -56,8 +53,8 @@ public final class ForStCompareBenchmark {
     private static final int PRELOAD = 100_000;
 
     /**
-     * Number of rows per WriteBatch in the {@code batchedPut} workload — matches the
-     * realistic per-checkpoint-barrier write fan-out in production Flink state backends.
+     * Number of rows per WriteBatch in the {@code batchedPut} workload — matches the realistic
+     * per-checkpoint-barrier write fan-out in production Flink state backends.
      */
     private static final int BATCH_SIZE = 1000;
 
@@ -123,9 +120,9 @@ public final class ForStCompareBenchmark {
     // --- harness -------------------------------------------------------------
 
     /**
-     * Manual JMH-style harness. Three phases per workload: warmup, measurement,
-     * teardown. Each phase runs for a fixed wall-clock budget; we count
-     * invocations and divide by elapsed time to derive throughput in ops/sec.
+     * Manual JMH-style harness. Three phases per workload: warmup, measurement, teardown. Each
+     * phase runs for a fixed wall-clock budget; we count invocations and divide by elapsed time to
+     * derive throughput in ops/sec.
      */
     public static void main(String[] args) throws Exception {
         final long warmupNanos =
@@ -147,8 +144,7 @@ public final class ForStCompareBenchmark {
 
             // Pre-load 100k entries for the point-lookup workload.
             System.out.printf(
-                    "[setup] preloading %d entries (each value=%d bytes)%n",
-                    PRELOAD, VALUE.length);
+                    "[setup] preloading %d entries (each value=%d bytes)%n", PRELOAD, VALUE.length);
             long preloadStart = System.nanoTime();
             for (int i = 0; i < PRELOAD; i++) {
                 byte[] k = keyOf(i);
@@ -251,9 +247,10 @@ public final class ForStCompareBenchmark {
             System.out.println("=== summary ===");
             System.out.printf("pointLookup     %.0f ops/s%n", pointThroughput);
             System.out.printf("sequentialPut   %.0f ops/s%n", putThroughput);
-            System.out.printf("batchedPut      %.0f rows/s (batch=%d)%n",
-                    batchedRowsPerSec, BATCH_SIZE);
-            System.out.printf("variant.libpath %s%n",
+            System.out.printf(
+                    "batchedPut      %.0f rows/s (batch=%d)%n", batchedRowsPerSec, BATCH_SIZE);
+            System.out.printf(
+                    "variant.libpath %s%n",
                     System.getProperty("org.forstdb.libpath", "<via java.library.path>"));
         } finally {
             try {

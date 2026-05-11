@@ -70,8 +70,8 @@ public final class FrsSnapshot implements AutoCloseable {
 
     /**
      * Releases the snapshot back to the engine. Idempotent: calling more than once is a no-op (does
-     * not double-release). Per spec §10.0 the underlying release call cannot fail with
-     * {@code INVALID_ARGUMENT} as long as the snapshot was originally obtained from {@code db}.
+     * not double-release). Per spec §10.0 the underlying release call cannot fail with {@code
+     * INVALID_ARGUMENT} as long as the snapshot was originally obtained from {@code db}.
      */
     @Override
     public void close() {

@@ -169,8 +169,7 @@ class ForStRsLinkerExtendedTest {
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
             try (FrsDb db = linker.dbOpenMemory(arena)) {
-                assertThrows(
-                        FrsBackendException.class, () -> linker.dbOpenCf(db, arena, "nope"));
+                assertThrows(FrsBackendException.class, () -> linker.dbOpenCf(db, arena, "nope"));
             }
         }
     }
@@ -184,7 +183,8 @@ class ForStRsLinkerExtendedTest {
                 long initial = linker.sequenceNumber(db);
                 linker.put(db, cf, utf8("k"), utf8("v"));
                 long afterPut = linker.sequenceNumber(db);
-                assertTrue(afterPut > initial,
+                assertTrue(
+                        afterPut > initial,
                         "sequence number should advance after put: " + initial + " -> " + afterPut);
                 assertDoesNotThrow(() -> linker.flush(db));
             }
@@ -211,11 +211,10 @@ class ForStRsLinkerExtendedTest {
     }
 
     /**
-     * Round-trips put/get through the tuned-config in-memory engine. Mirrors
-     * Preset A from the JMH bench: 256 MiB memtable budget × 8 buffers, default
-     * 4/4 background threads. Proves the new {@link
-     * ForStRsLinker#dbOpenMemoryTuned(Arena, long, long, long, long)} method
-     * is wired end-to-end through {@code frs_db_open_memory_tuned}.
+     * Round-trips put/get through the tuned-config in-memory engine. Mirrors Preset A from the JMH
+     * bench: 256 MiB memtable budget × 8 buffers, default 4/4 background threads. Proves the new
+     * {@link ForStRsLinker#dbOpenMemoryTuned(Arena, long, long, long, long)} method is wired
+     * end-to-end through {@code frs_db_open_memory_tuned}.
      */
     @Test
     void dbOpenMemoryTunedPresetARoundTrip() {
@@ -240,10 +239,9 @@ class ForStRsLinkerExtendedTest {
     }
 
     /**
-     * Passing {@code 0} for every knob falls back to the engine defaults; the
-     * resulting handle still survives a basic put/get round-trip and a clean
-     * close. Covers the per-knob "skip setter when zero" branch in
-     * {@code frs_db_open_memory_tuned}.
+     * Passing {@code 0} for every knob falls back to the engine defaults; the resulting handle
+     * still survives a basic put/get round-trip and a clean close. Covers the per-knob "skip setter
+     * when zero" branch in {@code frs_db_open_memory_tuned}.
      */
     @Test
     void dbOpenMemoryTunedZeroKnobsUsesDefaults() {
@@ -261,11 +259,9 @@ class ForStRsLinkerExtendedTest {
     }
 
     /**
-     * An out-of-range memtable size (1 byte, far below the 4 KiB
-     * {@code MIN_WRITE_BUFFER_SIZE} floor enforced by
-     * {@code EngineOptionsBuilder::try_build}) must surface as a clean
-     * {@link FrsBackendException} carrying the {@code INVALID_ARGUMENT}
-     * status, not a JVM panic / crash.
+     * An out-of-range memtable size (1 byte, far below the 4 KiB {@code MIN_WRITE_BUFFER_SIZE}
+     * floor enforced by {@code EngineOptionsBuilder::try_build}) must surface as a clean {@link
+     * FrsBackendException} carrying the {@code INVALID_ARGUMENT} status, not a JVM panic / crash.
      */
     @Test
     void dbOpenMemoryTunedRejectsUndersizedBuffer() {

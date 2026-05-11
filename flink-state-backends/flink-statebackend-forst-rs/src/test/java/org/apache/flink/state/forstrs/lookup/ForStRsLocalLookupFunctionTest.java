@@ -52,7 +52,9 @@ class ForStRsLocalLookupFunctionTest {
 
     /** Decode a UTF-8 byte payload into a single-column row of strings. */
     private static final Function<byte[], RowData> VALUE_DECODER =
-            bytes -> GenericRowData.of(StringData.fromString(new String(bytes, StandardCharsets.UTF_8)));
+            bytes ->
+                    GenericRowData.of(
+                            StringData.fromString(new String(bytes, StandardCharsets.UTF_8)));
 
     private static GenericRowData rowOf(String s) {
         return GenericRowData.of(StringData.fromString(s));
@@ -64,7 +66,9 @@ class ForStRsLocalLookupFunctionTest {
             ForStRsLinker linker = new ForStRsLinker(arena);
             try (FrsDb db = linker.dbOpenMemory(arena);
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-                linker.put(db, cf,
+                linker.put(
+                        db,
+                        cf,
                         "k1".getBytes(StandardCharsets.UTF_8),
                         "v1".getBytes(StandardCharsets.UTF_8));
 
@@ -91,13 +95,25 @@ class ForStRsLocalLookupFunctionTest {
             try (FrsDb db = linker.dbOpenMemory(arena);
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 // Three rows sharing prefix "p:" plus one outside the prefix.
-                linker.put(db, cf, "p:1".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "p:1".getBytes(StandardCharsets.UTF_8),
                         "alpha".getBytes(StandardCharsets.UTF_8));
-                linker.put(db, cf, "p:2".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "p:2".getBytes(StandardCharsets.UTF_8),
                         "beta".getBytes(StandardCharsets.UTF_8));
-                linker.put(db, cf, "p:3".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "p:3".getBytes(StandardCharsets.UTF_8),
                         "gamma".getBytes(StandardCharsets.UTF_8));
-                linker.put(db, cf, "x:1".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "x:1".getBytes(StandardCharsets.UTF_8),
                         "outside".getBytes(StandardCharsets.UTF_8));
 
                 ForStRsLocalLookupFunction fn =
@@ -123,9 +139,15 @@ class ForStRsLocalLookupFunctionTest {
             ForStRsLinker linker = new ForStRsLinker(arena);
             try (FrsDb db = linker.dbOpenMemory(arena);
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-                linker.put(db, cf, "a".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "a".getBytes(StandardCharsets.UTF_8),
                         "1".getBytes(StandardCharsets.UTF_8));
-                linker.put(db, cf, "b".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        cf,
+                        "b".getBytes(StandardCharsets.UTF_8),
                         "2".getBytes(StandardCharsets.UTF_8));
 
                 ForStRsLocalLookupFunction fn =

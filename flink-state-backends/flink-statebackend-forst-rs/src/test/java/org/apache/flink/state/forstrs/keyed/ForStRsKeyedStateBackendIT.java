@@ -51,23 +51,23 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  *
  * <p><b>Scope note (fallback mode).</b> The plan called for a {@code MiniClusterWithClientResource}
  * spin-up running a {@code keyBy(...).process(stateful op)} job, taking a real Flink checkpoint,
- * cancelling, restarting from the checkpoint, and verifying state. That path requires adding
- * {@code flink-test-utils} as a test dependency to this module — and, more importantly, the
- * {@link ForStRsAbstractKeyedStateBackend} skeleton (per its JavaDoc) does not yet implement
- * {@code createOrUpdateInternalState}, {@code create<T>InternalPriorityQueue}, or wire the
- * {@code AbstractStreamOperator}-side hooks Flink would invoke through MiniCluster. Those hookups
- * are explicitly tracked for B-Prod-P5 and beyond.
+ * cancelling, restarting from the checkpoint, and verifying state. That path requires adding {@code
+ * flink-test-utils} as a test dependency to this module — and, more importantly, the {@link
+ * ForStRsAbstractKeyedStateBackend} skeleton (per its JavaDoc) does not yet implement {@code
+ * createOrUpdateInternalState}, {@code create<T>InternalPriorityQueue}, or wire the {@code
+ * AbstractStreamOperator}-side hooks Flink would invoke through MiniCluster. Those hookups are
+ * explicitly tracked for B-Prod-P5 and beyond.
  *
  * <p>To still verify the P4 contract end-to-end, we drive the same code path the MiniCluster would:
  * the abstract backend's {@link ForStRsAbstractKeyedStateBackend#snapshot} method (which P3 wired)
- * + {@link ForStRsRestoreOperation#restore} (added in this PR), with state writes performed via
- * the L5 delegate's {@code linker.put}. This round-trip exercises the production sync+async
- * snapshot phases, the SST registry, and the restore download/strict-check + rebuild pipeline —
- * everything a MiniCluster job would exercise about the keyed-state-backend half of the contract.
+ * + {@link ForStRsRestoreOperation#restore} (added in this PR), with state writes performed via the
+ * L5 delegate's {@code linker.put}. This round-trip exercises the production sync+async snapshot
+ * phases, the SST registry, and the restore download/strict-check + rebuild pipeline — everything a
+ * MiniCluster job would exercise about the keyed-state-backend half of the contract.
  *
- * <p>When B-Prod-P5 wires {@code createOrUpdateInternalState} into the abstract backend, this
- * file should be expanded with a real {@code MiniClusterExtension} test running a
- * {@code KeyedProcessFunction} that writes ValueState; the round-trip skeleton here is the
+ * <p>When B-Prod-P5 wires {@code createOrUpdateInternalState} into the abstract backend, this file
+ * should be expanded with a real {@code MiniClusterExtension} test running a {@code
+ * KeyedProcessFunction} that writes ValueState; the round-trip skeleton here is the
  * checkpoint-strategy layer of that future test.
  */
 class ForStRsKeyedStateBackendIT {
@@ -120,7 +120,8 @@ class ForStRsKeyedStateBackendIT {
                 fut.run();
                 SnapshotResult<KeyedStateHandle> result = fut.get();
                 assertNotNull(result);
-                ckptHandle = (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+                ckptHandle =
+                        (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
                 assertEquals(42L, ckptHandle.getCheckpointId());
                 backend.notifyCheckpointComplete(42L);
             }

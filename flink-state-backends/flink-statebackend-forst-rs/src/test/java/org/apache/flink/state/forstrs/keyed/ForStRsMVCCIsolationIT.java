@@ -52,14 +52,14 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>Pre-load 1000 keys ({@code pre-N} → {@code pre-val-N}) and capture a snapshot {@code S}.
  *   <li>From a writer pool of 8 threads, write 100k keys ({@code post-N} → {@code post-val-N}) in
  *       parallel — each thread writes its slice of the keyspace.
- *   <li>Once writers complete, sample {@code getAt(S, ...)} for every {@code pre-N} key — they
- *       must all return their original values, no nulls and no surprise post-snapshot values.
+ *   <li>Once writers complete, sample {@code getAt(S, ...)} for every {@code pre-N} key — they must
+ *       all return their original values, no nulls and no surprise post-snapshot values.
  *   <li>Sample {@code getAt(S, ...)} for a handful of {@code post-N} keys — they must all return
  *       null (snapshot did not see the post-snapshot writes).
  * </ol>
  *
- * <p>Test uses 100k post-snapshot writes per spec; reduce to 10k under {@code -Dquick=true} to
- * keep CI under a minute.
+ * <p>Test uses 100k post-snapshot writes per spec; reduce to 10k under {@code -Dquick=true} to keep
+ * CI under a minute.
  */
 class ForStRsMVCCIsolationIT {
 
@@ -76,11 +76,7 @@ class ForStRsMVCCIsolationIT {
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 // ---- Pre-load. ----
                 for (int i = 0; i < preCount; i++) {
-                    linker.put(
-                            db,
-                            cf,
-                            ("pre-" + i).getBytes(),
-                            ("pre-val-" + i).getBytes());
+                    linker.put(db, cf, ("pre-" + i).getBytes(), ("pre-val-" + i).getBytes());
                 }
 
                 // ---- Capture the snapshot. ----
@@ -117,13 +113,12 @@ class ForStRsMVCCIsolationIT {
                     }
                     ready.await(10, TimeUnit.SECONDS);
                     start.countDown();
-                    assertTrue(
-                            done.await(120, TimeUnit.SECONDS),
-                            "writers should finish in 120s");
+                    assertTrue(done.await(120, TimeUnit.SECONDS), "writers should finish in 120s");
                     es.shutdown();
                     assertEquals(0, errs.get(), "no writer should throw");
 
-                    // ---- Verify snapshot isolation: every pre-* key visible at original value. ----
+                    // ---- Verify snapshot isolation: every pre-* key visible at original value.
+                    // ----
                     for (int i = 0; i < preCount; i++) {
                         byte[] got = linker.getAt(db, cf, snap, ("pre-" + i).getBytes());
                         assertTrue(got != null, "pre-" + i + " must be visible at the snapshot");

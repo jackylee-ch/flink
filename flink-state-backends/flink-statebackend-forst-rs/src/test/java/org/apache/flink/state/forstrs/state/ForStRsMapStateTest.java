@@ -54,12 +54,7 @@ class ForStRsMapStateTest {
     private static ForStRsMapState<String, Integer> newState(
             ForStRsLinker linker, FrsDb db, FrsCfHandle cf, String prefix) {
         return new ForStRsMapState<>(
-                linker,
-                db,
-                cf,
-                prefix(prefix),
-                StringSerializer.INSTANCE,
-                IntSerializer.INSTANCE);
+                linker, db, cf, prefix(prefix), StringSerializer.INSTANCE, IntSerializer.INSTANCE);
     }
 
     @Test

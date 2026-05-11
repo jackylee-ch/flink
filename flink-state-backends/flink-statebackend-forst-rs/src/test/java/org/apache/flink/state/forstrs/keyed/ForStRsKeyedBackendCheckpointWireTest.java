@@ -45,13 +45,13 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Wire-up test for {@link ForStRsAbstractKeyedStateBackend#snapshot} +
- * {@link ForStRsAbstractKeyedStateBackend#notifyCheckpointComplete} +
- * {@link ForStRsAbstractKeyedStateBackend#notifyCheckpointAborted} (B-Prod-P3 Tasks 3.6 + 3.9).
+ * Wire-up test for {@link ForStRsAbstractKeyedStateBackend#snapshot} + {@link
+ * ForStRsAbstractKeyedStateBackend#notifyCheckpointComplete} + {@link
+ * ForStRsAbstractKeyedStateBackend#notifyCheckpointAborted} (B-Prod-P3 Tasks 3.6 + 3.9).
  *
- * <p>Exercises the snapshot through the abstract backend's public surface (rather than the
- * strategy directly) and verifies the registry's ref-counts behave correctly across
- * complete vs. abort lifecycles.
+ * <p>Exercises the snapshot through the abstract backend's public surface (rather than the strategy
+ * directly) and verifies the registry's ref-counts behave correctly across complete vs. abort
+ * lifecycles.
  */
 class ForStRsKeyedBackendCheckpointWireTest {
 

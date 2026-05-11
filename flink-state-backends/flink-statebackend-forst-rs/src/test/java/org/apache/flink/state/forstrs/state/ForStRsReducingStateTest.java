@@ -53,12 +53,7 @@ class ForStRsReducingStateTest {
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 ForStRsReducingState<Long> state =
                         new ForStRsReducingState<>(
-                                linker,
-                                db,
-                                cf,
-                                prefix("reduce-1"),
-                                LongSerializer.INSTANCE,
-                                SUM);
+                                linker, db, cf, prefix("reduce-1"), LongSerializer.INSTANCE, SUM);
 
                 state.add(5L);
                 assertEquals(5L, state.get());
@@ -74,12 +69,7 @@ class ForStRsReducingStateTest {
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 ForStRsReducingState<Long> state =
                         new ForStRsReducingState<>(
-                                linker,
-                                db,
-                                cf,
-                                prefix("reduce-2"),
-                                LongSerializer.INSTANCE,
-                                SUM);
+                                linker, db, cf, prefix("reduce-2"), LongSerializer.INSTANCE, SUM);
 
                 state.add(3L);
                 state.add(4L);
@@ -98,12 +88,7 @@ class ForStRsReducingStateTest {
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 ForStRsReducingState<Long> state =
                         new ForStRsReducingState<>(
-                                linker,
-                                db,
-                                cf,
-                                prefix("reduce-3"),
-                                LongSerializer.INSTANCE,
-                                SUM);
+                                linker, db, cf, prefix("reduce-3"), LongSerializer.INSTANCE, SUM);
 
                 state.add(3L);
                 assertEquals(3L, state.get());
