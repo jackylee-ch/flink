@@ -92,6 +92,42 @@ under the License.
 		</dependency>
 
 		<!--
+			B-Prod-followup-4: flink-test-utils brings in MiniClusterResource,
+			MiniClusterWithClientResource, MiniClusterExtension + the streaming
+			and clients test-jar classes needed to drive a job through a
+			MiniCluster. Wires the canonical RocksDB-style test scaffolding
+			(see flink-statebackend-rocksdb/pom.xml for the upstream pattern).
+		-->
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-test-utils</artifactId>
+			<version>${project.version}</version>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-test-utils-junit</artifactId>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-streaming-java</artifactId>
+			<version>${project.version}</version>
+			<type>test-jar</type>
+			<scope>test</scope>
+		</dependency>
+
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-runtime</artifactId>
+			<version>${project.version}</version>
+			<type>test-jar</type>
+			<scope>test</scope>
+		</dependency>
+
+		<!--
 			JMH is declared in test scope so that the bench harness under
 			src/test/java/org/apache/flink/state/forstrs/jmh/ can pick up
 			@Benchmark annotations if we ever wire the JMH maven plugin in.
