@@ -42,4 +42,45 @@ class ForStRsOptionsTest {
         assertThrows(
                 IllegalArgumentException.class, () -> ForStRsOptions.CfMode.fromConfig("multi"));
     }
+
+    @Test
+    void buildsCorrectRouterFromCfMode() {
+        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofShared()) {
+            org.apache.flink.state.forstrs.ffm.ForStRsLinker linker =
+                    new org.apache.flink.state.forstrs.ffm.ForStRsLinker(arena);
+            try (org.apache.flink.state.forstrs.ffm.FrsDb db = linker.dbOpenMemory(arena);
+                    org.apache.flink.state.forstrs.ffm.FrsCfHandle cf =
+                            linker.dbDefaultCf(db, arena)) {
+
+                ForStRsOptions optsSingle =
+                        new ForStRsOptions().cfMode(ForStRsOptions.CfMode.SINGLE);
+                org.apache.flink.state.forstrs.keyed.cf.CfRouter rs =
+                        new org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackendBuilder<
+                                        String>(
+                                        linker,
+                                        arena,
+                                        org.apache.flink.api.common.typeutils.base.StringSerializer
+                                                .INSTANCE,
+                                        optsSingle)
+                                .withDb(db, cf)
+                                .buildCfRouter();
+                org.junit.jupiter.api.Assertions.assertTrue(rs.isSingleCf());
+
+                ForStRsOptions optsPer =
+                        new ForStRsOptions().cfMode(ForStRsOptions.CfMode.PER_STATE);
+                org.apache.flink.state.forstrs.keyed.cf.CfRouter rp =
+                        new org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackendBuilder<
+                                        String>(
+                                        linker,
+                                        arena,
+                                        org.apache.flink.api.common.typeutils.base.StringSerializer
+                                                .INSTANCE,
+                                        optsPer)
+                                .withDb(db, cf)
+                                .buildCfRouter();
+                org.junit.jupiter.api.Assertions.assertFalse(rp.isSingleCf());
+                rp.close();
+            }
+        }
+    }
 }
