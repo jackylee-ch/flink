@@ -96,6 +96,12 @@ public final class ForStRsOptions {
     private String cacheDir;
     private long cacheCapacityMb = 1024L;
 
+    // B-Prod-P7 §6d: shared LRU block cache + cross-CF WriteBufferManager.
+    // Defaults match the design doc (256 MiB cache, 512 MiB WBM); 0 means
+    // "use the engine default" (same value, but skips the FFI wire-up).
+    private long blockCacheCapacityBytes = 256L * 1024 * 1024;
+    private long writeBufferManagerCapacityBytes = 512L * 1024 * 1024;
+
     public ForStRsOptions() {}
 
     public CfMode cfMode() {
@@ -153,6 +159,41 @@ public final class ForStRsOptions {
     /** Convenience: cache capacity converted to bytes for the FFI call. */
     public long cacheCapacityBytes() {
         return cacheCapacityMb * 1024L * 1024L;
+    }
+
+    /**
+     * Returns the shared LRU block cache capacity in bytes (B-Prod-P7, spec §6d). Default: 256 MiB.
+     * {@code 0} means "use the engine default".
+     */
+    public long blockCacheCapacityBytes() {
+        return blockCacheCapacityBytes;
+    }
+
+    public ForStRsOptions blockCacheCapacityBytes(long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException(
+                    "blockCacheCapacityBytes must be >= 0, got " + bytes);
+        }
+        this.blockCacheCapacityBytes = bytes;
+        return this;
+    }
+
+    /**
+     * Returns the cross-CF WriteBufferManager capacity in bytes (B-Prod-P7, spec §6d). Default: 512
+     * MiB. {@code 0} disables the cross-CF cap (each CF still respects its own {@code
+     * write_buffer_size}).
+     */
+    public long writeBufferManagerCapacityBytes() {
+        return writeBufferManagerCapacityBytes;
+    }
+
+    public ForStRsOptions writeBufferManagerCapacityBytes(long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException(
+                    "writeBufferManagerCapacityBytes must be >= 0, got " + bytes);
+        }
+        this.writeBufferManagerCapacityBytes = bytes;
+        return this;
     }
 
     /** Column-family routing mode. */
