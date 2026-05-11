@@ -28,6 +28,7 @@ import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
+import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
 import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.InternalKeyContextImpl;
 import org.apache.flink.runtime.state.KeyGroupRange;
@@ -37,6 +38,8 @@ import org.apache.flink.runtime.state.Keyed;
 import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.SavepointResources;
 import org.apache.flink.runtime.state.SnapshotResult;
+import org.apache.flink.runtime.state.SnapshotStrategy;
+import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StateSnapshotTransformer.StateSnapshotTransformFactory;
 import org.apache.flink.runtime.state.StreamCompressionDecorator;
 import org.apache.flink.runtime.state.UncompressedStreamCompressionDecorator;
@@ -44,9 +47,11 @@ import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.metrics.LatencyTrackingStateConfig;
 import org.apache.flink.runtime.state.metrics.SizeTrackingStateConfig;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.RunnableFuture;
 import java.util.stream.Stream;
 
@@ -75,6 +80,20 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     private final ForStRsKeyedStateBackend<K> delegate;
 
     /**
+     * The snapshot strategy that drives incremental checkpoints (B-Prod-P3). Set lazily by
+     * {@link #setSnapshotStrategy(ForStRsSnapshotStrategy)} once the keyed-backend builder has the
+     * KGR + UUID + cfMap to construct it.
+     */
+    private ForStRsSnapshotStrategy snapshotStrategy;
+
+    /**
+     * The SST registry shared between this backend's snapshot strategy and the
+     * {@code notifyCheckpointComplete}/{@code notifyCheckpointAborted} hooks. Optional — only
+     * required once snapshot wiring is connected.
+     */
+    private ForStRsSstRegistry sstRegistry;
+
+    /**
      * Convenience constructor that wires the smallest-possible Flink runtime context (no metrics
      * tracking, no compression, no kvState registry, single key-group range [0, 0]) and delegates
      * the per-state CRUD work to a caller-supplied {@link ForStRsKeyedStateBackend}.
@@ -97,6 +116,22 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                 UncompressedStreamCompressionDecorator.INSTANCE,
                 /* keyContext= */ defaultKeyContext());
         this.delegate = delegate;
+    }
+
+    /**
+     * Wires the snapshot strategy + SST registry into this backend so {@link #snapshot} can drive
+     * checkpoints and {@link #notifyCheckpointComplete}/{@link #notifyCheckpointAborted} can manage
+     * the registry's ref-counts. Tests or higher-level builders call this after construction.
+     */
+    public void setSnapshotStrategy(
+            ForStRsSnapshotStrategy strategy, ForStRsSstRegistry sstRegistry) {
+        this.snapshotStrategy = strategy;
+        this.sstRegistry = sstRegistry;
+    }
+
+    /** Test accessor — returns the SST registry, or null if snapshot wiring isn't connected. */
+    public ForStRsSstRegistry getSstRegistry() {
+        return sstRegistry;
     }
 
     private static <K> InternalKeyContext<K> defaultKeyContext() {
@@ -149,8 +184,31 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             CheckpointStreamFactory streamFactory,
             CheckpointOptions checkpointOptions)
             throws Exception {
-        throw new UnsupportedOperationException(
-                "ForStRsAbstractKeyedStateBackend.snapshot is implemented in B-Prod-P3 (snapshot strategy)");
+        if (snapshotStrategy == null) {
+            throw new IllegalStateException(
+                    "ForStRsAbstractKeyedStateBackend.snapshot called before "
+                            + "setSnapshotStrategy(...) — wire the strategy via the builder or"
+                            + " test setup");
+        }
+        // Sync phase: capture engine snapshot + manifest (must be fast — runs on task thread).
+        ForStRsSnapshotResources resources = snapshotStrategy.syncPrepareResources(checkpointId);
+        // Build the async-phase supplier; wrap it in a FutureTask so the caller can run() it on
+        // the snapshot executor of their choice (Flink's SnapshotStrategyRunner usually).
+        SnapshotStrategy.SnapshotResultSupplier<KeyedStateHandle> supplier =
+                snapshotStrategy.asyncSnapshot(
+                        resources, checkpointId, timestamp, streamFactory, checkpointOptions);
+        FutureTask<SnapshotResult<KeyedStateHandle>> task =
+                new FutureTask<>(() -> supplier.get(getCancelStreamRegistry()));
+        return task;
+    }
+
+    /**
+     * Returns the cancel-stream registry that snapshot-strategy uploads should register their
+     * cancellable streams with. The base class has the field as protected; expose via a getter so
+     * the supplier can use it without reaching into super.cancelStreamRegistry directly.
+     */
+    private CloseableRegistry getCancelStreamRegistry() {
+        return cancelStreamRegistry;
     }
 
     @Override
@@ -179,7 +237,42 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
 
     @Override
     public void notifyCheckpointComplete(long checkpointId) throws Exception {
-        // No-op until P3 wires checkpoint snapshot strategy.
+        // Tell the snapshot strategy that this checkpoint id is now eligible as a base for
+        // future incremental checkpoints (subsequent dbSnapshot()s will pass it as
+        // base_checkpoint_id). The strategy keeps a monotonic max so out-of-order completes are
+        // safely ignored.
+        if (snapshotStrategy != null) {
+            snapshotStrategy.recordCompletedCheckpoint(checkpointId);
+            // Drop the per-checkpoint registration tracking — the registry's ref-counts persist
+            // (the SSTs registered for this checkpoint stay alive until subsumed by the registry
+            // when the next checkpoint completes).
+            snapshotStrategy.takePendingRegistrations(checkpointId);
+        }
+    }
+
+    /**
+     * Override of {@link org.apache.flink.api.common.state.CheckpointListener#notifyCheckpointAborted(long)}.
+     *
+     * <p>For an aborted checkpoint we must roll back the registry's ref-count bumps so the aborted
+     * checkpoint's "newly-uploaded" SSTs can drop to zero ref (eligible for discard) — the
+     * baseline shared with previously completed checkpoints is preserved because the registry's
+     * ref-counts are independent per checkpoint contribution.
+     */
+    @Override
+    public void notifyCheckpointAborted(long checkpointId) throws Exception {
+        // Parent default is no-op (CheckpointListener.notifyCheckpointAborted has a default impl);
+        // skip super to avoid forwarding to a default-method handle that doesn't exist on
+        // AbstractKeyedStateBackend itself.
+        if (sstRegistry == null || snapshotStrategy == null) {
+            return;
+        }
+        List<HandleAndLocalPath> rollback = snapshotStrategy.takePendingRegistrations(checkpointId);
+        if (rollback == null) {
+            return;
+        }
+        for (HandleAndLocalPath h : rollback) {
+            sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
+        }
     }
 
     @Override

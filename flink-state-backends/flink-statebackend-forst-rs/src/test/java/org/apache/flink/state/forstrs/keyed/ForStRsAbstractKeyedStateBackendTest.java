@@ -77,10 +77,12 @@ class ForStRsAbstractKeyedStateBackendTest {
                 // notifyCheckpointComplete is a no-op until P3.
                 backend.notifyCheckpointComplete(123L);
 
-                // Snapshot/savepoint/createOrUpdateInternalState/create stubs throw with explicit
-                // P3/P4 guidance.
+                // Snapshot now requires a SnapshotStrategy to be wired in via
+                // setSnapshotStrategy(...) — without it, snapshot() throws IllegalStateException
+                // with a guidance message. (P3 SnapshotStrategy integration tests cover the wired
+                // path; this skeleton test only confirms the unwired guard.)
                 assertThrows(
-                        UnsupportedOperationException.class,
+                        IllegalStateException.class,
                         () -> backend.snapshot(1L, 0L, null, null));
                 assertThrows(UnsupportedOperationException.class, backend::savepoint);
                 assertThrows(
