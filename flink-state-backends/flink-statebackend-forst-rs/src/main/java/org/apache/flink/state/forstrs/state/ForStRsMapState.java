@@ -36,33 +36,25 @@ import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
  * Minimal {@link MapState} implementation backed by ForSt-RS via the {@link ForStRsLinker} FFM
  * bridge.
  *
- * <p>This is a Phase-D L4 stepping stone: it demonstrates the keyed-map-state bridging pattern
- * end-to-end (composite-key encoding → put/get/delete + prefix-scan enumeration) without yet
- * plugging into Flink's {@code AbstractKeyedStateBackend} composition. A real keyed-state binding
- * would derive the per-record key from the operator's {@code KeyContext} (key + namespace) and
- * concat with the state-id prefix; here we accept a fixed prefix at construction time and treat
- * it as the map's identity prefix. That is sufficient for proof-of-concept enumeration semantics
- * and unit testing the FFM contract, but not for production-quality keyed-state.
+ * <p>Two construction modes are supported:
  *
- * <p><b>Storage encoding</b>: each map entry is stored under a composite ForSt key
- * <pre>
- *   composite_key = keyPrefix || serialize(UK)
- * </pre>
- * with the entry value being {@code serialize(UV)}. The construction-time {@code keyPrefix} acts
- * as the namespace for the map — every entry shares it and {@link #entries()} / {@link #keys()} /
- * {@link #values()} / {@link #iterator()} / {@link #isEmpty()} / {@link #clear()} are implemented
- * via {@link ForStRsLinker#prefixLookupOpen} bounded to {@code keyPrefix}. To recover the user
- * key on iteration we strip the leading {@code keyPrefix.length} bytes from the composite key
- * before deserializing — this is correct as long as no other state shares the same prefix.
- *
- * <p><b>Concurrency</b>: there is no transactional guarantee across multi-key operations; if the
- * caller mutates the map concurrently with an in-flight iteration the results are unspecified —
- * the same caveat the underlying ForSt-RS iterator exposes.
+ * <ol>
+ *   <li><b>Static byte[] prefix (legacy)</b>: composite ForSt key is {@code keyPrefix ||
+ *       serialize(UK)}. Prefix-scans use {@code keyPrefix} verbatim.
+ *   <li><b>Spec §6 kg-prefixed mode</b>: composite ForSt key is built per call via the supplied
+ *       {@code compositeKeyComputer} (which the keyed-state backend wires to {@code
+ *       ForStRsKeyGroupedSerializer.encodeForMap(currentKg, currentKey, stateName, ukSer, uk)}).
+ *       Prefix-scans use the per-state-prefix returned by {@code prefixComputer} (typically
+ *       {@code encodeForState(currentKg, currentKey, stateName)} — i.e. the kg+K+state portion that
+ *       every map entry shares as a byte prefix).
+ * </ol>
  *
  * @param <UK> user key type
  * @param <UV> user value type
@@ -79,6 +71,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final byte[] keyPrefix;
+    private final Supplier<byte[]> prefixComputer;
+    private final Function<UK, byte[]> compositeKeyComputer;
     private final TypeSerializer<UK> keySerializer;
     private final TypeSerializer<UV> valueSerializer;
 
@@ -86,6 +80,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final DataOutputSerializer valueOutBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    /** Legacy byte[]-prefix constructor. */
     public ForStRsMapState(
             ForStRsLinker linker,
             FrsDb db,
@@ -97,6 +92,34 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         this.db = db;
         this.cf = cf;
         this.keyPrefix = keyPrefix.clone();
+        this.prefixComputer = null;
+        this.compositeKeyComputer = null;
+        this.keySerializer = keySerializer;
+        this.valueSerializer = valueSerializer;
+        this.keyOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.valueOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+    }
+
+    /**
+     * Spec §6 kg-prefixed constructor. {@code prefixComputer} returns the per-state byte prefix
+     * (kg+K+stateName/) shared by every map entry; {@code compositeKeyComputer} maps a user key to
+     * the full composite ForSt key (the prefix bytes followed by serialize(UK)).
+     */
+    public ForStRsMapState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<UK> keySerializer,
+            TypeSerializer<UV> valueSerializer,
+            Supplier<byte[]> prefixComputer,
+            Function<UK, byte[]> compositeKeyComputer) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = null;
+        this.prefixComputer = prefixComputer;
+        this.compositeKeyComputer = compositeKeyComputer;
         this.keySerializer = keySerializer;
         this.valueSerializer = valueSerializer;
         this.keyOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
@@ -144,10 +167,6 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public Iterable<Map.Entry<UK, UV>> entries() throws IOException {
-        // Materialize eagerly: the underlying ForSt-RS iterator must be closed before we hand a
-        // result back to the caller, and the entries() contract returns an Iterable that may be
-        // walked multiple times. A future revision can swap this for a streaming view that
-        // owns/releases the iterator on its own lifecycle.
         List<Map.Entry<UK, UV>> out = new ArrayList<>();
         forEachEntry(
                 (uk, uv) -> out.add(new AbstractMap.SimpleImmutableEntry<>(uk, uv)),
@@ -177,19 +196,16 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     @Override
     public boolean isEmpty() throws IOException {
         try (Arena arena = Arena.ofShared();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, keyPrefix, arena)) {
+                FrsIterator iter = linker.prefixLookupOpen(db, cf, currentPrefix(), arena)) {
             return linker.iteratorNext(iter) == null;
         }
     }
 
     @Override
     public void clear() {
-        // Two-phase: collect composite keys under the prefix, then delete each. Holding the
-        // iterator open while issuing deletes is unsafe in general (snapshot vs mutation
-        // semantics) so we materialize first.
         List<byte[]> compositeKeys = new ArrayList<>();
         try (Arena arena = Arena.ofShared();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, keyPrefix, arena)) {
+                FrsIterator iter = linker.prefixLookupOpen(db, cf, currentPrefix(), arena)) {
             ForStRsLinker.IteratorEntry entry;
             while ((entry = linker.iteratorNext(iter)) != null) {
                 compositeKeys.add(entry.key());
@@ -200,28 +216,19 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Helpers
-    // ------------------------------------------------------------------
-
-    /**
-     * Common iteration helper. Walks every entry whose composite key starts with {@link
-     * #keyPrefix}, decodes the user key, optionally decodes the user value, and invokes the
-     * visitor. The visitor receives {@code null} for {@code uv} when {@code loadValues} is false,
-     * which lets the {@link #keys()} path skip a deserialization round-trip.
-     */
     private void forEachEntry(EntryVisitor<UK, UV> visitor, boolean loadValues) throws IOException {
+        byte[] prefix = currentPrefix();
         try (Arena arena = Arena.ofShared();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, keyPrefix, arena)) {
+                FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
             ForStRsLinker.IteratorEntry entry;
             while ((entry = linker.iteratorNext(iter)) != null) {
                 byte[] composite = entry.key();
-                if (composite.length < keyPrefix.length) {
+                if (composite.length < prefix.length) {
                     throw new IOException(
                             "Encountered composite key shorter than prefix during MapState scan");
                 }
                 inputBuffer.setBuffer(
-                        composite, keyPrefix.length, composite.length - keyPrefix.length);
+                        composite, prefix.length, composite.length - prefix.length);
                 UK uk = keySerializer.deserialize(inputBuffer);
                 UV uv = null;
                 if (loadValues) {
@@ -234,9 +241,25 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     }
 
     /**
-     * Returns the composite ForSt key for {@code userKey}: {@code keyPrefix || serialize(userKey)}.
+     * Returns the per-state byte prefix shared by every map entry. In legacy mode this is the
+     * construction-time {@code keyPrefix}; in kg-mode this is invoked dynamically.
+     */
+    private byte[] currentPrefix() {
+        if (prefixComputer != null) {
+            return prefixComputer.get();
+        }
+        return keyPrefix;
+    }
+
+    /**
+     * Returns the composite ForSt key for {@code userKey}: in legacy mode {@code keyPrefix ||
+     * serialize(userKey)}; in kg-mode {@code compositeKeyComputer.apply(userKey)} (which the
+     * keyed-state backend wires to {@code ForStRsKeyGroupedSerializer.encodeForMap}).
      */
     private byte[] composite(UK userKey) {
+        if (compositeKeyComputer != null) {
+            return compositeKeyComputer.apply(userKey);
+        }
         keyOutBuffer.clear();
         try {
             keySerializer.serialize(userKey, keyOutBuffer);

@@ -29,38 +29,12 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.io.IOException;
+import java.util.function.Supplier;
 
 /**
  * Minimal {@link AggregatingState} implementation backed by ForSt-RS via the {@link ForStRsLinker}
- * FFM bridge.
- *
- * <p>This is a Phase-D L4 stepping stone: it demonstrates the keyed-state bridging pattern for an
- * aggregating-typed value end-to-end (serialize accumulator → put → get → deserialize → add → put)
- * without yet plugging into Flink's {@code AbstractKeyedStateBackend} composition. A real
- * keyed-state binding would derive the per-record key from the operator's {@code KeyContext} (key +
- * namespace) and concat with the state-id prefix; here we accept a fixed prefix at construction
- * time and treat it as the full ForSt key. That is sufficient for proof-of-concept round-trips and
- * unit testing the FFM contract, but not for production-quality keyed-state.
- *
- * <p><b>Type-parameter discipline.</b> The {@link AggregateFunction} carries three type parameters
- * &mdash; {@code IN} (input), {@code ACC} (accumulator), and {@code OUT} (result). Only the
- * accumulator is persisted, so the configured {@link TypeSerializer} must be the one for {@code
- * ACC}. Do <em>not</em> pass an {@code IN} or {@code OUT} serializer here &mdash; many subtle bugs
- * arise from confusing the three. {@link #get()} reads the {@code ACC}, then projects through
- * {@link AggregateFunction#getResult(Object)} to produce {@code OUT}; {@link #add(Object)} reads
- * the {@code ACC}, calls {@link AggregateFunction#add(Object, Object)}, and writes the resulting
- * {@code ACC} back.
- *
- * <p><b>Storage encoding</b>: the single accumulator is serialized via the configured
- * {@code TypeSerializer<ACC>} and stored under the construction-time {@code keyPrefix} &mdash;
- * semantically the same single-value layout used by {@link ForStRsValueState} and {@link
- * ForStRsReducingState}.
- *
- * <p><b>Concurrency</b>: {@link #add(Object)} is implemented as read-modify-write across a separate
- * get + put, so concurrent appenders against the same key may lose updates. This is intentional for
- * the stepping-stone &mdash; RocksDB's AggregatingState has the same property; merge-operator
- * acceleration is deferred until the keyed-state binding lands and the payload-bound merge contract
- * is wired.
+ * FFM bridge. See {@link ForStRsValueState} for a description of the two construction modes (static
+ * byte[] prefix vs. kg-prefixed lazy compute per spec §6).
  *
  * @param <IN> input value type
  * @param <ACC> accumulator type (the type that is serialized and persisted)
@@ -76,12 +50,14 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final byte[] keyPrefix;
+    private final Supplier<byte[]> keyComputer;
     private final TypeSerializer<ACC> accSerializer;
     private final AggregateFunction<IN, ACC, OUT> aggregateFunction;
 
     private final DataOutputSerializer outputBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    /** Legacy byte[]-prefix constructor. */
     public ForStRsAggregatingState(
             ForStRsLinker linker,
             FrsDb db,
@@ -93,6 +69,26 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
         this.db = db;
         this.cf = cf;
         this.keyPrefix = keyPrefix.clone();
+        this.keyComputer = null;
+        this.accSerializer = accSerializer;
+        this.aggregateFunction = aggregateFunction;
+        this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+    }
+
+    /** Spec §6 kg-prefixed constructor. */
+    public ForStRsAggregatingState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<ACC> accSerializer,
+            AggregateFunction<IN, ACC, OUT> aggregateFunction,
+            Supplier<byte[]> keyComputer) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = null;
+        this.keyComputer = keyComputer;
         this.accSerializer = accSerializer;
         this.aggregateFunction = aggregateFunction;
         this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
@@ -116,8 +112,6 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
         }
         ACC next = aggregateFunction.add(value, current);
         if (next == null) {
-            // Defensive: if the user-supplied function returns a null accumulator, treat that as
-            // "no state to persist" rather than serializing a null reference.
             clear();
             return;
         }
@@ -129,9 +123,6 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
         linker.delete(db, cf, computeKey());
     }
 
-    /**
-     * Reads the encoded accumulator under {@link #computeKey()} or returns {@code null} if absent.
-     */
     private ACC readAccumulator() throws IOException {
         byte[] raw = linker.lookupKv(db, cf, computeKey());
         if (raw == null) {
@@ -141,7 +132,6 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
         return accSerializer.deserialize(inputBuffer);
     }
 
-    /** Serializes {@code acc} (assumed non-null) and stores it. */
     private void writeAccumulator(ACC acc) throws IOException {
         outputBuffer.clear();
         accSerializer.serialize(acc, outputBuffer);
@@ -149,12 +139,10 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
         linker.put(db, cf, computeKey(), payload);
     }
 
-    /**
-     * Returns the ForSt-RS key for the current logical entry. In this stepping-stone, we use the
-     * constructor-supplied prefix verbatim — a full keyed-state binding will append the per-record
-     * key + namespace here.
-     */
     private byte[] computeKey() {
+        if (keyComputer != null) {
+            return keyComputer.get();
+        }
         return keyPrefix;
     }
 }

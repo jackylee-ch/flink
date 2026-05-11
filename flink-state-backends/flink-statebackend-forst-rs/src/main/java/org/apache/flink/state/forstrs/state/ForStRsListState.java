@@ -31,29 +31,16 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Supplier;
 
 /**
  * Minimal {@link ListState} implementation backed by ForSt-RS via the {@link ForStRsLinker} FFM
- * bridge.
+ * bridge. See {@link ForStRsValueState} for a description of the two construction modes (static
+ * byte[] prefix vs. kg-prefixed lazy compute per spec §6).
  *
- * <p>This is a Phase-D L4 stepping stone: it demonstrates the keyed-state bridging pattern for a
- * list-typed value end-to-end (serialize list → put → get → deserialize list) without yet plugging
- * into Flink's {@code AbstractKeyedStateBackend} composition. A real keyed-state binding would
- * derive the per-record key from the operator's {@code KeyContext} (key + namespace) and concat
- * with the state-id prefix; here we accept a fixed prefix at construction time and treat it as the
- * full ForSt key. That is sufficient for proof-of-concept round-trips and unit testing the FFM
- * contract, but not for production-quality keyed-state.
- *
- * <p><b>Storage encoding</b>: the entire list is serialized into a single value as
- * {@code [count: i32 BE][elem_0_serialized][elem_1_serialized]...[elem_{count-1}_serialized]} via
- * the configured {@link TypeSerializer}. The value is stored under the construction-time
- * {@code keyPrefix}.
- *
- * <p><b>Concurrency</b>: {@code add} / {@code addAll} are implemented as read-modify-write across
- * a separate get + put, so concurrent appenders against the same key may lose updates. This is
- * intentional for the stepping-stone — RocksDB's ListState uses the merge-operator backed
- * append-only encoding to avoid this; that optimization is deferred until the keyed-state binding
- * lands and the payload-bound merge contract is wired.
+ * <p><b>Storage encoding</b>: the entire list is serialized into a single value as {@code [count:
+ * i32 BE][elem_0_serialized][elem_1_serialized]...[elem_{count-1}_serialized]} via the configured
+ * {@link TypeSerializer}.
  *
  * @param <T> element type
  */
@@ -69,11 +56,13 @@ public class ForStRsListState<T> implements ListState<T> {
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final byte[] keyPrefix;
+    private final Supplier<byte[]> keyComputer;
     private final TypeSerializer<T> serializer;
 
     private final DataOutputSerializer outputBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    /** Legacy byte[]-prefix constructor. */
     public ForStRsListState(
             ForStRsLinker linker,
             FrsDb db,
@@ -84,6 +73,24 @@ public class ForStRsListState<T> implements ListState<T> {
         this.db = db;
         this.cf = cf;
         this.keyPrefix = keyPrefix.clone();
+        this.keyComputer = null;
+        this.serializer = serializer;
+        this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+    }
+
+    /** Spec §6 kg-prefixed constructor. */
+    public ForStRsListState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<T> serializer,
+            Supplier<byte[]> keyComputer) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = null;
+        this.keyComputer = keyComputer;
         this.serializer = serializer;
         this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
@@ -92,15 +99,12 @@ public class ForStRsListState<T> implements ListState<T> {
     @Override
     public Iterable<T> get() throws IOException {
         List<T> stored = readList();
-        // Per Flink contract: empty list view rather than null when present-but-empty.
         return stored == null ? Collections.emptyList() : stored;
     }
 
     @Override
     public void add(T value) throws IOException {
         if (value == null) {
-            // Flink's contract states the behavior is undefined for null; mirror RocksDB's choice
-            // by rejecting it explicitly to avoid silently corrupting the encoded list.
             throw new NullPointerException("ForStRsListState.add does not accept null values");
         }
         List<T> current = readList();
@@ -114,7 +118,6 @@ public class ForStRsListState<T> implements ListState<T> {
     @Override
     public void update(List<T> values) throws IOException {
         if (values == null || values.isEmpty()) {
-            // Per Flink contract: an empty list (or null in our stepping-stone tolerance) clears.
             clear();
             return;
         }
@@ -130,7 +133,6 @@ public class ForStRsListState<T> implements ListState<T> {
     @Override
     public void addAll(List<T> values) throws IOException {
         if (values == null || values.isEmpty()) {
-            // No-op — Flink's contract says empty addAll leaves state unchanged.
             return;
         }
         for (T v : values) {
@@ -152,10 +154,6 @@ public class ForStRsListState<T> implements ListState<T> {
         linker.delete(db, cf, computeKey());
     }
 
-    /**
-     * Reads the encoded list under {@link #computeKey()} or returns {@code null} if no entry
-     * exists. The caller may safely mutate the returned list — it is freshly allocated.
-     */
     private List<T> readList() throws IOException {
         byte[] raw = linker.lookupKv(db, cf, computeKey());
         if (raw == null) {
@@ -173,7 +171,6 @@ public class ForStRsListState<T> implements ListState<T> {
         return out;
     }
 
-    /** Serializes {@code values} (assumed non-empty, non-null elements) and stores it. */
     private void writeList(List<T> values) throws IOException {
         outputBuffer.clear();
         outputBuffer.writeInt(values.size());
@@ -184,12 +181,10 @@ public class ForStRsListState<T> implements ListState<T> {
         linker.put(db, cf, computeKey(), payload);
     }
 
-    /**
-     * Returns the ForSt-RS key for the current logical entry. In this stepping-stone, we use the
-     * constructor-supplied prefix verbatim — a full keyed-state binding will append the per-record
-     * key + namespace here.
-     */
     private byte[] computeKey() {
+        if (keyComputer != null) {
+            return keyComputer.get();
+        }
         return keyPrefix;
     }
 }

@@ -28,20 +28,24 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.io.IOException;
+import java.util.function.Supplier;
 
 /**
  * Minimal {@link ValueState} implementation backed by ForSt-RS via the {@link ForStRsLinker} FFM
  * bridge.
  *
- * <p>This is a Phase-D L4 stepping stone: it demonstrates the keyed-state bridging pattern
- * end-to-end (serialize → put → get → deserialize) without yet plugging into Flink's {@code
- * AbstractKeyedStateBackend} composition. A real keyed-state binding would derive the per-record
- * key from the operator's {@code KeyContext} (key + namespace) and concat with the state-id prefix;
- * here we accept a fixed prefix at construction time and treat it as the full ForSt key. That is
- * sufficient for proof-of-concept round-trips and unit testing the FFM contract, but not for
- * production-quality keyed-state.
+ * <p>Two construction modes are supported:
  *
- * @param <T> element type
+ * <ol>
+ *   <li><b>Static byte[] prefix (legacy / direct-test mode)</b>: the entire ForSt key is the
+ *       construction-time {@code keyPrefix}. Used by the Phase-D L4 stepping-stone tests.
+ *   <li><b>Key-group prefixed mode (spec §6, P1+)</b>: the ForSt key is computed lazily per call
+ *       via a caller-supplied {@link Supplier Supplier&lt;byte[]&gt;}, which is expected to invoke
+ *       {@link org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer#encodeForState}
+ *       with the current key-group, current user-key, and stateName.
+ * </ol>
+ *
+ * @param <T> stored value type
  */
 @Internal
 public class ForStRsValueState<T> implements ValueState<T> {
@@ -52,12 +56,21 @@ public class ForStRsValueState<T> implements ValueState<T> {
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsCfHandle cf;
-    private final byte[] keyPrefix;
     private final TypeSerializer<T> serializer;
+
+    /** Mode 1: static byte[] prefix. */
+    private final byte[] keyPrefix;
+
+    /** Mode 2: kg-prefixed lazy compute (returns the full composite ForSt key per call). */
+    private final Supplier<byte[]> keyComputer;
 
     private final DataOutputSerializer outputBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    /**
+     * Legacy / stepping-stone constructor: caller supplies the ForSt key directly as a fixed
+     * prefix.
+     */
     public ForStRsValueState(
             ForStRsLinker linker,
             FrsDb db,
@@ -69,6 +82,28 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.cf = cf;
         this.keyPrefix = keyPrefix.clone();
         this.serializer = serializer;
+        this.keyComputer = null;
+        this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+    }
+
+    /**
+     * Spec §6 constructor: composite ForSt key is recomputed per call from the supplied
+     * keyComputer (which the keyed-state backend wires to {@code ForStRsKeyGroupedSerializer
+     * .encodeForState(currentKg, currentKey, stateName)}).
+     */
+    public ForStRsValueState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<T> serializer,
+            Supplier<byte[]> keyComputer) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = null;
+        this.serializer = serializer;
+        this.keyComputer = keyComputer;
         this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
     }
@@ -102,11 +137,14 @@ public class ForStRsValueState<T> implements ValueState<T> {
     }
 
     /**
-     * Returns the ForSt-RS key for the current logical entry. In this stepping-stone, we use the
-     * constructor-supplied prefix verbatim — a full keyed-state binding will append the per-record
-     * key + namespace here.
+     * Returns the ForSt-RS key for the current logical entry. In legacy/byte[] mode this is the
+     * construction-time prefix verbatim; in kg-prefixed mode it is freshly built by invoking the
+     * key-computer (typically wired to {@code ForStRsKeyGroupedSerializer.encodeForState}).
      */
     private byte[] computeKey() {
+        if (keyComputer != null) {
+            return keyComputer.get();
+        }
         return keyPrefix;
     }
 }
