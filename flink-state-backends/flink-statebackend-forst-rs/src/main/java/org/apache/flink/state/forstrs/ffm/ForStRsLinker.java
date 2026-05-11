@@ -62,6 +62,38 @@ public final class ForStRsLinker {
                     ValueLayout.JAVA_LONG.withName("len"),
                     ValueLayout.JAVA_LONG.withName("capacity"));
 
+    /**
+     * {@code FrsEngineOptions} struct layout (B-Prod-P7, spec §6d). Mirrors the {@code #[repr(C)]}
+     * struct in {@code crates/forst-rs-ffi/src/lib.rs}.
+     *
+     * <p>Layout (48 bytes on 64-bit):
+     *
+     * <pre>
+     * +0   ADDRESS (8B)   db_path
+     * +8   JAVA_LONG (8B) write_buffer_size
+     * +16  JAVA_INT  (4B) max_write_buffer_number
+     * +20  JAVA_INT  (4B) max_background_compactions
+     * +24  JAVA_INT  (4B) max_background_flushes
+     * +28  4B padding (alignment for following u64)
+     * +32  JAVA_LONG (8B) block_cache_capacity_bytes
+     * +40  JAVA_LONG (8B) write_buffer_manager_capacity_bytes
+     * </pre>
+     *
+     * <p>The padding is added explicitly via {@link MemoryLayout#paddingLayout(long)} so that the
+     * Java mirror produces the exact 48-byte struct that Rust's {@code #[repr(C)]} layout generates
+     * on the same target. Future fields land at +48 onwards (append-only).
+     */
+    public static final StructLayout FRS_ENGINE_OPTIONS_LAYOUT =
+            MemoryLayout.structLayout(
+                    ValueLayout.ADDRESS.withName("db_path"),
+                    ValueLayout.JAVA_LONG.withName("write_buffer_size"),
+                    ValueLayout.JAVA_INT.withName("max_write_buffer_number"),
+                    ValueLayout.JAVA_INT.withName("max_background_compactions"),
+                    ValueLayout.JAVA_INT.withName("max_background_flushes"),
+                    MemoryLayout.paddingLayout(4),
+                    ValueLayout.JAVA_LONG.withName("block_cache_capacity_bytes"),
+                    ValueLayout.JAVA_LONG.withName("write_buffer_manager_capacity_bytes"));
+
     // ValueLayout.ADDRESS_UNALIGNED and ValueLayout.JAVA_LONG_UNALIGNED are
     // used to read the FrsBytes out struct when it lives in a heap byte[24]
     // segment (which only guarantees 1-byte alignment). Strict-alignment reads
@@ -77,6 +109,10 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbOpenFromCheckpoint;
     private final MethodHandle frsDbOpenRemote;
     private final MethodHandle frsDbClose;
+    // B-Prod-P7 §6d: structured open + WriteBufferManager diagnostics.
+    private final MethodHandle frsDbOpenWithOptions;
+    private final MethodHandle frsDbWbmCapacity;
+    private final MethodHandle frsDbWbmCurrentBytes;
 
     // --- 2. CF management ---
     private final MethodHandle frsDbDefaultCf;
@@ -198,6 +234,25 @@ public final class ForStRsLinker {
                 bind(
                         "frs_db_close",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        // B-Prod-P7 §6d: structured open + WBM diagnostics. The opts arg
+        // is a pointer to FrsEngineOptions, allocated in the caller's Arena
+        // and populated field-by-field (see #dbOpenWithOptions).
+        this.frsDbOpenWithOptions =
+                bind(
+                        "frs_db_open_with_options",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // const FrsEngineOptions*
+                                ValueLayout.ADDRESS)); // out_handle (FrsDb*)
+        this.frsDbWbmCapacity =
+                bind(
+                        "frs_db_write_buffer_manager_capacity",
+                        FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
+        this.frsDbWbmCurrentBytes =
+                bind(
+                        "frs_db_write_buffer_manager_current_bytes",
+                        FunctionDescriptor.of(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS));
 
         // 2. CF management
         this.frsDbDefaultCf =
@@ -577,6 +632,93 @@ public final class ForStRsLinker {
         check(rc, "frs_db_open_memory_tuned");
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
+    }
+
+    /**
+     * Opens an in-memory or filesystem-backed engine using a structured {@link
+     * org.apache.flink.state.forstrs.config.ForStRsOptions} (B-Prod-P7, spec §6d).
+     *
+     * <p>Builds a native {@code FrsEngineOptions} struct in {@code arena}, sets the cache / WBM /
+     * write-buffer / background-thread fields, then dispatches to {@code frs_db_open_with_options}.
+     * {@code dbPath} of {@code null} or empty opens an in-memory engine at {@code /db}; non-null
+     * opens an on-disk engine at the given path. Each numeric field of {@code 0} keeps the engine's
+     * built-in default for that field.
+     *
+     * <p>The struct is allocated in {@code arena}; the caller may free it as soon as this method
+     * returns. Failure modes:
+     *
+     * <ul>
+     *   <li>{@link FrsStatus#INVALID_ARGUMENT} when any field violates the engine's validation caps
+     *       (e.g. cache > 1 PiB).
+     *   <li>{@link FrsStatus#PANIC} when the JVM cannot reach the cdylib (lookup failure).
+     * </ul>
+     */
+    public FrsDb dbOpenWithOptions(
+            Arena arena,
+            String dbPath,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int maxBackgroundCompactions,
+            int maxBackgroundFlushes,
+            long blockCacheCapacityBytes,
+            long writeBufferManagerCapacityBytes) {
+        MemorySegment optsSeg = arena.allocate(FRS_ENGINE_OPTIONS_LAYOUT);
+
+        MemorySegment pathSeg =
+                (dbPath == null || dbPath.isEmpty())
+                        ? MemorySegment.NULL
+                        : allocateCString(arena, dbPath);
+        // Field offsets: 0, 8, 16, 20, 24, 28(pad), 32, 40 — see
+        // FRS_ENGINE_OPTIONS_LAYOUT docstring.
+        optsSeg.set(ValueLayout.ADDRESS, 0, pathSeg);
+        optsSeg.set(ValueLayout.JAVA_LONG, 8, writeBufferSize);
+        optsSeg.set(ValueLayout.JAVA_INT, 16, maxWriteBufferNumber);
+        optsSeg.set(ValueLayout.JAVA_INT, 20, maxBackgroundCompactions);
+        optsSeg.set(ValueLayout.JAVA_INT, 24, maxBackgroundFlushes);
+        // 4 bytes padding at offset 28
+        optsSeg.set(ValueLayout.JAVA_LONG, 32, blockCacheCapacityBytes);
+        optsSeg.set(ValueLayout.JAVA_LONG, 40, writeBufferManagerCapacityBytes);
+
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsDbOpenWithOptions.invokeExact(optsSeg, outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_open_with_options threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_with_options");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    /**
+     * Returns the configured WriteBufferManager capacity in bytes (B-Prod-P7, spec §6d). {@code 0}
+     * means unbounded (the engine has no cross-CF cap). Useful for tuning ITs that want to verify
+     * their requested cap round-tripped through FFI.
+     */
+    public long dbWriteBufferManagerCapacity(FrsDb db) {
+        try {
+            return (long) frsDbWbmCapacity.invokeExact(db.handle());
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_write_buffer_manager_capacity threw: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Returns the running cross-CF memtable bytes tracked by the WriteBufferManager (B-Prod-P7,
+     * spec §6d). Used by ITs to assert the cap actually fires under load.
+     */
+    public long dbWriteBufferManagerCurrentBytes(FrsDb db) {
+        try {
+            return (long) frsDbWbmCurrentBytes.invokeExact(db.handle());
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_write_buffer_manager_current_bytes threw: " + t.getMessage());
+        }
     }
 
     /**
