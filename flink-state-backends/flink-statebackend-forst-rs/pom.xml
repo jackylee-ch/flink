@@ -111,6 +111,30 @@ under the License.
 			<scope>test</scope>
 		</dependency>
 
+		<!--
+			B-Prod-followup-LittleE2E: sibling state-backend modules whose SPI
+			factories the perf bench runs against. Pulled in at test scope so
+			LittleE2EPerfBench can drive `org.apache.flink.contrib.streaming.state.
+			EmbeddedRocksDBStateBackendFactory` and
+			`org.apache.flink.state.forst.ForStStateBackendFactory` (which itself
+			transitively pulls in org.forst:forstjni containing org.forstdb.*).
+			Without these, the bench's `forst` and `forst-via-libforst_rs_ffi`
+			variants fail with NoClassDefFoundError: org/forstdb/TickerType (run
+			25689814526 on 2026-05-11).
+		-->
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-statebackend-rocksdb</artifactId>
+			<version>${project.version}</version>
+			<scope>test</scope>
+		</dependency>
+		<dependency>
+			<groupId>org.apache.flink</groupId>
+			<artifactId>flink-statebackend-forst</artifactId>
+			<version>${project.version}</version>
+			<scope>test</scope>
+		</dependency>
+
 		<dependency>
 			<groupId>org.apache.flink</groupId>
 			<artifactId>flink-streaming-java</artifactId>
