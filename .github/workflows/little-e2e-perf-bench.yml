@@ -27,6 +27,7 @@ on:
     paths:
       - 'flink-state-backends/flink-statebackend-forst-rs/src/test/java/org/apache/flink/state/forstrs/perf/**'
       - 'flink-state-backends/flink-statebackend-forst-rs/run-little-e2e-perf.sh'
+      - 'flink-state-backends/flink-statebackend-forst-rs/pom.xml'
       - '.github/workflows/little-e2e-perf-bench.yml'
   workflow_dispatch:
     inputs:
