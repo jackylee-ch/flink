@@ -169,6 +169,15 @@ public final class ForStRsLinker {
     private final MethodHandle frsCfExport;
     private final MethodHandle frsDbCreateCfFromImport;
 
+    // --- 9b. drop_cf + ingest_external_sst (B-Prod-followup-5, spec §6g) ---
+    // Native fast-path import: hardlink pre-built SSTs into L0 in
+    // O(file-count) rather than scan + replay-put in O(key-count). The
+    // drop_cf companion lets callers reclaim a CF name before re-importing
+    // under it (the legacy migration path required a fresh name because
+    // `drop_cf` did not exist).
+    private final MethodHandle frsDbDropCf;
+    private final MethodHandle frsDbIngestExternalSst;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -565,6 +574,27 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // name (c_char*)
                                 ValueLayout.ADDRESS, // import_dir (c_char*)
                                 ValueLayout.ADDRESS)); // out_cf
+
+        // 9b. drop_cf + ingest_external_sst (B-Prod-followup-5).
+        // See crates/forst-rs-ffi/src/lib.rs::frs_db_drop_cf and
+        // crates/forst-rs-ffi/src/lib.rs::frs_db_ingest_external_sst.
+        this.frsDbDropCf =
+                bind(
+                        "frs_db_drop_cf",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS)); // cf
+
+        this.frsDbIngestExternalSst =
+                bind(
+                        "frs_db_ingest_external_sst",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // sst_paths (const char**)
+                                ValueLayout.JAVA_LONG)); // count (usize → JAVA_LONG)
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -1680,6 +1710,70 @@ public final class ForStRsLinker {
      * @throws FrsBackendException if the blob is missing, the magic header doesn't match, the CF
      *     name is already in use, or the underlying replay puts fail
      */
+    /**
+     * Drops a column family (B-Prod-followup-5, spec §6g).
+     *
+     * <p>Removes the CF from the engine's CF maps and flips its shared {@code dropped} flag.
+     * Subsequent native operations on the {@link FrsCfHandle} return {@code INVALID_ARGUMENT}.
+     * Idempotent on an already-dropped CF (returns OK); rejects the default CF.
+     *
+     * <p>Note: this method does NOT close the Java {@link FrsCfHandle}. The caller is still
+     * responsible for {@code cf.close()} to free the FFM allocation.
+     *
+     * @throws FrsBackendException if the native call returns a non-OK status (default CF dropped,
+     *     unknown handle, …)
+     */
+    public void dbDropCf(FrsDb db, FrsCfHandle cf) {
+        int rc;
+        try {
+            rc = (int) frsDbDropCf.invokeExact(db.handle(), cf.handle());
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_db_drop_cf threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_drop_cf");
+    }
+
+    /**
+     * Ingests pre-built SST files into the engine's L0 (B-Prod-followup-5, spec §6g).
+     *
+     * <p>Each path is hardlinked (or copied cross-FS) into the engine's SST directory, then
+     * registered at L0 via a single atomic version edit. See {@code
+     * crates/forst-rs-engine/src/db.rs::ingest_external_sst} for the caller contract (source-SST
+     * compatibility, key-range overlap rules, CF visibility caveats).
+     *
+     * <p>An empty {@code sstPaths} array is a no-op (returns OK).
+     *
+     * @throws FrsBackendException if any hardlink+copy fails, the SST cannot be parsed, or the
+     *     engine rejects the CF handle.
+     */
+    public void dbIngestExternalSst(FrsDb db, FrsCfHandle cf, java.util.List<String> sstPaths) {
+        if (sstPaths == null || sstPaths.isEmpty()) {
+            // Engine treats empty input as a no-op; mirror that here so
+            // callers don't have to special-case.
+            return;
+        }
+        try (Arena local = Arena.ofConfined()) {
+            int n = sstPaths.size();
+            // Allocate n C-string slots + an n-slot pointer array.
+            MemorySegment pathsArray = local.allocate(ValueLayout.ADDRESS, n);
+            for (int i = 0; i < n; i++) {
+                MemorySegment cstr = allocateCString(local, sstPaths.get(i));
+                pathsArray.setAtIndex(ValueLayout.ADDRESS, i, cstr);
+            }
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsDbIngestExternalSst.invokeExact(
+                                        db.handle(), cf.handle(), pathsArray, (long) n);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_db_ingest_external_sst threw: " + t.getMessage());
+            }
+            check(rc, "frs_db_ingest_external_sst");
+        }
+    }
+
     public FrsCfHandle dbCreateCfFromImport(FrsDb db, Arena arena, String name, String importDir) {
         MemorySegment outCf = arena.allocate(ValueLayout.ADDRESS);
         try (Arena local = Arena.ofConfined()) {

@@ -235,4 +235,107 @@ class ForStRsStateMigrationTest {
     void blobNameConstantMatchesEngine() {
         assertEquals("EXPORT.frsblob", ForStRsStateMigration.EXPORT_BLOB_NAME);
     }
+
+    // ----- B-Prod-followup-5: drop_cf + same-name import round trip -----
+
+    /**
+     * Drop-then-create round trip: dropping a CF flips its handle and allows a same-name create.
+     * This is the Flink-side counterpart to the engine-level
+     * {@code drop_cf_ingest_it::drop_cf_round_trip} test.
+     */
+    @Test
+    void dropColumnFamilyAllowsSameNameRecreate() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena)) {
+                String name = "drop-then-recreate";
+                FrsCfHandle cf1 = linker.dbCreateCf(db, arena, name);
+                linker.put(
+                        db,
+                        cf1,
+                        "k".getBytes(StandardCharsets.UTF_8),
+                        "v".getBytes(StandardCharsets.UTF_8));
+
+                // Drop the CF — subsequent ops on cf1 must fail.
+                ForStRsStateMigration.dropColumnFamily(db, cf1);
+                assertThrows(
+                        FrsBackendException.class,
+                        () ->
+                                linker.put(
+                                        db,
+                                        cf1,
+                                        "k2".getBytes(StandardCharsets.UTF_8),
+                                        "v2".getBytes(StandardCharsets.UTF_8)));
+                cf1.close();
+
+                // Same-name create now succeeds.
+                try (FrsCfHandle cf2 = linker.dbCreateCf(db, arena, name)) {
+                    linker.put(
+                            db,
+                            cf2,
+                            "k3".getBytes(StandardCharsets.UTF_8),
+                            "v3".getBytes(StandardCharsets.UTF_8));
+                    assertArrayEquals(
+                            "v3".getBytes(StandardCharsets.UTF_8),
+                            linker.get(db, cf2, "k3".getBytes(StandardCharsets.UTF_8)));
+                }
+            }
+        }
+    }
+
+    /** Idempotent: dropping an already-dropped CF returns silently. */
+    @Test
+    void dropColumnFamilyIsIdempotent() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbCreateCf(db, arena, "idempotent")) {
+                ForStRsStateMigration.dropColumnFamily(db, cf);
+                ForStRsStateMigration.dropColumnFamily(db, cf); // second drop = no-op
+            }
+        }
+    }
+
+    /** Dropping the default CF must surface as a backend exception. */
+    @Test
+    void dropDefaultColumnFamilyFails() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle defaultCf = linker.dbDefaultCf(db, arena)) {
+                assertThrows(
+                        FrsBackendException.class,
+                        () -> ForStRsStateMigration.dropColumnFamily(db, defaultCf));
+            }
+        }
+    }
+
+    /**
+     * Null contract for the new fast-path entry points. Empty {@code sstPaths} is allowed (engine
+     * treats it as a no-op).
+     */
+    @Test
+    void newApisNullContract() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                assertThrows(
+                        NullPointerException.class,
+                        () -> ForStRsStateMigration.dropColumnFamily(null, cf));
+                assertThrows(
+                        NullPointerException.class,
+                        () -> ForStRsStateMigration.dropColumnFamily(db, null));
+                assertThrows(
+                        NullPointerException.class,
+                        () -> ForStRsStateMigration.ingestExternalSst(null, cf, null));
+                assertThrows(
+                        NullPointerException.class,
+                        () -> ForStRsStateMigration.ingestExternalSst(db, null, null));
+                // Null / empty sstPaths is a no-op rather than a throw.
+                ForStRsStateMigration.ingestExternalSst(db, cf, null);
+                ForStRsStateMigration.ingestExternalSst(db, cf, java.util.Collections.emptyList());
+            }
+        }
+    }
 }

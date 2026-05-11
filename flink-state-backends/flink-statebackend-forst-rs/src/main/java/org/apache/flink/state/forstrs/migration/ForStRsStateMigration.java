@@ -126,4 +126,64 @@ public final class ForStRsStateMigration {
         Path absoluteDir = importDir.toAbsolutePath();
         return db.linker().dbCreateCfFromImport(db, arena, newCfName, absoluteDir.toString());
     }
+
+    /**
+     * Drops a column family by handle (B-Prod-followup-5, spec §6g).
+     *
+     * <p>After this call returns, the CF is unusable from any handle held against it (subsequent
+     * native operations fail with {@code INVALID_ARGUMENT}). The {@link FrsCfHandle} itself is NOT
+     * closed — callers are still responsible for {@code cf.close()} to release the FFM allocation.
+     *
+     * <p>Combined with {@link #createColumnFamilyFromImport}, this enables same-CF-name migration:
+     * drop the old CF, then re-import under the same name. Idempotent on an already-dropped CF
+     * (returns silently); rejects the default CF with {@code INVALID_ARGUMENT}.
+     *
+     * @param db open ForSt-RS database (must outlive this call)
+     * @param cf column-family handle to drop (any clone of the handle observes the drop)
+     * @throws NullPointerException if any argument is null
+     * @throws org.apache.flink.state.forstrs.FrsBackendException if the native call returns a
+     *     non-OK status (e.g. caller attempted to drop the default CF)
+     */
+    public static void dropColumnFamily(FrsDb db, FrsCfHandle cf) {
+        Objects.requireNonNull(db, "db");
+        Objects.requireNonNull(cf, "cf");
+        db.linker().dbDropCf(db, cf);
+    }
+
+    /**
+     * Ingests pre-built SST files into the engine's L0 layer under {@code cf}
+     * (B-Prod-followup-5, spec §6g).
+     *
+     * <p>This is the fast-path counterpart to {@link #createColumnFamilyFromImport}: instead of
+     * scanning every entry in the source CF and replaying via {@code put} (O(key-count)), the
+     * engine hardlinks (or copies cross-FS) the source SSTs into its own SST directory and
+     * registers them at L0 via a single atomic version edit (O(file-count)). See {@code
+     * crates/forst-rs-engine/src/db.rs::ingest_external_sst} for the caller contract — in
+     * particular, the source SSTs MUST be readable by ForSt-RS's SST reader and the key ranges
+     * SHOULD NOT overlap with non-L0 keys already present in the target.
+     *
+     * <p>Passing an empty or null {@code sstPaths} is a no-op.
+     *
+     * @param db destination ForSt-RS database (must outlive this call)
+     * @param cf destination CF handle (must outlive this call)
+     * @param sstPaths absolute paths to source SST files (each must exist for the duration of the
+     *     call; the engine takes no ownership)
+     * @throws NullPointerException if {@code db} or {@code cf} is null
+     * @throws org.apache.flink.state.forstrs.FrsBackendException if hardlink+copy fails, an SST
+     *     cannot be parsed, or the engine rejects the CF handle
+     */
+    public static void ingestExternalSst(
+            FrsDb db, FrsCfHandle cf, java.util.List<Path> sstPaths) {
+        Objects.requireNonNull(db, "db");
+        Objects.requireNonNull(cf, "cf");
+        if (sstPaths == null || sstPaths.isEmpty()) {
+            return;
+        }
+        java.util.List<String> abs = new java.util.ArrayList<>(sstPaths.size());
+        for (Path p : sstPaths) {
+            Objects.requireNonNull(p, "sstPaths element");
+            abs.add(p.toAbsolutePath().toString());
+        }
+        db.linker().dbIngestExternalSst(db, cf, abs);
+    }
 }
