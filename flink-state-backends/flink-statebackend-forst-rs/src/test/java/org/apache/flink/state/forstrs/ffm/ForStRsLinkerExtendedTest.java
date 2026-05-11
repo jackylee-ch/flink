@@ -332,4 +332,63 @@ class ForStRsLinkerExtendedTest {
             }
         }
     }
+
+    /**
+     * MVCC end-to-end across the FFM hop: write v1 → snapshot → write v2; getAt(snap, k) sees v1
+     * while normal get sees v2. Covers Task 2.6 (linker bindings for getAt) plus the snapshot
+     * lifetime contract in {@link FrsSnapshot}.
+     */
+    @Test
+    void snapshotIsolationAcrossFfmHop() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[] key = utf8("k");
+                linker.put(db, cf, key, utf8("v1"));
+
+                try (FrsSnapshot snap = linker.dbSnapshot(db, arena)) {
+                    // Write v2 AFTER the snapshot — normal get sees v2.
+                    linker.put(db, cf, key, utf8("v2"));
+                    assertArrayEquals(utf8("v2"), linker.get(db, cf, key));
+
+                    // getAt at the captured snapshot still sees v1.
+                    assertArrayEquals(utf8("v1"), linker.getAt(db, cf, snap, key));
+                }
+            }
+        }
+    }
+
+    /**
+     * iteratorOpenAt across the FFM hop: 3 keys before snapshot + 1 after. The snapshot iterator
+     * must yield exactly the 3 pre-snapshot keys (post-snapshot key filtered by snapshot.seq).
+     */
+    @Test
+    void iteratorOpenAtFiltersBySnapshotSeq() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                linker.put(db, cf, utf8("a"), utf8("1"));
+                linker.put(db, cf, utf8("b"), utf8("2"));
+                linker.put(db, cf, utf8("c"), utf8("3"));
+
+                try (FrsSnapshot snap = linker.dbSnapshot(db, arena)) {
+                    // Add post-snapshot key — must NOT appear in the iter.
+                    linker.put(db, cf, utf8("d"), utf8("4"));
+
+                    try (FrsIterator iter = linker.iteratorOpenAt(db, cf, snap, arena)) {
+                        List<String> keys = new ArrayList<>();
+                        IteratorEntry entry;
+                        while ((entry = linker.iteratorNext(iter)) != null) {
+                            keys.add(new String(entry.key(), StandardCharsets.UTF_8));
+                        }
+                        assertEquals(List.of("a", "b", "c"), keys);
+                    }
+                }
+            }
+        }
+    }
 }
