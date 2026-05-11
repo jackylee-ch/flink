@@ -75,6 +75,7 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbOpenMemory;
     private final MethodHandle frsDbOpenMemoryTuned;
     private final MethodHandle frsDbOpenFromCheckpoint;
+    private final MethodHandle frsDbOpenRemote;
     private final MethodHandle frsDbClose;
 
     // --- 2. CF management ---
@@ -177,6 +178,20 @@ public final class ForStRsLinker {
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
                                 ValueLayout.ADDRESS, // target_dir (c_char*)
+                                ValueLayout.ADDRESS)); // out_handle
+
+        // B-Prod-P6: open the engine on top of an OpenDAL URI with a local
+        // LRU cache. JSON config is a flat string-to-string object; pass
+        // "{}" or NULL when the URI scheme needs no extra config.
+        this.frsDbOpenRemote =
+                bind(
+                        "frs_db_open_remote",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // uri (c_char*)
+                                ValueLayout.ADDRESS, // opendal_config_json (c_char*)
+                                ValueLayout.ADDRESS, // cache_dir (c_char*)
+                                ValueLayout.JAVA_LONG, // cache_capacity_bytes (u64)
                                 ValueLayout.ADDRESS)); // out_handle
 
         this.frsDbClose =
@@ -578,6 +593,45 @@ public final class ForStRsLinker {
             throw new FrsBackendException(FrsStatus.PANIC, "frs_db_open threw: " + t.getMessage());
         }
         check(rc, "frs_db_open");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    /**
+     * Opens a remote-storage-backed engine with a local LRU SST cache (B-Prod-P6).
+     *
+     * <p>{@code uri} is an OpenDAL URI such as {@code memory://}, {@code file:///abs/path}, or
+     * {@code s3://bucket/}. {@code opendalConfigJson} carries any scheme-specific knobs (e.g.
+     * {@code {"region":"us-east-1","endpoint":"https://minio.example.com"}}); pass {@code "{}"} or
+     * {@code null} when none are needed. {@code cacheDir} is the local directory used for the LRU
+     * SST cache; {@code cacheCapacityBytes} caps its on-disk footprint.
+     *
+     * <p>Caller closes via {@link FrsDb#close()}.
+     */
+    public FrsDb dbOpenRemote(
+            Arena arena,
+            String uri,
+            String opendalConfigJson,
+            String cacheDir,
+            long cacheCapacityBytes) {
+        MemorySegment uriSeg = allocateCString(arena, uri);
+        MemorySegment cfgSeg =
+                opendalConfigJson == null
+                        ? MemorySegment.NULL
+                        : allocateCString(arena, opendalConfigJson);
+        MemorySegment cacheDirSeg = allocateCString(arena, cacheDir);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDbOpenRemote.invokeExact(
+                                    uriSeg, cfgSeg, cacheDirSeg, cacheCapacityBytes, outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_open_remote threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_remote");
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
     }
@@ -1185,8 +1239,7 @@ public final class ForStRsLinker {
                                     db.handle(), cf.handle(), ttlMs, stateType, timestampOffset);
         } catch (Throwable t) {
             throw new FrsBackendException(
-                    FrsStatus.PANIC,
-                    "frs_cf_set_compaction_filter_ttl threw: " + t.getMessage());
+                    FrsStatus.PANIC, "frs_cf_set_compaction_filter_ttl threw: " + t.getMessage());
         }
         check(rc, "frs_cf_set_compaction_filter_ttl");
     }
@@ -1289,9 +1342,9 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Opens a forward iterator that yields the latest version of each user-key with {@code seq &lt;=
-     * snapshot.seq}. Drive it with {@link #iteratorNext(FrsIterator)} and release with
-     * {@link FrsIterator#close()} (uses the standard non-prefix close path).
+     * Opens a forward iterator that yields the latest version of each user-key with {@code seq
+     * &lt;= snapshot.seq}. Drive it with {@link #iteratorNext(FrsIterator)} and release with {@link
+     * FrsIterator#close()} (uses the standard non-prefix close path).
      */
     public FrsIterator iteratorOpenAt(FrsDb db, FrsCfHandle cf, FrsSnapshot snapshot, Arena arena) {
         MemorySegment outIter = arena.allocate(ValueLayout.ADDRESS);

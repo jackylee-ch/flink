@@ -19,11 +19,10 @@
 package org.forstdb;
 
 /**
- * Mirrors the {@code org.forstdb.RocksDBException} class that the JNI shim
- * throws via {@code env.throw_new(...)}. We declare it as a {@link
- * RuntimeException} subclass so call-sites do not need to mark themselves
- * {@code throws} — handy for a JMH benchmark where checked-exception ceremony
- * would clutter the hot path.
+ * Mirrors the {@code org.forstdb.RocksDBException} class that the JNI shim throws via {@code
+ * env.throw_new(...)}. We declare it as a {@link RuntimeException} subclass so call-sites do not
+ * need to mark themselves {@code throws} — handy for a JMH benchmark where checked-exception
+ * ceremony would clutter the hot path.
  */
 public class RocksDBException extends RuntimeException {
     private static final long serialVersionUID = 1L;

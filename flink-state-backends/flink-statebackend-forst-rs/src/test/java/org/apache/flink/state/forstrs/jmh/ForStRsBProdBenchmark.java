@@ -29,7 +29,6 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
-import java.lang.foreign.ValueLayout;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -49,8 +48,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code dbSnapshot()} P99 &lt; 100µs under 100 concurrent in-flight snapshots.
  *   <li>Sync-phase (snapshot + {@code createIncrementalCheckpointAt}) P95 &lt; 1ms under the same
  *       100-snapshot in-flight pressure.
- *   <li>Single-CF vs per-state-CF (CfMode comparison) point-lookup + write throughput at
- *       {@code state.size = 1 GiB} (or whatever {@code -Dbench.preload.entries} caps the test at).
+ *   <li>Single-CF vs per-state-CF (CfMode comparison) point-lookup + write throughput at {@code
+ *       state.size = 1 GiB} (or whatever {@code -Dbench.preload.entries} caps the test at).
  * </ul>
  *
  * <h2>Why a {@code @Test} and not a JMH {@code @Benchmark}</h2>
@@ -58,15 +57,15 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>The flink-statebackend-forst-rs module has JMH on the test classpath (jmh-core 1.37) but does
  * not wire the JMH maven plugin. Existing peer benches ({@link ForStRsFfmBenchmark}, {@link
  * ForStCompareBenchmark}) follow the "plain {@code main()} driven by surefire" pattern. We follow
- * the JUnit variant of that pattern so the bench can be invoked as
- * {@code -Dtest=ForStRsBProdBenchmark} and inherits the surefire JVM args (the {@code
+ * the JUnit variant of that pattern so the bench can be invoked as {@code
+ * -Dtest=ForStRsBProdBenchmark} and inherits the surefire JVM args (the {@code
  * --enable-native-access=ALL-UNNAMED} the FFM API requires).
  *
  * <p>Each {@code @Test} method runs {@code OPS} timed iterations (default 50_000), records every
  * sample's nanosecond latency into a {@code long[]}, sorts, and prints P50 / P95 / P99 / max plus
- * the spec acceptance pass/fail line. Tests are tagged {@code @Tag("bench")} so a normal
- * {@code mvn test} run can exclude them via {@code -DexcludedGroups=bench}; the recommended
- * invocation is the explicit {@code -Dtest=} filter.
+ * the spec acceptance pass/fail line. Tests are tagged {@code @Tag("bench")} so a normal {@code mvn
+ * test} run can exclude them via {@code -DexcludedGroups=bench}; the recommended invocation is the
+ * explicit {@code -Dtest=} filter.
  *
  * <h2>"100 concurrent in-flight snapshots"</h2>
  *
@@ -114,6 +113,7 @@ public class ForStRsBProdBenchmark {
     private static final int DEFAULT_INFLIGHT_SNAPSHOTS = 100;
     private static final int DEFAULT_MEASURE_OPS = 50_000;
     private static final int DEFAULT_WARMUP_OPS = 5_000;
+
     /** Number of CFs in the per-state-CF mode (matches a typical 4-state Flink job). */
     private static final int PER_STATE_CF_COUNT = 4;
 
@@ -152,13 +152,7 @@ public class ForStRsBProdBenchmark {
         long max = sorted[sorted.length - 1];
         System.out.printf(
                 "[%s] n=%,d  p50=%.3fµs  p95=%.3fµs  p99=%.3fµs  p99.9=%.3fµs  max=%.3fµs%n",
-                label,
-                sorted.length,
-                p50 / 1e3,
-                p95 / 1e3,
-                p99 / 1e3,
-                p999 / 1e3,
-                max / 1e3);
+                label, sorted.length, p50 / 1e3, p95 / 1e3, p99 / 1e3, p999 / 1e3, max / 1e3);
     }
 
     /**
@@ -178,10 +172,7 @@ public class ForStRsBProdBenchmark {
         long elapsed = System.nanoTime() - start;
         System.out.printf(
                 "[setup] preloaded %,d entries (%,d-byte values, ~%.1f MiB) in %.2f s%n",
-                preload,
-                valueBytes,
-                preload * (long) valueBytes / 1048576.0,
-                elapsed / 1e9);
+                preload, valueBytes, preload * (long) valueBytes / 1048576.0, elapsed / 1e9);
     }
 
     // ------------------------------------------------------------------
@@ -215,8 +206,7 @@ public class ForStRsBProdBenchmark {
                     ring.add(linker.dbSnapshot(db, arena));
                 }
                 System.out.printf(
-                        "[setup] pre-captured %d in-flight snapshots; entering warmup%n",
-                        inflight);
+                        "[setup] pre-captured %d in-flight snapshots; entering warmup%n", inflight);
 
                 // ---- Warmup ----
                 for (int i = 0; i < warmupOps; i++) {
@@ -259,10 +249,10 @@ public class ForStRsBProdBenchmark {
     }
 
     /**
-     * Spec §16 acceptance: sync-phase (snapshot + {@code createIncrementalCheckpointAt}) P95
-     * &lt; 1ms under 100 concurrent in-flight snapshots. We measure the full sync-phase critical
-     * section of {@link org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy} — the part
-     * that runs on the task thread and must not stall barrier propagation.
+     * Spec §16 acceptance: sync-phase (snapshot + {@code createIncrementalCheckpointAt}) P95 &lt;
+     * 1ms under 100 concurrent in-flight snapshots. We measure the full sync-phase critical section
+     * of {@link org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy} — the part that runs
+     * on the task thread and must not stall barrier propagation.
      *
      * <p>Each iteration:
      *
@@ -299,8 +289,7 @@ public class ForStRsBProdBenchmark {
                     ring.add(linker.dbSnapshot(db, arena));
                 }
                 System.out.printf(
-                        "[setup] pre-captured %d in-flight snapshots; entering warmup%n",
-                        inflight);
+                        "[setup] pre-captured %d in-flight snapshots; entering warmup%n", inflight);
 
                 AtomicLong ckptIdCounter = new AtomicLong(1L);
                 MemorySegment resultBuf = arena.allocate(32L);
@@ -353,8 +342,8 @@ public class ForStRsBProdBenchmark {
     /**
      * Stress variant that drives {@code dbSnapshot} from {@link #DEFAULT_INFLIGHT_SNAPSHOTS} JVM
      * threads concurrently — an alternative interpretation of "100 concurrent in-flight" that
-     * captures lock-contention overhead as well as registry-size cost. Each thread runs
-     * {@code measureOps / threadCount} captures with try-with-resources release; the bench reports
+     * captures lock-contention overhead as well as registry-size cost. Each thread runs {@code
+     * measureOps / threadCount} captures with try-with-resources release; the bench reports
      * aggregate throughput plus per-iteration percentile across the merged sample stream.
      */
     @Test
@@ -427,10 +416,10 @@ public class ForStRsBProdBenchmark {
 
     /**
      * Single-CF point-lookup throughput: all preloaded keys live in one CF; the lookup workload
-     * touches a uniformly-random subset (modulo {@code preloadEntries}). The companion
-     * {@link #cfModePerStatePointLookup()} runs the same total number of lookups but spread across
-     * {@link #PER_STATE_CF_COUNT} CFs. Aggregated, the two report the throughput delta the spec
-     * §16 acceptance bar wants: single-CF should win on point-lookup at the per-CF metadata cost,
+     * touches a uniformly-random subset (modulo {@code preloadEntries}). The companion {@link
+     * #cfModePerStatePointLookup()} runs the same total number of lookups but spread across {@link
+     * #PER_STATE_CF_COUNT} CFs. Aggregated, the two report the throughput delta the spec §16
+     * acceptance bar wants: single-CF should win on point-lookup at the per-CF metadata cost,
      * per-state-CF wins when state classes have wildly different working sets.
      */
     @Test
@@ -571,10 +560,7 @@ public class ForStRsBProdBenchmark {
                 long t0 = System.nanoTime();
                 for (int i = 0; i < measureOps; i++) {
                     linker.put(
-                            db,
-                            cf,
-                            keyOf(preloadEntries + warmupOps + i),
-                            valueOf(i, valueBytes));
+                            db, cf, keyOf(preloadEntries + warmupOps + i), valueOf(i, valueBytes));
                 }
                 long elapsed = System.nanoTime() - t0;
 

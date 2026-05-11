@@ -46,7 +46,8 @@ class ForStRsValueStateTest {
 
                 byte[] keyPrefix = "state-id-1".getBytes(StandardCharsets.UTF_8);
                 ForStRsValueState<String> state =
-                        new ForStRsValueState<>(linker, db, cf, keyPrefix, StringSerializer.INSTANCE);
+                        new ForStRsValueState<>(
+                                linker, db, cf, keyPrefix, StringSerializer.INSTANCE);
 
                 // Initially absent.
                 assertNull(state.value());

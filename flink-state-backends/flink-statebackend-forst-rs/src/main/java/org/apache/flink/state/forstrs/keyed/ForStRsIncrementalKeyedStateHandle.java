@@ -45,19 +45,19 @@ import java.util.stream.Stream;
  * <ul>
  *   <li>a {@code privateState} list — the per-checkpoint manifest blob and any other
  *       single-checkpoint artefacts that don't participate in cross-checkpoint sharing,
- *   <li>a {@code baseCheckpointId} — the previous checkpoint this incremental was taken against
- *       (0 for a full / first checkpoint), and
- *   <li>a {@code cfMap} — column family name → column family identifier on the engine side, used
- *       by restore to recreate matching CF handles in the right order.
+ *   <li>a {@code baseCheckpointId} — the previous checkpoint this incremental was taken against (0
+ *       for a full / first checkpoint), and
+ *   <li>a {@code cfMap} — column family name → column family identifier on the engine side, used by
+ *       restore to recreate matching CF handles in the right order.
  * </ul>
  *
  * <p>The "many-method" surface of {@link
  * org.apache.flink.runtime.state.IncrementalKeyedStateHandle} (and its supertype {@link
  * org.apache.flink.runtime.state.CompositeStateHandle}) is satisfied by inheriting from
  * AbstractIncrementalStateHandle for {@link #getBackendIdentifier()}, {@link #getKeyGroupRange()},
- * {@link #getSharedStateHandles()}, {@link #getMetaDataStateHandle()}, {@link
- * #getStateHandleId()}, {@link #getCheckpointId()}, and {@link #getIntersection(KeyGroupRange)};
- * we add the remaining abstract methods from {@link StateObject} and {@link
+ * {@link #getSharedStateHandles()}, {@link #getMetaDataStateHandle()}, {@link #getStateHandleId()},
+ * {@link #getCheckpointId()}, and {@link #getIntersection(KeyGroupRange)}; we add the remaining
+ * abstract methods from {@link StateObject} and {@link
  * org.apache.flink.runtime.state.CompositeStateHandle} below.
  */
 @Internal
@@ -253,7 +253,6 @@ public class ForStRsIncrementalKeyedStateHandle extends AbstractIncrementalState
     // -- Note: getIntersection is inherited from AbstractIncrementalStateHandle, which already
     // restricts to the exact-range case until rescaling lands in P4. We do NOT override it.
 
-
     /**
      * {@link CheckpointBoundKeyedStateHandle#rebound(long)} — returns a copy with the new
      * checkpoint id (used by Flink's checkpoint subsumption when a checkpoint is repurposed).
@@ -274,5 +273,4 @@ public class ForStRsIncrementalKeyedStateHandle extends AbstractIncrementalState
                 persistedSizeOfThisCheckpoint,
                 getStateHandleId());
     }
-
 }

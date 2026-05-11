@@ -59,28 +59,29 @@ import java.util.function.Function;
  * methods (snapshot strategies, key-group iteration, savepoint resources, priority-queue factory,
  * applyToAllKeys, …) that depend on substantial Flink-runtime plumbing not yet wired in this
  * Phase-D L5 stepping stone. The follow-up units that turn this into a fully Flink-integrated
- * backend are tracked as Phase-D L5 (sync v1) and Phase-D L6 (rescaling + checkpoints) per
- * {@code docs/superpowers/planning/v3.2/reports/B1_pr_split_plan.md}.
+ * backend are tracked as Phase-D L5 (sync v1) and Phase-D L6 (rescaling + checkpoints) per {@code
+ * docs/superpowers/planning/v3.2/reports/B1_pr_split_plan.md}.
  *
  * <p><b>Key model.</b> Flink's keyed-state model is a function {@code (currentKey, stateId,
- * userKey?) → value}; the state-object hides the user-side {@code userKey} (e.g.
- * {@code MapState.put(uk, uv)}). This backend maps that to a single ForSt key namespace by
- * concatenating:
+ * userKey?) → value}; the state-object hides the user-side {@code userKey} (e.g. {@code
+ * MapState.put(uk, uv)}). This backend maps that to a single ForSt key namespace by concatenating:
+ *
  * <pre>
  *   forstKey = "k/" || serialize(currentKey) || "/" || stateName.bytes(UTF-8) || "/" [|| serialize(uk)]
  * </pre>
- * The trailing user-key segment is handled inside {@link ForStRsMapState}; the per-state-name
+ *
+ * <p>The trailing user-key segment is handled inside {@link ForStRsMapState}; the per-state-name
  * prefix produced here is what the value/list/reducing/aggregating constructors receive as their
  * {@code keyPrefix}.
  *
- * <p><b>Lifetime.</b> The backend owns the {@link Arena}, {@link ForStRsLinker}, {@link FrsDb}
- * and default {@link FrsCfHandle}; {@link #close()} releases all of them in reverse order. State
+ * <p><b>Lifetime.</b> The backend owns the {@link Arena}, {@link ForStRsLinker}, {@link FrsDb} and
+ * default {@link FrsCfHandle}; {@link #close()} releases all of them in reverse order. State
  * objects returned by the {@code getXxxState} factories must not be used after {@link #close()}.
  *
- * <p><b>State caching.</b> State objects are cached by {@code stateName} so that successive
- * {@code getValueState("counter", …)} calls under the same current key return the same instance —
- * matching Flink's contract that state objects are stateful with respect to the current key. When
- * {@link #setCurrentKey(Object)} is invoked we recompute the per-state-name prefix lazily by
+ * <p><b>State caching.</b> State objects are cached by {@code stateName} so that successive {@code
+ * getValueState("counter", …)} calls under the same current key return the same instance — matching
+ * Flink's contract that state objects are stateful with respect to the current key. When {@link
+ * #setCurrentKey(Object)} is invoked we recompute the per-state-name prefix lazily by
  * <i>recreating</i> the cached state objects for the new key, which is the simplest correct
  * behavior at this stepping-stone level. A future revision will replace the cache with a per-state
  * "rebind to current key" hook to avoid the per-key-switch object churn.
@@ -112,9 +113,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private final DataOutputSerializer keyOutBuffer = new DataOutputSerializer(DEFAULT_KEY_BUFFER);
 
     /**
-     * Cache of currently-bound state objects keyed by {@code stateName}. Cleared on every
-     * {@link #setCurrentKey(Object)} call because the per-state {@code keyPrefix} embeds the
-     * current key.
+     * Cache of currently-bound state objects keyed by {@code stateName}. Cleared on every {@link
+     * #setCurrentKey(Object)} call because the per-state {@code keyPrefix} embeds the current key.
      */
     private final Map<String, Object> stateCache = new HashMap<>();
 
@@ -138,10 +138,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Constructs a backend that may or may not own the supplied resources. When
-     * {@code ownsResources} is {@code false}, {@link #close()} will only release the per-state
-     * cache and leave the linker/db/cf/arena untouched — useful for tests that want to share an
-     * Arena across multiple backends.
+     * Constructs a backend that may or may not own the supplied resources. When {@code
+     * ownsResources} is {@code false}, {@link #close()} will only release the per-state cache and
+     * leave the linker/db/cf/arena untouched — useful for tests that want to share an Arena across
+     * multiple backends.
      */
     public ForStRsKeyedStateBackend(
             Arena arena,
@@ -195,8 +195,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
 
     /**
      * Returns a {@link ForStRsValueState} bound to the current key + supplied state-id. The same
-     * instance is returned for repeated calls with the same {@code stateName} until
-     * {@link #setCurrentKey(Object)} is invoked.
+     * instance is returned for repeated calls with the same {@code stateName} until {@link
+     * #setCurrentKey(Object)} is invoked.
      *
      * @throws IllegalStateException if {@link #setCurrentKey(Object)} has not been called
      */
@@ -235,9 +235,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
 
     /** Returns a {@link ForStRsMapState} bound to the current key + state-id. */
     public <UK, UV> ForStRsMapState<UK, UV> getMapState(
-            String stateName,
-            TypeSerializer<UK> keySer,
-            TypeSerializer<UV> valueSer) {
+            String stateName, TypeSerializer<UK> keySer, TypeSerializer<UV> valueSer) {
         ensureCurrentKey();
         @SuppressWarnings("unchecked")
         ForStRsMapState<UK, UV> existing =
@@ -253,9 +251,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Returns a {@link ForStRsReducingState} bound to the current key + state-id. The
-     * {@code reduceFunction} is captured at first creation; subsequent calls under the same key
-     * return the cached instance and the {@code reduceFunction} argument is ignored.
+     * Returns a {@link ForStRsReducingState} bound to the current key + state-id. The {@code
+     * reduceFunction} is captured at first creation; subsequent calls under the same key return the
+     * cached instance and the {@code reduceFunction} argument is ignored.
      */
     public <T> ForStRsReducingState<T> getReducingState(
             String stateName,
@@ -277,9 +275,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Returns a {@link ForStRsAggregatingState} bound to the current key + state-id. The
-     * {@code aggregateFunction} is captured at first creation; subsequent calls under the same
-     * key return the cached instance.
+     * Returns a {@link ForStRsAggregatingState} bound to the current key + state-id. The {@code
+     * aggregateFunction} is captured at first creation; subsequent calls under the same key return
+     * the cached instance.
      */
     public <IN, ACC, OUT> ForStRsAggregatingState<IN, ACC, OUT> getAggregatingState(
             String stateName,
@@ -330,9 +328,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * {@code targetDir} (which must not yet exist) and returns the same path.
      *
      * <p>The full Flink {@code snapshot(checkpointId, timestamp, factory, options)} signature on
-     * {@code CheckpointableKeyedStateBackend} returns a {@code RunnableFuture<SnapshotResult>}; that
-     * surface depends on {@code CheckpointStreamFactory} / {@code KeyedStateHandle} plumbing not
-     * wired in this stepping stone. The simplified API here is enough for the snapshot+restore
+     * {@code CheckpointableKeyedStateBackend} returns a {@code RunnableFuture<SnapshotResult>};
+     * that surface depends on {@code CheckpointStreamFactory} / {@code KeyedStateHandle} plumbing
+     * not wired in this stepping stone. The simplified API here is enough for the snapshot+restore
      * round-trip tests and for documenting what the L6 hand-off needs to wrap.
      *
      * @throws IllegalStateException if this backend has already been {@link #close() closed}
@@ -347,9 +345,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
 
     /**
      * Phase-D L5 restore counterpart to {@link #snapshot(Path)}. Opens a fresh {@link FrsDb} from a
-     * checkpoint directory written by {@link #snapshot(Path)} (or any other call to
-     * {@link ForStRsLinker#createCheckpoint(FrsDb, String)}) and returns a new backend instance
-     * pointing at the restored state.
+     * checkpoint directory written by {@link #snapshot(Path)} (or any other call to {@link
+     * ForStRsLinker#createCheckpoint(FrsDb, String)}) and returns a new backend instance pointing
+     * at the restored state.
      *
      * <p>The supplied {@code linker} and {@code arena} are <i>borrowed</i> — they are not closed by
      * the returned backend (which is constructed with {@code ownsResources=false} for the arena +
@@ -361,10 +359,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * directly. Copy the directory beforehand if you need to preserve the original snapshot.
      */
     public static <K> ForStRsKeyedStateBackend<K> restoreFromSnapshot(
-            ForStRsLinker linker,
-            Arena arena,
-            Path snapshotDir,
-            TypeSerializer<K> keySerializer) {
+            ForStRsLinker linker, Arena arena, Path snapshotDir, TypeSerializer<K> keySerializer) {
         FrsDb restored = linker.dbOpenFromCheckpoint(arena, snapshotDir.toString());
         FrsCfHandle cf;
         try {
@@ -379,24 +374,24 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Returns an {@link Iterator} over every distinct key present under the given {@code stateName}.
-     * Iteration order is the underlying ForSt-RS scan order (lexicographic over serialized keys);
-     * callers should not rely on a stable ordering. Each key is materialized lazily by
-     * deserializing the K-bytes embedded in the composite ForSt key.
+     * Returns an {@link Iterator} over every distinct key present under the given {@code
+     * stateName}. Iteration order is the underlying ForSt-RS scan order (lexicographic over
+     * serialized keys); callers should not rely on a stable ordering. Each key is materialized
+     * lazily by deserializing the K-bytes embedded in the composite ForSt key.
      *
-     * <p><b>Decoding.</b> Composite keys produced by this backend follow the layout
-     * {@code "k/" || serialize(K) || "/" || stateName.bytes || "/" [ || serialize(UK) ]}. To recover
-     * K we scan with prefix {@code "k/"} and, for each composite key, locate the tail marker
-     * {@code "/" || stateName.bytes || "/"} after the {@code "k/"} prefix. Everything between
-     * {@code "k/"} (offset 2) and that marker is treated as {@code serialize(K)} and fed back through
-     * {@link TypeSerializer#deserialize}. Map-state entries (which add a user-key suffix) and
+     * <p><b>Decoding.</b> Composite keys produced by this backend follow the layout {@code "k/" ||
+     * serialize(K) || "/" || stateName.bytes || "/" [ || serialize(UK) ]}. To recover K we scan
+     * with prefix {@code "k/"} and, for each composite key, locate the tail marker {@code "/" ||
+     * stateName.bytes || "/"} after the {@code "k/"} prefix. Everything between {@code "k/"}
+     * (offset 2) and that marker is treated as {@code serialize(K)} and fed back through {@link
+     * TypeSerializer#deserialize}. Map-state entries (which add a user-key suffix) and
      * value/list/reducing/aggregating entries (which have no suffix) both yield the same K, and
      * duplicates are filtered via a {@link LinkedHashSet}.
      *
-     * <p><b>Limits.</b> If {@code serialize(K)} can itself contain the byte sequence
-     * {@code "/" || stateName || "/"} the heuristic above could be ambiguous. We bias toward the
-     * <i>last</i> occurrence of the marker so that map-state user-key suffixes never confuse the
-     * boundary. For the typical Flink {@link org.apache.flink.api.common.typeutils.base.StringSerializer}
+     * <p><b>Limits.</b> If {@code serialize(K)} can itself contain the byte sequence {@code "/" ||
+     * stateName || "/"} the heuristic above could be ambiguous. We bias toward the <i>last</i>
+     * occurrence of the marker so that map-state user-key suffixes never confuse the boundary. For
+     * the typical Flink {@link org.apache.flink.api.common.typeutils.base.StringSerializer}
      * (length-prefixed UTF-8) and primitive serializers this is unambiguous.
      */
     public Iterator<K> keys(String stateName) {
@@ -456,11 +451,11 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Convenience over {@link #keys(String)} that, for every key {@code k} present under
-     * {@code stateName}, transiently {@link #setCurrentKey(Object) sets the current key} to
-     * {@code k} and invokes {@code action}. The original current key is restored on completion (or
-     * cleared if none was set). Useful for "scan + apply" use-cases like windowing eviction or
-     * timer-style traversal.
+     * Convenience over {@link #keys(String)} that, for every key {@code k} present under {@code
+     * stateName}, transiently {@link #setCurrentKey(Object) sets the current key} to {@code k} and
+     * invokes {@code action}. The original current key is restored on completion (or cleared if
+     * none was set). Useful for "scan + apply" use-cases like windowing eviction or timer-style
+     * traversal.
      */
     public void applyToAllKeys(String stateName, Function<K, ?> action) {
         if (closed) {
@@ -498,9 +493,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Releases all per-state-cache entries. When this backend was constructed with
-     * {@code ownsResources=true}, also closes (in order) the default CF, the database, and the
-     * Arena that owns the linker's symbol lookup.
+     * Releases all per-state-cache entries. When this backend was constructed with {@code
+     * ownsResources=true}, also closes (in order) the default CF, the database, and the Arena that
+     * owns the linker's symbol lookup.
      */
     @Override
     public void close() throws IOException {
@@ -640,11 +635,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Returns the highest index {@code i >= fromInclusive} such that
-     * {@code data[i .. i+needle.length] == needle}, or {@code -1} when no such index exists. Picking
-     * the last occurrence biases {@link #keys(String)} toward the value/list/map separator that sits
-     * at the end of the K-segment — even if the K-segment itself happens to contain the same byte
-     * pattern.
+     * Returns the highest index {@code i >= fromInclusive} such that {@code data[i ..
+     * i+needle.length] == needle}, or {@code -1} when no such index exists. Picking the last
+     * occurrence biases {@link #keys(String)} toward the value/list/map separator that sits at the
+     * end of the K-segment — even if the K-segment itself happens to contain the same byte pattern.
      */
     private static int findLastSubsequence(byte[] data, int fromInclusive, byte[] needle) {
         if (needle.length == 0 || data.length < needle.length) {
@@ -686,10 +680,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Variant of {@link ForStRsKeyedStateBackend} produced by
-     * {@link #restoreFromSnapshot(ForStRsLinker, Arena, Path, TypeSerializer)}. It owns the
-     * <i>database</i> and the <i>default CF</i> it was constructed with — but not the
-     * arena/linker, which are owned by the caller. This split lets a single arena+linker straddle a
+     * Variant of {@link ForStRsKeyedStateBackend} produced by {@link
+     * #restoreFromSnapshot(ForStRsLinker, Arena, Path, TypeSerializer)}. It owns the
+     * <i>database</i> and the <i>default CF</i> it was constructed with — but not the arena/linker,
+     * which are owned by the caller. This split lets a single arena+linker straddle a
      * snapshot+restore boundary.
      */
     private static final class RestoredForStRsKeyedStateBackend<K>

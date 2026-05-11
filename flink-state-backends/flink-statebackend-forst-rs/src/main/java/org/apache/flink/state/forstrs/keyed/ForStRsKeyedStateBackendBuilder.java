@@ -61,14 +61,59 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
         return this;
     }
 
+    /**
+     * Opens the engine based on {@link ForStRsOptions#storageUri()} (B-Prod-P6).
+     *
+     * <p>If {@code storage.uri} is set, the backend opens via {@link ForStRsLinker#dbOpenRemote} on
+     * the configured OpenDAL URI with a local LRU SST cache rooted at {@link
+     * ForStRsOptions#cacheDir()}. Otherwise it falls back to {@link ForStRsLinker#dbOpen} on {@code
+     * localPath} (the legacy local-FS path).
+     *
+     * <p>The returned {@link FrsDb} is also stored on this builder so subsequent calls to {@link
+     * #buildCfRouter()} pick it up. The matching default CF is opened automatically.
+     */
+    public ForStRsKeyedStateBackendBuilder<K> openDb(String localPath) {
+        FrsDb opened;
+        String uri = options.storageUri();
+        if (uri != null && !uri.isEmpty()) {
+            String cacheDir = options.cacheDir();
+            if (cacheDir == null || cacheDir.isEmpty()) {
+                throw new IllegalArgumentException(
+                        "state.backend.forst-rs.storage.cache-dir must be set when storage.uri is set");
+            }
+            opened =
+                    linker.dbOpenRemote(
+                            arena,
+                            uri,
+                            options.opendalConfigJson(),
+                            cacheDir,
+                            options.cacheCapacityBytes());
+        } else {
+            opened = linker.dbOpen(arena, localPath);
+        }
+        FrsCfHandle cf = linker.dbDefaultCf(opened, arena);
+        return withDb(opened, cf);
+    }
+
     public CfRouter buildCfRouter() {
         if (db == null || defaultCf == null) {
-            throw new IllegalStateException("withDb(db, defaultCf) must be called first");
+            throw new IllegalStateException(
+                    "withDb(db, defaultCf) or openDb(localPath) must be called first");
         }
         return switch (options.cfMode()) {
             case SINGLE -> new SingleCfRouter(defaultCf);
             case PER_STATE -> new PerStateCfRouter(linker, db, arena);
         };
+    }
+
+    /** Returns the opened FrsDb (or null if neither {@link #withDb} nor {@link #openDb} ran). */
+    public FrsDb db() {
+        return db;
+    }
+
+    /** Returns the default CF handle (or null if not yet opened). */
+    public FrsCfHandle defaultCf() {
+        return defaultCf;
     }
 
     public ForStRsLinker linker() {

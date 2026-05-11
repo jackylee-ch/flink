@@ -88,8 +88,8 @@ public class ForStRsValueState<T> implements ValueState<T> {
     }
 
     /**
-     * Spec §6 constructor: composite ForSt key is recomputed per call from the supplied
-     * keyComputer (which the keyed-state backend wires to {@code ForStRsKeyGroupedSerializer
+     * Spec §6 constructor: composite ForSt key is recomputed per call from the supplied keyComputer
+     * (which the keyed-state backend wires to {@code ForStRsKeyGroupedSerializer
      * .encodeForState(currentKg, currentKey, stateName)}).
      */
     public ForStRsValueState(

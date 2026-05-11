@@ -25,12 +25,12 @@ import java.io.IOException;
 /**
  * Module-internal "checkpoint restore failed" exception (B-Prod-P4 Task 4.2).
  *
- * <p>Flink's runtime does not currently ship a public {@code CheckpointRestoreException} —
- * the module-internal {@link org.apache.flink.runtime.state.BackendBuildingException} is the
- * closest public type, but it does not carry the failed-path / checkpoint-id pair we want for
- * strict-restore diagnostics. We therefore expose this dedicated subclass of {@link IOException}
- * so a missing SST surfaces with both fields and so callers can pattern-match without leaking
- * a runtime-internal type.
+ * <p>Flink's runtime does not currently ship a public {@code CheckpointRestoreException} — the
+ * module-internal {@link org.apache.flink.runtime.state.BackendBuildingException} is the closest
+ * public type, but it does not carry the failed-path / checkpoint-id pair we want for
+ * strict-restore diagnostics. We therefore expose this dedicated subclass of {@link IOException} so
+ * a missing SST surfaces with both fields and so callers can pattern-match without leaking a
+ * runtime-internal type.
  *
  * <p>Used by {@link ForStRsRestoreOperation} when a downloaded checkpoint is missing one or more
  * SST files referenced by its manifest, or when manifest parsing itself fails.
@@ -46,7 +46,8 @@ public class ForStRsCheckpointRestoreException extends IOException {
     /** Checkpoint id the restore was operating on. */
     private final long checkpointId;
 
-    public ForStRsCheckpointRestoreException(String missingPath, long checkpointId, String message) {
+    public ForStRsCheckpointRestoreException(
+            String missingPath, long checkpointId, String message) {
         super(message);
         this.missingPath = missingPath;
         this.checkpointId = checkpointId;

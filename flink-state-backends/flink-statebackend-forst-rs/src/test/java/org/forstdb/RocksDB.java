@@ -19,15 +19,14 @@
 package org.forstdb;
 
 /**
- * Minimal Java surface that matches the JNI symbols exported by the ForSt-RS
- * {@code compat-jni} feature. This is NOT the upstream community {@code
- * org.forstdb.RocksDB} class — it only declares the flat helper methods that
- * the ForSt-RS shim implements. The class name + package are chosen so that
- * the JNI symbol mangling lines up with the {@code Java_org_forstdb_RocksDB_*}
- * symbols in {@code libforst_rs_ffi.dylib}.
+ * Minimal Java surface that matches the JNI symbols exported by the ForSt-RS {@code compat-jni}
+ * feature. This is NOT the upstream community {@code org.forstdb.RocksDB} class — it only declares
+ * the flat helper methods that the ForSt-RS shim implements. The class name + package are chosen so
+ * that the JNI symbol mangling lines up with the {@code Java_org_forstdb_RocksDB_*} symbols in
+ * {@code libforst_rs_ffi.dylib}.
  *
- * <p>The cdylib path can be overridden via the {@code org.forstdb.libpath}
- * system property; otherwise we fall back to {@code System.loadLibrary("forstjni")}.
+ * <p>The cdylib path can be overridden via the {@code org.forstdb.libpath} system property;
+ * otherwise we fall back to {@code System.loadLibrary("forstjni")}.
  */
 public class RocksDB {
 
@@ -84,8 +83,7 @@ public class RocksDB {
             int valOff,
             int valLen);
 
-    public static native byte[] get(
-            long handle, long cfHandle, byte[] key, int keyOff, int keyLen);
+    public static native byte[] get(long handle, long cfHandle, byte[] key, int keyOff, int keyLen);
 
     public static native void delete(
             long handle, long cfHandle, byte[] key, int keyOff, int keyLen);
@@ -105,5 +103,6 @@ public class RocksDB {
     // in lock-step; arrays MUST have equal length or an exception is thrown.
     public static native void batchPut(long handle, long cfHandle, byte[][] keys, byte[][] values);
 
-    public static native void writeBatch(long handle, long cfHandle, byte[][] keys, byte[][] values);
+    public static native void writeBatch(
+            long handle, long cfHandle, byte[][] keys, byte[][] values);
 }

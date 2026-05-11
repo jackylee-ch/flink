@@ -38,9 +38,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Round-trips a {@link ForStRsMapState} constructed via the spec §6 kg-prefixed ctor: the
- * composite ForSt keys are recomputed per call via {@code encodeForMap}; the iteration prefix is
- * recomputed via {@code encodeForState}.
+ * Round-trips a {@link ForStRsMapState} constructed via the spec §6 kg-prefixed ctor: the composite
+ * ForSt keys are recomputed per call via {@code encodeForMap}; the iteration prefix is recomputed
+ * via {@code encodeForState}.
  */
 class ForStRsMapStateKgTest {
 

@@ -43,8 +43,8 @@ import java.util.Optional;
  *
  * <p>This is the Flink-side counterpart to the engine's pinned-SST tracking; the engine ensures
  * each `live` SST stays on disk until its retaining snapshots release, the Java registry ensures
- * each uploaded {@link StreamStateHandle} stays referenceable on remote storage until its
- * retaining checkpoints subsume.
+ * each uploaded {@link StreamStateHandle} stays referenceable on remote storage until its retaining
+ * checkpoints subsume.
  */
 @Internal
 public final class ForStRsSstRegistry {

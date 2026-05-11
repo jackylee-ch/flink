@@ -33,15 +33,14 @@ import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.InternalKeyContextImpl;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
-import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.Keyed;
+import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.SavepointResources;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.SnapshotStrategy;
 import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StateSnapshotTransformer.StateSnapshotTransformFactory;
-import org.apache.flink.runtime.state.StreamCompressionDecorator;
 import org.apache.flink.runtime.state.UncompressedStreamCompressionDecorator;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.metrics.LatencyTrackingStateConfig;
@@ -59,17 +58,17 @@ import java.util.stream.Stream;
  * Spec §4 skeleton: a {@link AbstractKeyedStateBackend} subclass that wires the ForSt-RS engine
  * into Flink's keyed-state SPI. The constructor satisfies Flink 2.2.0's {@code
  * AbstractKeyedStateBackend} ctor (10 args) and the abstract methods are implemented as
- * "implemented in P3/P4" stubs throwing {@link UnsupportedOperationException}; the inner
- * round-trip primitives still live on {@link ForStRsKeyedStateBackend} (which this skeleton
- * delegates to once full snapshot/restore wiring lands).
+ * "implemented in P3/P4" stubs throwing {@link UnsupportedOperationException}; the inner round-trip
+ * primitives still live on {@link ForStRsKeyedStateBackend} (which this skeleton delegates to once
+ * full snapshot/restore wiring lands).
  *
  * <p><b>Why a separate class.</b> The existing {@link ForStRsKeyedStateBackend} (Phase-D L5) is a
- * standalone {@code Closeable} consumed by a wide test surface that would not survive switching
- * its parent class today (e.g., {@link ForStRsKeyedStateBackend#setCurrentKey} returns void with
- * the byte-prefix invalidation policy that cleanly works only when the class isn't already
- * inheriting key-context plumbing from {@code AbstractKeyedStateBackend}). Per the plan, this
- * skeleton lands now to "match what Flink's keyed-state SPI registries expect"; the L5 class will
- * be folded into this one in P3/P4 once snapshot/restore + key-group iteration are wired.
+ * standalone {@code Closeable} consumed by a wide test surface that would not survive switching its
+ * parent class today (e.g., {@link ForStRsKeyedStateBackend#setCurrentKey} returns void with the
+ * byte-prefix invalidation policy that cleanly works only when the class isn't already inheriting
+ * key-context plumbing from {@code AbstractKeyedStateBackend}). Per the plan, this skeleton lands
+ * now to "match what Flink's keyed-state SPI registries expect"; the L5 class will be folded into
+ * this one in P3/P4 once snapshot/restore + key-group iteration are wired.
  *
  * @param <K> key type
  */
@@ -80,16 +79,16 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     private final ForStRsKeyedStateBackend<K> delegate;
 
     /**
-     * The snapshot strategy that drives incremental checkpoints (B-Prod-P3). Set lazily by
-     * {@link #setSnapshotStrategy(ForStRsSnapshotStrategy)} once the keyed-backend builder has the
-     * KGR + UUID + cfMap to construct it.
+     * The snapshot strategy that drives incremental checkpoints (B-Prod-P3). Set lazily by {@link
+     * #setSnapshotStrategy(ForStRsSnapshotStrategy)} once the keyed-backend builder has the KGR +
+     * UUID + cfMap to construct it.
      */
     private ForStRsSnapshotStrategy snapshotStrategy;
 
     /**
-     * The SST registry shared between this backend's snapshot strategy and the
-     * {@code notifyCheckpointComplete}/{@code notifyCheckpointAborted} hooks. Optional — only
-     * required once snapshot wiring is connected.
+     * The SST registry shared between this backend's snapshot strategy and the {@code
+     * notifyCheckpointComplete}/{@code notifyCheckpointAborted} hooks. Optional — only required
+     * once snapshot wiring is connected.
      */
     private ForStRsSstRegistry sstRegistry;
 
@@ -251,12 +250,13 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     }
 
     /**
-     * Override of {@link org.apache.flink.api.common.state.CheckpointListener#notifyCheckpointAborted(long)}.
+     * Override of {@link
+     * org.apache.flink.api.common.state.CheckpointListener#notifyCheckpointAborted(long)}.
      *
      * <p>For an aborted checkpoint we must roll back the registry's ref-count bumps so the aborted
-     * checkpoint's "newly-uploaded" SSTs can drop to zero ref (eligible for discard) — the
-     * baseline shared with previously completed checkpoints is preserved because the registry's
-     * ref-counts are independent per checkpoint contribution.
+     * checkpoint's "newly-uploaded" SSTs can drop to zero ref (eligible for discard) — the baseline
+     * shared with previously completed checkpoints is preserved because the registry's ref-counts
+     * are independent per checkpoint contribution.
      */
     @Override
     public void notifyCheckpointAborted(long checkpointId) throws Exception {

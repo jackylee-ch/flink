@@ -44,7 +44,57 @@ public final class ForStRsOptions {
                                     + " 'per-state': each state name gets its own CF (lazy"
                                     + " creation, soft limit 256 CFs).");
 
+    // ----- B-Prod-P6: disaggregated remote storage -----
+
+    /** OpenDAL URI for the remote storage backend (e.g. {@code s3://bucket/}). */
+    public static final ConfigOption<String> STORAGE_URI =
+            ConfigOptions.key("state.backend.forst-rs.storage.uri")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "If set, the keyed-state backend opens the engine via OpenDAL on this"
+                                    + " URI (memory://, file:///abs/path, or s3://bucket/). When"
+                                    + " unset, the backend falls back to a local-FS engine at the"
+                                    + " usual data directory.");
+
+    /**
+     * Flat JSON object of OpenDAL backend-specific config (e.g. {@code
+     * {"region":"us-east-1","endpoint":"..."}}).
+     */
+    public static final ConfigOption<String> OPENDAL_CONFIG =
+            ConfigOptions.key("state.backend.forst-rs.storage.opendal-config")
+                    .stringType()
+                    .defaultValue("{}")
+                    .withDescription(
+                            "Flat JSON object holding OpenDAL backend-specific configuration."
+                                    + " Keys must match the underlying service builder field names"
+                                    + " (e.g. region, endpoint, access_key_id, secret_access_key for"
+                                    + " s3). Ignored for memory:// and file:// URIs.");
+
+    /** Local directory used for the SST LRU cache when {@link #STORAGE_URI} is set. */
+    public static final ConfigOption<String> CACHE_DIR =
+            ConfigOptions.key("state.backend.forst-rs.storage.cache-dir")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Local directory used by the SST LRU cache that fronts remote storage."
+                                    + " Required when storage.uri is set.");
+
+    /** Total LRU cache budget on local disk, in MiB. */
+    public static final ConfigOption<Long> CACHE_CAPACITY_MB =
+            ConfigOptions.key("state.backend.forst-rs.storage.cache-capacity-mb")
+                    .longType()
+                    .defaultValue(1024L)
+                    .withDescription(
+                            "Total bytes (MiB) the SST LRU cache may occupy on local disk."
+                                    + " Default 1 GiB. A value of 0 disables the cache (every read"
+                                    + " hits the remote backend).");
+
     private CfMode cfMode = CfMode.SINGLE;
+    private String storageUri;
+    private String opendalConfigJson = "{}";
+    private String cacheDir;
+    private long cacheCapacityMb = 1024L;
 
     public ForStRsOptions() {}
 
@@ -55,6 +105,54 @@ public final class ForStRsOptions {
     public ForStRsOptions cfMode(CfMode m) {
         this.cfMode = m;
         return this;
+    }
+
+    /** OpenDAL URI for remote storage; {@code null} means use the local data directory. */
+    public String storageUri() {
+        return storageUri;
+    }
+
+    public ForStRsOptions storageUri(String uri) {
+        this.storageUri = uri;
+        return this;
+    }
+
+    /** Flat JSON object of OpenDAL config; never null (defaults to {@code "{}"}). */
+    public String opendalConfigJson() {
+        return opendalConfigJson;
+    }
+
+    public ForStRsOptions opendalConfigJson(String json) {
+        this.opendalConfigJson = json == null || json.isEmpty() ? "{}" : json;
+        return this;
+    }
+
+    /** Local cache directory (must be set when {@link #storageUri()} is non-null). */
+    public String cacheDir() {
+        return cacheDir;
+    }
+
+    public ForStRsOptions cacheDir(String dir) {
+        this.cacheDir = dir;
+        return this;
+    }
+
+    /** LRU cache capacity in MiB; defaults to 1 GiB. */
+    public long cacheCapacityMb() {
+        return cacheCapacityMb;
+    }
+
+    public ForStRsOptions cacheCapacityMb(long mb) {
+        if (mb < 0) {
+            throw new IllegalArgumentException("cacheCapacityMb must be >= 0, got " + mb);
+        }
+        this.cacheCapacityMb = mb;
+        return this;
+    }
+
+    /** Convenience: cache capacity converted to bytes for the FFI call. */
+    public long cacheCapacityBytes() {
+        return cacheCapacityMb * 1024L * 1024L;
     }
 
     /** Column-family routing mode. */

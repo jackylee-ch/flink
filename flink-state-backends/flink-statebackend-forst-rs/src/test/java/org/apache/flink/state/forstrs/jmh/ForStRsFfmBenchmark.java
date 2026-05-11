@@ -106,12 +106,11 @@ public final class ForStRsFfmBenchmark {
     private static final long FLAG_NULLABLE = 0x2L;
 
     /**
-     * Builds a no-op release callback (C function pointer) for FFI_Arrow{Array,Schema}.
-     * Required because arrow-rs's {@code from_ffi} import wraps the array in an Arc
-     * whose drop calls release on the embedded fn pointer. We own all memory in the
-     * caller arena (closed at bench end), so the callback must NOT free anything —
-     * it just sets {@code release = NULL} on the passed-in struct, which is the
-     * canonical "consumed" marker per the Arrow C Data Interface contract.
+     * Builds a no-op release callback (C function pointer) for FFI_Arrow{Array,Schema}. Required
+     * because arrow-rs's {@code from_ffi} import wraps the array in an Arc whose drop calls release
+     * on the embedded fn pointer. We own all memory in the caller arena (closed at bench end), so
+     * the callback must NOT free anything — it just sets {@code release = NULL} on the passed-in
+     * struct, which is the canonical "consumed" marker per the Arrow C Data Interface contract.
      */
     private static MemorySegment buildNoopReleaseStub(Arena arena, long releaseOffset)
             throws NoSuchMethodException, IllegalAccessException {
@@ -120,17 +119,13 @@ public final class ForStRsFfmBenchmark {
                         .findStatic(
                                 ForStRsFfmBenchmark.class,
                                 "noopRelease",
-                                MethodType.methodType(
-                                        void.class, MemorySegment.class, long.class));
+                                MethodType.methodType(void.class, MemorySegment.class, long.class));
         // Bind the release-offset constant into the target so the upcall can
         // zero out the release slot of any passed-in FFI struct (matches arrow-rs's
         // own release_array, which sets self.release = None).
         MethodHandle bound = MethodHandles.insertArguments(target, 1, releaseOffset);
         return Linker.nativeLinker()
-                .upcallStub(
-                        bound,
-                        FunctionDescriptor.ofVoid(ValueLayout.ADDRESS),
-                        arena);
+                .upcallStub(bound, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS), arena);
     }
 
     @SuppressWarnings("unused")
@@ -148,12 +143,11 @@ public final class ForStRsFfmBenchmark {
     }
 
     /**
-     * Stages the canonical {@code key: Binary, value: Binary nullable, op_type: UInt8}
-     * RecordBatch (BATCH_SIZE rows) as a hand-rolled FFI_ArrowArray + FFI_ArrowSchema
-     * pair. Returns a record holding the live (per-call) and template (constants)
-     * segments so the bench can {@code MemorySegment.copy(template -> live)} between
-     * iterations, since {@code frs_batch_put_arrow} overwrites the live structs with
-     * the empty() marker on consumption.
+     * Stages the canonical {@code key: Binary, value: Binary nullable, op_type: UInt8} RecordBatch
+     * (BATCH_SIZE rows) as a hand-rolled FFI_ArrowArray + FFI_ArrowSchema pair. Returns a record
+     * holding the live (per-call) and template (constants) segments so the bench can {@code
+     * MemorySegment.copy(template -> live)} between iterations, since {@code frs_batch_put_arrow}
+     * overwrites the live structs with the empty() marker on consumption.
      */
     private static ArrowBatchSegments stageArrowBatch(Arena arena, MemorySegment releaseStub) {
         long ptrSz = ValueLayout.ADDRESS.byteSize();
@@ -219,7 +213,13 @@ public final class ForStRsFfmBenchmark {
         writeArrowSchema(keySchema, fmtBinary, fieldKey, 0L, 0, MemorySegment.NULL, releaseStub);
         MemorySegment valSchema = arena.allocate(ARROW_SCHEMA_BYTES);
         writeArrowSchema(
-                valSchema, fmtBinary, fieldValue, FLAG_NULLABLE, 0, MemorySegment.NULL, releaseStub);
+                valSchema,
+                fmtBinary,
+                fieldValue,
+                FLAG_NULLABLE,
+                0,
+                MemorySegment.NULL,
+                releaseStub);
         MemorySegment opSchema = arena.allocate(ARROW_SCHEMA_BYTES);
         writeArrowSchema(opSchema, fmtU8, fieldOpType, 0L, 0, MemorySegment.NULL, releaseStub);
 
@@ -245,13 +245,7 @@ public final class ForStRsFfmBenchmark {
 
         MemorySegment schemaTemplate = arena.allocate(ARROW_SCHEMA_BYTES);
         writeArrowSchema(
-                schemaTemplate,
-                fmtStruct,
-                MemorySegment.NULL,
-                0L,
-                3,
-                schemaChildren,
-                releaseStub);
+                schemaTemplate, fmtStruct, MemorySegment.NULL, 0L, 3, schemaChildren, releaseStub);
         MemorySegment schemaLive = arena.allocate(ARROW_SCHEMA_BYTES);
         MemorySegment.copy(schemaTemplate, 0L, schemaLive, 0L, ARROW_SCHEMA_BYTES);
 

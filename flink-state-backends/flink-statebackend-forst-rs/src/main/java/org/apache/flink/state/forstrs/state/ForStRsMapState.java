@@ -51,9 +51,9 @@ import java.util.function.Supplier;
  *   <li><b>Spec §6 kg-prefixed mode</b>: composite ForSt key is built per call via the supplied
  *       {@code compositeKeyComputer} (which the keyed-state backend wires to {@code
  *       ForStRsKeyGroupedSerializer.encodeForMap(currentKg, currentKey, stateName, ukSer, uk)}).
- *       Prefix-scans use the per-state-prefix returned by {@code prefixComputer} (typically
- *       {@code encodeForState(currentKg, currentKey, stateName)} — i.e. the kg+K+state portion that
- *       every map entry shares as a byte prefix).
+ *       Prefix-scans use the per-state-prefix returned by {@code prefixComputer} (typically {@code
+ *       encodeForState(currentKg, currentKey, stateName)} — i.e. the kg+K+state portion that every
+ *       map entry shares as a byte prefix).
  * </ol>
  *
  * @param <UK> user key type
@@ -227,8 +227,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                     throw new IOException(
                             "Encountered composite key shorter than prefix during MapState scan");
                 }
-                inputBuffer.setBuffer(
-                        composite, prefix.length, composite.length - prefix.length);
+                inputBuffer.setBuffer(composite, prefix.length, composite.length - prefix.length);
                 UK uk = keySerializer.deserialize(inputBuffer);
                 UV uv = null;
                 if (loadValues) {

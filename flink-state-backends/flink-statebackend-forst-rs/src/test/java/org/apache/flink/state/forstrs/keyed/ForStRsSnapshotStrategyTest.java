@@ -46,9 +46,9 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Drives the snapshot strategy end-to-end against a filesystem-backed ForSt-RS engine: writes a
  * batch of keys, runs a full incremental checkpoint, asserts a valid {@link
- * ForStRsIncrementalKeyedStateHandle} comes out, then writes more keys and runs a second
- * checkpoint with the first as base — the second's {@code sharedState} list must be non-empty
- * (engine reports SSTs from ckpt 1 as shared with ckpt 2 because compaction has not run between).
+ * ForStRsIncrementalKeyedStateHandle} comes out, then writes more keys and runs a second checkpoint
+ * with the first as base — the second's {@code sharedState} list must be non-empty (engine reports
+ * SSTs from ckpt 1 as shared with ckpt 2 because compaction has not run between).
  */
 class ForStRsSnapshotStrategyTest {
 
@@ -78,7 +78,8 @@ class ForStRsSnapshotStrategyTest {
                                 arena,
                                 Map.of("default", 0L));
 
-                MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+                MemCheckpointStreamFactory factory =
+                        new MemCheckpointStreamFactory(64 * 1024 * 1024);
 
                 // ---- First checkpoint (full — base = 0). ----
                 ForStRsSnapshotResources res1 = strategy.syncPrepareResources(1L);

@@ -57,9 +57,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * <ul>
  *   <li><b>Sync phase</b> ({@link #syncPrepareResources(long)}) — captures an engine snapshot
  *       (pinning compaction at the current seq) and invokes {@link
- *       ForStRsLinker#createIncrementalCheckpointAt} which writes a manifest blob + reports
- *       (new SSTs, shared SSTs) for this checkpoint relative to the previous {@code
- *       lastCheckpointId} this strategy successfully completed.
+ *       ForStRsLinker#createIncrementalCheckpointAt} which writes a manifest blob + reports (new
+ *       SSTs, shared SSTs) for this checkpoint relative to the previous {@code lastCheckpointId}
+ *       this strategy successfully completed.
  *   <li><b>Async phase</b> ({@link #asyncSnapshot}) — runs in a virtual thread, uploads the
  *       manifest + new SSTs via {@link ForStRsSstUploader}, registers the new SSTs in the local
  *       {@link ForStRsSstRegistry}, then assembles a {@link ForStRsIncrementalKeyedStateHandle}.
@@ -68,8 +68,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * </ul>
  *
  * <p>Thread model: sync phase runs on the task thread (must be fast — we issue 2 FFI calls), async
- * phase dispatches one virtual thread per file via the uploader, then the orchestrating
- * {@link SnapshotStrategy.SnapshotResultSupplier} blocks on the join. {@link CloseableRegistry}
+ * phase dispatches one virtual thread per file via the uploader, then the orchestrating {@link
+ * SnapshotStrategy.SnapshotResultSupplier} blocks on the join. {@link CloseableRegistry}
  * registration is no-op for v1 because each upload future already self-cleans on completion;
  * cancellation hooks land in P4 alongside the restore wiring.
  */
@@ -90,9 +90,9 @@ public class ForStRsSnapshotStrategy
     private final Map<String, Long> cfMap;
 
     /**
-     * The previous successfully-completed checkpoint id. Updated by
-     * {@link #recordCompletedCheckpoint(long)} when notifyCheckpointComplete fires; used as
-     * {@code base_checkpoint_id} for the next sync-phase capture.
+     * The previous successfully-completed checkpoint id. Updated by {@link
+     * #recordCompletedCheckpoint(long)} when notifyCheckpointComplete fires; used as {@code
+     * base_checkpoint_id} for the next sync-phase capture.
      */
     private final AtomicLong lastCompletedCheckpointId = new AtomicLong(0L);
 
@@ -195,8 +195,8 @@ public class ForStRsSnapshotStrategy
 
     /**
      * Test/backend accessor — returns and removes the per-checkpoint registration list so the
-     * keyed-backend can roll back ref-counts on abort. Returns {@code null} if no registrations
-     * for that id are tracked (already consumed or never tracked).
+     * keyed-backend can roll back ref-counts on abort. Returns {@code null} if no registrations for
+     * that id are tracked (already consumed or never tracked).
      */
     public List<HandleAndLocalPath> takePendingRegistrations(long checkpointId) {
         return pendingRegistrations.remove(checkpointId);
@@ -262,7 +262,10 @@ public class ForStRsSnapshotStrategy
             String localPath = p.getFileName().toString();
             sstRegistry
                     .get(new StateHandleID(localPath))
-                    .ifPresent(h -> thisCheckpointRegistrations.add(HandleAndLocalPath.of(h, localPath)));
+                    .ifPresent(
+                            h ->
+                                    thisCheckpointRegistrations.add(
+                                            HandleAndLocalPath.of(h, localPath)));
         }
         pendingRegistrations.put(resources.getCheckpointId(), thisCheckpointRegistrations);
         // Manifest is private — kept off the shared list. (Carried as the metaStateHandle below.)
@@ -301,8 +304,8 @@ public class ForStRsSnapshotStrategy
 
     /**
      * Reads a {@code FrsLiveFileList*} stored at {@code resultStruct[off]} and walks its inner
-     * {@code files} array, extracting each file's {@code path}. Other fields (size/seq/level/cf) are
-     * ignored for now — we only need the absolute path for upload.
+     * {@code files} array, extracting each file's {@code path}. Other fields (size/seq/level/cf)
+     * are ignored for now — we only need the absolute path for upload.
      */
     private static List<Path> readSstList(MemorySegment resultStruct, long off) {
         MemorySegment listPtr = resultStruct.get(ValueLayout.ADDRESS, off);

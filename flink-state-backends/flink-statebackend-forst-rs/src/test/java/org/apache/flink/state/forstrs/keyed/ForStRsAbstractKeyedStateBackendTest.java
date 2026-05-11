@@ -82,8 +82,7 @@ class ForStRsAbstractKeyedStateBackendTest {
                 // with a guidance message. (P3 SnapshotStrategy integration tests cover the wired
                 // path; this skeleton test only confirms the unwired guard.)
                 assertThrows(
-                        IllegalStateException.class,
-                        () -> backend.snapshot(1L, 0L, null, null));
+                        IllegalStateException.class, () -> backend.snapshot(1L, 0L, null, null));
                 assertThrows(UnsupportedOperationException.class, backend::savepoint);
                 assertThrows(
                         UnsupportedOperationException.class,

@@ -81,7 +81,11 @@ class ForStRsRestoreOperationTest {
                 assertArrayEquals(
                         expected,
                         got,
-                        "restored DB must round-trip k-" + i + " (was=" + java.util.Arrays.toString(got) + ")");
+                        "restored DB must round-trip k-"
+                                + i
+                                + " (was="
+                                + java.util.Arrays.toString(got)
+                                + ")");
             }
 
             // SST registry should contain at least one entry now — enables incremental ckpts.

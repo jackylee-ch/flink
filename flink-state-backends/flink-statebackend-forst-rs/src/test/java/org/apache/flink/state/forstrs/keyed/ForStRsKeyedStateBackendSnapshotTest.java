@@ -44,19 +44,19 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * Snapshot / restore + key-iteration tests for {@link ForStRsKeyedStateBackend}.
  *
- * <p>These exercise the Phase-D L5 simplified snapshot API (
- * {@link ForStRsKeyedStateBackend#snapshot(Path)} +
- * {@link ForStRsKeyedStateBackend#restoreFromSnapshot(ForStRsLinker, Arena, Path,
- * org.apache.flink.api.common.typeutils.TypeSerializer)} ) and the {@code keys} /
- * {@code applyToAllKeys} surface that's the precursor to Flink's per-key-group iteration.
+ * <p>These exercise the Phase-D L5 simplified snapshot API ( {@link
+ * ForStRsKeyedStateBackend#snapshot(Path)} + {@link
+ * ForStRsKeyedStateBackend#restoreFromSnapshot(ForStRsLinker, Arena, Path,
+ * org.apache.flink.api.common.typeutils.TypeSerializer)} ) and the {@code keys} / {@code
+ * applyToAllKeys} surface that's the precursor to Flink's per-key-group iteration.
  */
 class ForStRsKeyedStateBackendSnapshotTest {
 
     /**
      * Constructs an on-disk backend rooted at {@code dbPath} that <i>shares</i> the supplied
      * arena+linker. Closing the returned backend releases the {@link FrsDb}+default-CF but leaves
-     * the arena/linker untouched — matching the contract used by
-     * {@link ForStRsKeyedStateBackend#restoreFromSnapshot(ForStRsLinker, Arena, Path,
+     * the arena/linker untouched — matching the contract used by {@link
+     * ForStRsKeyedStateBackend#restoreFromSnapshot(ForStRsLinker, Arena, Path,
      * org.apache.flink.api.common.typeutils.TypeSerializer)}.
      */
     private static ForStRsKeyedStateBackend<String> openOnDisk(
@@ -84,8 +84,7 @@ class ForStRsKeyedStateBackendSnapshotTest {
             // Phase 1: open a fresh backend, write under "alice", snapshot, dispose.
             ForStRsKeyedStateBackend<String> writer = openOnDisk(linker, arena, dbDir);
             writer.setCurrentKey("alice");
-            ForStRsValueState<String> v =
-                    writer.getValueState("secret", StringSerializer.INSTANCE);
+            ForStRsValueState<String> v = writer.getValueState("secret", StringSerializer.INSTANCE);
             v.update("secret-value");
             assertEquals("secret-value", v.value());
 
@@ -119,8 +118,7 @@ class ForStRsKeyedStateBackendSnapshotTest {
             ForStRsKeyedStateBackend<String> writer = openOnDisk(linker, arena, dbDir);
             writer.setCurrentKey("bob");
             ForStRsMapState<String, Integer> m =
-                    writer.getMapState(
-                            "scores", StringSerializer.INSTANCE, IntSerializer.INSTANCE);
+                    writer.getMapState("scores", StringSerializer.INSTANCE, IntSerializer.INSTANCE);
             m.put("python", 1);
             m.put("rust", 2);
             m.put("java", 3);
@@ -189,7 +187,8 @@ class ForStRsKeyedStateBackendSnapshotTest {
                             collected.add(k);
                             return null;
                         });
-                assertEquals(3, collected.size(), "applyToAllKeys must visit each key exactly once");
+                assertEquals(
+                        3, collected.size(), "applyToAllKeys must visit each key exactly once");
                 assertEquals(
                         Set.of("alice", "bob", "charlie"),
                         new HashSet<>(collected),

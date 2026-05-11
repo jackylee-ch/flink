@@ -37,10 +37,9 @@ import java.util.concurrent.CompletableFuture;
  * fresh virtual thread (via {@link Thread#ofVirtual()}) which:
  *
  * <ol>
- *   <li>opens a {@link CheckpointStateOutputStream} from the factory under the requested
- *       checkpoint scope (typically {@link CheckpointedStateScope#SHARED} for SSTs the next
- *       checkpoint may want to reuse, {@link CheckpointedStateScope#EXCLUSIVE} for the per-ckpt
- *       manifest blob),
+ *   <li>opens a {@link CheckpointStateOutputStream} from the factory under the requested checkpoint
+ *       scope (typically {@link CheckpointedStateScope#SHARED} for SSTs the next checkpoint may
+ *       want to reuse, {@link CheckpointedStateScope#EXCLUSIVE} for the per-ckpt manifest blob),
  *   <li>streams the file contents via an 8KiB buffer (avoids loading the whole SST into a single
  *       byte array — RocksDB SSTs are routinely &gt;64MiB),
  *   <li>completes the future with the {@link StreamStateHandle} returned by {@code

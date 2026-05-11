@@ -38,9 +38,9 @@ import java.lang.foreign.Arena;
  * <ul>
  *   <li>{@link #createKeyedStateBackend(KeyedStateBackendParameters)} — currently throws because
  *       the simpler {@link ForStRsKeyedStateBackend} stepping-stone does <i>not</i> implement
- *       {@link CheckpointableKeyedStateBackend} (no snapshot / key-group / savepoint plumbing
- *       yet). Use {@link #createBasicKeyedBackend(TypeSerializer)} for proof-of-concept and unit
- *       tests until the L5 sync-v1 / L6 rescaling work lands.
+ *       {@link CheckpointableKeyedStateBackend} (no snapshot / key-group / savepoint plumbing yet).
+ *       Use {@link #createBasicKeyedBackend(TypeSerializer)} for proof-of-concept and unit tests
+ *       until the L5 sync-v1 / L6 rescaling work lands.
  *   <li>{@link #createOperatorStateBackend(OperatorStateBackendParameters)} — delegates to Flink's
  *       {@link DefaultOperatorStateBackendBuilder}, which is the standard pattern for backends
  *       whose operator state is just a serialized bytestream rather than a KV store.
@@ -87,15 +87,16 @@ public class ForStRsStateBackend implements StateBackend {
     }
 
     /**
-     * Phase-D L5 stepping-stone factory: opens an in-memory ForSt-RS engine and returns a
-     * {@link ForStRsKeyedStateBackend} bound to it. The returned backend owns the underlying
-     * {@link Arena}, {@link ForStRsLinker}, {@link FrsDb} and default {@link FrsCfHandle}; closing
-     * it releases all of them.
+     * Phase-D L5 stepping-stone factory: opens an in-memory ForSt-RS engine and returns a {@link
+     * ForStRsKeyedStateBackend} bound to it. The returned backend owns the underlying {@link
+     * Arena}, {@link ForStRsLinker}, {@link FrsDb} and default {@link FrsCfHandle}; closing it
+     * releases all of them.
      *
-     * <p>This entry-point is provided because {@link #createKeyedStateBackend(KeyedStateBackendParameters)}
-     * cannot yet return a {@link ForStRsKeyedStateBackend} — that class does not implement the
-     * {@link CheckpointableKeyedStateBackend} contract. Once snapshot / key-group / savepoint
-     * plumbing is wired in Phase-D L5/L6 the two factory methods will collapse into one.
+     * <p>This entry-point is provided because {@link
+     * #createKeyedStateBackend(KeyedStateBackendParameters)} cannot yet return a {@link
+     * ForStRsKeyedStateBackend} — that class does not implement the {@link
+     * CheckpointableKeyedStateBackend} contract. Once snapshot / key-group / savepoint plumbing is
+     * wired in Phase-D L5/L6 the two factory methods will collapse into one.
      */
     public <K> ForStRsKeyedStateBackend<K> createBasicKeyedBackend(
             TypeSerializer<K> keySerializer) {
@@ -116,5 +117,4 @@ public class ForStRsStateBackend implements StateBackend {
             throw e;
         }
     }
-
 }
