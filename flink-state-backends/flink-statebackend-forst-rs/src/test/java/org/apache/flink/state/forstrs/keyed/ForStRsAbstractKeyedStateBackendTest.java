@@ -84,8 +84,12 @@ class ForStRsAbstractKeyedStateBackendTest {
                 assertThrows(
                         IllegalStateException.class, () -> backend.snapshot(1L, 0L, null, null));
                 assertThrows(UnsupportedOperationException.class, backend::savepoint);
+                // createOrUpdateInternalState is wired in B-Prod-followup-L5/L6 — passing a null
+                // descriptor surfaces an NPE because the implementation reads the state-name +
+                // type. (Real Flink callers always pass a non-null StateDescriptor; this null
+                // case pins the early-fail contract.)
                 assertThrows(
-                        UnsupportedOperationException.class,
+                        NullPointerException.class,
                         () -> backend.createOrUpdateInternalState(null, null, null));
                 // create(...) for priority-queues has a complex generic bound (T extends
                 // HeapPriorityQueueElement & PriorityComparable & Keyed); skipping the direct

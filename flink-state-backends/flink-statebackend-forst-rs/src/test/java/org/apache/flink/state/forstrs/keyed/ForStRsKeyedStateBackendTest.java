@@ -230,17 +230,15 @@ class ForStRsKeyedStateBackendTest {
     }
 
     @Test
-    void testCreateKeyedStateBackendThrowsUOE() {
-        // Until Phase-D L5/L6 wires the full CheckpointableKeyedStateBackend interface, the
-        // canonical Flink entry-point must surface a clear error rather than silently no-op.
+    void testCreateKeyedStateBackendRequiresParameters() {
+        // L5/L6 wired: createKeyedStateBackend(parameters) returns a real
+        // CheckpointableKeyedStateBackend when parameters is supplied. Calling with null still
+        // surfaces a NullPointerException — the SPI contract says parameters is non-null. This
+        // contract test pins that null-handling so a regression is caught quickly.
         ForStRsStateBackend sb = new ForStRsStateBackend();
-        UnsupportedOperationException e =
-                assertThrows(
-                        UnsupportedOperationException.class,
-                        () -> sb.createKeyedStateBackend(null));
-        assertTrue(
-                e.getMessage().contains("createBasicKeyedBackend"),
-                "UOE message should point users at the stepping-stone factory");
+        assertThrows(
+                NullPointerException.class,
+                () -> sb.createKeyedStateBackend(null));
     }
 
     @Test

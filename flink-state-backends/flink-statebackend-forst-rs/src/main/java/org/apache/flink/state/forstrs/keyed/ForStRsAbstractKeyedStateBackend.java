@@ -22,8 +22,13 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
+import org.apache.flink.api.common.state.AggregatingStateDescriptor;
+import org.apache.flink.api.common.state.ListStateDescriptor;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.state.ReducingStateDescriptor;
 import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
+import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.fs.CloseableRegistry;
@@ -142,6 +147,58 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     }
 
     /**
+     * Full-keygroup-range constructor used by the SPI path ({@link
+     * org.apache.flink.state.forstrs.ForStRsStateBackend#createKeyedStateBackend}). Plumbs through
+     * the real {@link KeyGroupRange} and {@code numberOfKeyGroups} from the Flink
+     * {@link org.apache.flink.runtime.state.StateBackend.KeyedStateBackendParameters} so that
+     * key-group routing (Flink's {@code KeyGroupRangeAssignment.assignToKeyGroup}) lands on a
+     * group inside the backend's responsibility window.
+     */
+    public ForStRsAbstractKeyedStateBackend(
+            TypeSerializer<K> keySerializer,
+            ClassLoader userCodeClassLoader,
+            ExecutionConfig executionConfig,
+            CloseableRegistry cancelStreamRegistry,
+            ForStRsKeyedStateBackend<K> delegate,
+            KeyGroupRange keyGroupRange,
+            int numberOfKeyGroups) {
+        super(
+                /* kvStateRegistry= */ null,
+                keySerializer,
+                userCodeClassLoader,
+                executionConfig,
+                TtlTimeProvider.DEFAULT,
+                LatencyTrackingStateConfig.disabled(),
+                SizeTrackingStateConfig.disabled(),
+                cancelStreamRegistry,
+                UncompressedStreamCompressionDecorator.INSTANCE,
+                /* keyContext= */ new InternalKeyContextImpl<>(keyGroupRange, numberOfKeyGroups));
+        this.delegate = delegate;
+    }
+
+    /**
+     * Overrides {@link AbstractKeyedStateBackend#setCurrentKey} to additionally forward the new
+     * key to the underlying {@link ForStRsKeyedStateBackend} delegate so per-state {@code
+     * keyPrefix} bytes stay in sync with the Flink key-context that {@link
+     * org.apache.flink.runtime.state.AbstractKeyedStateBackend#getOrCreateKeyedState} consults.
+     */
+    @Override
+    public void setCurrentKey(K newKey) {
+        super.setCurrentKey(newKey);
+        if (delegate != null) {
+            delegate.setCurrentKey(newKey);
+        }
+    }
+
+    @Override
+    public void setCurrentKeyAndKeyGroup(K newKey, int newKeyGroupIndex) {
+        super.setCurrentKeyAndKeyGroup(newKey, newKeyGroupIndex);
+        if (delegate != null) {
+            delegate.setCurrentKey(newKey);
+        }
+    }
+
+    /**
      * Wires the snapshot strategy + SST registry into this backend so {@link #snapshot} can drive
      * checkpoints and {@link #notifyCheckpointComplete}/{@link #notifyCheckpointAborted} can manage
      * the registry's ref-counts. Tests or higher-level builders call this after construction.
@@ -240,14 +297,97 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                 "ForStRsAbstractKeyedStateBackend.savepoint is implemented in B-Prod-P4 (savepoint resources)");
     }
 
+    /**
+     * Cache of created InternalKvState adapter wrappers keyed by state-descriptor name so repeat
+     * calls return the same adapter (matching the AbstractKeyedStateBackend.keyValueStatesByName
+     * contract). The adapters re-fetch the underlying L5 ForStRs* state on every method call so
+     * they automatically pick up the post-setCurrentKey rebind via the delegate's cache.
+     */
+    private final java.util.Map<String, org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?>>
+            internalStatesByName = new java.util.HashMap<>();
+
     @Override
+    @SuppressWarnings("unchecked")
     public <N, SV, SEV, S extends State, IS extends S> IS createOrUpdateInternalState(
             TypeSerializer<N> namespaceSerializer,
             StateDescriptor<S, SV> stateDesc,
             StateSnapshotTransformFactory<SEV> snapshotTransformFactory)
             throws Exception {
-        throw new UnsupportedOperationException(
-                "ForStRsAbstractKeyedStateBackend.createOrUpdateInternalState is implemented in B-Prod-P3 (state-factory wiring)");
+        // Idempotent: cached adapter wins, matching the parent's contract that successive
+        // getOrCreateKeyedState calls return the same kvState instance.
+        org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> existing =
+                internalStatesByName.get(stateDesc.getName());
+        if (existing != null) {
+            return (IS) existing;
+        }
+        org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> created;
+        switch (stateDesc.getType()) {
+            case VALUE: {
+                ValueStateDescriptor<SV> vsd = (ValueStateDescriptor<SV>) stateDesc;
+                created =
+                        new ForStRsInternalKvStateAdapters.ValueAdapter<>(
+                                getKeySerializer(),
+                                (TypeSerializer<Object>) namespaceSerializer,
+                                vsd.getSerializer(),
+                                stateDesc.getName(),
+                                (ForStRsKeyedStateBackend<K>) delegate);
+                break;
+            }
+            case LIST: {
+                ListStateDescriptor<Object> lsd = (ListStateDescriptor<Object>) stateDesc;
+                created =
+                        new ForStRsInternalKvStateAdapters.ListAdapter<>(
+                                getKeySerializer(),
+                                (TypeSerializer<Object>) namespaceSerializer,
+                                lsd.getElementSerializer(),
+                                stateDesc.getName(),
+                                (ForStRsKeyedStateBackend<K>) delegate);
+                break;
+            }
+            case MAP: {
+                MapStateDescriptor<Object, Object> msd =
+                        (MapStateDescriptor<Object, Object>) stateDesc;
+                created =
+                        new ForStRsInternalKvStateAdapters.MapAdapter<>(
+                                getKeySerializer(),
+                                (TypeSerializer<Object>) namespaceSerializer,
+                                msd.getKeySerializer(),
+                                msd.getValueSerializer(),
+                                stateDesc.getName(),
+                                (ForStRsKeyedStateBackend<K>) delegate);
+                break;
+            }
+            case REDUCING: {
+                ReducingStateDescriptor<SV> rsd = (ReducingStateDescriptor<SV>) stateDesc;
+                created =
+                        new ForStRsInternalKvStateAdapters.ReducingAdapter<>(
+                                getKeySerializer(),
+                                (TypeSerializer<Object>) namespaceSerializer,
+                                rsd.getSerializer(),
+                                stateDesc.getName(),
+                                rsd.getReduceFunction(),
+                                (ForStRsKeyedStateBackend<K>) delegate);
+                break;
+            }
+            case AGGREGATING: {
+                AggregatingStateDescriptor<Object, SV, Object> asd =
+                        (AggregatingStateDescriptor<Object, SV, Object>) stateDesc;
+                created =
+                        new ForStRsInternalKvStateAdapters.AggregatingAdapter<>(
+                                getKeySerializer(),
+                                (TypeSerializer<Object>) namespaceSerializer,
+                                asd.getSerializer(),
+                                stateDesc.getName(),
+                                asd.getAggregateFunction(),
+                                (ForStRsKeyedStateBackend<K>) delegate);
+                break;
+            }
+            default:
+                throw new UnsupportedOperationException(
+                        "ForStRs backend does not support state type: " + stateDesc.getType());
+        }
+        internalStatesByName.put(stateDesc.getName(), created);
+        return (IS) created;
     }
 
     @Override

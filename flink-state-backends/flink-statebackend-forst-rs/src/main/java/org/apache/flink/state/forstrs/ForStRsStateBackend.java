@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs;
 
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackendBuilder;
 import org.apache.flink.runtime.state.OperatorStateBackend;
@@ -26,25 +27,34 @@ import org.apache.flink.runtime.state.StateBackend;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.keyed.ForStRsAbstractKeyedStateBackend;
 import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
+import org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
 
+import java.io.File;
 import java.lang.foreign.Arena;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.UUID;
 
 /**
  * {@link StateBackend} backed by ForSt-RS via JDK 25 FFM.
  *
- * <p><b>v3.2 Phase-D L5 status.</b> This backend exposes:
+ * <p><b>SPI entry-point (L5/L6 wired).</b> {@link
+ * #createKeyedStateBackend(KeyedStateBackendParameters)} now returns a real {@link
+ * ForStRsAbstractKeyedStateBackend} (constructed via {@link ForStRsKeyedStateBackend} delegate),
+ * so a Flink user setting {@code state.backend =
+ * org.apache.flink.state.forstrs.ForStRsStateBackendFactory} can run keyed-state jobs. Storage
+ * URI routing follows {@link ForStRsOptions#storageUri()}: when set, the backend opens via
+ * {@link ForStRsLinker#dbOpenRemote OpenDAL}, otherwise via {@link ForStRsLinker#dbOpen} on a
+ * unique subdirectory under the TaskManager's tmp working directory.
  *
- * <ul>
- *   <li>{@link #createKeyedStateBackend(KeyedStateBackendParameters)} — currently throws because
- *       the simpler {@link ForStRsKeyedStateBackend} stepping-stone does <i>not</i> implement
- *       {@link CheckpointableKeyedStateBackend} (no snapshot / key-group / savepoint plumbing yet).
- *       Use {@link #createBasicKeyedBackend(TypeSerializer)} for proof-of-concept and unit tests
- *       until the L5 sync-v1 / L6 rescaling work lands.
- *   <li>{@link #createOperatorStateBackend(OperatorStateBackendParameters)} — delegates to Flink's
- *       {@link DefaultOperatorStateBackendBuilder}, which is the standard pattern for backends
- *       whose operator state is just a serialized bytestream rather than a KV store.
- * </ul>
+ * <p>{@link #createOperatorStateBackend(OperatorStateBackendParameters)} delegates to Flink's
+ * {@link DefaultOperatorStateBackendBuilder} — the standard pattern for backends whose operator
+ * state is a serialized bytestream rather than a KV store.
  *
  * @see ForStRsOptions
  * @see ForStRsLinker
@@ -62,14 +72,101 @@ public class ForStRsStateBackend implements StateBackend {
     @Override
     public <K> CheckpointableKeyedStateBackend<K> createKeyedStateBackend(
             StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
-        // ForStRsKeyedStateBackend (Phase-D L5 stepping stone) does not yet implement the full
-        // CheckpointableKeyedStateBackend surface (snapshot, key-groups, savepoint, applyToAllKeys
-        // — ~25 methods). Tests should call createBasicKeyedBackend directly until L5/L6 lands.
-        throw new UnsupportedOperationException(
-                "ForStRsStateBackend.createKeyedStateBackend returning a "
-                        + "CheckpointableKeyedStateBackend is a Phase-D L5/L6 follow-up. "
-                        + "Use ForStRsStateBackend.createBasicKeyedBackend(keySerializer) for the "
-                        + "stepping-stone proof-of-concept that wires the 5 state types end-to-end.");
+        ForStRsOptions options = new ForStRsOptions();
+        Environment env = parameters.getEnv();
+
+        // Resolve a unique local DB path under the TaskManager's tmp working directory.
+        // Layout: <tmp>/forst-rs/<operatorIdSanitized>-<uuid>. The sanitisation matches the
+        // community ForSt backend so the directory is always a legal filename even when the
+        // operator identifier contains slashes or other unfriendly characters.
+        String fileSafeOpId =
+                parameters.getOperatorIdentifier().replaceAll("[^a-zA-Z0-9\\-]", "_");
+        File tmpRoot = env.getTaskManagerInfo().getTmpWorkingDirectory();
+        Path dbRoot = tmpRoot.toPath().resolve("forst-rs");
+        Files.createDirectories(dbRoot);
+        Path localDbPath = dbRoot.resolve(fileSafeOpId + "-" + UUID.randomUUID());
+
+        Arena arena = Arena.ofShared();
+        ForStRsLinker linker = null;
+        FrsDb db = null;
+        FrsCfHandle cf = null;
+        try {
+            linker = new ForStRsLinker(arena);
+            String storageUri = options.storageUri();
+            if (storageUri != null && !storageUri.isEmpty()) {
+                String cacheDir = options.cacheDir();
+                if (cacheDir == null || cacheDir.isEmpty()) {
+                    // Fall back to a per-backend cache subdirectory next to the local DB path.
+                    cacheDir = localDbPath.resolveSibling("cache").toString();
+                    Files.createDirectories(Path.of(cacheDir));
+                }
+                db =
+                        linker.dbOpenRemote(
+                                arena,
+                                storageUri,
+                                options.opendalConfigJson(),
+                                cacheDir,
+                                options.cacheCapacityBytes());
+            } else {
+                db = linker.dbOpen(arena, localDbPath.toString());
+            }
+            cf = linker.dbDefaultCf(db, arena);
+
+            TypeSerializer<K> keySerializer = parameters.getKeySerializer();
+            ForStRsKeyedStateBackend<K> delegate =
+                    new ForStRsKeyedStateBackend<>(
+                            arena, linker, db, cf, keySerializer, /* ownsResources= */ true);
+
+            // ForStRsAbstractKeyedStateBackend owns the delegate's lifecycle via close().
+            ForStRsAbstractKeyedStateBackend<K> backend =
+                    new ForStRsAbstractKeyedStateBackend<>(
+                            keySerializer,
+                            env.getUserCodeClassLoader().asClassLoader(),
+                            env.getExecutionConfig(),
+                            parameters.getCancelStreamRegistry(),
+                            delegate,
+                            parameters.getKeyGroupRange(),
+                            parameters.getNumberOfKeyGroups());
+
+            // Wire the snapshot strategy so Flink-triggered checkpoints have somewhere to go.
+            // We use the single-CF "default" map (cfId=0) which matches the SingleCfRouter
+            // default routing — ForStRsSstRegistry is per-backend (no cross-task sharing in v1).
+            ForStRsSstRegistry sstRegistry = new ForStRsSstRegistry();
+            ForStRsSnapshotStrategy strategy =
+                    new ForStRsSnapshotStrategy(
+                            linker,
+                            db,
+                            UUID.randomUUID(),
+                            parameters.getKeyGroupRange(),
+                            sstRegistry,
+                            new ForStRsSstUploader(),
+                            arena,
+                            Map.of("default", 0L));
+            backend.setSnapshotStrategy(strategy, sstRegistry);
+            return backend;
+        } catch (Throwable t) {
+            // Best-effort tear-down on construction failure so we don't leak FFM handles.
+            if (cf != null) {
+                try {
+                    cf.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (db != null) {
+                try {
+                    db.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                arena.close();
+            } catch (Throwable ignored) {
+            }
+            if (t instanceof Exception ex) {
+                throw ex;
+            }
+            throw new Exception("ForStRsStateBackend.createKeyedStateBackend failed", t);
+        }
     }
 
     @Override
@@ -92,11 +189,9 @@ public class ForStRsStateBackend implements StateBackend {
      * Arena}, {@link ForStRsLinker}, {@link FrsDb} and default {@link FrsCfHandle}; closing it
      * releases all of them.
      *
-     * <p>This entry-point is provided because {@link
-     * #createKeyedStateBackend(KeyedStateBackendParameters)} cannot yet return a {@link
-     * ForStRsKeyedStateBackend} — that class does not implement the {@link
-     * CheckpointableKeyedStateBackend} contract. Once snapshot / key-group / savepoint plumbing is
-     * wired in Phase-D L5/L6 the two factory methods will collapse into one.
+     * <p>This entry-point predates the L5/L6 SPI wiring and is kept for direct unit tests that
+     * want the lean L5-class surface (no Flink runtime context). Production code paths should
+     * use {@link #createKeyedStateBackend(KeyedStateBackendParameters)} instead.
      */
     public <K> ForStRsKeyedStateBackend<K> createBasicKeyedBackend(
             TypeSerializer<K> keySerializer) {
