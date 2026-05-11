@@ -20,6 +20,8 @@ package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.functions.AggregateFunction;
+import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
@@ -46,10 +48,18 @@ import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.metrics.LatencyTrackingStateConfig;
 import org.apache.flink.runtime.state.metrics.SizeTrackingStateConfig;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
+import org.apache.flink.state.forstrs.async.ForStRsAsyncAggregatingState;
+import org.apache.flink.state.forstrs.async.ForStRsAsyncListState;
+import org.apache.flink.state.forstrs.async.ForStRsAsyncMapState;
+import org.apache.flink.state.forstrs.async.ForStRsAsyncReducingState;
+import org.apache.flink.state.forstrs.async.ForStRsAsyncValueState;
+import org.apache.flink.state.forstrs.async.PerKeyFuturesChain;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.RunnableFuture;
 import java.util.stream.Stream;
@@ -91,6 +101,19 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * once snapshot wiring is connected.
      */
     private ForStRsSstRegistry sstRegistry;
+
+    /**
+     * Per-key futures chain shared by all {@code getAsync*State} factories on this backend (spec
+     * §6e). Lazily initialised on first call so backends used purely synchronously do not pay the
+     * cost of a virtual-thread executor.
+     */
+    private volatile PerKeyFuturesChain<K> asyncChain;
+
+    /**
+     * Executor backing {@link #asyncChain}. Owned by this backend; closed in {@link #close()}.
+     * Lazily created via {@link #ensureAsyncChain()}.
+     */
+    private volatile java.util.concurrent.ExecutorService asyncExecutor;
 
     /**
      * Convenience constructor that wires the smallest-possible Flink runtime context (no metrics
@@ -284,11 +307,91 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         return (int) Math.min(Integer.MAX_VALUE, n);
     }
 
+    // ------------------------------------------------------------------
+    // Async state SPI (spec §6e — Flink 2.x async stateful operators)
+    // ------------------------------------------------------------------
+
+    /**
+     * Returns an {@link ForStRsAsyncValueState} bound to {@code stateName}. The returned wrapper
+     * captures {@linkplain ForStRsKeyedStateBackend#getCurrentKey current key} on each method call
+     * and serialises per-key ops via this backend's {@link PerKeyFuturesChain}.
+     *
+     * <p>Per-key ordering and cross-key parallelism are guaranteed by the shared chain. Callers may
+     * submit multiple ops for the same key in flight and observe submit-order completion.
+     */
+    public <T> ForStRsAsyncValueState<K, T> getAsyncValueState(
+            String stateName, TypeSerializer<T> valueSerializer) {
+        return new ForStRsAsyncValueState<>(
+                delegate, stateName, valueSerializer, ensureAsyncChain());
+    }
+
+    /** Async counterpart of {@link ForStRsKeyedStateBackend#getListState}. */
+    public <T> ForStRsAsyncListState<K, T> getAsyncListState(
+            String stateName, TypeSerializer<T> elementSerializer) {
+        return new ForStRsAsyncListState<>(
+                delegate, stateName, elementSerializer, ensureAsyncChain());
+    }
+
+    /** Async counterpart of {@link ForStRsKeyedStateBackend#getMapState}. */
+    public <UK, UV> ForStRsAsyncMapState<K, UK, UV> getAsyncMapState(
+            String stateName,
+            TypeSerializer<UK> userKeySerializer,
+            TypeSerializer<UV> userValueSerializer) {
+        return new ForStRsAsyncMapState<>(
+                delegate, stateName, userKeySerializer, userValueSerializer, ensureAsyncChain());
+    }
+
+    /** Async counterpart of {@link ForStRsKeyedStateBackend#getReducingState}. */
+    public <T> ForStRsAsyncReducingState<K, T> getAsyncReducingState(
+            String stateName, TypeSerializer<T> serializer, ReduceFunction<T> reduceFunction) {
+        return new ForStRsAsyncReducingState<>(
+                delegate, stateName, serializer, reduceFunction, ensureAsyncChain());
+    }
+
+    /** Async counterpart of {@link ForStRsKeyedStateBackend#getAggregatingState}. */
+    public <IN, ACC, OUT> ForStRsAsyncAggregatingState<K, IN, ACC, OUT> getAsyncAggregatingState(
+            String stateName,
+            TypeSerializer<ACC> accSerializer,
+            AggregateFunction<IN, ACC, OUT> aggregateFunction) {
+        return new ForStRsAsyncAggregatingState<>(
+                delegate, stateName, accSerializer, aggregateFunction, ensureAsyncChain());
+    }
+
+    /**
+     * Lazily constructs the per-key futures chain backed by a virtual-thread executor on first
+     * call. Idempotent and thread-safe via double-checked locking on the {@code asyncChain} field.
+     */
+    private PerKeyFuturesChain<K> ensureAsyncChain() {
+        PerKeyFuturesChain<K> chain = asyncChain;
+        if (chain == null) {
+            synchronized (this) {
+                chain = asyncChain;
+                if (chain == null) {
+                    java.util.concurrent.ExecutorService exec =
+                            Executors.newVirtualThreadPerTaskExecutor();
+                    chain = new PerKeyFuturesChain<>((Executor) exec);
+                    this.asyncExecutor = exec;
+                    this.asyncChain = chain;
+                }
+            }
+        }
+        return chain;
+    }
+
+    /** Test accessor for the async chain (or {@code null} if no async state op has been issued). */
+    public PerKeyFuturesChain<K> getAsyncChain() {
+        return asyncChain;
+    }
+
     @Override
     public void close() throws IOException {
         try {
             super.close();
         } finally {
+            // Best-effort shutdown of the async executor — long-running async ops are interrupted.
+            if (asyncExecutor != null) {
+                asyncExecutor.shutdownNow();
+            }
             delegate.close();
         }
     }
