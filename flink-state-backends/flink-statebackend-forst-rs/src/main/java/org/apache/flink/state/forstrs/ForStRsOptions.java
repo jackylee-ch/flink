@@ -33,7 +33,58 @@ public final class ForStRsOptions {
                             "Absolute path to libforst_rs_ffi.{dylib,so,dll}. "
                                     + "If unset, java.library.path is used via System.loadLibrary.");
 
-    private ForStRsOptions() {
-        // utility class
+    /** ConfigOption for the cf.mode flag (single | per-state). */
+    public static final ConfigOption<String> CF_MODE =
+            ConfigOptions.key("state.backend.forst-rs.cf.mode")
+                    .stringType()
+                    .defaultValue("single")
+                    .withDescription(
+                            "Column-family routing mode for keyed states. 'single' (default): all"
+                                    + " state names share the default CF (lowest engine overhead)."
+                                    + " 'per-state': each state name gets its own CF (lazy"
+                                    + " creation, soft limit 256 CFs).");
+
+    private CfMode cfMode = CfMode.SINGLE;
+
+    public ForStRsOptions() {}
+
+    public CfMode cfMode() {
+        return cfMode;
+    }
+
+    public ForStRsOptions cfMode(CfMode m) {
+        this.cfMode = m;
+        return this;
+    }
+
+    /** Column-family routing mode. */
+    public enum CfMode {
+        SINGLE("single"),
+        PER_STATE("per-state");
+
+        private final String configValue;
+
+        CfMode(String configValue) {
+            this.configValue = configValue;
+        }
+
+        public String configValue() {
+            return configValue;
+        }
+
+        public static CfMode fromConfig(String value) {
+            if (value == null || value.isEmpty()) {
+                return SINGLE;
+            }
+            for (CfMode m : values()) {
+                if (m.configValue.equals(value)) {
+                    return m;
+                }
+            }
+            throw new IllegalArgumentException(
+                    "Unknown state.backend.forst-rs.cf.mode: '"
+                            + value
+                            + "' (expected: single | per-state)");
+        }
     }
 }
