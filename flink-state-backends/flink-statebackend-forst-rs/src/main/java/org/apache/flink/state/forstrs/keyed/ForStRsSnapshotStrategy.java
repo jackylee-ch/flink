@@ -56,8 +56,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <ul>
  *   <li><b>Sync phase</b> ({@link #syncPrepareResources(long)}) — captures an engine snapshot
- *       (pinning compaction at the current seq). This is O(1) and non-blocking so it does not
- *       stall the data path during checkpoint barriers.
+ *       (pinning compaction at the current seq). This is O(1) and non-blocking so it does not stall
+ *       the data path during checkpoint barriers.
  *   <li><b>Async phase</b> ({@link #asyncSnapshot}) — runs in a virtual thread, invokes {@link
  *       ForStRsLinker#createIncrementalCheckpointAt} which flushes memtables and writes a manifest
  *       blob + reports (new SSTs, shared SSTs) for this checkpoint relative to the previous {@code
@@ -71,8 +71,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Thread model: sync phase runs on the task thread (must be fast — we issue 1 FFI call:
  * dbSnapshot), async phase dispatches one virtual thread per file via the uploader, then the
  * orchestrating {@link SnapshotStrategy.SnapshotResultSupplier} blocks on the join. {@link
- * CloseableRegistry} registration is no-op for v1 because each upload future already self-cleans
- * on completion; cancellation hooks land in P4 alongside the restore wiring.
+ * CloseableRegistry} registration is no-op for v1 because each upload future already self-cleans on
+ * completion; cancellation hooks land in P4 alongside the restore wiring.
  */
 @Internal
 public class ForStRsSnapshotStrategy
@@ -151,8 +151,7 @@ public class ForStRsSnapshotStrategy
         // at the captured seq — concurrent writes do not affect correctness.
         long baseCheckpointId = lastCompletedCheckpointId.get();
 
-        return new ForStRsSnapshotResources(
-                linker, db, snapshot, checkpointId, baseCheckpointId);
+        return new ForStRsSnapshotResources(linker, db, snapshot, checkpointId, baseCheckpointId);
     }
 
     @Override
@@ -215,13 +214,11 @@ public class ForStRsSnapshotStrategy
 
         // ---- Upload manifest (private state) under EXCLUSIVE scope. ----
         CompletableFuture<StreamStateHandle> manifestFut =
-                uploader.upload(
-                        manifestPath,
-                        streamFactory,
-                        CheckpointedStateScope.EXCLUSIVE);
+                uploader.upload(manifestPath, streamFactory, CheckpointedStateScope.EXCLUSIVE);
 
         // ---- Upload each new SST under SHARED scope (eligible for cross-checkpoint sharing). ----
-        List<CompletableFuture<HandleAndLocalPath>> newSstFuts = new ArrayList<>(newSstFiles.size());
+        List<CompletableFuture<HandleAndLocalPath>> newSstFuts =
+                new ArrayList<>(newSstFiles.size());
         for (Path p : newSstFiles) {
             String localPath = p.getFileName().toString();
             CompletableFuture<HandleAndLocalPath> f =

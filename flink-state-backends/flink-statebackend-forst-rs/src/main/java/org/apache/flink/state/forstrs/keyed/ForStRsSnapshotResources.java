@@ -33,8 +33,8 @@ import org.apache.flink.state.forstrs.ffm.FrsSnapshot;
  * <ul>
  *   <li>the engine-side {@link FrsSnapshot} pinning the source seq;
  *   <li>the checkpoint id and base checkpoint id needed by the async phase to call {@link
- *       ForStRsLinker#createIncrementalCheckpointAt} (moved out of the sync phase to avoid
- *       blocking the data path with flush I/O during checkpoint barriers).
+ *       ForStRsLinker#createIncrementalCheckpointAt} (moved out of the sync phase to avoid blocking
+ *       the data path with flush I/O during checkpoint barriers).
  * </ul>
  *
  * <p>The async phase calls {@code createIncrementalCheckpointAt} which flushes memtables and
