@@ -423,4 +423,29 @@ class ForStRsLinkerExtendedTest {
             }
         }
     }
+
+    @Test
+    void getPinnedReturnsInlineValue() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                linker.put(db, cf, utf8("k"), utf8("small-value"));
+                byte[] pinned = linker.getPinned(db, cf, utf8("k"));
+                assertNotNull(pinned);
+                assertArrayEquals(utf8("small-value"), pinned);
+            }
+        }
+    }
+
+    @Test
+    void getPinnedReturnsNullForMissingKey() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                assertNull(linker.getPinned(db, cf, utf8("missing")));
+            }
+        }
+    }
 }

@@ -123,6 +123,7 @@ public final class ForStRsLinker {
     // --- 3. Point ops ---
     private final MethodHandle frsPut;
     private final MethodHandle frsGet;
+    private final MethodHandle frsGetPinned;
     private final MethodHandle frsGetAndPut;
     private final MethodHandle frsDelete;
 
@@ -329,6 +330,21 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG, // key_len
                                 ValueLayout.ADDRESS)); // out FrsBytes*
+
+        // Zero-copy pinned get from memtable inline storage. Returns a direct
+        // pointer into the memtable's HashEntry.inline_value without any Rust-side
+        // Vec allocation. Critical mode: the key byte[] is pinned for the call.
+        this.frsGetPinned =
+                bindCritical(
+                        "frs_get_pinned",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key ptr
+                                ValueLayout.JAVA_LONG, // key_len
+                                ValueLayout.ADDRESS, // out_ptr (*const u8*)
+                                ValueLayout.ADDRESS)); // out_len (usize*)
 
         this.frsGetAndPut =
                 bindCritical(
@@ -976,6 +992,58 @@ public final class ForStRsLinker {
     /** Returns the value for {@code key} or {@code null} if absent. */
     public byte[] get(FrsDb db, FrsCfHandle cf, byte[] key) {
         return getInternal(frsGet, "frs_get", db, cf, key);
+    }
+
+    /** Native status code returned when the value is not inline (too large or in SST). */
+    private static final int FRS_STATUS_FALLBACK = 16;
+
+    /**
+     * ThreadLocal buffer for the 16-byte out struct used by {@link #getPinned}: 8 bytes for the
+     * pointer + 8 bytes for the length. Avoids per-call allocation on the hot path.
+     */
+    private static final ThreadLocal<byte[]> PINNED_OUT_BUF =
+            ThreadLocal.withInitial(() -> new byte[16]);
+
+    /**
+     * Zero-copy get from memtable inline storage. Returns the value bytes directly (copied from
+     * native pointer) without Rust-side Vec allocation. Returns {@code null} if the value is not
+     * inline (caller should fall back to {@link #get}).
+     *
+     * <p>The returned pointer points directly into the memtable's {@code HashEntry.inline_value:
+     * Box<[u8]>}. It is valid until the memtable is flushed (which cannot happen mid-record in
+     * Flink's single-threaded-per-slot model).
+     */
+    public byte[] getPinned(FrsDb db, FrsCfHandle cf, byte[] key) {
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        byte[] outBuf = PINNED_OUT_BUF.get();
+        MemorySegment outSeg = MemorySegment.ofArray(outBuf);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsGetPinned.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySeg,
+                                    (long) key.length,
+                                    outSeg.asSlice(0, 8), // out_ptr
+                                    outSeg.asSlice(8, 8)); // out_len
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_get_pinned threw: " + t.getMessage());
+        }
+        if (rc == FRS_STATUS_FALLBACK) {
+            return null; // not inline — caller should fall back to get()
+        }
+        check(rc, "frs_get_pinned");
+        // Read ptr + len from the out buffer (heap byte[] — use unaligned reads)
+        long ptr = MemorySegment.ofArray(outBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+        long len = MemorySegment.ofArray(outBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 8);
+        if (ptr == 0 || len == 0) {
+            return null;
+        }
+        // Copy from native pointer to byte[] (one copy, no Rust allocation)
+        return MemorySegment.ofAddress(ptr).reinterpret(len).toArray(ValueLayout.JAVA_BYTE);
     }
 
     /**

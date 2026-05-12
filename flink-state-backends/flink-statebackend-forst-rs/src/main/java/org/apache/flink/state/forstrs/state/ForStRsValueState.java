@@ -119,7 +119,12 @@ public class ForStRsValueState<T> implements ValueState<T> {
     @Override
     public T value() throws IOException {
         lastValueKey = computeKey();
-        byte[] raw = linker.get(db, cf, lastValueKey);
+        // Fast path: zero-copy from memtable inline storage (no Rust Vec alloc)
+        byte[] raw = linker.getPinned(db, cf, lastValueKey);
+        if (raw == null) {
+            // Fallback: regular get (allocating path for large values / SST-resident)
+            raw = linker.get(db, cf, lastValueKey);
+        }
         if (raw == null) {
             return null;
         }
