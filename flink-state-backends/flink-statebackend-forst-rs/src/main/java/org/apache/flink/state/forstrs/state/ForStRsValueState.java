@@ -137,6 +137,26 @@ public class ForStRsValueState<T> implements ValueState<T> {
     }
 
     /**
+     * Combined get + put in one FFM call. Returns the old value (null if absent) and writes the new
+     * value atomically. Saves one FFM boundary crossing vs separate {@link #value()} + {@link
+     * #update(Object)} for the read-modify-write pattern.
+     *
+     * @param newValue the value to write (must not be null — use {@link #clear()} for deletion)
+     * @return the previous value, or null if the key did not exist
+     */
+    public T getAndUpdate(T newValue) throws IOException {
+        outputBuffer.clear();
+        serializer.serialize(newValue, outputBuffer);
+        byte[] payload = outputBuffer.getCopyOfBuffer();
+        byte[] oldRaw = linker.getAndPut(db, cf, computeKey(), payload);
+        if (oldRaw == null) {
+            return null;
+        }
+        inputBuffer.setBuffer(oldRaw);
+        return serializer.deserialize(inputBuffer);
+    }
+
+    /**
      * Returns the ForSt-RS key for the current logical entry. In legacy/byte[] mode this is the
      * construction-time prefix verbatim; in kg-prefixed mode it is freshly built by invoking the
      * key-computer (typically wired to {@code ForStRsKeyGroupedSerializer.encodeForState}).

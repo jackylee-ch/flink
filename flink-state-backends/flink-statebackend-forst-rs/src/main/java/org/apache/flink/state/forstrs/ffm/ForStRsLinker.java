@@ -123,6 +123,7 @@ public final class ForStRsLinker {
     // --- 3. Point ops ---
     private final MethodHandle frsPut;
     private final MethodHandle frsGet;
+    private final MethodHandle frsGetAndPut;
     private final MethodHandle frsDelete;
 
     // --- 3b. Batch ops ---
@@ -328,6 +329,19 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG, // key_len
                                 ValueLayout.ADDRESS)); // out FrsBytes*
+
+        this.frsGetAndPut =
+                bindCritical(
+                        "frs_get_and_put",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key ptr
+                                ValueLayout.JAVA_LONG, // key_len
+                                ValueLayout.ADDRESS, // new_value ptr
+                                ValueLayout.JAVA_LONG, // new_value_len
+                                ValueLayout.ADDRESS)); // out FrsBytes* (old value)
 
         this.frsDelete =
                 bindCritical(
@@ -965,6 +979,49 @@ public final class ForStRsLinker {
     }
 
     /**
+     * Combined get + put in one FFM call. Returns the old value ({@code null} if the key did not
+     * exist before the put). The put always succeeds regardless of whether the key existed.
+     *
+     * <p>Saves one FFM boundary crossing vs separate {@link #get} + {@link #put} for the dominant
+     * ValueState read-modify-write pattern.
+     */
+    public byte[] getAndPut(FrsDb db, FrsCfHandle cf, byte[] key, byte[] newValue) {
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        MemorySegment valSeg = MemorySegment.ofArray(newValue);
+        byte[] outBytesArr = FRS_BYTES_BUF.get();
+        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsGetAndPut.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySeg,
+                                    (long) key.length,
+                                    valSeg,
+                                    (long) newValue.length,
+                                    outBytes);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_get_and_put threw: " + t.getMessage());
+        }
+        if (rc == FrsStatus.NOT_FOUND.code()) {
+            return null; // key didn't exist before the put (put still succeeded)
+        }
+        check(rc, "frs_get_and_put");
+
+        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
+        long len =
+                outBytes.get(
+                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        if (dataAddr == 0L) {
+            return null;
+        }
+        return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_and_put/free");
+    }
+
+    /**
      * Batched put — writes {@code count} key/value pairs in one engine call.
      *
      * <p>The four "parallel array" segments must be laid out in native memory:
@@ -1061,8 +1118,8 @@ public final class ForStRsLinker {
      * Batch point-lookup: reads {@code count} keys in one FFM call, amortizing the boundary
      * crossing cost across N lookups.
      *
-     * <p>The caller supplies pre-staged native segments for key pointers and key lengths. The method
-     * allocates the output FrsBytes array internally and reads/frees each result.
+     * <p>The caller supplies pre-staged native segments for key pointers and key lengths. The
+     * method allocates the output FrsBytes array internally and reads/frees each result.
      *
      * @return array of length {@code count}; null entries mean "not found".
      */
@@ -1079,7 +1136,11 @@ public final class ForStRsLinker {
                 rc =
                         (int)
                                 frsBatchGet.invokeExact(
-                                        db.handle(), cf.handle(), keyPtrs, keyLens, count,
+                                        db.handle(),
+                                        cf.handle(),
+                                        keyPtrs,
+                                        keyLens,
+                                        count,
                                         outValues);
             } catch (Throwable t) {
                 throw new FrsBackendException(
@@ -1095,8 +1156,7 @@ public final class ForStRsLinker {
                 if (dataAddr != 0L && len > 0) {
                     MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
                     results[i] = new byte[(int) len];
-                    MemorySegment.copy(
-                            dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
+                    MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
                     // Free the native allocation
                     int freeRc;
                     try {
@@ -1148,7 +1208,11 @@ public final class ForStRsLinker {
                 rc =
                         (int)
                                 frsBatchGet.invokeExact(
-                                        db.handle(), cf.handle(), keyPtrs, keyLens, (long) count,
+                                        db.handle(),
+                                        cf.handle(),
+                                        keyPtrs,
+                                        keyLens,
+                                        (long) count,
                                         outValues);
             } catch (Throwable t) {
                 throw new FrsBackendException(
@@ -1164,8 +1228,7 @@ public final class ForStRsLinker {
                 if (dataAddr != 0L && len > 0) {
                     MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
                     results[i] = new byte[(int) len];
-                    MemorySegment.copy(
-                            dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
+                    MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
                     int freeRc;
                     try {
                         freeRc = (int) frsBytesFree.invokeExact(entry);
