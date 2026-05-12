@@ -200,9 +200,18 @@ run_variant() {
     fi
     echo ""
     echo "--- $label ---"
+    # Use JDK 17 for non-forst-rs variants (rocksdb + forst use JNI which
+    # doesn't need FFM; forstjni-0.1.8 has JDK 25 compat issues with its
+    # native library loading path). forst-rs REQUIRES JDK 25 for FFM.
+    local java_bin="$JAVA_HOME/bin/java"
+    local jvm_module_args="--enable-native-access=ALL-UNNAMED"
+    if [ "$backend" != "forst-rs" ] && [ -n "${JAVA17_HOME:-}" ] && [ -x "$JAVA17_HOME/bin/java" ]; then
+        java_bin="$JAVA17_HOME/bin/java"
+        jvm_module_args=""  # JDK 17 doesn't need --enable-native-access
+    fi
     # shellcheck disable=SC2086
-    "$JAVA_HOME/bin/java" \
-        --enable-native-access=ALL-UNNAMED \
+    "$java_bin" \
+        $jvm_module_args \
         -Dforstrs.native.libpath="$CDYLIB" \
         $extra_jvm_args \
         "$@" \

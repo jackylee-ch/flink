@@ -107,6 +107,18 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
 
+      - name: Setup JDK 17 (for forst/rocksdb variants — forstjni native lib compat)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+        env:
+          # Don't override JAVA_HOME — keep JDK 25 as default for forst-rs FFM
+          JAVA_TOOL_OPTIONS: ''
+
+      - name: Export JAVA17_HOME for the bench script
+        run: echo "JAVA17_HOME=$(dirname $(dirname $(find /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.* -name java -path '*/bin/java' | head -1)))" >> "$GITHUB_ENV"
+
       - name: Setup Maven 3.9.6
         uses: stCarolas/setup-maven@v5
         with:
