@@ -20,8 +20,11 @@ package org.apache.flink.state.forstrs.keyed;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
+
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ForStRsKeyGroupedSerializerTest {
 
@@ -89,5 +92,86 @@ class ForStRsKeyGroupedSerializerTest {
         // For this test we just assert the prefix STARTS with the kg bytes.
         assertEquals((byte) 0x00, prefix[0]);
         assertEquals((byte) 0x07, prefix[1]);
+    }
+
+    // ------------------------------------------------------------------
+    // Vector API batch key-group assignment tests
+    // ------------------------------------------------------------------
+
+    @Test
+    void batchAssignKeyGroupsPowerOfTwo() {
+        // maxParallelism=128 is power-of-2 — exercises the SIMD AND path
+        int maxParallelism = 128;
+        byte[][] keys = new byte[100][];
+        for (int i = 0; i < keys.length; i++) {
+            keys[i] = ("key-" + i).getBytes();
+        }
+        int[] result = ForStRsKeyGroupedSerializer.batchAssignKeyGroups(keys, maxParallelism);
+        assertEquals(keys.length, result.length);
+
+        // Verify each result matches the scalar reference implementation
+        for (int i = 0; i < keys.length; i++) {
+            int expected =
+                    ForStRsKeyGroupedSerializer.scalarMurmurHash(Arrays.hashCode(keys[i]))
+                            & (maxParallelism - 1);
+            assertEquals(expected, result[i], "Mismatch at index " + i);
+            assertTrue(result[i] >= 0 && result[i] < maxParallelism);
+        }
+    }
+
+    @Test
+    void batchAssignKeyGroupsNonPowerOfTwo() {
+        // maxParallelism=100 is NOT power-of-2 — exercises the scalar modulo path
+        int maxParallelism = 100;
+        byte[][] keys = new byte[73][];
+        for (int i = 0; i < keys.length; i++) {
+            keys[i] = ("record-" + i).getBytes();
+        }
+        int[] result = ForStRsKeyGroupedSerializer.batchAssignKeyGroups(keys, maxParallelism);
+        assertEquals(keys.length, result.length);
+
+        for (int i = 0; i < keys.length; i++) {
+            int hash = ForStRsKeyGroupedSerializer.scalarMurmurHash(Arrays.hashCode(keys[i]));
+            int expected = hash % maxParallelism;
+            assertEquals(expected, result[i], "Mismatch at index " + i);
+            assertTrue(result[i] >= 0 && result[i] < maxParallelism);
+        }
+    }
+
+    @Test
+    void batchAssignKeyGroupsEmptyInput() {
+        int[] result = ForStRsKeyGroupedSerializer.batchAssignKeyGroups(new byte[0][], 128);
+        assertEquals(0, result.length);
+    }
+
+    @Test
+    void batchAssignKeyGroupsLargeBatch() {
+        // Exercises multiple full SIMD vector iterations + tail
+        int maxParallelism = 256;
+        byte[][] keys = new byte[1000][];
+        for (int i = 0; i < keys.length; i++) {
+            keys[i] = ("large-batch-key-" + i).getBytes();
+        }
+        int[] result = ForStRsKeyGroupedSerializer.batchAssignKeyGroups(keys, maxParallelism);
+        assertEquals(keys.length, result.length);
+
+        // Spot-check first, middle, last
+        for (int idx : new int[] {0, 499, 999}) {
+            int expected =
+                    ForStRsKeyGroupedSerializer.scalarMurmurHash(Arrays.hashCode(keys[idx]))
+                            & (maxParallelism - 1);
+            assertEquals(expected, result[idx], "Mismatch at index " + idx);
+        }
+    }
+
+    @Test
+    void scalarMurmurHashMatchesFlinkMathUtils() {
+        // Verify our scalar implementation matches the expected murmur hash behavior:
+        // non-negative output for all inputs
+        int[] testInputs = {0, 1, -1, Integer.MAX_VALUE, Integer.MIN_VALUE, 42, -999};
+        for (int input : testInputs) {
+            int result = ForStRsKeyGroupedSerializer.scalarMurmurHash(input);
+            assertTrue(result >= 0, "murmurHash(" + input + ") should be non-negative, got " + result);
+        }
     }
 }

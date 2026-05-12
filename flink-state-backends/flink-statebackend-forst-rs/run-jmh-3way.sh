@@ -228,6 +228,7 @@ echo "[run] variant=$VARIANT preset=$PRESET lib=$LIB main=$MAIN_CLASS"
 RESULT_FILE="/tmp/jmh-results-$VARIANT-$PRESET.txt"
 "$JAVA_HOME/bin/java" \
   --enable-native-access=ALL-UNNAMED \
+  --add-modules jdk.incubator.vector \
   ${JVM_EXTRA[@]+"${JVM_EXTRA[@]}"} \
   -Xms256m -Xmx2g \
   ${LIB_PROP[@]+"${LIB_PROP[@]}"} \

@@ -204,7 +204,7 @@ run_variant() {
     # doesn't need FFM; forstjni-0.1.8 has JDK 25 compat issues with its
     # native library loading path). forst-rs REQUIRES JDK 25 for FFM.
     local java_bin="$JAVA_HOME/bin/java"
-    local jvm_module_args="--enable-native-access=ALL-UNNAMED"
+    local jvm_module_args="--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector"
     if [ "$backend" != "forst-rs" ] && [ -n "${JAVA17_HOME:-}" ] && [ -x "$JAVA17_HOME/bin/java" ]; then
         java_bin="$JAVA17_HOME/bin/java"
         jvm_module_args=""  # JDK 17 doesn't need --enable-native-access

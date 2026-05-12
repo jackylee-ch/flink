@@ -52,7 +52,9 @@ under the License.
 		<forstrs.native.libpath>${user.home}/Code/stczwd/ForSt/target/release/libforst_rs_ffi.dylib</forstrs.native.libpath>
 		<surefire.module.config><!--
 			FFM API requires opt-in for native access in JDK 22+.
+			Vector API (jdk.incubator.vector) requires add-modules.
 			-->--enable-native-access=ALL-UNNAMED
+			--add-modules jdk.incubator.vector
 			-Dforstrs.native.libpath=${forstrs.native.libpath}
 		</surefire.module.config>
 	</properties>
@@ -188,5 +190,20 @@ under the License.
 		</dependency>
 
 	</dependencies>
+
+	<build>
+		<plugins>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-compiler-plugin</artifactId>
+				<configuration>
+					<compilerArgs combine.children="append">
+						<arg>--add-modules</arg>
+						<arg>jdk.incubator.vector</arg>
+					</compilerArgs>
+				</configuration>
+			</plugin>
+		</plugins>
+	</build>
 
 </project>
