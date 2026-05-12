@@ -24,10 +24,6 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsSnapshot;
 
-import java.lang.foreign.MemorySegment;
-import java.nio.file.Path;
-import java.util.List;
-
 /**
  * Captured-but-not-yet-uploaded incremental checkpoint state (B-Prod-P3 Task 3.4).
  *
@@ -36,15 +32,17 @@ import java.util.List;
  *
  * <ul>
  *   <li>the engine-side {@link FrsSnapshot} pinning the source seq;
- *   <li>the per-checkpoint result struct (Arena-allocated 32-byte buffer) that must be freed via
- *       {@link ForStRsLinker#dbIncrementalCheckpointResultFree(MemorySegment)} once async upload
- *       completes;
- *   <li>the manifest path (private state — uploaded once, owned by this checkpoint);
- *   <li>the lists of new + shared SST file paths the async phase must upload + register.
+ *   <li>the checkpoint id and base checkpoint id needed by the async phase to call {@link
+ *       ForStRsLinker#createIncrementalCheckpointAt} (moved out of the sync phase to avoid
+ *       blocking the data path with flush I/O during checkpoint barriers).
  * </ul>
  *
- * <p>{@link #release()} disposes the snapshot + frees the result struct; the Arena that backs the
- * struct is provided by the strategy and outlives this resource.
+ * <p>The async phase calls {@code createIncrementalCheckpointAt} which flushes memtables and
+ * computes the manifest + SST file lists. This is safe because the snapshot pins all versions at
+ * the captured seq — concurrent writes do not affect correctness.
+ *
+ * <p>{@link #release()} disposes the snapshot; the async phase is responsible for freeing the
+ * result struct via {@code ForStRsLinker.dbIncrementalCheckpointResultFree}.
  */
 @Internal
 public final class ForStRsSnapshotResources implements SnapshotResources {
@@ -52,10 +50,6 @@ public final class ForStRsSnapshotResources implements SnapshotResources {
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsSnapshot snapshot;
-    private final MemorySegment resultStruct;
-    private final Path manifestPath;
-    private final List<Path> newSstFiles;
-    private final List<Path> sharedSstFiles;
     private final long checkpointId;
     private final long baseCheckpointId;
 
@@ -63,37 +57,17 @@ public final class ForStRsSnapshotResources implements SnapshotResources {
             ForStRsLinker linker,
             FrsDb db,
             FrsSnapshot snapshot,
-            MemorySegment resultStruct,
-            Path manifestPath,
-            List<Path> newSstFiles,
-            List<Path> sharedSstFiles,
             long checkpointId,
             long baseCheckpointId) {
         this.linker = linker;
         this.db = db;
         this.snapshot = snapshot;
-        this.resultStruct = resultStruct;
-        this.manifestPath = manifestPath;
-        this.newSstFiles = newSstFiles;
-        this.sharedSstFiles = sharedSstFiles;
         this.checkpointId = checkpointId;
         this.baseCheckpointId = baseCheckpointId;
     }
 
     public FrsSnapshot getSnapshot() {
         return snapshot;
-    }
-
-    public Path getManifestPath() {
-        return manifestPath;
-    }
-
-    public List<Path> getNewSstFiles() {
-        return newSstFiles;
-    }
-
-    public List<Path> getSharedSstFiles() {
-        return sharedSstFiles;
     }
 
     public long getCheckpointId() {
@@ -106,15 +80,7 @@ public final class ForStRsSnapshotResources implements SnapshotResources {
 
     @Override
     public void release() {
-        // Free the engine-side checkpoint-result allocations first (before releasing the snapshot —
-        // the manifest C string lives in the result struct).
-        try {
-            linker.dbIncrementalCheckpointResultFree(resultStruct);
-        } catch (RuntimeException ignored) {
-            // Idempotent on the native side; swallow to honor SnapshotResources.release()'s
-            // best-effort contract.
-        }
-        // Then release the engine snapshot so compaction can advance past its seq.
+        // Release the engine snapshot so compaction can advance past its seq.
         try {
             snapshot.close();
         } catch (RuntimeException ignored) {
@@ -127,8 +93,8 @@ public final class ForStRsSnapshotResources implements SnapshotResources {
         return db;
     }
 
-    /** Test/read accessor for the captured 32-byte result struct (Arena-allocated). */
-    public MemorySegment getResultStruct() {
-        return resultStruct;
+    /** Returns the linker for use by the async phase. */
+    public ForStRsLinker getLinker() {
+        return linker;
     }
 }

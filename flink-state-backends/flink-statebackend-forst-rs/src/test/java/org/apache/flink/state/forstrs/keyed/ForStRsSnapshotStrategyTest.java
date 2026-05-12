@@ -83,12 +83,8 @@ class ForStRsSnapshotStrategyTest {
 
                 // ---- First checkpoint (full — base = 0). ----
                 ForStRsSnapshotResources res1 = strategy.syncPrepareResources(1L);
-                assertNotNull(res1.getManifestPath(), "engine must produce a manifest path");
-                assertTrue(
-                        res1.getNewSstFiles().size() >= 1,
-                        "expected at least one new SST after seed writes");
-                assertEquals(
-                        0, res1.getSharedSstFiles().size(), "first checkpoint has no shared SSTs");
+                assertNotNull(res1.getSnapshot(), "sync phase must capture a snapshot");
+                assertEquals(0L, res1.getBaseCheckpointId(), "first checkpoint base is 0");
 
                 SnapshotResult<?> result1 =
                         strategy.asyncSnapshot(res1, 1L, 0L, factory, null)

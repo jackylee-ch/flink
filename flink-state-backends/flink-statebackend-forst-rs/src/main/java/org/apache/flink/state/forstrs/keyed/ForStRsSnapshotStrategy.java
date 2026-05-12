@@ -56,22 +56,23 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <ul>
  *   <li><b>Sync phase</b> ({@link #syncPrepareResources(long)}) — captures an engine snapshot
- *       (pinning compaction at the current seq) and invokes {@link
- *       ForStRsLinker#createIncrementalCheckpointAt} which writes a manifest blob + reports (new
- *       SSTs, shared SSTs) for this checkpoint relative to the previous {@code lastCheckpointId}
- *       this strategy successfully completed.
- *   <li><b>Async phase</b> ({@link #asyncSnapshot}) — runs in a virtual thread, uploads the
- *       manifest + new SSTs via {@link ForStRsSstUploader}, registers the new SSTs in the local
- *       {@link ForStRsSstRegistry}, then assembles a {@link ForStRsIncrementalKeyedStateHandle}.
- *       Shared SSTs from prior checkpoints are looked up from the registry rather than re-uploaded.
- *       The returned {@link SnapshotResult} carries the JM-owned handle (no task-local copy in v1).
+ *       (pinning compaction at the current seq). This is O(1) and non-blocking so it does not
+ *       stall the data path during checkpoint barriers.
+ *   <li><b>Async phase</b> ({@link #asyncSnapshot}) — runs in a virtual thread, invokes {@link
+ *       ForStRsLinker#createIncrementalCheckpointAt} which flushes memtables and writes a manifest
+ *       blob + reports (new SSTs, shared SSTs) for this checkpoint relative to the previous {@code
+ *       lastCheckpointId}. Then uploads the manifest + new SSTs via {@link ForStRsSstUploader},
+ *       registers the new SSTs in the local {@link ForStRsSstRegistry}, and assembles a {@link
+ *       ForStRsIncrementalKeyedStateHandle}. Shared SSTs from prior checkpoints are looked up from
+ *       the registry rather than re-uploaded. The returned {@link SnapshotResult} carries the
+ *       JM-owned handle (no task-local copy in v1).
  * </ul>
  *
- * <p>Thread model: sync phase runs on the task thread (must be fast — we issue 2 FFI calls), async
- * phase dispatches one virtual thread per file via the uploader, then the orchestrating {@link
- * SnapshotStrategy.SnapshotResultSupplier} blocks on the join. {@link CloseableRegistry}
- * registration is no-op for v1 because each upload future already self-cleans on completion;
- * cancellation hooks land in P4 alongside the restore wiring.
+ * <p>Thread model: sync phase runs on the task thread (must be fast — we issue 1 FFI call:
+ * dbSnapshot), async phase dispatches one virtual thread per file via the uploader, then the
+ * orchestrating {@link SnapshotStrategy.SnapshotResultSupplier} blocks on the join. {@link
+ * CloseableRegistry} registration is no-op for v1 because each upload future already self-cleans
+ * on completion; cancellation hooks land in P4 alongside the restore wiring.
  */
 @Internal
 public class ForStRsSnapshotStrategy
@@ -140,38 +141,18 @@ public class ForStRsSnapshotStrategy
 
     @Override
     public ForStRsSnapshotResources syncPrepareResources(long checkpointId) throws Exception {
-        // Step 1: capture an engine snapshot (pinning the seq).
+        // Step 1: capture an engine snapshot (pinning the seq). This is O(1) and non-blocking.
         FrsSnapshot snapshot = linker.dbSnapshot(db, nativeArena);
 
-        // Step 2: ask the engine to compute new+shared SSTs relative to the last completed
-        // checkpoint and to persist a manifest blob covering this checkpoint.
+        // Step 2: record the base checkpoint id for the async phase. The actual
+        // createIncrementalCheckpointAt call (which flushes memtables and computes
+        // new/shared SST lists) is deferred to the async phase so it does NOT block
+        // the task thread during checkpoint barriers. The snapshot pins all versions
+        // at the captured seq — concurrent writes do not affect correctness.
         long baseCheckpointId = lastCompletedCheckpointId.get();
-        // The result struct is 32 bytes per the ABI: 8 + 8 + 8 + 4 + 4(padding).
-        MemorySegment result = nativeArena.allocate(32);
-        try {
-            linker.createIncrementalCheckpointAt(
-                    db, snapshot, checkpointId, baseCheckpointId, result);
-        } catch (RuntimeException re) {
-            // If the engine call fails, we still need to release the snapshot.
-            snapshot.close();
-            throw re;
-        }
-
-        // Step 3: marshal the result struct's three fields into Java objects.
-        Path manifestPath = readCString(result, 0L);
-        List<Path> newSstFiles = readSstList(result, PTR);
-        List<Path> sharedSstFiles = readSstList(result, 2 * PTR);
 
         return new ForStRsSnapshotResources(
-                linker,
-                db,
-                snapshot,
-                result,
-                manifestPath,
-                newSstFiles,
-                sharedSstFiles,
-                checkpointId,
-                baseCheckpointId);
+                linker, db, snapshot, checkpointId, baseCheckpointId);
     }
 
     @Override
@@ -205,17 +186,43 @@ public class ForStRsSnapshotStrategy
     private SnapshotResult<KeyedStateHandle> doAsyncSnapshot(
             ForStRsSnapshotResources resources, CheckpointStreamFactory streamFactory)
             throws Exception {
+        // ---- Compute the incremental checkpoint (flush + SST enumeration). ----
+        // This was moved out of the sync phase to avoid blocking the task thread
+        // during checkpoint barriers. The snapshot pins all versions at the captured
+        // seq so concurrent writes do not affect correctness.
+        MemorySegment result = nativeArena.allocate(32);
+        try {
+            linker.createIncrementalCheckpointAt(
+                    db,
+                    resources.getSnapshot(),
+                    resources.getCheckpointId(),
+                    resources.getBaseCheckpointId(),
+                    result);
+        } catch (RuntimeException re) {
+            throw re;
+        }
+
+        Path manifestPath = readCString(result, 0L);
+        List<Path> newSstFiles = readSstList(result, PTR);
+        List<Path> sharedSstFiles = readSstList(result, 2 * PTR);
+
+        // Free the result struct now that we've marshalled the data into Java objects.
+        try {
+            linker.dbIncrementalCheckpointResultFree(result);
+        } catch (RuntimeException ignored) {
+            // Idempotent on the native side.
+        }
+
         // ---- Upload manifest (private state) under EXCLUSIVE scope. ----
         CompletableFuture<StreamStateHandle> manifestFut =
                 uploader.upload(
-                        resources.getManifestPath(),
+                        manifestPath,
                         streamFactory,
                         CheckpointedStateScope.EXCLUSIVE);
 
         // ---- Upload each new SST under SHARED scope (eligible for cross-checkpoint sharing). ----
-        List<Path> newFiles = resources.getNewSstFiles();
-        List<CompletableFuture<HandleAndLocalPath>> newSstFuts = new ArrayList<>(newFiles.size());
-        for (Path p : newFiles) {
+        List<CompletableFuture<HandleAndLocalPath>> newSstFuts = new ArrayList<>(newSstFiles.size());
+        for (Path p : newSstFiles) {
             String localPath = p.getFileName().toString();
             CompletableFuture<HandleAndLocalPath> f =
                     uploader.upload(p, streamFactory, CheckpointedStateScope.SHARED)
@@ -225,8 +232,7 @@ public class ForStRsSnapshotStrategy
 
         // ---- Resolve shared SSTs from the registry (already uploaded by a prior ckpt). ----
         List<HandleAndLocalPath> sharedHandles = new ArrayList<>();
-        List<Path> sharedFiles = resources.getSharedSstFiles();
-        for (Path p : sharedFiles) {
+        for (Path p : sharedSstFiles) {
             String localPath = p.getFileName().toString();
             StateHandleID id = new StateHandleID(localPath);
             StreamStateHandle h =
@@ -258,7 +264,7 @@ public class ForStRsSnapshotStrategy
         }
         // Also include the shared SSTs: their ref-counts were bumped above so abort must roll those
         // back as well.
-        for (Path p : sharedFiles) {
+        for (Path p : sharedSstFiles) {
             String localPath = p.getFileName().toString();
             sstRegistry
                     .get(new StateHandleID(localPath))
