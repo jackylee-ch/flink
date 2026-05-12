@@ -64,6 +64,7 @@ public class LittleE2EPerfBench {
         long events = Long.parseLong(arg(args, "--events", "1000000"));
         int warmups = Integer.parseInt(arg(args, "--warmups", "1"));
         int parallelism = Integer.parseInt(arg(args, "--parallelism", "2"));
+        long ckptInterval = Long.parseLong(arg(args, "--checkpoint-interval", "0"));
 
         Configuration cfg = new Configuration();
         cfg.set(StateBackendOptions.STATE_BACKEND, factoryFor(backend));
@@ -78,16 +79,16 @@ public class LittleE2EPerfBench {
         mc.before();
         try {
             for (int i = 0; i < warmups; i++) {
-                runJob(events, "warmup-" + i, backend, parallelism);
+                runJob(events, "warmup-" + i, backend, parallelism, ckptInterval);
             }
             long start = System.nanoTime();
-            runJob(events, "measure", backend, parallelism);
+            runJob(events, "measure", backend, parallelism, ckptInterval);
             long elapsedNs = System.nanoTime() - start;
             double throughput = (double) events * 1e9 / elapsedNs;
             // One canonical RESULT line per invocation — parsed by the driver script.
             System.out.printf(
-                    "RESULT backend=%s events=%d parallelism=%d elapsed_ms=%.2f throughput_eps=%.0f%n",
-                    backend, events, parallelism, elapsedNs / 1e6, throughput);
+                    "RESULT backend=%s events=%d parallelism=%d checkpoint_ms=%d elapsed_ms=%.2f throughput_eps=%.0f%n",
+                    backend, events, parallelism, ckptInterval, elapsedNs / 1e6, throughput);
         } finally {
             mc.after();
         }
@@ -114,10 +115,14 @@ public class LittleE2EPerfBench {
      * distinct keys × N-slot keyBy means each slot sees ~(100/N) keyed-state writes per event
      * group, which is enough to expose state access latency without saturating the source.
      */
-    private static void runJob(long events, String label, String backend, int parallelism)
+    private static void runJob(
+            long events, String label, String backend, int parallelism, long ckptInterval)
             throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
+        if (ckptInterval > 0) {
+            env.enableCheckpointing(ckptInterval);
+        }
         DataStream<Long> source = env.fromSequence(1, events);
         source.keyBy(x -> x % 100).flatMap(new SumState()).sinkTo(new DiscardingSink<>());
         env.execute("LittleE2EPerf-" + backend + "-" + label);

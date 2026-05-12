@@ -45,6 +45,15 @@ FLINK_ROOT="$(cd "$ROOT/../.." && pwd)"
 EVENTS="${EVENTS:-1000000}"
 WARMUPS="${WARMUPS:-1}"
 PARALLELISM_SWEEP="${PARALLELISM_SWEEP:-2 4 8}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-0}"
+
+# JFR profiling: set PROFILE=1 to attach Java Flight Recorder to forst-rs runs.
+# The JFR file is written to /tmp/forst-rs-profile.jfr for post-hoc analysis.
+if [ "${PROFILE:-}" = "1" ]; then
+    PROFILE_ARGS="-XX:+FlightRecorder -XX:StartFlightRecording=duration=120s,filename=/tmp/forst-rs-profile.jfr"
+else
+    PROFILE_ARGS=""
+fi
 
 # Default-locate the cdylib next to this checkout. Same default the existing
 # JMH driver script uses (run-jmh-3way.sh) so the two scripts share a
@@ -184,15 +193,23 @@ run_variant() {
     local label="$1"
     local backend="$2"
     shift 2
+    local extra_jvm_args=""
+    # Attach JFR profiling to forst-rs variants when PROFILE=1
+    if [ -n "$PROFILE_ARGS" ] && [ "$backend" = "forst-rs" ]; then
+        extra_jvm_args="$PROFILE_ARGS"
+    fi
     echo ""
     echo "--- $label ---"
+    # shellcheck disable=SC2086
     "$JAVA_HOME/bin/java" \
         --enable-native-access=ALL-UNNAMED \
         -Dforstrs.native.libpath="$CDYLIB" \
+        $extra_jvm_args \
         "$@" \
         -cp "$CP" \
         org.apache.flink.state.forstrs.perf.LittleE2EPerfBench \
-        --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS" --parallelism "$PAR"
+        --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS" --parallelism "$PAR" \
+        --checkpoint-interval "$CHECKPOINT_INTERVAL"
     local rc=$?
     if [ $rc -ne 0 ]; then
         echo "VARIANT_FAILED label='$label' backend=$backend parallelism=$PAR exit_code=$rc"
@@ -208,6 +225,17 @@ for PAR in $PARALLELISM_SWEEP; do
         "-Djava.library.path=$LIBSWAP_DIR"
     run_variant "forst-rs (p=$PAR)" forst-rs
 done
+
+# Checkpoint variant: p=4, ckpt=5s — measures overhead of periodic snapshots.
+if [ "${CHECKPOINT_INTERVAL:-0}" = "0" ]; then
+    echo ""
+    echo "====== Checkpoint variant: p=4, ckpt=5000ms ======"
+    PAR=4
+    CHECKPOINT_INTERVAL=5000
+    run_variant "rocksdb (p=4, ckpt=5s)" rocksdb
+    run_variant "forst-rs (p=4, ckpt=5s)" forst-rs
+    CHECKPOINT_INTERVAL=0
+fi
 set -e
 
 echo ""
