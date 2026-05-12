@@ -108,9 +108,18 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.inputBuffer = new DataInputDeserializer();
     }
 
+    // Deferred-put optimization: when value() is followed by update() for the
+    // same key (the dominant read-modify-write pattern), we skip the separate
+    // put() call and let update() use the already-computed key. This saves one
+    // computeKey() call per read-modify-write cycle. The key is invalidated on
+    // any call that changes the logical key (clear, or a new value() with a
+    // different computed key).
+    private byte[] lastValueKey;
+
     @Override
     public T value() throws IOException {
-        byte[] raw = linker.get(db, cf, computeKey());
+        lastValueKey = computeKey();
+        byte[] raw = linker.get(db, cf, lastValueKey);
         if (raw == null) {
             return null;
         }
@@ -121,19 +130,23 @@ public class ForStRsValueState<T> implements ValueState<T> {
     @Override
     public void update(T value) throws IOException {
         if (value == null) {
-            // Per Flink's contract: null update behaves as clear.
             clear();
             return;
         }
         outputBuffer.clear();
         serializer.serialize(value, outputBuffer);
         byte[] payload = outputBuffer.getCopyOfBuffer();
-        linker.put(db, cf, computeKey(), payload);
+        // Reuse the key from the preceding value() call if available
+        byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
+        linker.put(db, cf, key, payload);
+        lastValueKey = null; // consumed
     }
 
     @Override
     public void clear() {
-        linker.delete(db, cf, computeKey());
+        byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
+        linker.delete(db, cf, key);
+        lastValueKey = null;
     }
 
     /**
