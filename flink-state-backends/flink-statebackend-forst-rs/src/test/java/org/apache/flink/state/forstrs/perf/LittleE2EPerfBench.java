@@ -61,8 +61,9 @@ public class LittleE2EPerfBench {
 
     public static void main(String[] args) throws Exception {
         String backend = arg(args, "--backend", "forst-rs");
-        long events = Long.parseLong(arg(args, "--events", "100000"));
+        long events = Long.parseLong(arg(args, "--events", "1000000"));
         int warmups = Integer.parseInt(arg(args, "--warmups", "1"));
+        int parallelism = Integer.parseInt(arg(args, "--parallelism", "2"));
 
         Configuration cfg = new Configuration();
         cfg.set(StateBackendOptions.STATE_BACKEND, factoryFor(backend));
@@ -70,23 +71,23 @@ public class LittleE2EPerfBench {
         MiniClusterWithClientResource mc =
                 new MiniClusterWithClientResource(
                         new MiniClusterResourceConfiguration.Builder()
-                                .setNumberSlotsPerTaskManager(2)
+                                .setNumberSlotsPerTaskManager(parallelism)
                                 .setNumberTaskManagers(1)
                                 .setConfiguration(cfg)
                                 .build());
         mc.before();
         try {
             for (int i = 0; i < warmups; i++) {
-                runJob(events, "warmup-" + i, backend);
+                runJob(events, "warmup-" + i, backend, parallelism);
             }
             long start = System.nanoTime();
-            runJob(events, "measure", backend);
+            runJob(events, "measure", backend, parallelism);
             long elapsedNs = System.nanoTime() - start;
             double throughput = (double) events * 1e9 / elapsedNs;
             // One canonical RESULT line per invocation — parsed by the driver script.
             System.out.printf(
-                    "RESULT backend=%s events=%d elapsed_ms=%.2f throughput_eps=%.0f%n",
-                    backend, events, elapsedNs / 1e6, throughput);
+                    "RESULT backend=%s events=%d parallelism=%d elapsed_ms=%.2f throughput_eps=%.0f%n",
+                    backend, events, parallelism, elapsedNs / 1e6, throughput);
         } finally {
             mc.after();
         }
@@ -108,14 +109,15 @@ public class LittleE2EPerfBench {
 
     /**
      * The bench workload: a stateful per-key running sum over {@code env.fromSequence(1, N)}.
-     * Parallelism=2 mirrors the slots-per-TM=2 cluster config, so each slot owns half the key
-     * space and exercises a parallel state backend (not the trivial single-key path). 100
-     * distinct keys × 2-slot keyBy means each slot sees ~50 keyed-state writes per event group,
-     * which is enough to expose state access latency without saturating the source.
+     * Parallelism mirrors the slots-per-TM cluster config, so each slot owns a portion of the
+     * key space and exercises a parallel state backend (not the trivial single-key path). 100
+     * distinct keys × N-slot keyBy means each slot sees ~(100/N) keyed-state writes per event
+     * group, which is enough to expose state access latency without saturating the source.
      */
-    private static void runJob(long events, String label, String backend) throws Exception {
+    private static void runJob(long events, String label, String backend, int parallelism)
+            throws Exception {
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
-        env.setParallelism(2);
+        env.setParallelism(parallelism);
         DataStream<Long> source = env.fromSequence(1, events);
         source.keyBy(x -> x % 100).flatMap(new SumState()).sinkTo(new DiscardingSink<>());
         env.execute("LittleE2EPerf-" + backend + "-" + label);

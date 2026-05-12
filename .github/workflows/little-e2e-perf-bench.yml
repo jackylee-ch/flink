@@ -32,9 +32,9 @@ on:
   workflow_dispatch:
     inputs:
       events:
-        description: 'Events per backend (default 100000, max 1000000)'
+        description: 'Events per backend (default 1000000, max 10000000)'
         required: false
-        default: '100000'
+        default: '1000000'
 
 permissions: read-all
 
@@ -96,7 +96,7 @@ jobs:
     name: "LittleE2E perf bench across 4 backends"
     needs: build-cdylib
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout Flink (this repo)
         uses: actions/checkout@v4
@@ -136,7 +136,7 @@ jobs:
 
       - name: Run LittleE2E bench across 4 backends
         env:
-          EVENTS: ${{ github.event.inputs.events || '100000' }}
+          EVENTS: ${{ github.event.inputs.events || '1000000' }}
           FORST_RS_CDYLIB: ${{ steps.cdylib.outputs.lib_path }}
           MAVEN_OPTS: "--enable-native-access=ALL-UNNAMED"
         run: |

@@ -42,8 +42,9 @@ FLINK_ROOT="$(cd "$ROOT/../.." && pwd)"
 # ----------------------------------------------------------------------
 # Library + workload params
 # ----------------------------------------------------------------------
-EVENTS="${EVENTS:-100000}"
+EVENTS="${EVENTS:-1000000}"
 WARMUPS="${WARMUPS:-1}"
+PARALLELISM_SWEEP="${PARALLELISM_SWEEP:-2 4 8}"
 
 # Default-locate the cdylib next to this checkout. Same default the existing
 # JMH driver script uses (run-jmh-3way.sh) so the two scripts share a
@@ -169,7 +170,7 @@ esac
 # ----------------------------------------------------------------------
 echo ""
 echo "=== LittleE2EPerfBench across 4 backend variants ==="
-echo "Events: $EVENTS   Warmups: $WARMUPS"
+echo "Events: $EVENTS   Warmups: $WARMUPS   Parallelism sweep: $PARALLELISM_SWEEP"
 echo "CDylib: $CDYLIB"
 echo ""
 
@@ -191,18 +192,22 @@ run_variant() {
         "$@" \
         -cp "$CP" \
         org.apache.flink.state.forstrs.perf.LittleE2EPerfBench \
-        --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS"
+        --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS" --parallelism "$PAR"
     local rc=$?
     if [ $rc -ne 0 ]; then
-        echo "VARIANT_FAILED label='$label' backend=$backend exit_code=$rc"
+        echo "VARIANT_FAILED label='$label' backend=$backend parallelism=$PAR exit_code=$rc"
     fi
 }
 
-run_variant "rocksdb" rocksdb
-run_variant "forst (community libforstjni)" forst
-run_variant "forst (libforstjni -> libforst_rs_ffi swap)" forst \
-    "-Djava.library.path=$LIBSWAP_DIR"
-run_variant "forst-rs" forst-rs
+for PAR in $PARALLELISM_SWEEP; do
+    echo ""
+    echo "====== Parallelism = $PAR ======"
+    run_variant "rocksdb (p=$PAR)" rocksdb
+    run_variant "forst (community libforstjni, p=$PAR)" forst
+    run_variant "forst (libforstjni -> libforst_rs_ffi swap, p=$PAR)" forst \
+        "-Djava.library.path=$LIBSWAP_DIR"
+    run_variant "forst-rs (p=$PAR)" forst-rs
+done
 set -e
 
 echo ""
