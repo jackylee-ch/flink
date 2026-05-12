@@ -127,6 +127,7 @@ public final class ForStRsLinker {
 
     // --- 3b. Batch ops ---
     private final MethodHandle frsBatchPut;
+    private final MethodHandle frsBatchGet;
 
     // C1: zero-copy batch_put via Arrow C Data Interface. The native side
     // takes an FFI_ArrowArray + FFI_ArrowSchema pair (key | value | op_type)
@@ -357,6 +358,22 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // values (uint8_t* const*)
                                 ValueLayout.ADDRESS, // value_lens (size_t*)
                                 ValueLayout.JAVA_LONG)); // count (size_t)
+
+        // frs_batch_get: reads N keys in one call, returning N FrsBytes slots.
+        // Native signature:
+        //   int frs_batch_get(FrsDb, FrsCfHandle, *const *const u8 keys,
+        //                     *const usize key_lens, usize count, *mut FrsBytes out_values)
+        this.frsBatchGet =
+                bind(
+                        "frs_batch_get",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // keys (uint8_t* const*)
+                                ValueLayout.ADDRESS, // key_lens (size_t*)
+                                ValueLayout.JAVA_LONG, // count (size_t)
+                                ValueLayout.ADDRESS)); // out_values (FrsBytes*)
 
         // C1: zero-copy batch_put via Arrow C Data Interface.
         // Native signature:
@@ -1037,6 +1054,129 @@ public final class ForStRsLinker {
                         (long) v.length);
             }
             batchPut(db, cf, keyPtrs, keyLens, valPtrs, valLens, count);
+        }
+    }
+
+    /**
+     * Batch point-lookup: reads {@code count} keys in one FFM call, amortizing the boundary
+     * crossing cost across N lookups.
+     *
+     * <p>The caller supplies pre-staged native segments for key pointers and key lengths. The method
+     * allocates the output FrsBytes array internally and reads/frees each result.
+     *
+     * @return array of length {@code count}; null entries mean "not found".
+     */
+    public byte[][] batchGet(
+            FrsDb db, FrsCfHandle cf, MemorySegment keyPtrs, MemorySegment keyLens, long count) {
+        if (count == 0) {
+            return new byte[0][];
+        }
+        try (Arena local = Arena.ofConfined()) {
+            long bytesSize = FRS_BYTES_LAYOUT.byteSize();
+            MemorySegment outValues = local.allocate(bytesSize * count);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsBatchGet.invokeExact(
+                                        db.handle(), cf.handle(), keyPtrs, keyLens, count,
+                                        outValues);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
+            }
+            check(rc, "frs_batch_get");
+
+            byte[][] results = new byte[(int) count][];
+            for (int i = 0; i < (int) count; i++) {
+                MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
+                long dataAddr = entry.get(ValueLayout.ADDRESS, 0).address();
+                long len = entry.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
+                if (dataAddr != 0L && len > 0) {
+                    MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
+                    results[i] = new byte[(int) len];
+                    MemorySegment.copy(
+                            dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
+                    // Free the native allocation
+                    int freeRc;
+                    try {
+                        freeRc = (int) frsBytesFree.invokeExact(entry);
+                    } catch (Throwable t) {
+                        throw new FrsBackendException(
+                                FrsStatus.PANIC, "frs_bytes_free threw: " + t.getMessage());
+                    }
+                    check(freeRc, "frs_batch_get/free");
+                }
+                // else: results[i] stays null (not found)
+            }
+            return results;
+        }
+    }
+
+    /**
+     * Convenience overload — stages {@code keys} into a fresh confined arena and forwards to {@link
+     * #batchGet(FrsDb, FrsCfHandle, MemorySegment, MemorySegment, long)}.
+     *
+     * @return array of length {@code keys.length}; null entries mean "not found".
+     */
+    public byte[][] batchGet(FrsDb db, FrsCfHandle cf, byte[][] keys) {
+        int count = keys.length;
+        if (count == 0) {
+            return new byte[0][];
+        }
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keyPtrs = local.allocate((long) count * ValueLayout.ADDRESS.byteSize());
+            MemorySegment keyLens = local.allocate((long) count * ValueLayout.JAVA_LONG.byteSize());
+            for (int i = 0; i < count; i++) {
+                byte[] k = keys[i];
+                MemorySegment ks = local.allocate(k.length == 0 ? 1 : k.length);
+                if (k.length > 0) {
+                    MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
+                }
+                keyPtrs.set(ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), ks);
+                keyLens.set(
+                        ValueLayout.JAVA_LONG,
+                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
+                        (long) k.length);
+            }
+            // Allocate out_values in this arena (will be freed with the arena, but we
+            // free individual FrsBytes payloads inside batchGetRaw).
+            long bytesSize = FRS_BYTES_LAYOUT.byteSize();
+            MemorySegment outValues = local.allocate(bytesSize * count);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsBatchGet.invokeExact(
+                                        db.handle(), cf.handle(), keyPtrs, keyLens, (long) count,
+                                        outValues);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
+            }
+            check(rc, "frs_batch_get");
+
+            byte[][] results = new byte[count][];
+            for (int i = 0; i < count; i++) {
+                MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
+                long dataAddr = entry.get(ValueLayout.ADDRESS, 0).address();
+                long len = entry.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
+                if (dataAddr != 0L && len > 0) {
+                    MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
+                    results[i] = new byte[(int) len];
+                    MemorySegment.copy(
+                            dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
+                    int freeRc;
+                    try {
+                        freeRc = (int) frsBytesFree.invokeExact(entry);
+                    } catch (Throwable t) {
+                        throw new FrsBackendException(
+                                FrsStatus.PANIC, "frs_bytes_free threw: " + t.getMessage());
+                    }
+                    check(freeRc, "frs_batch_get/free");
+                }
+            }
+            return results;
         }
     }
 

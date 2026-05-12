@@ -387,4 +387,40 @@ class ForStRsLinkerExtendedTest {
             }
         }
     }
+
+    @Test
+    void batchGetReturnsCorrectValuesAndNulls() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                linker.put(db, cf, utf8("k1"), utf8("v1"));
+                linker.put(db, cf, utf8("k2"), utf8("v2"));
+                linker.put(db, cf, utf8("k3"), utf8("v3"));
+
+                byte[][] keys = {utf8("k1"), utf8("k2"), utf8("missing"), utf8("k3")};
+                byte[][] results = linker.batchGet(db, cf, keys);
+
+                assertEquals(4, results.length);
+                assertArrayEquals(utf8("v1"), results[0]);
+                assertArrayEquals(utf8("v2"), results[1]);
+                assertNull(results[2]);
+                assertArrayEquals(utf8("v3"), results[3]);
+            }
+        }
+    }
+
+    @Test
+    void batchGetEmptyKeysReturnsEmptyArray() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[][] results = linker.batchGet(db, cf, new byte[0][]);
+                assertEquals(0, results.length);
+            }
+        }
+    }
 }
