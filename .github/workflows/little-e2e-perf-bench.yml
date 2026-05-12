@@ -107,19 +107,6 @@ jobs:
           java-version: '25'
           distribution: 'temurin'
 
-      - name: Setup JDK 17 (for forst/rocksdb variants — forstjni native lib compat)
-        uses: actions/setup-java@v4
-        with:
-          java-version: '17'
-          distribution: 'temurin'
-
-      - name: Export JAVA17_HOME and restore JAVA_HOME to JDK 25
-        run: |
-          # setup-java@v4 sets JAVA_HOME to the last-installed JDK (17).
-          # Save it as JAVA17_HOME, then restore JAVA_HOME to JDK 25 for forst-rs FFM.
-          echo "JAVA17_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
-          echo "JAVA_HOME=$JAVA_HOME_25_X64" >> "$GITHUB_ENV"
-
       - name: Setup Maven 3.9.6
         uses: stCarolas/setup-maven@v5
         with:
