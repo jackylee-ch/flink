@@ -112,12 +112,13 @@ jobs:
         with:
           java-version: '17'
           distribution: 'temurin'
-        env:
-          # Don't override JAVA_HOME — keep JDK 25 as default for forst-rs FFM
-          JAVA_TOOL_OPTIONS: ''
 
-      - name: Export JAVA17_HOME for the bench script
-        run: echo "JAVA17_HOME=$(dirname $(dirname $(find /opt/hostedtoolcache/Java_Temurin-Hotspot_jdk/17.* -name java -path '*/bin/java' | head -1)))" >> "$GITHUB_ENV"
+      - name: Export JAVA17_HOME and restore JAVA_HOME to JDK 25
+        run: |
+          # setup-java@v4 sets JAVA_HOME to the last-installed JDK (17).
+          # Save it as JAVA17_HOME, then restore JAVA_HOME to JDK 25 for forst-rs FFM.
+          echo "JAVA17_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "JAVA_HOME=$JAVA_HOME_25_X64" >> "$GITHUB_ENV"
 
       - name: Setup Maven 3.9.6
         uses: stCarolas/setup-maven@v5
