@@ -35,6 +35,7 @@ import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.state.AbstractKeyedStateBackend;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
+import org.apache.flink.runtime.state.DoneFuture;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
 import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.InternalKeyContextImpl;
@@ -63,6 +64,9 @@ import org.apache.flink.state.forstrs.async.PerKeyFuturesChain;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
 import java.util.List;
 import java.util.concurrent.Executor;
@@ -90,6 +94,9 @@ import java.util.stream.Stream;
  */
 @Internal
 public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBackend<K> {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(ForStRsAbstractKeyedStateBackend.class);
 
     /** A delegate L5 backend (existing simple Closeable) that owns the actual FFM handles. */
     private final ForStRsKeyedStateBackend<K> delegate;
@@ -335,12 +342,30 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         //   * matches the contract Flink's CheckpointAsyncExecutor expects to drive with .run().
         // Execution type ASYNCHRONOUS = the returned future is not pre-run; Flink's coordinator
         // schedules .run() on its async snapshot executor.
-        return new SnapshotStrategyRunner<>(
-                        "ForStRs-incremental-snapshot",
-                        snapshotStrategy,
-                        cancelStreamRegistry,
-                        SnapshotExecutionType.ASYNCHRONOUS)
-                .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
+        try {
+            return new SnapshotStrategyRunner<>(
+                            "ForStRs-incremental-snapshot",
+                            snapshotStrategy,
+                            cancelStreamRegistry,
+                            SnapshotExecutionType.ASYNCHRONOUS)
+                    .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
+        } catch (IOException e) {
+            // The cancelStreamRegistry may already be closed if a prior checkpoint's async
+            // phase failed or the task is being cancelled. In that case the
+            // SnapshotStrategyRunner cannot register its cancellation hook and throws
+            // "Cannot register Closeable, registry is already closed."
+            // Gracefully abort: return a pre-completed future with an empty result so the
+            // checkpoint coordinator can proceed without hanging the job.
+            if (e.getMessage() != null
+                    && e.getMessage().contains("registry is already closed")) {
+                LOG.info(
+                        "Checkpoint {} skipped — cancelStreamRegistry already closed"
+                                + " (prior checkpoint failure or task cancellation).",
+                        checkpointId);
+                return DoneFuture.of(SnapshotResult.empty());
+            }
+            throw e;
+        }
     }
 
     @Override
