@@ -40,22 +40,23 @@ import org.apache.flink.util.Collector;
  *
  * <ol>
  *   <li>Boots a {@link MiniClusterWithClientResource} with {@code state.backend} configured to one
- *       of the three SPI factory classes ({@code EmbeddedRocksDBStateBackendFactory},
- *       {@code ForStStateBackendFactory}, or {@code ForStRsStateBackendFactory}).
+ *       of the three SPI factory classes ({@code EmbeddedRocksDBStateBackendFactory}, {@code
+ *       ForStStateBackendFactory}, or {@code ForStRsStateBackendFactory}).
  *   <li>Runs {@code --warmups N} warmup jobs (default 1), then 1 measured job over the same
- *       workload — {@code env.fromSequence(1, EVENTS).keyBy(x -> x % 100).flatMap(SumState).discard()}.
+ *       workload — {@code env.fromSequence(1, EVENTS).keyBy(x -> x %
+ *       100).flatMap(SumState).discard()}.
  *   <li>Emits a single {@code RESULT} line to stdout, parsed by the driver script for the
  *       comparison table.
  * </ol>
  *
- * <p>The script {@code run-little-e2e-perf.sh} drives this main class four times — once per
- * backend variant. The fourth ("forst with libforstjni→libforst_rs_ffi swap") reuses
- * {@code --backend forst} but with {@code -Djava.library.path} pointing at a directory that
- * stages the forst-rs cdylib under the upstream JNI lib name; see the script for the swap.
+ * <p>The script {@code run-little-e2e-perf.sh} drives this main class four times — once per backend
+ * variant. The fourth ("forst with libforstjni→libforst_rs_ffi swap") reuses {@code --backend
+ * forst} but with {@code -Djava.library.path} pointing at a directory that stages the forst-rs
+ * cdylib under the upstream JNI lib name; see the script for the swap.
  *
  * <p>Checkpointing is intentionally disabled here — we isolate the state-access cost (gets,
- * updates, scan-during-key-rebalancing) from the checkpoint-snapshot cost. Real-scale
- * end-to-end checkpointed measurements belong with the Nexmark matrix.
+ * updates, scan-during-key-rebalancing) from the checkpoint-snapshot cost. Real-scale end-to-end
+ * checkpointed measurements belong with the Nexmark matrix.
  */
 public class LittleE2EPerfBench {
 
@@ -95,13 +96,14 @@ public class LittleE2EPerfBench {
     }
 
     /**
-     * Maps the CLI backend tag onto the canonical {@code StateBackendFactory} class name. The
-     * Flink 2.2.0 binary uses these exact FQCNs — confirmed in the corresponding source files
-     * under {@code flink-state-backends/flink-statebackend-{rocksdb,forst,forst-rs}/src/main/}.
+     * Maps the CLI backend tag onto the canonical {@code StateBackendFactory} class name. The Flink
+     * 2.2.0 binary uses these exact FQCNs — confirmed in the corresponding source files under
+     * {@code flink-state-backends/flink-statebackend-{rocksdb,forst,forst-rs}/src/main/}.
      */
     private static String factoryFor(String backend) {
         return switch (backend) {
-            case "rocksdb" -> "org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackendFactory";
+            case "rocksdb" ->
+                    "org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackendFactory";
             case "forst" -> "org.apache.flink.state.forst.ForStStateBackendFactory";
             case "forst-rs" -> "org.apache.flink.state.forstrs.ForStRsStateBackendFactory";
             default -> throw new IllegalArgumentException("unknown backend: " + backend);
@@ -110,10 +112,10 @@ public class LittleE2EPerfBench {
 
     /**
      * The bench workload: a stateful per-key running sum over {@code env.fromSequence(1, N)}.
-     * Parallelism mirrors the slots-per-TM cluster config, so each slot owns a portion of the
-     * key space and exercises a parallel state backend (not the trivial single-key path). 100
-     * distinct keys × N-slot keyBy means each slot sees ~(100/N) keyed-state writes per event
-     * group, which is enough to expose state access latency without saturating the source.
+     * Parallelism mirrors the slots-per-TM cluster config, so each slot owns a portion of the key
+     * space and exercises a parallel state backend (not the trivial single-key path). 100 distinct
+     * keys × N-slot keyBy means each slot sees ~(100/N) keyed-state writes per event group, which
+     * is enough to expose state access latency without saturating the source.
      */
     private static void runJob(
             long events, String label, String backend, int parallelism, long ckptInterval)

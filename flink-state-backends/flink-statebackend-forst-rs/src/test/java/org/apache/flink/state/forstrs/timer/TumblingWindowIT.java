@@ -43,33 +43,32 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p><b>Scope reality check.</b> A full {@code MiniClusterWithClientResource} job that drives 1M
  * events through a tumbling-window operator is desirable but heavy: it would require the {@link
- * org.apache.flink.state.forstrs.ForStRsStateBackend#createKeyedStateBackend} entry point to
- * return a real {@code CheckpointableKeyedStateBackend} (the abstract backend currently throws —
- * see its JavaDoc for the L5/L6 follow-up), so the IT here exercises the queue directly: simulate
- * timer registration on every event, drain timers in key-group order, and assert the expected
- * fire count.
+ * org.apache.flink.state.forstrs.ForStRsStateBackend#createKeyedStateBackend} entry point to return
+ * a real {@code CheckpointableKeyedStateBackend} (the abstract backend currently throws — see its
+ * JavaDoc for the L5/L6 follow-up), so the IT here exercises the queue directly: simulate timer
+ * registration on every event, drain timers in key-group order, and assert the expected fire count.
  *
  * <p>The original P9 IT held at 5k events because each {@code poll()} on the FFM-backed engine
  * opens a fresh prefix-scan iterator (~2ms per call on the test machine), so a high-count drain
  * dominated IT wall-time. B-Prod-followup-4 closed that gap by:
  *
  * <ol>
- *   <li>Switching the drain path from per-element {@code poll()} (one iterator open per fire) to
- *       a per-key-group bulk drain using {@link
+ *   <li>Switching the drain path from per-element {@code poll()} (one iterator open per fire) to a
+ *       per-key-group bulk drain using {@link
  *       ForStRsKeyGroupedInternalPriorityQueue#getSubsetForKeyGroup(int)} (one iterator open per
  *       key group) followed by a single {@link
- *       ForStRsKeyGroupedInternalPriorityQueue#removeAll(java.util.Collection)} bulk-delete.
- *       This collapses iterator-open cost from O(N) to O(KG), which is the only thing that was
- *       capping the scale.
+ *       ForStRsKeyGroupedInternalPriorityQueue#removeAll(java.util.Collection)} bulk-delete. This
+ *       collapses iterator-open cost from O(N) to O(KG), which is the only thing that was capping
+ *       the scale.
  *   <li>Adding a second test that retains the per-element {@code poll()} drain semantics so we
- *       still cover the production hot path; that test runs at the original scale where its cost
- *       is acceptable.
+ *       still cover the production hot path; that test runs at the original scale where its cost is
+ *       acceptable.
  * </ol>
  *
- * <p>The scaled-up test still validates the same correctness invariants — every registered
- * timer is fired exactly once and {@code KeyGroupRange}-resident keys are returned in sorted
- * order. A future task can flip both tests onto the MiniCluster path once L5/L6 lands and the
- * {@code createKeyedStateBackend} stub goes away.
+ * <p>The scaled-up test still validates the same correctness invariants — every registered timer is
+ * fired exactly once and {@code KeyGroupRange}-resident keys are returned in sorted order. A future
+ * task can flip both tests onto the MiniCluster path once L5/L6 lands and the {@code
+ * createKeyedStateBackend} stub goes away.
  */
 class TumblingWindowIT {
 
@@ -105,10 +104,10 @@ class TumblingWindowIT {
 
     /**
      * 100k events / 10k keys — 20× the original 5k spec the IT held while we still drained
-     * timer-by-timer. Drain path uses {@code getSubsetForKeyGroup(kg)} + {@code removeAll(set)}
-     * to amortize the iterator-open cost across each key group. Run time on the developer
-     * workstation: ~5s end-to-end vs. ~10s for the 5k poll() variant — so the per-element
-     * iterator-open path was the only cost that mattered at scale.
+     * timer-by-timer. Drain path uses {@code getSubsetForKeyGroup(kg)} + {@code removeAll(set)} to
+     * amortize the iterator-open cost across each key group. Run time on the developer workstation:
+     * ~5s end-to-end vs. ~10s for the 5k poll() variant — so the per-element iterator-open path was
+     * the only cost that mattered at scale.
      */
     @Test
     void tumblingWindowFireCountMatchesExpectation_scaledBulkDrain() throws Exception {
@@ -177,10 +176,10 @@ class TumblingWindowIT {
     }
 
     /**
-     * Smaller-scale (5k events / 500 keys) test that still exercises the per-element {@code
-     * poll()} path — the production code path used by Flink's window/timer operators when a
-     * timer fires individually. Held at the legacy 5k scale so the iterator-open cost stays
-     * bounded; flagged to be lifted once we add a batched bulk-poll FFI call.
+     * Smaller-scale (5k events / 500 keys) test that still exercises the per-element {@code poll()}
+     * path — the production code path used by Flink's window/timer operators when a timer fires
+     * individually. Held at the legacy 5k scale so the iterator-open cost stays bounded; flagged to
+     * be lifted once we add a batched bulk-poll FFI call.
      */
     @Test
     void tumblingWindowFireCountMatchesExpectation_pollPath() throws Exception {
@@ -227,7 +226,8 @@ class TumblingWindowIT {
             }
         }
 
-        assertEquals(registered, fired, "poll() drain must fire every registered timer exactly once");
+        assertEquals(
+                registered, fired, "poll() drain must fire every registered timer exactly once");
         long expectedWindows = (long) events * EVENT_INTERVAL_MS / WINDOW_SIZE_MS + 1;
         assertTrue(
                 registeredEndTimes.size() <= expectedWindows + 1,

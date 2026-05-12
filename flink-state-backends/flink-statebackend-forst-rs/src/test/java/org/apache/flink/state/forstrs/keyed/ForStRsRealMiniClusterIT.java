@@ -64,25 +64,23 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 /**
  * B-Prod-followup-4 / -L5L6 — real MiniCluster integration test.
  *
- * <p>This test brings up an actual Flink {@link
- * org.apache.flink.runtime.minicluster.MiniCluster} configured to use the {@link
- * org.apache.flink.state.forstrs.ForStRsStateBackendFactory} and validates the SPI surface
- * end-to-end:
+ * <p>This test brings up an actual Flink {@link org.apache.flink.runtime.minicluster.MiniCluster}
+ * configured to use the {@link org.apache.flink.state.forstrs.ForStRsStateBackendFactory} and
+ * validates the SPI surface end-to-end:
  *
  * <ul>
- *   <li><b>Unkeyed-job smoke test</b>: cluster boots with the backend wired and an unkeyed job
- *       runs to completion.
- *   <li><b>Keyed-state job</b> using {@code ValueStateDescriptor} runs end-to-end through the
- *       wired SPI ({@code state.backend = ForStRsStateBackendFactory} →
- *       {@code createKeyedStateBackend} → {@code ForStRsAbstractKeyedStateBackend} →
- *       {@code createOrUpdateInternalState} adapters).
- *   <li><b>Restart-from-failure</b>: a keyed job with checkpointing enabled survives a
- *       one-shot injected failure via Flink's restart-strategy, exercising
- *       {@code createKeyedStateBackend} twice (initial + post-restart).
+ *   <li><b>Unkeyed-job smoke test</b>: cluster boots with the backend wired and an unkeyed job runs
+ *       to completion.
+ *   <li><b>Keyed-state job</b> using {@code ValueStateDescriptor} runs end-to-end through the wired
+ *       SPI ({@code state.backend = ForStRsStateBackendFactory} → {@code createKeyedStateBackend} →
+ *       {@code ForStRsAbstractKeyedStateBackend} → {@code createOrUpdateInternalState} adapters).
+ *   <li><b>Restart-from-failure</b>: a keyed job with checkpointing enabled survives a one-shot
+ *       injected failure via Flink's restart-strategy, exercising {@code createKeyedStateBackend}
+ *       twice (initial + post-restart).
  *   <li><b>Engine-level snapshot+restore</b> driven under a live MiniCluster executor context
- *       (drives the same {@link ForStRsAbstractKeyedStateBackend} +
- *       {@link ForStRsRestoreOperation} round-trip the {@link ForStRsKeyedStateBackendIT}
- *       fallback uses, scheduled here from a realistic concurrency surface).
+ *       (drives the same {@link ForStRsAbstractKeyedStateBackend} + {@link ForStRsRestoreOperation}
+ *       round-trip the {@link ForStRsKeyedStateBackendIT} fallback uses, scheduled here from a
+ *       realistic concurrency surface).
  * </ul>
  */
 class ForStRsRealMiniClusterIT {
@@ -140,9 +138,7 @@ class ForStRsRealMiniClusterIT {
         env.setParallelism(2);
 
         DataStream<Long> source = env.fromSequence(1, 1000);
-        source.keyBy((Long x) -> x % 2)
-                .flatMap(new SumState())
-                .sinkTo(new DiscardingSink<>());
+        source.keyBy((Long x) -> x % 2).flatMap(new SumState()).sinkTo(new DiscardingSink<>());
 
         // Real run: the keyed job must complete without surfacing an
         // UnsupportedOperationException — proves the SPI entry-point now
@@ -199,8 +195,7 @@ class ForStRsRealMiniClusterIT {
                     new ForStRsKeyedStateBackend<>(
                             arena, linker, db, cf, StringSerializer.INSTANCE, false);
             for (int i = 0; i < 64; i++) {
-                linker.put(
-                        db, cf, ("mc-k-" + i).getBytes(), ("mc-v-" + i).getBytes());
+                linker.put(db, cf, ("mc-k-" + i).getBytes(), ("mc-v-" + i).getBytes());
             }
 
             ForStRsSstRegistry registry = new ForStRsSstRegistry();
@@ -357,7 +352,8 @@ class ForStRsRealMiniClusterIT {
 
                 SnapshotResult<KeyedStateHandle> result = fut.get();
                 runner.join();
-                assertNotNull(result, "L7 SnapshotStrategyRunner-wrapped future must return result");
+                assertNotNull(
+                        result, "L7 SnapshotStrategyRunner-wrapped future must return result");
 
                 ForStRsIncrementalKeyedStateHandle handle =
                         (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
@@ -472,9 +468,7 @@ class ForStRsRealMiniClusterIT {
                                     ("l7-k-" + i).getBytes());
                     assertNotNull(got, "L7 restore key l7-k-" + i + " must round-trip");
                     assertEquals(
-                            "l7-v-" + i,
-                            new String(got),
-                            "L7 restore value mismatch for key " + i);
+                            "l7-v-" + i, new String(got), "L7 restore value mismatch for key " + i);
                 }
                 assertEquals(41L, restored.getRestoredCheckpointId());
             } finally {
@@ -509,11 +503,11 @@ class ForStRsRealMiniClusterIT {
     }
 
     /**
-     * Variant of {@link SumState} that throws on its very first invocation across the entire
-     * JVM (process-static one-shot flag). Used by the restart-from-failure IT to force one
-     * failure → restart → completion cycle, exercising createKeyedStateBackend on both the
-     * initial open AND the post-restart re-open. State written before the failure is intentionally
-     * discarded — Flink will replay from the last committed checkpoint.
+     * Variant of {@link SumState} that throws on its very first invocation across the entire JVM
+     * (process-static one-shot flag). Used by the restart-from-failure IT to force one failure →
+     * restart → completion cycle, exercising createKeyedStateBackend on both the initial open AND
+     * the post-restart re-open. State written before the failure is intentionally discarded — Flink
+     * will replay from the last committed checkpoint.
      */
     static class SumStateOnceFails extends RichFlatMapFunction<Long, Tuple2<Long, Long>> {
         private static final java.util.concurrent.atomic.AtomicBoolean WILL_FAIL =
@@ -525,7 +519,8 @@ class ForStRsRealMiniClusterIT {
         public void open(OpenContext ctx) {
             state =
                     getRuntimeContext()
-                            .getState(new ValueStateDescriptor<>("running-sum-failover", Types.LONG));
+                            .getState(
+                                    new ValueStateDescriptor<>("running-sum-failover", Types.LONG));
             seenSinceOpen = 0;
         }
 
@@ -546,5 +541,4 @@ class ForStRsRealMiniClusterIT {
     // Quiet down javac about the unused AtomicLong field pattern shown in the legacy spec.
     @SuppressWarnings("unused")
     private static AtomicLong unusedSpecArtifact = new AtomicLong();
-
 }

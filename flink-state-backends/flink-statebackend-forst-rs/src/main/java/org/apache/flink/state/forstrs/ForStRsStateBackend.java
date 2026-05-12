@@ -48,12 +48,12 @@ import java.util.UUID;
  *
  * <p><b>SPI entry-point (L5/L6 wired).</b> {@link
  * #createKeyedStateBackend(KeyedStateBackendParameters)} now returns a real {@link
- * ForStRsAbstractKeyedStateBackend} (constructed via {@link ForStRsKeyedStateBackend} delegate),
- * so a Flink user setting {@code state.backend =
- * org.apache.flink.state.forstrs.ForStRsStateBackendFactory} can run keyed-state jobs. Storage
- * URI routing follows {@link ForStRsOptions#storageUri()}: when set, the backend opens via
- * {@link ForStRsLinker#dbOpenRemote OpenDAL}, otherwise via {@link ForStRsLinker#dbOpen} on a
- * unique subdirectory under the TaskManager's tmp working directory.
+ * ForStRsAbstractKeyedStateBackend} (constructed via {@link ForStRsKeyedStateBackend} delegate), so
+ * a Flink user setting {@code state.backend =
+ * org.apache.flink.state.forstrs.ForStRsStateBackendFactory} can run keyed-state jobs. Storage URI
+ * routing follows {@link ForStRsOptions#storageUri()}: when set, the backend opens via {@link
+ * ForStRsLinker#dbOpenRemote OpenDAL}, otherwise via {@link ForStRsLinker#dbOpen} on a unique
+ * subdirectory under the TaskManager's tmp working directory.
  *
  * <p>{@link #createOperatorStateBackend(OperatorStateBackendParameters)} delegates to Flink's
  * {@link DefaultOperatorStateBackendBuilder} — the standard pattern for backends whose operator
@@ -82,8 +82,7 @@ public class ForStRsStateBackend implements StateBackend {
         // Layout: <tmp>/forst-rs/<operatorIdSanitized>-<uuid>. The sanitisation matches the
         // community ForSt backend so the directory is always a legal filename even when the
         // operator identifier contains slashes or other unfriendly characters.
-        String fileSafeOpId =
-                parameters.getOperatorIdentifier().replaceAll("[^a-zA-Z0-9\\-]", "_");
+        String fileSafeOpId = parameters.getOperatorIdentifier().replaceAll("[^a-zA-Z0-9\\-]", "_");
         File tmpRoot = env.getTaskManagerInfo().getTmpWorkingDirectory();
         Path dbRoot = tmpRoot.toPath().resolve("forst-rs");
         Files.createDirectories(dbRoot);
@@ -221,9 +220,9 @@ public class ForStRsStateBackend implements StateBackend {
      * Arena}, {@link ForStRsLinker}, {@link FrsDb} and default {@link FrsCfHandle}; closing it
      * releases all of them.
      *
-     * <p>This entry-point predates the L5/L6 SPI wiring and is kept for direct unit tests that
-     * want the lean L5-class surface (no Flink runtime context). Production code paths should
-     * use {@link #createKeyedStateBackend(KeyedStateBackendParameters)} instead.
+     * <p>This entry-point predates the L5/L6 SPI wiring and is kept for direct unit tests that want
+     * the lean L5-class surface (no Flink runtime context). Production code paths should use {@link
+     * #createKeyedStateBackend(KeyedStateBackendParameters)} instead.
      */
     public <K> ForStRsKeyedStateBackend<K> createBasicKeyedBackend(
             TypeSerializer<K> keySerializer) {

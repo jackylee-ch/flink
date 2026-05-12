@@ -151,8 +151,8 @@ public final class ForStRsStateMigration {
     }
 
     /**
-     * Ingests pre-built SST files into the engine's L0 layer under {@code cf}
-     * (B-Prod-followup-5, spec §6g).
+     * Ingests pre-built SST files into the engine's L0 layer under {@code cf} (B-Prod-followup-5,
+     * spec §6g).
      *
      * <p>This is the fast-path counterpart to {@link #createColumnFamilyFromImport}: instead of
      * scanning every entry in the source CF and replaying via {@code put} (O(key-count)), the
@@ -172,8 +172,7 @@ public final class ForStRsStateMigration {
      * @throws org.apache.flink.state.forstrs.FrsBackendException if hardlink+copy fails, an SST
      *     cannot be parsed, or the engine rejects the CF handle
      */
-    public static void ingestExternalSst(
-            FrsDb db, FrsCfHandle cf, java.util.List<Path> sstPaths) {
+    public static void ingestExternalSst(FrsDb db, FrsCfHandle cf, java.util.List<Path> sstPaths) {
         Objects.requireNonNull(db, "db");
         Objects.requireNonNull(cf, "cf");
         if (sstPaths == null || sstPaths.isEmpty()) {

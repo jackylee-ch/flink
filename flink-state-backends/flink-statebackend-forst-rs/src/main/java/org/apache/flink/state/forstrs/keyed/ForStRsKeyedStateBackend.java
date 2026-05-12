@@ -121,6 +121,14 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private K currentKey;
     private byte[] currentKeyBytes;
 
+    /**
+     * Monotonically increasing generation counter, bumped on every effective {@link
+     * #setCurrentKey(Object)} call (i.e. when the key actually changes). Used by adapters to detect
+     * stale cached state objects without a HashMap lookup on every state access (Phase B1+B3
+     * optimization).
+     */
+    private long keyGeneration;
+
     private boolean closed = false;
 
     /**
@@ -180,6 +188,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         this.currentKey = newKey;
         this.currentKeyBytes = serialized;
+        // Bump generation so adapters know their cached state is stale.
+        this.keyGeneration++;
         // Invalidate the per-state cache because every entry's keyPrefix encodes the old key.
         this.stateCache.clear();
     }
@@ -187,6 +197,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     /** Returns the current key (last successfully {@code setCurrentKey}-ed value, or null). */
     public K getCurrentKey() {
         return currentKey;
+    }
+
+    /**
+     * Returns the current key generation — a monotonically increasing counter bumped on every
+     * effective key change. Adapters use this to detect stale cached state objects without a
+     * HashMap lookup on every state access (Phase B1+B3 optimization).
+     */
+    public long getKeyGeneration() {
+        return keyGeneration;
     }
 
     // ------------------------------------------------------------------

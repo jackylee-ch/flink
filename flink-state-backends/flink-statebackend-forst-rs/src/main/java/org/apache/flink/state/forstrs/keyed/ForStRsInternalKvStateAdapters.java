@@ -41,22 +41,22 @@ import java.util.Map;
 /**
  * Lightweight {@code InternalKvState}-shaped wrappers around the existing per-state ForStRs
  * classes. Used by {@link ForStRsAbstractKeyedStateBackend#createOrUpdateInternalState} so the
- * keyed-state backend exposes the {@code InternalKvState} surface Flink's higher-level
- * machinery requires while delegating all real work to {@link ForStRsKeyedStateBackend}'s
- * existing per-state-name factories.
+ * keyed-state backend exposes the {@code InternalKvState} surface Flink's higher-level machinery
+ * requires while delegating all real work to {@link ForStRsKeyedStateBackend}'s existing
+ * per-state-name factories.
  *
  * <p><b>Namespace model.</b> ForSt-RS currently supports a single implicit namespace per
- * state-name. Adapters track {@code currentNamespace} and forward it to the per-state cache
- * key prefix only via the existing state-name routing — i.e. the namespace is part of the
- * state-name identity but does not partition the keyspace further. This matches how the
- * widely-used Flink primitives (ValueState/ListState/MapState/ReducingState/AggregatingState)
- * interact with the runtime when no per-window namespacing is in play.
+ * state-name. Adapters track {@code currentNamespace} and forward it to the per-state cache key
+ * prefix only via the existing state-name routing — i.e. the namespace is part of the state-name
+ * identity but does not partition the keyspace further. This matches how the widely-used Flink
+ * primitives (ValueState/ListState/MapState/ReducingState/AggregatingState) interact with the
+ * runtime when no per-window namespacing is in play.
  *
- * <p><b>Queryable state &amp; TTL incremental cleanup.</b> The
- * {@link org.apache.flink.runtime.state.internal.InternalKvState#getSerializedValue} and
- * {@code getStateIncrementalVisitor} entry points throw {@link UnsupportedOperationException} —
- * the former is only used by Flink's queryable-state API (deprecated in Flink 2.x) and the
- * latter is only invoked when TTL-with-incremental-cleanup is enabled on the state descriptor.
+ * <p><b>Queryable state &amp; TTL incremental cleanup.</b> The {@link
+ * org.apache.flink.runtime.state.internal.InternalKvState#getSerializedValue} and {@code
+ * getStateIncrementalVisitor} entry points throw {@link UnsupportedOperationException} — the former
+ * is only used by Flink's queryable-state API (deprecated in Flink 2.x) and the latter is only
+ * invoked when TTL-with-incremental-cleanup is enabled on the state descriptor.
  */
 @Internal
 final class ForStRsInternalKvStateAdapters {
@@ -116,9 +116,10 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         @Override
-        public final
-                org.apache.flink.runtime.state.internal.InternalKvState.StateIncrementalVisitor<K, N, V>
-                        getStateIncrementalVisitor(int recommendedMaxNumberOfReturnedRecords) {
+        public final org.apache.flink.runtime.state.internal.InternalKvState
+                                .StateIncrementalVisitor<
+                        K, N, V>
+                getStateIncrementalVisitor(int recommendedMaxNumberOfReturnedRecords) {
             throw new UnsupportedOperationException(
                     "ForStRs backend does not support state-incremental visitors (TTL"
                             + " incremental cleanup) yet");
@@ -131,6 +132,15 @@ final class ForStRsInternalKvStateAdapters {
     static final class ValueAdapter<K, N, V> extends AbstractAdapter<K, N, V>
             implements InternalValueState<K, N, V> {
 
+        /**
+         * Cached bound state object — avoids the HashMap lookup in {@code delegate.getValueState}
+         * on every {@code value()}/{@code update()} call when the key hasn't changed (Phase B1+B3
+         * optimization). Invalidated when {@code cachedGeneration != delegate.getKeyGeneration()}.
+         */
+        private ForStRsValueState<V> cachedState;
+
+        private long cachedGeneration = -1;
+
         ValueAdapter(
                 TypeSerializer<K> keySerializer,
                 TypeSerializer<N> namespaceSerializer,
@@ -141,7 +151,13 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsValueState<V> bind() {
-            return delegate.getValueState(stateName, valueSerializer);
+            long gen = delegate.getKeyGeneration();
+            if (cachedState != null && gen == cachedGeneration) {
+                return cachedState;
+            }
+            cachedState = delegate.getValueState(stateName, valueSerializer);
+            cachedGeneration = gen;
+            return cachedState;
         }
 
         @Override
@@ -172,6 +188,11 @@ final class ForStRsInternalKvStateAdapters {
 
         private final TypeSerializer<T> elementSerializer;
 
+        /** Cached bound state (Phase B1+B3 optimization — same pattern as ValueAdapter). */
+        private ForStRsListState<T> cachedState;
+
+        private long cachedGeneration = -1;
+
         @SuppressWarnings({"unchecked", "rawtypes"})
         ListAdapter(
                 TypeSerializer<K> keySerializer,
@@ -190,7 +211,13 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsListState<T> bind() {
-            return delegate.getListState(stateName, elementSerializer);
+            long gen = delegate.getKeyGeneration();
+            if (cachedState != null && gen == cachedGeneration) {
+                return cachedState;
+            }
+            cachedState = delegate.getListState(stateName, elementSerializer);
+            cachedGeneration = gen;
+            return cachedState;
         }
 
         @Override
@@ -252,6 +279,11 @@ final class ForStRsInternalKvStateAdapters {
         private final TypeSerializer<UK> userKeySerializer;
         private final TypeSerializer<UV> userValueSerializer;
 
+        /** Cached bound state (Phase B1+B3 optimization). */
+        private ForStRsMapState<UK, UV> cachedState;
+
+        private long cachedGeneration = -1;
+
         @SuppressWarnings({"rawtypes", "unchecked"})
         MapAdapter(
                 TypeSerializer<K> keySerializer,
@@ -272,7 +304,13 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsMapState<UK, UV> bind() {
-            return delegate.getMapState(stateName, userKeySerializer, userValueSerializer);
+            long gen = delegate.getKeyGeneration();
+            if (cachedState != null && gen == cachedGeneration) {
+                return cachedState;
+            }
+            cachedState = delegate.getMapState(stateName, userKeySerializer, userValueSerializer);
+            cachedGeneration = gen;
+            return cachedState;
         }
 
         @Override
@@ -339,6 +377,11 @@ final class ForStRsInternalKvStateAdapters {
 
         private final ReduceFunction<T> reduceFunction;
 
+        /** Cached bound state (Phase B1+B3 optimization). */
+        private ForStRsReducingState<T> cachedState;
+
+        private long cachedGeneration = -1;
+
         ReducingAdapter(
                 TypeSerializer<K> keySerializer,
                 TypeSerializer<N> namespaceSerializer,
@@ -351,7 +394,13 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsReducingState<T> bind() {
-            return delegate.getReducingState(stateName, valueSerializer, reduceFunction);
+            long gen = delegate.getKeyGeneration();
+            if (cachedState != null && gen == cachedGeneration) {
+                return cachedState;
+            }
+            cachedState = delegate.getReducingState(stateName, valueSerializer, reduceFunction);
+            cachedGeneration = gen;
+            return cachedState;
         }
 
         @Override
@@ -399,6 +448,11 @@ final class ForStRsInternalKvStateAdapters {
 
         private final AggregateFunction<IN, ACC, OUT> aggregateFunction;
 
+        /** Cached bound state (Phase B1+B3 optimization). */
+        private ForStRsAggregatingState<IN, ACC, OUT> cachedState;
+
+        private long cachedGeneration = -1;
+
         AggregatingAdapter(
                 TypeSerializer<K> keySerializer,
                 TypeSerializer<N> namespaceSerializer,
@@ -411,7 +465,14 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsAggregatingState<IN, ACC, OUT> bind() {
-            return delegate.getAggregatingState(stateName, valueSerializer, aggregateFunction);
+            long gen = delegate.getKeyGeneration();
+            if (cachedState != null && gen == cachedGeneration) {
+                return cachedState;
+            }
+            cachedState =
+                    delegate.getAggregatingState(stateName, valueSerializer, aggregateFunction);
+            cachedGeneration = gen;
+            return cachedState;
         }
 
         @Override

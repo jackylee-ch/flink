@@ -1300,6 +1300,14 @@ public final class ForStRsLinker {
     // ------------------------------------------------------------------
 
     /**
+     * ThreadLocal pool for the 24-byte FrsBytes out-struct used by {@link #getInternal}. Avoids
+     * allocating a fresh {@code byte[24]} on every point-lookup call. Thread-safe because Flink
+     * task slots are single-threaded per operator chain.
+     */
+    private static final ThreadLocal<byte[]> FRS_BYTES_BUF =
+            ThreadLocal.withInitial(() -> new byte[24]);
+
+    /**
      * Shared Get/LookupKv helper: marshals the key, reads the FrsBytes, frees the buffer.
      *
      * <p>Hot path optimization: both the key buffer and the small (24-byte) {@code FrsBytes} out
@@ -1307,11 +1315,14 @@ public final class ForStRsLinker {
      * critical-mode handle, eliminating any per-call native allocation. The pointer + length we
      * read back from the heap-byte-array view use unaligned address/long layouts (alignment 1)
      * because a {@code byte[]} only guarantees 1-byte alignment.
+     *
+     * <p>The 24-byte out buffer is pooled via ThreadLocal to avoid per-call allocation (Phase B1+B3
+     * optimization).
      */
     private byte[] getInternal(MethodHandle mh, String fn, FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
         // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
-        byte[] outBytesArr = new byte[24];
+        byte[] outBytesArr = FRS_BYTES_BUF.get();
         MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
         int rc;
         try {
@@ -1728,7 +1739,8 @@ public final class ForStRsLinker {
         try {
             rc = (int) frsDbDropCf.invokeExact(db.handle(), cf.handle());
         } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, "frs_db_drop_cf threw: " + t.getMessage());
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_drop_cf threw: " + t.getMessage());
         }
         check(rc, "frs_db_drop_cf");
     }

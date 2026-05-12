@@ -57,8 +57,8 @@ class ForStRsStateMigrationTest {
 
     /**
      * §16 acceptance criterion: 10k-key round-trip across an export/import boundary on a single
-     * shared engine. Mirrors the engine-level Rust test
-     * {@code crates/forst-rs-engine/tests/cf_import_export_it.rs::cf_export_then_import_round_trips_10k_keys}
+     * shared engine. Mirrors the engine-level Rust test {@code
+     * crates/forst-rs-engine/tests/cf_import_export_it.rs::cf_export_then_import_round_trips_10k_keys}
      * but exercises the full Java→FFM→Rust call path.
      */
     @Test
@@ -111,9 +111,7 @@ class ForStRsStateMigrationTest {
                     // keys absent from the source set.
                     assertNull(
                             linker.get(
-                                    db,
-                                    imported,
-                                    "never-written".getBytes(StandardCharsets.UTF_8)),
+                                    db, imported, "never-written".getBytes(StandardCharsets.UTF_8)),
                             "imported CF should not return values for unrelated keys");
                 }
             }
@@ -153,7 +151,10 @@ class ForStRsStateMigrationTest {
             ForStRsLinker linker = new ForStRsLinker(arena);
             try (FrsDb db = linker.dbOpenMemory(arena);
                     FrsCfHandle src = linker.dbCreateCf(db, arena, "dupe-src")) {
-                linker.put(db, src, "k".getBytes(StandardCharsets.UTF_8),
+                linker.put(
+                        db,
+                        src,
+                        "k".getBytes(StandardCharsets.UTF_8),
                         "v".getBytes(StandardCharsets.UTF_8));
                 ForStRsStateMigration.exportColumnFamily(db, src, exportDir);
 
@@ -240,8 +241,8 @@ class ForStRsStateMigrationTest {
 
     /**
      * Drop-then-create round trip: dropping a CF flips its handle and allows a same-name create.
-     * This is the Flink-side counterpart to the engine-level
-     * {@code drop_cf_ingest_it::drop_cf_round_trip} test.
+     * This is the Flink-side counterpart to the engine-level {@code
+     * drop_cf_ingest_it::drop_cf_round_trip} test.
      */
     @Test
     void dropColumnFamilyAllowsSameNameRecreate() {

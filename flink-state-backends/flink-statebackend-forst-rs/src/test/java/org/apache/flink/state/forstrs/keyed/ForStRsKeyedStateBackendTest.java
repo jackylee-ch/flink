@@ -236,9 +236,7 @@ class ForStRsKeyedStateBackendTest {
         // surfaces a NullPointerException — the SPI contract says parameters is non-null. This
         // contract test pins that null-handling so a regression is caught quickly.
         ForStRsStateBackend sb = new ForStRsStateBackend();
-        assertThrows(
-                NullPointerException.class,
-                () -> sb.createKeyedStateBackend(null));
+        assertThrows(NullPointerException.class, () -> sb.createKeyedStateBackend(null));
     }
 
     @Test

@@ -44,6 +44,15 @@ public final class ForStRsKeyGroupedSerializer<K> {
 
     private static final byte SEP = (byte) '/';
 
+    /**
+     * ThreadLocal pool for the DataOutputSerializer used by {@link #encodeForState} and {@link
+     * #encodeForMap}. Avoids allocating a fresh buffer on every key-encoding call. The buffer is
+     * reset via {@code clear()} which resets the write position without reallocating the backing
+     * array (Phase B1+B3 optimization).
+     */
+    private static final ThreadLocal<DataOutputSerializer> POOL =
+            ThreadLocal.withInitial(() -> new DataOutputSerializer(256));
+
     private final TypeSerializer<K> keySerializer;
 
     public ForStRsKeyGroupedSerializer(TypeSerializer<K> keySerializer) {
@@ -56,7 +65,8 @@ public final class ForStRsKeyGroupedSerializer<K> {
 
     public byte[] encodeForState(int keyGroup, K userKey, String stateName) {
         validateKeyGroup(keyGroup);
-        DataOutputSerializer out = new DataOutputSerializer(64);
+        DataOutputSerializer out = POOL.get();
+        out.clear();
         try {
             out.writeShort(keyGroup); // 2 bytes BE per Flink convention
             keySerializer.serialize(userKey, out);
@@ -77,7 +87,8 @@ public final class ForStRsKeyGroupedSerializer<K> {
             TypeSerializer<UK> userKeySerializer,
             UK userMapKey) {
         validateKeyGroup(keyGroup);
-        DataOutputSerializer out = new DataOutputSerializer(64);
+        DataOutputSerializer out = POOL.get();
+        out.clear();
         try {
             out.writeShort(keyGroup);
             keySerializer.serialize(userKey, out);
