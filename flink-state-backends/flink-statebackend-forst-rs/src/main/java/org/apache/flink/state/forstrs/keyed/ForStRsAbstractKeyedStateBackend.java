@@ -325,6 +325,9 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                             + "setSnapshotStrategy(...) — wire the strategy via the builder or"
                             + " test setup");
         }
+        // Flush all buffered writes before capturing the snapshot — correctness requirement:
+        // the engine snapshot must include all state mutations up to this barrier.
+        delegate.flushWriteBuffer();
         // Drive the snapshot through Flink's canonical SnapshotStrategyRunner so the returned
         // RunnableFuture is wrapped in an AsyncSnapshotCallable that:
         //   * registers cancellation hooks on cancelStreamRegistry (for checkpoint abort),

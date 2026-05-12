@@ -28,6 +28,8 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.io.IOException;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Supplier;
 
 /**
@@ -67,9 +69,22 @@ public class ForStRsValueState<T> implements ValueState<T> {
     private final DataOutputSerializer outputBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    // ------------------------------------------------------------------
+    // Write-behind buffer hooks (optional — null when buffer is disabled)
+    // ------------------------------------------------------------------
+
+    /** Reads from the shared write buffer; returns null on miss. */
+    private final Function<byte[], byte[]> writeBufferGet;
+
+    /** Writes to the shared write buffer (deferred native put). */
+    private final java.util.function.BiConsumer<byte[], byte[]> writeBufferPut;
+
+    /** Deletes from the shared write buffer + issues native delete. */
+    private final Consumer<byte[]> writeBufferDelete;
+
     /**
      * Legacy / stepping-stone constructor: caller supplies the ForSt key directly as a fixed
-     * prefix.
+     * prefix. No write-buffer support.
      */
     public ForStRsValueState(
             ForStRsLinker linker,
@@ -85,10 +100,39 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.keyComputer = null;
         this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
+        this.writeBufferGet = null;
+        this.writeBufferPut = null;
+        this.writeBufferDelete = null;
     }
 
     /**
-     * Spec §6 constructor: composite ForSt key is recomputed per call from the supplied keyComputer
+     * Write-buffer-enabled constructor: caller supplies the ForSt key directly as a fixed prefix
+     * plus write-buffer hooks from the owning backend.
+     */
+    public ForStRsValueState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            byte[] keyPrefix,
+            TypeSerializer<T> serializer,
+            Function<byte[], byte[]> writeBufferGet,
+            java.util.function.BiConsumer<byte[], byte[]> writeBufferPut,
+            Consumer<byte[]> writeBufferDelete) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = keyPrefix.clone();
+        this.serializer = serializer;
+        this.keyComputer = null;
+        this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+        this.writeBufferGet = writeBufferGet;
+        this.writeBufferPut = writeBufferPut;
+        this.writeBufferDelete = writeBufferDelete;
+    }
+
+    /**
+     * Spec section 6 constructor: composite ForSt key is recomputed per call from the supplied keyComputer
      * (which the keyed-state backend wires to {@code ForStRsKeyGroupedSerializer
      * .encodeForState(currentKg, currentKey, stateName)}).
      */
@@ -106,6 +150,9 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.keyComputer = keyComputer;
         this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
+        this.writeBufferGet = null;
+        this.writeBufferPut = null;
+        this.writeBufferDelete = null;
     }
 
     // Deferred-put optimization: when value() is followed by update() for the
@@ -119,6 +166,14 @@ public class ForStRsValueState<T> implements ValueState<T> {
     @Override
     public T value() throws IOException {
         lastValueKey = computeKey();
+        // Check write buffer first (serves repeated reads for same key — 0 native calls)
+        if (writeBufferGet != null) {
+            byte[] buffered = writeBufferGet.apply(lastValueKey);
+            if (buffered != null) {
+                inputBuffer.setBuffer(buffered);
+                return serializer.deserialize(inputBuffer);
+            }
+        }
         // Fast path: zero-copy from memtable inline storage (no Rust Vec alloc)
         byte[] raw = linker.getPinned(db, cf, lastValueKey);
         if (raw == null) {
@@ -143,14 +198,23 @@ public class ForStRsValueState<T> implements ValueState<T> {
         byte[] payload = outputBuffer.getCopyOfBuffer();
         // Reuse the key from the preceding value() call if available
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
-        linker.put(db, cf, key, payload);
+        // Buffer the write instead of calling native immediately
+        if (writeBufferPut != null) {
+            writeBufferPut.accept(key, payload);
+        } else {
+            linker.put(db, cf, key, payload);
+        }
         lastValueKey = null; // consumed
     }
 
     @Override
     public void clear() {
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
-        linker.delete(db, cf, key);
+        if (writeBufferDelete != null) {
+            writeBufferDelete.accept(key);
+        } else {
+            linker.delete(db, cf, key);
+        }
         lastValueKey = null;
     }
 

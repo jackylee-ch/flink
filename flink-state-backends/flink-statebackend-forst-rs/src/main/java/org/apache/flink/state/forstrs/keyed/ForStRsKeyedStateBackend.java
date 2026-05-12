@@ -118,6 +118,26 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     private final Map<String, Object> stateCache = new HashMap<>();
 
+    // ------------------------------------------------------------------
+    // Write-behind buffer: defers native put calls and serves subsequent
+    // reads from the buffer. Flushed in batch (batchPut) every
+    // WRITE_BUFFER_FLUSH_THRESHOLD writes or on checkpoint/close.
+    // ------------------------------------------------------------------
+
+    /** Flush threshold: number of buffered writes before auto-flush. */
+    private static final int WRITE_BUFFER_FLUSH_THRESHOLD = 1024;
+
+    /**
+     * Write-behind buffer: maps full composite ForSt keys to their latest value bytes. Shared
+     * across all ValueState instances on this backend. Reads check this buffer first (0-cost hit);
+     * writes go here instead of native. Flushed via {@link #flushWriteBuffer()} on threshold,
+     * checkpoint, or close.
+     */
+    private final Map<ByteArrayWrapper, byte[]> writeBuffer = new HashMap<>();
+
+    /** Running count of buffered writes since last flush. */
+    private int writeBufferCount = 0;
+
     private K currentKey;
     private byte[] currentKeyBytes;
 
@@ -230,7 +250,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         byte[] prefix = buildPrefix(stateName);
         ForStRsValueState<T> created =
-                new ForStRsValueState<>(linker, db, defaultCf, prefix, valueSerializer);
+                new ForStRsValueState<>(
+                        linker,
+                        db,
+                        defaultCf,
+                        prefix,
+                        valueSerializer,
+                        this::getFromWriteBuffer,
+                        this::putToWriteBuffer,
+                        this::deleteFromWriteBuffer);
         stateCache.put(valueStateCacheKey(stateName), created);
         return created;
     }
@@ -327,6 +355,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * tests; in production a more efficient per-CF cardinality estimator would replace this.
      */
     public long numKeyValueStateEntries() {
+        // Flush buffered writes so the count reflects all pending mutations.
+        flushWriteBuffer();
         long count = 0;
         try (Arena local = Arena.ofShared();
                 org.apache.flink.state.forstrs.ffm.FrsIterator iter =
@@ -358,6 +388,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (closed) {
             throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
         }
+        // Flush buffered writes before checkpoint — correctness requirement.
+        flushWriteBuffer();
         linker.createCheckpoint(db, targetDir.toString());
         return targetDir;
     }
@@ -417,6 +449,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (closed) {
             throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
         }
+        // Flush buffered writes so the scan reflects all pending mutations.
+        flushWriteBuffer();
         byte[] nameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         byte[] tailMarker = new byte[1 + nameBytes.length + 1];
         tailMarker[0] = (byte) '/';
@@ -520,6 +554,88 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         return arena;
     }
 
+    // ------------------------------------------------------------------
+    // Write-behind buffer API — used by ForStRsValueState
+    // ------------------------------------------------------------------
+
+    /**
+     * Returns the buffered value for the given composite ForSt key, or {@code null} if no buffered
+     * write exists for that key. Called by {@link ForStRsValueState#value()} before falling through
+     * to native.
+     */
+    public byte[] getFromWriteBuffer(byte[] key) {
+        return writeBuffer.get(new ByteArrayWrapper(key));
+    }
+
+    /**
+     * Buffers a write for the given composite ForSt key. The write is NOT sent to native
+     * immediately — it will be flushed in batch when the threshold is reached, on checkpoint, or on
+     * close. Called by {@link ForStRsValueState#update(Object)}.
+     */
+    public void putToWriteBuffer(byte[] key, byte[] value) {
+        writeBuffer.put(new ByteArrayWrapper(key), value);
+        writeBufferCount++;
+        if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD) {
+            flushWriteBuffer();
+        }
+    }
+
+    /**
+     * Removes a key from the write buffer and issues a native delete. Called by {@link
+     * ForStRsValueState#clear()} to ensure the delete reaches the engine and the buffer doesn't
+     * serve stale data.
+     */
+    public void deleteFromWriteBuffer(byte[] key) {
+        writeBuffer.remove(new ByteArrayWrapper(key));
+        linker.delete(db, defaultCf, key);
+    }
+
+    /**
+     * Flushes all buffered writes to the engine in one batch call. Must be called before checkpoint
+     * (correctness) and before close (durability). Safe to call when the buffer is empty (no-op).
+     */
+    public void flushWriteBuffer() {
+        if (writeBuffer.isEmpty()) {
+            return;
+        }
+        int count = writeBuffer.size();
+        byte[][] keys = new byte[count][];
+        byte[][] values = new byte[count][];
+        int i = 0;
+        for (Map.Entry<ByteArrayWrapper, byte[]> entry : writeBuffer.entrySet()) {
+            keys[i] = entry.getKey().bytes;
+            values[i] = entry.getValue();
+            i++;
+        }
+        linker.batchPut(db, defaultCf, keys, values);
+        writeBuffer.clear();
+        writeBufferCount = 0;
+    }
+
+    /**
+     * Wrapper for {@code byte[]} that provides value-based {@code hashCode}/{@code equals} so it
+     * can serve as a HashMap key. The hash is computed once at construction.
+     */
+    static final class ByteArrayWrapper {
+        final byte[] bytes;
+        private final int hash;
+
+        ByteArrayWrapper(byte[] bytes) {
+            this.bytes = bytes;
+            this.hash = java.util.Arrays.hashCode(bytes);
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            return o instanceof ByteArrayWrapper w && java.util.Arrays.equals(bytes, w.bytes);
+        }
+    }
+
     /**
      * Releases all per-state-cache entries. When this backend was constructed with {@code
      * ownsResources=true}, also closes (in order) the default CF, the database, and the Arena that
@@ -531,6 +647,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             return;
         }
         closed = true;
+        // Flush any buffered writes before releasing resources.
+        flushWriteBuffer();
         stateCache.clear();
         if (!ownsResources) {
             return;
