@@ -161,10 +161,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             inputBuffer.setBuffer(cached);
             return valueSerializer.deserialize(inputBuffer);
         }
-        byte[] raw = linker.getPinned(db, cf, compositeKey);
-        if (raw == null) {
-            raw = linker.lookupKv(db, cf, compositeKey);
-        }
+        byte[] raw = linker.getIntoBuf(db, cf, compositeKey);
         if (raw == null) {
             return null;
         }
@@ -215,11 +212,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         if (readCache.containsKey(cacheKey)) {
             return true;
         }
-        byte[] raw = linker.getPinned(db, cf, compositeKey);
-        if (raw == null) {
-            raw = linker.lookupKv(db, cf, compositeKey);
-        }
-        return raw != null;
+        return linker.getIntoBuf(db, cf, compositeKey) != null;
     }
 
     @Override

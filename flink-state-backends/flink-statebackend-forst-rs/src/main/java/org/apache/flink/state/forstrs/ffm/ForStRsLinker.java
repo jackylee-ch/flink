@@ -149,6 +149,7 @@ public final class ForStRsLinker {
 
     // --- 6. Delta-Join lookup + iterator ---
     private final MethodHandle frsLookupKv;
+    private final MethodHandle frsGetIntoBuf;
     private final MethodHandle frsIteratorOpen;
     private final MethodHandle frsIteratorSeek;
     private final MethodHandle frsIteratorNext;
@@ -464,6 +465,19 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG, // key_len
                                 ValueLayout.ADDRESS)); // out FrsBytes*
+
+        this.frsGetIntoBuf =
+                bindCritical(
+                        "frs_get_into_buf",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key ptr
+                                ValueLayout.JAVA_LONG, // key_len
+                                ValueLayout.ADDRESS, // out_buf ptr
+                                ValueLayout.JAVA_LONG, // out_buf_cap
+                                ValueLayout.ADDRESS)); // out_val_len ptr
 
         this.frsIteratorOpen =
                 bind(
@@ -1416,6 +1430,41 @@ public final class ForStRsLinker {
      */
     public byte[] lookupKv(FrsDb db, FrsCfHandle cf, byte[] key) {
         return getInternal(frsLookupKv, "frs_lookup_kv", db, cf, key);
+    }
+
+    private static final int GET_INTO_BUF_CAP = 4096;
+    private static final ThreadLocal<byte[]> GET_INTO_BUF =
+            ThreadLocal.withInitial(() -> new byte[GET_INTO_BUF_CAP]);
+    private static final ThreadLocal<byte[]> GET_INTO_LEN_BUF =
+            ThreadLocal.withInitial(() -> new byte[8]);
+
+    public byte[] getIntoBuf(FrsDb db, FrsCfHandle cf, byte[] key) {
+        MemorySegment keySeg = MemorySegment.ofArray(key);
+        byte[] outBuf = GET_INTO_BUF.get();
+        MemorySegment outBufSeg = MemorySegment.ofArray(outBuf);
+        byte[] lenBuf = GET_INTO_LEN_BUF.get();
+        MemorySegment lenSeg = MemorySegment.ofArray(lenBuf);
+        int rc;
+        try {
+            rc = (int) frsGetIntoBuf.invokeExact(
+                    db.handle(), cf.handle(),
+                    keySeg, (long) key.length,
+                    outBufSeg, (long) GET_INTO_BUF_CAP,
+                    lenSeg);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_get_into_buf threw: " + t.getMessage());
+        }
+        if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL
+            return lookupKv(db, cf, key);
+        }
+        check(rc, "frs_get_into_buf");
+        long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+        if (valLen == 0) {
+            return null;
+        }
+        byte[] result = new byte[(int) valLen];
+        System.arraycopy(outBuf, 0, result, 0, (int) valLen);
+        return result;
     }
 
     /** Opens a forward iterator over the entire column family. */
