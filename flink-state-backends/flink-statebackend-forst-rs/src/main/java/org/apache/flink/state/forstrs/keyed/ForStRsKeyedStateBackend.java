@@ -136,6 +136,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private static final int ADAPTIVE_SAMPLE_WINDOW = 1024;
     private static final double DISABLE_THRESHOLD = 0.10;
     private static final double ENABLE_THRESHOLD = 0.50;
+    private static final int MAX_BUFFER_ENTRIES = 4096;
 
     /**
      * Write-behind buffer: maps full composite ForSt keys to their latest value bytes. Shared
@@ -613,12 +614,6 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     public byte[] getFromWriteBuffer(byte[] key) {
         if (!bufferEnabled) {
-            sampleTotal++;
-            if (sampleTotal >= ADAPTIVE_SAMPLE_WINDOW) {
-                sampleHits = 0;
-                sampleTotal = 0;
-                bufferEnabled = true;
-            }
             return null;
         }
         byte[] result = writeBuffer.get(new ByteArrayWrapper(key));
@@ -650,7 +645,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         writeBuffer.put(new ByteArrayWrapper(key), value);
         writeBufferCount++;
-        if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD) {
+        if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD || writeBuffer.size() >= MAX_BUFFER_ENTRIES) {
             flushWriteBuffer();
         }
     }

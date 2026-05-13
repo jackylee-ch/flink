@@ -89,7 +89,15 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
                             cacheDir,
                             options.cacheCapacityBytes());
         } else {
-            opened = linker.dbOpen(arena, localPath);
+            opened = linker.dbOpenWithOptions(
+                    arena,
+                    localPath,
+                    512L * 1024 * 1024,  // write_buffer_size: 512MB (fits 1M+ keys in memtable)
+                    3,                    // max_write_buffer_number
+                    4,                    // max_background_compactions
+                    2,                    // max_background_flushes
+                    256L * 1024 * 1024,   // block_cache_capacity_bytes
+                    options.writeBufferManagerCapacityBytes());
         }
         FrsCfHandle cf = linker.dbDefaultCf(opened, arena);
         return withDb(opened, cf);
