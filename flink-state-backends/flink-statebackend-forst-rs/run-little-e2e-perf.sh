@@ -143,19 +143,30 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# Build the module (test-classes) + sibling state-backend modules (rocksdb,
-# forst) so their factory classes are on the classpath for variants 1/2/3.
+# Build the modules in two steps with different JDKs:
+#   Step 1: rocksdb + forst with JDK 17 (class version 61) — these run on JDK 17
+#   Step 2: forst-rs with JDK 25 (needs FFM) — runs on JDK 25
+#
+# Root cause of the split: a single mvn install with JDK 25 compiles ALL
+# modules at class version 69, making flink-statebackend-forst unloadable
+# on JDK 17 (UnsupportedClassVersionError).
 # -am pulls the upstream multi-module dependency closure (flink-runtime,
 # flink-streaming-java test-jars, etc.).
 # ----------------------------------------------------------------------
-echo "[build] mvn install (forst-rs + sibling backends, no tests)"
+echo "[build] mvn install rocksdb + forst (JDK 17)"
 (
     cd "$FLINK_ROOT"
-    mvn -q -B \
-        -pl flink-state-backends/flink-statebackend-forst-rs,flink-state-backends/flink-statebackend-rocksdb,flink-state-backends/flink-statebackend-forst \
-        -am \
-        install \
-        -DskipTests -Drat.skip=true \
+    JAVA_HOME="$JDK17_HOME" mvn -q -B \
+        -pl flink-state-backends/flink-statebackend-rocksdb,flink-state-backends/flink-statebackend-forst \
+        -am install -DskipTests -Drat.skip=true
+)
+
+echo "[build] mvn install forst-rs (JDK 25)"
+(
+    cd "$FLINK_ROOT"
+    JAVA_HOME="$JDK25_HOME" mvn -q -B \
+        -pl flink-state-backends/flink-statebackend-forst-rs \
+        -am install -DskipTests -Drat.skip=true \
         -Dforstrs.native.libpath="$CDYLIB"
 )
 
