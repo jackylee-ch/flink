@@ -133,6 +133,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     private static final int WRITE_BUFFER_FLUSH_THRESHOLD = 64;
 
+    private static final int ADAPTIVE_SAMPLE_WINDOW = 1024;
+    private static final double DISABLE_THRESHOLD = 0.10;
+    private static final double ENABLE_THRESHOLD = 0.50;
+
     /**
      * Write-behind buffer: maps full composite ForSt keys to their latest value bytes. Shared
      * across all ValueState instances on this backend. Reads check this buffer first (0-cost hit);
@@ -143,6 +147,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
 
     /** Running count of buffered writes since last flush. */
     private int writeBufferCount = 0;
+
+    private int sampleHits = 0;
+    private int sampleTotal = 0;
+    private boolean bufferEnabled = true;
 
     // ------------------------------------------------------------------
     // Pre-allocated flush staging buffers (Optimization 2).
@@ -604,7 +612,30 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * to native.
      */
     public byte[] getFromWriteBuffer(byte[] key) {
-        return writeBuffer.get(new ByteArrayWrapper(key));
+        if (!bufferEnabled) {
+            sampleTotal++;
+            if (sampleTotal >= ADAPTIVE_SAMPLE_WINDOW) {
+                sampleHits = 0;
+                sampleTotal = 0;
+                bufferEnabled = true;
+            }
+            return null;
+        }
+        byte[] result = writeBuffer.get(new ByteArrayWrapper(key));
+        sampleTotal++;
+        if (result != null) {
+            sampleHits++;
+        }
+        if (sampleTotal >= ADAPTIVE_SAMPLE_WINDOW) {
+            double hitRate = (double) sampleHits / sampleTotal;
+            if (hitRate < DISABLE_THRESHOLD) {
+                bufferEnabled = false;
+                flushWriteBuffer();
+            }
+            sampleHits = 0;
+            sampleTotal = 0;
+        }
+        return result;
     }
 
     /**
@@ -613,6 +644,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * close. Called by {@link ForStRsValueState#update(Object)}.
      */
     public void putToWriteBuffer(byte[] key, byte[] value) {
+        if (!bufferEnabled) {
+            linker.put(db, defaultCf, key, value);
+            return;
+        }
         writeBuffer.put(new ByteArrayWrapper(key), value);
         writeBufferCount++;
         if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD) {

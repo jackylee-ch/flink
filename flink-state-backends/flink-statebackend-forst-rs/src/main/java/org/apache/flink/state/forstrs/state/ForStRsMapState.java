@@ -33,6 +33,7 @@ import java.lang.foreign.Arena;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +68,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     /** Initial buffer size for key/value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
+    private static final int MAP_WRITE_BUFFER_THRESHOLD = 64;
+
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsCfHandle cf;
@@ -79,6 +82,23 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final DataOutputSerializer keyOutBuffer;
     private final DataOutputSerializer valueOutBuffer;
     private final DataInputDeserializer inputBuffer;
+
+    private final Map<ByteArrayKey, byte[]> writeCache = new HashMap<>();
+    private final Map<ByteArrayKey, byte[]> readCache = new HashMap<>(256);
+    private int writeCacheCount = 0;
+
+    static final class ByteArrayKey {
+        final byte[] bytes;
+        private final int hash;
+        ByteArrayKey(byte[] bytes) {
+            this.bytes = bytes;
+            this.hash = java.util.Arrays.hashCode(bytes);
+        }
+        @Override public int hashCode() { return hash; }
+        @Override public boolean equals(Object o) {
+            return o instanceof ByteArrayKey k && java.util.Arrays.equals(bytes, k.bytes);
+        }
+    }
 
     /** Legacy byte[]-prefix constructor. */
     public ForStRsMapState(
@@ -129,10 +149,23 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public UV get(UK key) throws IOException {
-        byte[] raw = linker.lookupKv(db, cf, composite(key));
+        byte[] compositeKey = composite(key);
+        ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
+        byte[] cached = writeCache.get(cacheKey);
+        if (cached != null) {
+            inputBuffer.setBuffer(cached);
+            return valueSerializer.deserialize(inputBuffer);
+        }
+        cached = readCache.get(cacheKey);
+        if (cached != null) {
+            inputBuffer.setBuffer(cached);
+            return valueSerializer.deserialize(inputBuffer);
+        }
+        byte[] raw = linker.lookupKv(db, cf, compositeKey);
         if (raw == null) {
             return null;
         }
+        readCache.put(cacheKey, raw);
         inputBuffer.setBuffer(raw);
         return valueSerializer.deserialize(inputBuffer);
     }
@@ -142,7 +175,12 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         valueOutBuffer.clear();
         valueSerializer.serialize(value, valueOutBuffer);
         byte[] payload = valueOutBuffer.getCopyOfBuffer();
-        linker.put(db, cf, composite(key), payload);
+        byte[] compositeKey = composite(key);
+        writeCache.put(new ByteArrayKey(compositeKey), payload);
+        writeCacheCount++;
+        if (writeCacheCount >= MAP_WRITE_BUFFER_THRESHOLD) {
+            flushMapWriteCache();
+        }
     }
 
     @Override
@@ -157,12 +195,20 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void remove(UK key) {
-        linker.delete(db, cf, composite(key));
+        byte[] compositeKey = composite(key);
+        ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
+        writeCache.remove(cacheKey);
+        readCache.remove(cacheKey);
+        linker.delete(db, cf, compositeKey);
     }
 
     @Override
     public boolean contains(UK key) throws IOException {
-        return linker.lookupKv(db, cf, composite(key)) != null;
+        byte[] compositeKey = composite(key);
+        if (writeCache.containsKey(new ByteArrayKey(compositeKey))) {
+            return true;
+        }
+        return linker.lookupKv(db, cf, compositeKey) != null;
     }
 
     @Override
@@ -281,5 +327,21 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     @SuppressWarnings("unused")
     private static <X> Iterable<X> emptyIterable() {
         return Collections.emptyList();
+    }
+
+    private void flushMapWriteCache() {
+        if (writeCache.isEmpty()) {
+            return;
+        }
+        for (Map.Entry<ByteArrayKey, byte[]> entry : writeCache.entrySet()) {
+            linker.put(db, cf, entry.getKey().bytes, entry.getValue());
+        }
+        writeCache.clear();
+        writeCacheCount = 0;
+    }
+
+    public void flush() {
+        flushMapWriteCache();
+        readCache.clear();
     }
 }
