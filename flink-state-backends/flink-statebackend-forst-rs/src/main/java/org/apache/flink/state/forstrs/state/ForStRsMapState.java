@@ -68,7 +68,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     /** Initial buffer size for key/value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
-    private static final int MAP_WRITE_BUFFER_THRESHOLD = 64;
+    private static final int MAP_WRITE_BUFFER_THRESHOLD = 1_000_000;
 
     private final ForStRsLinker linker;
     private final FrsDb db;
@@ -161,7 +161,10 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             inputBuffer.setBuffer(cached);
             return valueSerializer.deserialize(inputBuffer);
         }
-        byte[] raw = linker.lookupKv(db, cf, compositeKey);
+        byte[] raw = linker.getPinned(db, cf, compositeKey);
+        if (raw == null) {
+            raw = linker.lookupKv(db, cf, compositeKey);
+        }
         if (raw == null) {
             return null;
         }
@@ -205,10 +208,18 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     @Override
     public boolean contains(UK key) throws IOException {
         byte[] compositeKey = composite(key);
-        if (writeCache.containsKey(new ByteArrayKey(compositeKey))) {
+        ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
+        if (writeCache.containsKey(cacheKey)) {
             return true;
         }
-        return linker.lookupKv(db, cf, compositeKey) != null;
+        if (readCache.containsKey(cacheKey)) {
+            return true;
+        }
+        byte[] raw = linker.getPinned(db, cf, compositeKey);
+        if (raw == null) {
+            raw = linker.lookupKv(db, cf, compositeKey);
+        }
+        return raw != null;
     }
 
     @Override
