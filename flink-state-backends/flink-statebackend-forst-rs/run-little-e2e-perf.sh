@@ -28,7 +28,9 @@
 #   FORST_RS_CDYLIB    Path to libforst_rs_ffi.{so,dylib}; default infers from repo layout
 #   EVENTS             Events per measured run (default 100000, recommend up to 1000000)
 #   WARMUPS            Warmup runs per backend (default 1)
-#   JAVA_HOME          JDK 25+ home (FFM stable on 25+, required for forst-rs variant)
+#   JAVA_HOME_25       JDK 25+ home (FFM stable on 25+, required for forst-rs variant)
+#   JAVA_HOME_17       JDK 17+ home (for rocksdb + forst variants)
+#   JAVA_HOME          Fallback: used as JDK 25 if JAVA_HOME_25 not set
 #
 # This script intentionally does NOT shell out to maven-dependency-plugin at runtime — that adds
 # minutes of resolution latency that would dominate a CI loop. Instead it walks ~/.m2 once via
@@ -77,7 +79,12 @@ if [ ! -f "$CDYLIB" ]; then
 fi
 
 # ----------------------------------------------------------------------
-# JAVA_HOME — JDK 25 required for the FFM bridge in forst-rs.
+# JAVA_HOME / JAVA_HOME_25 / JAVA_HOME_17 — dual-JDK support.
+#
+# forst-rs requires JDK 25 (FFM). rocksdb + forst run on JDK 17.
+# The GHA workflow sets JAVA_HOME_25 and JAVA_HOME_17 explicitly.
+# For local dev, JAVA_HOME is used as the JDK 25 path and JDK 17 is
+# auto-detected or defaults to JAVA_HOME (runs everything on JDK 25).
 # ----------------------------------------------------------------------
 auto_detect_jdk25() {
     if [ -d /Library/Java/JavaVirtualMachines ]; then
@@ -88,22 +95,51 @@ auto_detect_jdk25() {
             return
         fi
     fi
-    # Linux / CI hint: setup-java@v4 sets JAVA_HOME directly.
     echo ""
 }
-needs_autodetect=1
-if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
-    jver="$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | awk -F'"' '{print $2}' | cut -d. -f1)"
-    if [ "${jver:-0}" -ge 25 ] 2>/dev/null; then
-        needs_autodetect=0
+auto_detect_jdk17() {
+    if [ -d /Library/Java/JavaVirtualMachines ]; then
+        local found
+        found="$(find /Library/Java/JavaVirtualMachines -maxdepth 1 -name '*17*' | head -1)"
+        if [ -n "$found" ]; then
+            echo "$found/Contents/Home"
+            return
+        fi
+    fi
+    echo ""
+}
+
+# Resolve JDK 25 (required for forst-rs + compilation)
+if [ -n "${JAVA_HOME_25:-}" ] && [ -x "${JAVA_HOME_25}/bin/java" ]; then
+    JDK25_HOME="$JAVA_HOME_25"
+else
+    needs_autodetect=1
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "${JAVA_HOME}/bin/java" ]; then
+        jver="$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | awk -F'"' '{print $2}' | cut -d. -f1)"
+        if [ "${jver:-0}" -ge 25 ] 2>/dev/null; then
+            needs_autodetect=0
+            JDK25_HOME="$JAVA_HOME"
+        fi
+    fi
+    if [ "$needs_autodetect" = 1 ]; then
+        JDK25_HOME="$(auto_detect_jdk25)"
     fi
 fi
-if [ "$needs_autodetect" = 1 ]; then
-    JAVA_HOME="$(auto_detect_jdk25)"
-fi
-if [ -z "${JAVA_HOME:-}" ] || [ ! -x "$JAVA_HOME/bin/java" ]; then
-    echo "FATAL: JDK 25 not found; set JAVA_HOME to a JDK 25+ install" >&2
+if [ -z "${JDK25_HOME:-}" ] || [ ! -x "$JDK25_HOME/bin/java" ]; then
+    echo "FATAL: JDK 25 not found; set JAVA_HOME or JAVA_HOME_25 to a JDK 25+ install" >&2
     exit 1
+fi
+export JAVA_HOME="$JDK25_HOME"
+
+# Resolve JDK 17 (for rocksdb + forst variants)
+if [ -n "${JAVA_HOME_17:-}" ] && [ -x "${JAVA_HOME_17}/bin/java" ]; then
+    JDK17_HOME="$JAVA_HOME_17"
+else
+    JDK17_HOME="$(auto_detect_jdk17)"
+    # Fall back to JDK 25 if no JDK 17 found (local dev: all variants on JDK 25)
+    if [ -z "$JDK17_HOME" ] || [ ! -x "$JDK17_HOME/bin/java" ]; then
+        JDK17_HOME="$JDK25_HOME"
+    fi
 fi
 
 # ----------------------------------------------------------------------
@@ -155,6 +191,21 @@ CP="$ROOT/target/test-classes:$ROOT/target/classes:$DEP_CP"
 [ -f "$FORST_JAR" ]   && CP="$CP:$FORST_JAR"
 
 # ----------------------------------------------------------------------
+# Compile the JDK-17-compatible bench class. This lives under
+# src/test/java17/ and is compiled separately with --release 17 so it
+# can run on JDK 17 for the rocksdb + forst variants.
+# ----------------------------------------------------------------------
+JDK17_BENCH_SRC="$ROOT/src/test/java17/org/apache/flink/state/forstrs/perf/LittleE2EPerfBenchJdk17.java"
+JDK17_BENCH_OUT="$ROOT/target/test-classes-jdk17"
+if [ -f "$JDK17_BENCH_SRC" ]; then
+    echo "[compile] LittleE2EPerfBenchJdk17.java (--release 17)"
+    mkdir -p "$JDK17_BENCH_OUT"
+    "$JDK25_HOME/bin/javac" --release 17 -cp "$CP" -d "$JDK17_BENCH_OUT" "$JDK17_BENCH_SRC"
+fi
+# Prepend JDK17 bench classes to classpath (takes priority over test-classes for the Jdk17 class)
+CP_JDK17="$JDK17_BENCH_OUT:$CP"
+
+# ----------------------------------------------------------------------
 # Stage the cdylib under the upstream JNI lib name. Variant 3 sets
 # java.library.path so org.forstdb.RocksDB.loadLibrary() finds our cdylib
 # instead of the community libforstjni — this proves the forst-rs cdylib is
@@ -181,6 +232,8 @@ echo ""
 echo "=== LittleE2EPerfBench across 4 backend variants ==="
 echo "Events: $EVENTS   Warmups: $WARMUPS   Parallelism sweep: $PARALLELISM_SWEEP"
 echo "CDylib: $CDYLIB"
+echo "JDK 25 (forst-rs): $JDK25_HOME"
+echo "JDK 17 (rocksdb/forst): $JDK17_HOME"
 echo ""
 
 # Per-variant runs are non-fatal: if variant 2 (community forstjni) fails
@@ -189,7 +242,30 @@ echo ""
 # signature), we still want variants 1, 3, 4 to produce numbers. set +e
 # is scoped to the variant loop; the rest of the script remains strict.
 set +e
-run_variant() {
+
+# run_variant_jdk17: runs rocksdb/forst variants on JDK 17 using LittleE2EPerfBenchJdk17
+run_variant_jdk17() {
+    local label="$1"
+    local backend="$2"
+    shift 2
+    echo ""
+    echo "--- $label ---"
+    local java_bin="$JDK17_HOME/bin/java"
+    # shellcheck disable=SC2086
+    "$java_bin" \
+        "$@" \
+        -cp "$CP_JDK17" \
+        org.apache.flink.state.forstrs.perf.LittleE2EPerfBenchJdk17 \
+        --backend "$backend" --events "$EVENTS" --warmups "$WARMUPS" --parallelism "$PAR" \
+        --checkpoint-interval "$CHECKPOINT_INTERVAL"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "VARIANT_FAILED label='$label' backend=$backend parallelism=$PAR exit_code=$rc"
+    fi
+}
+
+# run_variant_jdk25: runs forst-rs on JDK 25 using LittleE2EPerfBench (FFM + Vector API)
+run_variant_jdk25() {
     local label="$1"
     local backend="$2"
     shift 2
@@ -200,11 +276,7 @@ run_variant() {
     fi
     echo ""
     echo "--- $label ---"
-    # All variants use JDK 25: the bench class (LittleE2EPerfBench) is compiled
-    # with --release 25 and cannot run on JDK 17. The forst-rs variant also
-    # needs FFM (--enable-native-access). The forst (forstjni) variant may fail
-    # due to forstjni-0.1.8's JDK 25 incompatibility (upstream issue).
-    local java_bin="$JAVA_HOME/bin/java"
+    local java_bin="$JDK25_HOME/bin/java"
     local jvm_module_args="--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector"
     # shellcheck disable=SC2086
     "$java_bin" \
@@ -225,11 +297,11 @@ run_variant() {
 for PAR in $PARALLELISM_SWEEP; do
     echo ""
     echo "====== Parallelism = $PAR ======"
-    run_variant "rocksdb (p=$PAR)" rocksdb
-    run_variant "forst (community libforstjni, p=$PAR)" forst
-    run_variant "forst (libforstjni -> libforst_rs_ffi swap, p=$PAR)" forst \
+    run_variant_jdk17 "rocksdb (p=$PAR)" rocksdb
+    run_variant_jdk17 "forst (community libforstjni, p=$PAR)" forst
+    run_variant_jdk17 "forst (libforstjni -> libforst_rs_ffi swap, p=$PAR)" forst \
         "-Djava.library.path=$LIBSWAP_DIR"
-    run_variant "forst-rs (p=$PAR)" forst-rs
+    run_variant_jdk25 "forst-rs (p=$PAR)" forst-rs
 done
 
 # Checkpoint variant: p=4, ckpt=5s — measures overhead of periodic snapshots.
@@ -238,8 +310,8 @@ if [ "${CHECKPOINT_INTERVAL:-0}" = "0" ]; then
     echo "====== Checkpoint variant: p=4, ckpt=5000ms ======"
     PAR=4
     CHECKPOINT_INTERVAL=5000
-    run_variant "rocksdb (p=4, ckpt=5s)" rocksdb
-    run_variant "forst-rs (p=4, ckpt=5s)" forst-rs
+    run_variant_jdk17 "rocksdb (p=4, ckpt=5s)" rocksdb
+    run_variant_jdk25 "forst-rs (p=4, ckpt=5s)" forst-rs
     CHECKPOINT_INTERVAL=0
 fi
 set -e
