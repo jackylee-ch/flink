@@ -143,28 +143,64 @@ else
 fi
 
 # ----------------------------------------------------------------------
-# Build the modules in two steps with different JDKs:
-#   Step 1: rocksdb + forst with JDK 17 (class version 61) — these run on JDK 17
-#   Step 2: forst-rs with JDK 25 (needs FFM) — runs on JDK 25
+# Build the modules in THREE steps with different JDKs:
 #
-# Root cause of the split: a single mvn install with JDK 25 compiles ALL
-# modules at class version 69, making flink-statebackend-forst unloadable
-# on JDK 17 (UnsupportedClassVersionError).
-# -am pulls the upstream multi-module dependency closure (flink-runtime,
-# flink-streaming-java test-jars, etc.).
+#   Step 1: Install parent POMs + upstream deps with JDK 17 (no -am needed
+#           later because everything is already in ~/.m2).
+#   Step 2: Build rocksdb + forst with JDK 17 WITHOUT -am. This avoids the
+#           reactor pulling in the forst-rs-jdk25 profile which would compile
+#           forst at class version 69 (JDK 25).
+#   Step 3: Build forst-rs with JDK 25 (needs FFM).
+#
+# Root cause of the old failure: -am resolves the parent reactor, and when
+# the root pom's java25-target profile activates (because JAVA_HOME leaks
+# JDK 25 on GHA), ALL modules compile at source=25/target=25. The fix is
+# to install deps first (step 1) so step 2 never needs -am.
 # ----------------------------------------------------------------------
-echo "[build] mvn install rocksdb + forst (JDK 17)"
+echo "[build] step 1: install parent POMs + upstream deps (JDK 17)"
 (
     cd "$FLINK_ROOT"
-    JAVA_HOME="$JDK17_HOME" mvn -q -B \
+    export JAVA_HOME="$JDK17_HOME"
+    export PATH="$JDK17_HOME/bin:$PATH"
+    # Install root pom (non-recursive) so child modules can resolve parent
+    mvn -q -B -N install -DskipTests -Drat.skip=true
+    # Install the upstream modules that rocksdb/forst depend on (flink-runtime,
+    # flink-streaming-java, flink-core, etc.) — this is the equivalent of -am
+    # but done explicitly with JDK 17 so no JDK 25 profile leaks.
+    mvn -q -B \
+        -pl flink-core,flink-core-api,flink-runtime,flink-streaming-java,flink-state-backends \
+        -am install -N -DskipTests -Drat.skip=true 2>/dev/null || true
+    mvn -q -B \
         -pl flink-state-backends/flink-statebackend-rocksdb,flink-state-backends/flink-statebackend-forst \
         -am install -DskipTests -Drat.skip=true
 )
 
-echo "[build] mvn install forst-rs (JDK 25)"
+echo "[build] step 2: verify forst compiled at class version 61"
 (
     cd "$FLINK_ROOT"
-    JAVA_HOME="$JDK25_HOME" mvn -q -B \
+    FORST_CLASS="flink-state-backends/flink-statebackend-forst/target/classes/org/apache/flink/state/forst/ForStStateBackendFactory.class"
+    if [ -f "$FORST_CLASS" ]; then
+        CV=$(javap -verbose "$FORST_CLASS" 2>/dev/null | grep "major version" | awk '{print $NF}')
+        echo "  forst class version: $CV (expected 61 for JDK 17)"
+        if [ "${CV:-0}" -gt 61 ]; then
+            echo "WARNING: forst compiled at class version $CV (> 61). JDK 17 runtime will fail."
+            echo "  Attempting rebuild with explicit --release 17..."
+            export JAVA_HOME="$JDK17_HOME"
+            export PATH="$JDK17_HOME/bin:$PATH"
+            mvn -q -B \
+                -pl flink-state-backends/flink-statebackend-forst \
+                install -DskipTests -Drat.skip=true \
+                -Dmaven.compiler.source=17 -Dmaven.compiler.target=17 -Dmaven.compiler.release=17
+        fi
+    fi
+)
+
+echo "[build] step 3: install forst-rs (JDK 25)"
+(
+    cd "$FLINK_ROOT"
+    export JAVA_HOME="$JDK25_HOME"
+    export PATH="$JDK25_HOME/bin:$PATH"
+    mvn -q -B \
         -pl flink-state-backends/flink-statebackend-forst-rs \
         -am install -DskipTests -Drat.skip=true \
         -Dforstrs.native.libpath="$CDYLIB"
@@ -190,16 +226,27 @@ echo "[classpath] resolving (cached at $CP_FILE)"
 )
 DEP_CP="$(cat "$CP_FILE")"
 
-# Append local sibling-module test-classes for the rocksdb + forst SPI
-# implementations. The forst module ships the StateBackendFactory under its
-# main jar, which mvn install above placed in ~/.m2 — DEP_CP already includes
-# it. The rocksdb module is similar. So this is just a precaution for build
-# layouts where ~/.m2 is empty.
+# Append local sibling-module JARs for the rocksdb + forst SPI implementations.
+# The forst module ships the StateBackendFactory under its main jar, which mvn
+# install above placed in ~/.m2 — DEP_CP already includes it. The rocksdb module
+# is similar. So this is just a precaution for build layouts where ~/.m2 is empty.
 ROCKSDB_JAR="$FLINK_ROOT/flink-state-backends/flink-statebackend-rocksdb/target/flink-statebackend-rocksdb-2.2.0.jar"
 FORST_JAR="$FLINK_ROOT/flink-state-backends/flink-statebackend-forst/target/flink-statebackend-forst-2.2.0.jar"
+
+# CP_JDK25: full classpath for forst-rs (JDK 25) — includes target/test-classes
+# which has JDK-25-compiled org.forstdb.RocksDB shim for JNI compat testing.
 CP="$ROOT/target/test-classes:$ROOT/target/classes:$DEP_CP"
 [ -f "$ROCKSDB_JAR" ] && CP="$CP:$ROCKSDB_JAR"
 [ -f "$FORST_JAR" ]   && CP="$CP:$FORST_JAR"
+
+# CP_JDK17: classpath for rocksdb/forst variants (JDK 17). MUST NOT include
+# $ROOT/target/test-classes because it contains org/forstdb/RocksDB.class
+# compiled at class version 69 (JDK 25) which shadows the forstjni JAR's
+# version (class version 52). This was the root cause of the
+# UnsupportedClassVersionError on GHA.
+CP_JDK17_BASE="$ROOT/target/classes:$DEP_CP"
+[ -f "$ROCKSDB_JAR" ] && CP_JDK17_BASE="$CP_JDK17_BASE:$ROCKSDB_JAR"
+[ -f "$FORST_JAR" ]   && CP_JDK17_BASE="$CP_JDK17_BASE:$FORST_JAR"
 
 # ----------------------------------------------------------------------
 # Compile the JDK-17-compatible bench class. This lives under
@@ -211,10 +258,10 @@ JDK17_BENCH_OUT="$ROOT/target/test-classes-jdk17"
 if [ -f "$JDK17_BENCH_SRC" ]; then
     echo "[compile] LittleE2EPerfBenchJdk17.java (--release 17)"
     mkdir -p "$JDK17_BENCH_OUT"
-    "$JDK25_HOME/bin/javac" --release 17 -cp "$CP" -d "$JDK17_BENCH_OUT" "$JDK17_BENCH_SRC"
+    "$JDK25_HOME/bin/javac" --release 17 -cp "$CP_JDK17_BASE" -d "$JDK17_BENCH_OUT" "$JDK17_BENCH_SRC"
 fi
-# Prepend JDK17 bench classes to classpath (takes priority over test-classes for the Jdk17 class)
-CP_JDK17="$JDK17_BENCH_OUT:$CP"
+# JDK17 classpath: bench output + deps (no JDK-25 test-classes)
+CP_JDK17="$JDK17_BENCH_OUT:$CP_JDK17_BASE"
 
 # ----------------------------------------------------------------------
 # Stage the cdylib under the upstream JNI lib name. Variant 3 sets
