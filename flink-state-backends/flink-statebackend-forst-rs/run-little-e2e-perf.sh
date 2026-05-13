@@ -162,14 +162,9 @@ echo "[build] step 1: install parent POMs + upstream deps (JDK 17)"
     cd "$FLINK_ROOT"
     export JAVA_HOME="$JDK17_HOME"
     export PATH="$JDK17_HOME/bin:$PATH"
-    # Install root pom (non-recursive) so child modules can resolve parent
-    mvn -q -B -N install -DskipTests -Drat.skip=true
-    # Install the upstream modules that rocksdb/forst depend on (flink-runtime,
-    # flink-streaming-java, flink-core, etc.) — this is the equivalent of -am
-    # but done explicitly with JDK 17 so no JDK 25 profile leaks.
-    mvn -q -B \
-        -pl flink-core,flink-core-api,flink-runtime,flink-streaming-java,flink-state-backends \
-        -am install -N -DskipTests -Drat.skip=true 2>/dev/null || true
+    # Build rocksdb + forst with -am (also-make-dependencies) using JDK 17.
+    # The export ensures Maven detects JDK 17, so the root pom's java25-target
+    # profile ([25,)) does NOT activate, and all modules compile at class version 61.
     mvn -q -B \
         -pl flink-state-backends/flink-statebackend-rocksdb,flink-state-backends/flink-statebackend-forst \
         -am install -DskipTests -Drat.skip=true
