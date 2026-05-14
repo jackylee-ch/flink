@@ -168,7 +168,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             inputBuffer.setBuffer(cached);
             return valueSerializer.deserialize(inputBuffer);
         }
-        byte[] raw = linker.getIntoBuf(db, cf, compositeKey);
+        byte[] raw = linker.getFast(db, cf, compositeKey);
         if (raw == null) {
             return null;
         }
