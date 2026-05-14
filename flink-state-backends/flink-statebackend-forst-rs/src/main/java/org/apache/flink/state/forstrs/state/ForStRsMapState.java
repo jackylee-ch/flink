@@ -68,7 +68,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     /** Initial buffer size for key/value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
-    private static final int MAP_WRITE_BUFFER_THRESHOLD = 1_000_000;
+    private static final int MAP_WRITE_BUFFER_THRESHOLD = 64;
 
     private final ForStRsLinker linker;
     private final FrsDb db;
@@ -337,9 +337,16 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         if (writeCache.isEmpty()) {
             return;
         }
+        int count = writeCache.size();
+        byte[][] keys = new byte[count][];
+        byte[][] values = new byte[count][];
+        int i = 0;
         for (Map.Entry<ByteArrayKey, byte[]> entry : writeCache.entrySet()) {
-            linker.put(db, cf, entry.getKey().bytes, entry.getValue());
+            keys[i] = entry.getKey().bytes;
+            values[i] = entry.getValue();
+            i++;
         }
+        linker.batchPut(db, cf, keys, values);
         writeCache.clear();
         writeCacheCount = 0;
     }
