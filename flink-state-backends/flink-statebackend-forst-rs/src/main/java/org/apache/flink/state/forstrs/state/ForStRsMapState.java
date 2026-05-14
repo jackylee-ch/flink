@@ -68,7 +68,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     /** Initial buffer size for key/value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
-    private static final int MAP_WRITE_BUFFER_THRESHOLD = Integer.MAX_VALUE;
+    private static final int MAP_WRITE_BUFFER_THRESHOLD = 524288;
 
     private final ForStRsLinker linker;
     private final FrsDb db;
