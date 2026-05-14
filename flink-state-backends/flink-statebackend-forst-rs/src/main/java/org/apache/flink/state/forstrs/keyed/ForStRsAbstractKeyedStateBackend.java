@@ -335,6 +335,7 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // Flush all buffered writes before capturing the snapshot — correctness requirement:
         // the engine snapshot must include all state mutations up to this barrier.
         delegate.flushWriteBuffer();
+        delegate.flushAllMapStates();
         // Drive the snapshot through Flink's canonical SnapshotStrategyRunner so the returned
         // RunnableFuture is wrapped in an AsyncSnapshotCallable that:
         //   * registers cancellation hooks on cancelStreamRegistry (for checkpoint abort),
@@ -356,8 +357,7 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             // "Cannot register Closeable, registry is already closed."
             // Gracefully abort: return a pre-completed future with an empty result so the
             // checkpoint coordinator can proceed without hanging the job.
-            if (e.getMessage() != null
-                    && e.getMessage().contains("registry is already closed")) {
+            if (e.getMessage() != null && e.getMessage().contains("registry is already closed")) {
                 LOG.info(
                         "Checkpoint {} skipped — cancelStreamRegistry already closed"
                                 + " (prior checkpoint failure or task cancellation).",

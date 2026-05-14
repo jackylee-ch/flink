@@ -279,10 +279,8 @@ final class ForStRsInternalKvStateAdapters {
         private final TypeSerializer<UK> userKeySerializer;
         private final TypeSerializer<UV> userValueSerializer;
 
-        /** Cached bound state (Phase B1+B3 optimization). */
+        /** Cached bound state (persists across key changes — kg-prefixed mode). */
         private ForStRsMapState<UK, UV> cachedState;
-
-        private long cachedGeneration = -1;
 
         @SuppressWarnings({"rawtypes", "unchecked"})
         MapAdapter(
@@ -304,12 +302,10 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         private ForStRsMapState<UK, UV> bind() {
-            long gen = delegate.getKeyGeneration();
-            if (cachedState != null && gen == cachedGeneration) {
+            if (cachedState != null) {
                 return cachedState;
             }
             cachedState = delegate.getMapState(stateName, userKeySerializer, userValueSerializer);
-            cachedGeneration = gen;
             return cachedState;
         }
 

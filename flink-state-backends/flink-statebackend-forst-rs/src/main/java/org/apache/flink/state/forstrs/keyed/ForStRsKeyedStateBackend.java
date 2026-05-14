@@ -120,6 +120,13 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     private final Map<String, Object> stateCache = new HashMap<>();
 
+    /**
+     * Registry of kg-prefixed MapState instances that persist across key changes. These use dynamic
+     * prefix/composite-key computers and accumulate writes in their internal cache. Flushed on
+     * checkpoint via {@link #flushAllMapStates()}.
+     */
+    private final Map<String, ForStRsMapState<?, ?>> mapStateRegistry = new HashMap<>();
+
     // ------------------------------------------------------------------
     // Write-behind buffer: defers native put calls and serves subsequent
     // reads from the buffer. Flushed in batch (batchPut) every
@@ -329,20 +336,30 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         return created;
     }
 
-    /** Returns a {@link ForStRsMapState} bound to the current key + state-id. */
+    /**
+     * Returns a {@link ForStRsMapState} bound to the current key + state-id. Uses the kg-prefixed
+     * constructor so the same instance persists across key changes — its write cache accumulates
+     * entries from all keys and flushes in batch on checkpoint.
+     */
+    @SuppressWarnings("unchecked")
     public <UK, UV> ForStRsMapState<UK, UV> getMapState(
             String stateName, TypeSerializer<UK> keySer, TypeSerializer<UV> valueSer) {
         ensureCurrentKey();
-        @SuppressWarnings("unchecked")
         ForStRsMapState<UK, UV> existing =
-                (ForStRsMapState<UK, UV>) stateCache.get(mapStateCacheKey(stateName));
+                (ForStRsMapState<UK, UV>) mapStateRegistry.get(stateName);
         if (existing != null) {
             return existing;
         }
-        byte[] prefix = buildPrefix(stateName);
         ForStRsMapState<UK, UV> created =
-                new ForStRsMapState<>(linker, db, defaultCf, prefix, keySer, valueSer);
-        stateCache.put(mapStateCacheKey(stateName), created);
+                new ForStRsMapState<>(
+                        linker,
+                        db,
+                        defaultCf,
+                        keySer,
+                        valueSer,
+                        () -> buildPrefix(stateName),
+                        (uk) -> buildCompositeMapKey(stateName, keySer, uk));
+        mapStateRegistry.put(stateName, created);
         return created;
     }
 
@@ -406,6 +423,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     public long numKeyValueStateEntries() {
         // Flush buffered writes so the count reflects all pending mutations.
         flushWriteBuffer();
+        flushAllMapStates();
         long count = 0;
         try (Arena local = Arena.ofShared();
                 org.apache.flink.state.forstrs.ffm.FrsIterator iter =
@@ -439,6 +457,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         // Flush buffered writes before checkpoint — correctness requirement.
         flushWriteBuffer();
+        flushAllMapStates();
         linker.createCheckpoint(db, targetDir.toString());
         return targetDir;
     }
@@ -500,6 +519,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         // Flush buffered writes so the scan reflects all pending mutations.
         flushWriteBuffer();
+        flushAllMapStates();
         byte[] nameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         byte[] tailMarker = new byte[1 + nameBytes.length + 1];
         tailMarker[0] = (byte) '/';
@@ -645,7 +665,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         writeBuffer.put(new ByteArrayWrapper(key), value);
         writeBufferCount++;
-        if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD || writeBuffer.size() >= MAX_BUFFER_ENTRIES) {
+        if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD
+                || writeBuffer.size() >= MAX_BUFFER_ENTRIES) {
             flushWriteBuffer();
         }
     }
@@ -703,10 +724,26 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 i++;
             }
             linker.batchPut(
-                    db, defaultCf, flushKeyPtrs, flushKeyLens, flushValuePtrs, flushValueLens, count);
+                    db,
+                    defaultCf,
+                    flushKeyPtrs,
+                    flushKeyLens,
+                    flushValuePtrs,
+                    flushValueLens,
+                    count);
         }
         writeBuffer.clear();
         writeBufferCount = 0;
+    }
+
+    /**
+     * Flushes all registered kg-prefixed MapState instances. Called on checkpoint and close to
+     * ensure all buffered map-state writes reach the engine before snapshot.
+     */
+    public void flushAllMapStates() {
+        for (ForStRsMapState<?, ?> ms : mapStateRegistry.values()) {
+            ms.flush();
+        }
     }
 
     /**
@@ -746,6 +783,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         closed = true;
         // Flush any buffered writes before releasing resources.
         flushWriteBuffer();
+        flushAllMapStates();
         stateCache.clear();
         if (!ownsResources) {
             return;
@@ -843,6 +881,27 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         off += nameBytes.length;
         System.arraycopy(SLASH, 0, out, off, SLASH.length);
         return out;
+    }
+
+    /**
+     * Builds the full composite ForSt key for a MapState user key: {@code "k/" ||
+     * serialize(currentKey) || "/" || stateName.bytes || "/" || serialize(uk)}. Used by the
+     * kg-prefixed MapState constructor's {@code compositeKeyComputer}.
+     */
+    private <UK> byte[] buildCompositeMapKey(
+            String stateName, TypeSerializer<UK> ukSerializer, UK userKey) {
+        byte[] prefix = buildPrefix(stateName);
+        DataOutputSerializer ukOut = new DataOutputSerializer(32);
+        try {
+            ukSerializer.serialize(userKey, ukOut);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize MapState user key", e);
+        }
+        byte[] ukBytes = ukOut.getCopyOfBuffer();
+        byte[] full = new byte[prefix.length + ukBytes.length];
+        System.arraycopy(prefix, 0, full, 0, prefix.length);
+        System.arraycopy(ukBytes, 0, full, prefix.length, ukBytes.length);
+        return full;
     }
 
     private static String valueStateCacheKey(String stateName) {

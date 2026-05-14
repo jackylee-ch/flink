@@ -68,7 +68,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     /** Initial buffer size for key/value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
-    private static final int MAP_WRITE_BUFFER_THRESHOLD = 64;
+    private static final int MAP_WRITE_BUFFER_THRESHOLD = Integer.MAX_VALUE;
 
     private final ForStRsLinker linker;
     private final FrsDb db;
@@ -90,12 +90,19 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     static final class ByteArrayKey {
         final byte[] bytes;
         private final int hash;
+
         ByteArrayKey(byte[] bytes) {
             this.bytes = bytes;
             this.hash = java.util.Arrays.hashCode(bytes);
         }
-        @Override public int hashCode() { return hash; }
-        @Override public boolean equals(Object o) {
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object o) {
             return o instanceof ByteArrayKey k && java.util.Arrays.equals(bytes, k.bytes);
         }
     }
@@ -245,6 +252,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public boolean isEmpty() throws IOException {
+        if (!writeCache.isEmpty()) {
+            byte[] prefix = currentPrefix();
+            for (ByteArrayKey k : writeCache.keySet()) {
+                if (startsWith(k.bytes, prefix)) {
+                    return false;
+                }
+            }
+        }
+        flushMapWriteCache();
         try (Arena arena = Arena.ofShared();
                 FrsIterator iter = linker.prefixLookupOpen(db, cf, currentPrefix(), arena)) {
             return linker.iteratorNext(iter) == null;
@@ -253,9 +269,13 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void clear() {
+        flushMapWriteCache();
+        byte[] prefix = currentPrefix();
+        writeCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
+        readCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
         List<byte[]> compositeKeys = new ArrayList<>();
         try (Arena arena = Arena.ofShared();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, currentPrefix(), arena)) {
+                FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
             ForStRsLinker.IteratorEntry entry;
             while ((entry = linker.iteratorNext(iter)) != null) {
                 compositeKeys.add(entry.key());
@@ -267,6 +287,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     }
 
     private void forEachEntry(EntryVisitor<UK, UV> visitor, boolean loadValues) throws IOException {
+        flushMapWriteCache();
         byte[] prefix = currentPrefix();
         try (Arena arena = Arena.ofShared();
                 FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
@@ -331,6 +352,18 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     @SuppressWarnings("unused")
     private static <X> Iterable<X> emptyIterable() {
         return Collections.emptyList();
+    }
+
+    private static boolean startsWith(byte[] data, byte[] prefix) {
+        if (data.length < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (data[i] != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private void flushMapWriteCache() {
