@@ -25,17 +25,22 @@ import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
 import org.apache.flink.runtime.rpc.FatalErrorHandler;
+import org.apache.flink.state.forstrs.exec.FrsIterHandle;
+import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsEnginePanicError;
 import org.apache.flink.state.forstrs.ffm.FrsErrorCode;
+import org.apache.flink.state.forstrs.ffm.FrsException;
 import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Vectorized {@link StateExecutor} that dispatches an entire batch of state requests via a single
@@ -61,9 +66,13 @@ public class VectorizedExecutor implements StateExecutor {
 
     // Optional metrics + fatal-handler — set via setters after construction so that
     // backends that don't yet have a MetricGroup can still instantiate the executor.
-    // Phase P5 will plumb MetricGroup through backend constructors and make these final.
     private DispatchMetrics metrics;
     private FatalErrorHandler fatalHandler;
+
+    // Optional SlotArenaScope + monotonic handle ID counter for ITER_PREFIX dispatch.
+    // Set via setSlotScope() before any submitVectorized(IterPrefixRequest) calls.
+    private SlotArenaScope slotScope;
+    private final AtomicLong nextIterHandleId = new AtomicLong(0);
 
     // Long-lived classifier-side buffers (reused across batches via reset()).
     private final ColumnarBatchBuffer getKeys;
@@ -117,6 +126,15 @@ public class VectorizedExecutor implements StateExecutor {
         this.fatalHandler = fh;
     }
 
+    /**
+     * Attach a {@link SlotArenaScope} for ITER_PREFIX dispatch. Must be set before any
+     * {@link IterPrefixRequest} is dispatched; the scope is used to allocate per-iterator Arenas
+     * and register handles for turn-boundary lifetime management.
+     */
+    public void setSlotScope(SlotArenaScope scope) {
+        this.slotScope = scope;
+    }
+
     @Override
     public AsyncRequestContainer<StateRequest<?, ?, ?, ?>> createRequestContainer() {
         // Each batch gets its own classifier that wraps the long-lived buffers.
@@ -140,6 +158,11 @@ public class VectorizedExecutor implements StateExecutor {
             executeDeletes(classifier);
             executeGets(classifier);
             executeIters(classifier);
+            // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is non-null/non-empty.
+            IterPrefixBatchBuffer ipBuf = classifier.iterPrefixBuffer();
+            if (ipBuf != null && !ipBuf.isEmpty()) {
+                dispatchIterPrefix(ipBuf);
+            }
             return CompletableFuture.completedFuture(null);
         } catch (Exception e) {
             return CompletableFuture.failedFuture(e);
@@ -156,6 +179,10 @@ public class VectorizedExecutor implements StateExecutor {
         executeDeletes(single);
         executeGets(single);
         executeIters(single);
+        IterPrefixBatchBuffer ipBuf = single.iterPrefixBuffer();
+        if (ipBuf != null && !ipBuf.isEmpty()) {
+            dispatchIterPrefix(ipBuf);
+        }
     }
 
     @Override
@@ -323,16 +350,86 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     /**
-     * Dispatches an ITER_PREFIX batch via {@code frs_vec_iter_prefix_open} FFI.
+     * Dispatches an ITER_PREFIX batch via {@code frs_vec_iter_prefix_open} FFI (P5).
      *
-     * <p>Real implementation lands in P3 (umbrella spec §3 Trace D).
+     * <p>For each request in the buffer, opens a native prefix-bounded iterator, wraps it in an
+     * {@link FrsIterHandle}, registers it with the {@link SlotArenaScope}, and completes the
+     * request's future with an {@link IterPrefixRequest.IterFirstChunk} carrying the handle and
+     * first-chunk row count.
+     *
+     * <p>Requires {@link #setSlotScope(SlotArenaScope)} to have been called beforehand; throws
+     * {@link IllegalStateException} if the scope is not set.
      *
      * @param buffer the ITER_PREFIX batch buffer populated by the classifier
-     * @throws UnsupportedOperationException always (P3 pending)
      */
     public void dispatchIterPrefix(IterPrefixBatchBuffer buffer) {
-        throw new UnsupportedOperationException(
-                "ITER_PREFIX dispatch lands in P3 (umbrella spec §3 Trace D)");
+        if (slotScope == null) {
+            throw new IllegalStateException(
+                    "SlotArenaScope not set on VectorizedExecutor — call setSlotScope() "
+                            + "before dispatching ITER_PREFIX requests");
+        }
+        long t0 = System.nanoTime();
+        int rowsTotal = 0;
+        long bytesIn = 0;
+
+        List<MemorySegment> prefixSlices = buffer.prefixSlices();
+        List<MemorySegment> chunkBufSlices = buffer.chunkBufSlices();
+        List<CompletableFuture<IterPrefixRequest.IterFirstChunk>> futures = buffer.futures();
+
+        for (int row = 0; row < buffer.count(); row++) {
+            MemorySegment prefix = prefixSlices.get(row);
+            MemorySegment chunkBuf = chunkBufSlices.get(row);
+            CompletableFuture<IterPrefixRequest.IterFirstChunk> future = futures.get(row);
+
+            // Allocate out-params in a per-iterator Arena; the Arena is closed when the
+            // handle is closed (via FrsIterHandle.close() → perIterArena.close()).
+            Arena perIterArena = Arena.ofShared();
+            MemorySegment outHandle = perIterArena.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment outRowCount = perIterArena.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = perIterArena.allocate(ValueLayout.JAVA_INT);
+
+            int rc = linker.frsVecIterPrefixOpen(
+                    db.handle(), cf.handle(),
+                    prefix, (int) prefix.byteSize(),
+                    chunkBuf, (int) chunkBuf.byteSize(),
+                    outHandle, outRowCount, outBytesUsed);
+
+            FrsErrorCode code = FrsErrorCode.fromU32(rc);
+            if (code != FrsErrorCode.OK) {
+                perIterArena.close();
+                future.completeExceptionally(
+                        new FrsException(code, row, new byte[0]));
+                if (metrics != null) {
+                    metrics.recordFfiError(
+                            VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", code);
+                }
+                continue;
+            }
+
+            long nativeHandle = outHandle.get(ValueLayout.JAVA_LONG, 0);
+            int firstChunkRows = outRowCount.get(ValueLayout.JAVA_INT, 0);
+            int firstChunkBytes = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+            rowsTotal += firstChunkRows;
+            bytesIn += firstChunkBytes;
+
+            long jHandleId = nextIterHandleId.incrementAndGet();
+            FrsIterHandle fh =
+                    new FrsIterHandle(jHandleId, nativeHandle, linker, perIterArena, slotScope);
+            slotScope.registerIter(fh);
+            if (metrics != null) {
+                metrics.recordIterHandlesOpened();
+            }
+            future.complete(new IterPrefixRequest.IterFirstChunk(fh, firstChunkRows));
+        }
+
+        if (metrics != null) {
+            metrics.recordDispatch(
+                    VectorizedStateRequest.Kind.ITER_PREFIX,
+                    MIXED_STATE,
+                    rowsTotal,
+                    bytesIn,
+                    System.nanoTime() - t0);
+        }
     }
 
     /**
