@@ -36,14 +36,18 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Encapsulates a MAP_ITER/MAP_ITER_KEY/MAP_ITER_VALUE request for prefix-scan execution. Uses
  * {@link ForStRsLinker#prefixLookupOpen} + {@link ForStRsLinker#iteratorNext} to iterate entries
  * matching a key prefix, batching up to {@link #CACHE_SIZE_LIMIT} entries.
+ *
+ * <p>Implements {@link VectorizedStateRequest} as Kind.ITER_PREFIX. The {@link #future()} method
+ * returns {@code null} because completion is handled via Flink's {@code InternalAsyncFuture}.
  */
 @Internal
-public class ForStRsDBIterRequest<K, N, UK, UV> {
+public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements VectorizedStateRequest {
 
     static final int CACHE_SIZE_LIMIT = 128;
 
@@ -52,6 +56,36 @@ public class ForStRsDBIterRequest<K, N, UK, UV> {
     private final StateRequestType originalRequestType;
     private final ForStRsIterableState<K, N, UK, UV> iterableState;
     @Nullable private FrsIterator existingIterator;
+    private String stateName = "unknown";
+
+    // --- VectorizedStateRequest implementation ---
+
+    @Override
+    public Kind kind() {
+        return Kind.ITER_PREFIX;
+    }
+
+    /** V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called. */
+    @Override
+    public String stateName() {
+        return stateName;
+    }
+
+    /**
+     * Sets the state name for classifier grouping and per-state metrics.
+     */
+    public void setStateName(String stateName) {
+        this.stateName = stateName;
+    }
+
+    /**
+     * Returns {@code null} — completion uses Flink's {@code InternalAsyncFuture} via {@link
+     * #completeBatch} / {@link #process}.
+     */
+    @Override
+    public CompletableFuture<?> future() {
+        return null;
+    }
 
     public ForStRsDBIterRequest(
             byte[] prefix,

@@ -20,17 +20,23 @@ package org.apache.flink.state.forstrs;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Encapsulates a single put (or delete) request for batch execution. Holds serialized key + value
  * bytes and a reference to the original StateRequest.
+ *
+ * <p>Implements {@link VectorizedStateRequest} as Kind.PUT. The {@link #future()} method returns
+ * {@code null} because completion is handled via Flink's internal {@code InternalAsyncFuture}.
+ * Use {@link #complete()} instead.
  */
 @Internal
-public class ForStRsDBPutRequest<K, N, V> {
+public non-sealed class ForStRsDBPutRequest<K, N, V> implements VectorizedStateRequest {
 
     private final byte[] serializedKey;
     private final byte[] serializedValue;
     private final StateRequest<K, N, ?, ?> request;
+    private String stateName = "unknown";
 
     public ForStRsDBPutRequest(
             byte[] serializedKey, byte[] serializedValue, StateRequest<K, N, ?, ?> request) {
@@ -46,6 +52,35 @@ public class ForStRsDBPutRequest<K, N, V> {
     /** Returns null for delete operations. */
     public byte[] getSerializedValue() {
         return serializedValue;
+    }
+
+    // --- VectorizedStateRequest implementation ---
+
+    @Override
+    public Kind kind() {
+        return Kind.PUT;
+    }
+
+    /** V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called. */
+    @Override
+    public String stateName() {
+        return stateName;
+    }
+
+    /**
+     * Sets the state name for classifier grouping and per-state metrics.
+     */
+    public void setStateName(String stateName) {
+        this.stateName = stateName;
+    }
+
+    /**
+     * Returns {@code null} — completion uses Flink's {@code InternalAsyncFuture} via {@link
+     * #complete()}.
+     */
+    @Override
+    public CompletableFuture<?> future() {
+        return null;
     }
 
     @SuppressWarnings("unchecked")
