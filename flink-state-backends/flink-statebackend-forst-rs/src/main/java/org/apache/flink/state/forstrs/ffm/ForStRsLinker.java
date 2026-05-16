@@ -212,6 +212,12 @@ public final class ForStRsLinker {
     private final MethodHandle frsVecIterPrefixAbort;
     private final MethodHandle frsVecMergeAppend;
 
+    // 13. Range iterator (P9, §2-D): mirrors prefix handles with extra hi-bound argument.
+    private final MethodHandle frsVecIterRangeOpen;
+    private final MethodHandle frsVecIterRangeNext;
+    private final MethodHandle frsVecIterRangeClose;
+    private final MethodHandle frsVecIterRangeAbort;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -225,10 +231,7 @@ public final class ForStRsLinker {
         }
 
         // 0. ABI version negotiation
-        this.frsAbiVersion =
-                bind(
-                        "frs_abi_version",
-                        FunctionDescriptor.of(ValueLayout.JAVA_INT));
+        this.frsAbiVersion = bind("frs_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
 
         // 1. Lifecycle
         this.frsDbOpen =
@@ -723,8 +726,7 @@ public final class ForStRsLinker {
                 bind(
                         "frs_writebatch_close",
                         FunctionDescriptor.of(
-                                ValueLayout.JAVA_INT,
-                                ValueLayout.ADDRESS)); // wb handle
+                                ValueLayout.JAVA_INT, ValueLayout.ADDRESS)); // wb handle
 
         // 7. TTL compaction filter — Flink-shaped per-CF filter that drops entries
         // older than ttl_ms. Engine-side enforcement runs at flush + L0→L1 compaction;
@@ -856,29 +858,86 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG)); // count (usize → JAVA_LONG)
 
         // 10. Vectorized chunked iterator (P3-A/P3-B, spec §1 §b + §2 component E)
-        this.frsVecIterPrefixOpen = bind("frs_vec_iter_prefix_open", FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.ADDRESS,   // db
-                ValueLayout.ADDRESS,   // cf
-                ValueLayout.ADDRESS,   // prefix_ptr
-                ValueLayout.JAVA_INT,  // prefix_len (u32)
-                ValueLayout.ADDRESS,   // chunk_buf_ptr
-                ValueLayout.JAVA_INT,  // chunk_buf_cap (u32)
-                ValueLayout.ADDRESS,   // out_handle (*mut u64)
-                ValueLayout.ADDRESS,   // out_row_count (*mut u32)
-                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
-        this.frsVecIterPrefixNext = bind("frs_vec_iter_prefix_next", FunctionDescriptor.of(
-                ValueLayout.JAVA_INT,
-                ValueLayout.JAVA_LONG, // handle (u64 scalar)
-                ValueLayout.ADDRESS,   // chunk_buf_ptr
-                ValueLayout.JAVA_INT,  // chunk_buf_cap (u32)
-                ValueLayout.ADDRESS,   // out_row_count (*mut u32)
-                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
-        this.frsVecIterPrefixClose = bind("frs_vec_iter_prefix_close",
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
-        this.frsVecIterPrefixAbort = bind("frs_vec_iter_prefix_abort",
-                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
-        this.frsVecMergeAppend = bind("frs_vec_merge_append", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT)); // P6-B
+        this.frsVecIterPrefixOpen =
+                bind(
+                        "frs_vec_iter_prefix_open",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // prefix_ptr
+                                ValueLayout.JAVA_INT, // prefix_len (u32)
+                                ValueLayout.ADDRESS, // chunk_buf_ptr
+                                ValueLayout.JAVA_INT, // chunk_buf_cap (u32)
+                                ValueLayout.ADDRESS, // out_handle (*mut u64)
+                                ValueLayout.ADDRESS, // out_row_count (*mut u32)
+                                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
+        this.frsVecIterPrefixNext =
+                bind(
+                        "frs_vec_iter_prefix_next",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_LONG, // handle (u64 scalar)
+                                ValueLayout.ADDRESS, // chunk_buf_ptr
+                                ValueLayout.JAVA_INT, // chunk_buf_cap (u32)
+                                ValueLayout.ADDRESS, // out_row_count (*mut u32)
+                                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
+        this.frsVecIterPrefixClose =
+                bind(
+                        "frs_vec_iter_prefix_close",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        this.frsVecIterPrefixAbort =
+                bind(
+                        "frs_vec_iter_prefix_abort",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        this.frsVecMergeAppend =
+                bind(
+                        "frs_vec_merge_append",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT)); // P6-B
+
+        // 13. Vectorized chunked range iterator (P9, spec §2 component D)
+        this.frsVecIterRangeOpen =
+                bind(
+                        "frs_vec_iter_range_open",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS));
+        this.frsVecIterRangeNext =
+                bind(
+                        "frs_vec_iter_range_next",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.JAVA_LONG,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS,
+                                ValueLayout.ADDRESS));
+        this.frsVecIterRangeClose =
+                bind(
+                        "frs_vec_iter_range_close",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        this.frsVecIterRangeAbort =
+                bind(
+                        "frs_vec_iter_range_abort",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -1066,8 +1125,8 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Returns the FRS_ABI_VERSION from the loaded native lib.
-     * Compare against {@link FrsAbi#EXPECTED_ABI_VERSION} at backend init.
+     * Returns the FRS_ABI_VERSION from the loaded native lib. Compare against {@link
+     * FrsAbi#EXPECTED_ABI_VERSION} at backend init.
      */
     public int frsAbiVersion() {
         try {
@@ -1917,11 +1976,7 @@ public final class ForStRsLinker {
             rc =
                     (int)
                             frsVectorizedBatchDelete.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keyOffsetsSeg,
-                                    keyDataSeg,
-                                    count);
+                                    db.handle(), cf.handle(), keyOffsetsSeg, keyDataSeg, count);
         } catch (Throwable t) {
             throw new FrsBackendException(
                     FrsStatus.PANIC, "frs_vectorized_batch_delete threw: " + t.getMessage());
@@ -2217,10 +2272,10 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Fast-path equivalent of {@link #getIntoBuf}: same wire shape, but the Rust side skips
-     * {@code catch_unwind} + {@code Arc::clone}, saving ~1.5µs per call. Safe when the caller
-     * guarantees the {@code db} handle outlives the call — which is true for the lifetime of a
-     * Flink TaskExecutor (the backend holds the db open until close).
+     * Fast-path equivalent of {@link #getIntoBuf}: same wire shape, but the Rust side skips {@code
+     * catch_unwind} + {@code Arc::clone}, saving ~1.5µs per call. Safe when the caller guarantees
+     * the {@code db} handle outlives the call — which is true for the lifetime of a Flink
+     * TaskExecutor (the backend holds the db open until close).
      */
     public byte[] getFast(FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
@@ -2241,8 +2296,7 @@ public final class ForStRsLinker {
                                     (long) GET_INTO_BUF_CAP,
                                     lenSeg);
         } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_get_fast threw: " + t.getMessage());
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_get_fast threw: " + t.getMessage());
         }
         if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL → fall back to general get
             return get(db, cf, key);
@@ -3048,14 +3102,27 @@ public final class ForStRsLinker {
 
     /** Opens a prefix-scan iterator and fills the first chunk. Returns native error code. */
     public int frsVecIterPrefixOpen(
-            MemorySegment db, MemorySegment cf,
-            MemorySegment prefix, int prefixLen,
-            MemorySegment chunkBuf, int chunkBufCap,
-            MemorySegment outHandle, MemorySegment outRowCount, MemorySegment outBytesUsed) {
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment prefix,
+            int prefixLen,
+            MemorySegment chunkBuf,
+            int chunkBufCap,
+            MemorySegment outHandle,
+            MemorySegment outRowCount,
+            MemorySegment outBytesUsed) {
         try {
-            return (int) frsVecIterPrefixOpen.invokeExact(
-                    db, cf, prefix, prefixLen, chunkBuf, chunkBufCap,
-                    outHandle, outRowCount, outBytesUsed);
+            return (int)
+                    frsVecIterPrefixOpen.invokeExact(
+                            db,
+                            cf,
+                            prefix,
+                            prefixLen,
+                            chunkBuf,
+                            chunkBufCap,
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_iter_prefix_open failed", t);
         }
@@ -3063,11 +3130,15 @@ public final class ForStRsLinker {
 
     /** Pulls the next chunk from an open iterator. Returns native error code. */
     public int frsVecIterPrefixNext(
-            long handle, MemorySegment chunkBuf, int chunkBufCap,
-            MemorySegment outRowCount, MemorySegment outBytesUsed) {
+            long handle,
+            MemorySegment chunkBuf,
+            int chunkBufCap,
+            MemorySegment outRowCount,
+            MemorySegment outBytesUsed) {
         try {
-            return (int) frsVecIterPrefixNext.invokeExact(
-                    handle, chunkBuf, chunkBufCap, outRowCount, outBytesUsed);
+            return (int)
+                    frsVecIterPrefixNext.invokeExact(
+                            handle, chunkBuf, chunkBufCap, outRowCount, outBytesUsed);
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_iter_prefix_next failed", t);
         }
@@ -3083,8 +3154,8 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Watchdog hook: marks handle as aborted so subsequent next() returns empty.
-     * Returns native error code (201 = ITER_CURSOR_INVALID if handle unknown).
+     * Watchdog hook: marks handle as aborted so subsequent next() returns empty. Returns 201 if
+     * unknown.
      */
     public int frsVecIterPrefixAbort(long handle) {
         try {
@@ -3095,5 +3166,86 @@ public final class ForStRsLinker {
     }
 
     /** Appends N merge operands for key (P6-B §1 §a). Returns native error code. */
-    public int frsVecMergeAppend(MemorySegment db, MemorySegment cf, MemorySegment keyPtr, int keyLen, MemorySegment operandPtrs, MemorySegment operandLens, int numOperands) { try { return (int) frsVecMergeAppend.invokeExact(db, cf, keyPtr, keyLen, operandPtrs, operandLens, numOperands); } catch (Throwable t) { throw new RuntimeException("frs_vec_merge_append failed", t); } }
+    public int frsVecMergeAppend(
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment keyPtr,
+            int keyLen,
+            MemorySegment operandPtrs,
+            MemorySegment operandLens,
+            int numOperands) {
+        try {
+            return (int)
+                    frsVecMergeAppend.invokeExact(
+                            db, cf, keyPtr, keyLen, operandPtrs, operandLens, numOperands);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_merge_append failed", t);
+        }
+    }
+
+    /** [P9 §2-D] Opens a [lo, hi) range iterator and fills the first chunk. Returns error code. */
+    public int frsVecIterRangeOpen(
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment lo,
+            int loLen,
+            MemorySegment hi,
+            int hiLen,
+            MemorySegment chunkBuf,
+            int chunkBufCap,
+            MemorySegment outHandle,
+            MemorySegment outRowCount,
+            MemorySegment outBytesUsed) {
+        try {
+            return (int)
+                    frsVecIterRangeOpen.invokeExact(
+                            db,
+                            cf,
+                            lo,
+                            loLen,
+                            hi,
+                            hiLen,
+                            chunkBuf,
+                            chunkBufCap,
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_range_open failed", t);
+        }
+    }
+
+    /** [P9] Pulls the next chunk from an open range iterator. Returns error code. */
+    public int frsVecIterRangeNext(
+            long handle,
+            MemorySegment chunkBuf,
+            int chunkBufCap,
+            MemorySegment outRowCount,
+            MemorySegment outBytesUsed) {
+        try {
+            return (int)
+                    frsVecIterRangeNext.invokeExact(
+                            handle, chunkBuf, chunkBufCap, outRowCount, outBytesUsed);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_range_next failed", t);
+        }
+    }
+
+    /** [P9] Releases a native range iterator handle. Returns error code. */
+    public int frsVecIterRangeClose(long handle) {
+        try {
+            return (int) frsVecIterRangeClose.invokeExact(handle);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_range_close failed", t);
+        }
+    }
+
+    /** [P9] Watchdog: marks range handle as aborted. Returns 201 if handle unknown. */
+    public int frsVecIterRangeAbort(long handle) {
+        try {
+            return (int) frsVecIterRangeAbort.invokeExact(handle);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_range_abort failed", t);
+        }
+    }
 }

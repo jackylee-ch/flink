@@ -118,18 +118,18 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     /**
-     * Attach a FatalErrorHandler for fail-process error escalation (PANIC_CAUGHT / UNKNOWN).
-     * If not set, fail-process errors are still thrown as {@link FrsEnginePanicError} — Flink's
-     * default uncaught-exception handler will catch them at the task level.
+     * Attach a FatalErrorHandler for fail-process error escalation (PANIC_CAUGHT / UNKNOWN). If not
+     * set, fail-process errors are still thrown as {@link FrsEnginePanicError} — Flink's default
+     * uncaught-exception handler will catch them at the task level.
      */
     public void setFatalHandler(FatalErrorHandler fh) {
         this.fatalHandler = fh;
     }
 
     /**
-     * Attach a {@link SlotArenaScope} for ITER_PREFIX dispatch. Must be set before any
-     * {@link IterPrefixRequest} is dispatched; the scope is used to allocate per-iterator Arenas
-     * and register handles for turn-boundary lifetime management.
+     * Attach a {@link SlotArenaScope} for ITER_PREFIX dispatch. Must be set before any {@link
+     * IterPrefixRequest} is dispatched; the scope is used to allocate per-iterator Arenas and
+     * register handles for turn-boundary lifetime management.
      */
     public void setSlotScope(SlotArenaScope scope) {
         this.slotScope = scope;
@@ -163,7 +163,8 @@ public class VectorizedExecutor implements StateExecutor {
             if (amBuf != null && !amBuf.isEmpty()) {
                 dispatchAppendMerge(amBuf);
             }
-            // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is non-null/non-empty.
+            // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is
+            // non-null/non-empty.
             IterPrefixBatchBuffer ipBuf = classifier.iterPrefixBuffer();
             if (ipBuf != null && !ipBuf.isEmpty()) {
                 dispatchIterPrefix(ipBuf);
@@ -209,8 +210,8 @@ public class VectorizedExecutor implements StateExecutor {
     // -----------------------------------------------------------------
 
     /**
-     * Aggregate stateName for old-style Flink-runtime batches that mix multiple state names.
-     * The new-style VectorizedStateRequest path (P5+) will provide per-state attribution.
+     * Aggregate stateName for old-style Flink-runtime batches that mix multiple state names. The
+     * new-style VectorizedStateRequest path (P5+) will provide per-state attribution.
      */
     private static final String MIXED_STATE = "_mixed";
 
@@ -244,11 +245,7 @@ public class VectorizedExecutor implements StateExecutor {
             return;
         }
         linker.vectorizedBatchDelete(
-                db,
-                cf,
-                c.deleteKeys().offsetsSegment(),
-                c.deleteKeys().dataSegment(),
-                n);
+                db, cf, c.deleteKeys().offsetsSegment(), c.deleteKeys().dataSegment(), n);
         StateRequest<?, ?, ?, ?>[] reqs = c.deleteRequests();
         for (int i = 0; i < n; i++) {
             completePut(reqs[i]);
@@ -318,8 +315,7 @@ public class VectorizedExecutor implements StateExecutor {
             byte[] raw = null;
             if (vld != 0) {
                 int start = outOffsets.get(ValueLayout.JAVA_INT, (long) i * Integer.BYTES);
-                int end =
-                        outOffsets.get(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES);
+                int end = outOffsets.get(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES);
                 int len = end - start;
                 if (len > 0) {
                     raw = new byte[len];
@@ -346,10 +342,10 @@ public class VectorizedExecutor implements StateExecutor {
     /**
      * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI (P6-B).
      *
-     * <p>Per-request dispatch: for each request in the buffer, allocates a small scratch
-     * {@link Arena} to hold the {@code operand_ptrs} and {@code operand_lens} arrays, then calls
-     * {@code frs_vec_merge_append} with the key and N operand slices. V1 uses one FFI call per
-     * request; true multi-request batching is V1.x.
+     * <p>Per-request dispatch: for each request in the buffer, allocates a small scratch {@link
+     * Arena} to hold the {@code operand_ptrs} and {@code operand_lens} arrays, then calls {@code
+     * frs_vec_merge_append} with the key and N operand slices. V1 uses one FFI call per request;
+     * true multi-request batching is V1.x.
      *
      * <p>Each request carries N value slices (one per list element). For {@link
      * org.apache.flink.state.forstrs.state.ForStRsListStateV2#addAll(java.util.List)}, N &gt; 1 so
@@ -375,10 +371,11 @@ public class VectorizedExecutor implements StateExecutor {
             CompletableFuture<Void> future = futures.get(row);
 
             // Extract key slice from the columnar key buffer.
-            int keyStart = keyBuf.offsetsSegment().get(
-                    ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-            int keyEnd = keyBuf.offsetsSegment().get(
-                    ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+            int keyStart =
+                    keyBuf.offsetsSegment().get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+            int keyEnd =
+                    keyBuf.offsetsSegment()
+                            .get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
             int keyLen = keyEnd - keyStart;
             MemorySegment keyPtr = keyBuf.dataSegment().asSlice(keyStart, keyLen);
 
@@ -402,10 +399,9 @@ public class VectorizedExecutor implements StateExecutor {
                     ptrs.setAtIndex(ValueLayout.ADDRESS, i, nativeV);
                     lens.setAtIndex(ValueLayout.JAVA_INT, i, (int) vLen);
                 }
-                int rc = linker.frsVecMergeAppend(
-                        db.handle(), cf.handle(),
-                        keyPtr, keyLen,
-                        ptrs, lens, vs.length);
+                int rc =
+                        linker.frsVecMergeAppend(
+                                db.handle(), cf.handle(), keyPtr, keyLen, ptrs, lens, vs.length);
                 FrsErrorCode code = FrsErrorCode.fromU32(rc);
                 if (code == FrsErrorCode.OK) {
                     future.complete(null);
@@ -413,11 +409,10 @@ public class VectorizedExecutor implements StateExecutor {
                 } else if (code.isFailProcess()) {
                     if (metrics != null) {
                         metrics.recordFfiError(
-                                VectorizedStateRequest.Kind.APPEND_MERGE,
-                                "_mixed", code);
+                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
                     }
-                    FrsEnginePanicError panicErr = new FrsEnginePanicError(
-                            code, "kind=APPEND_MERGE row=" + row);
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(code, "kind=APPEND_MERGE row=" + row);
                     if (fatalHandler != null) {
                         fatalHandler.onFatalError(panicErr);
                     }
@@ -425,8 +420,7 @@ public class VectorizedExecutor implements StateExecutor {
                 } else {
                     if (metrics != null) {
                         metrics.recordFfiError(
-                                VectorizedStateRequest.Kind.APPEND_MERGE,
-                                "_mixed", code);
+                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
                     }
                     future.completeExceptionally(new FrsException(code, row, new byte[0]));
                 }
@@ -484,20 +478,24 @@ public class VectorizedExecutor implements StateExecutor {
             MemorySegment outRowCount = perIterArena.allocate(ValueLayout.JAVA_INT);
             MemorySegment outBytesUsed = perIterArena.allocate(ValueLayout.JAVA_INT);
 
-            int rc = linker.frsVecIterPrefixOpen(
-                    db.handle(), cf.handle(),
-                    prefix, (int) prefix.byteSize(),
-                    chunkBuf, (int) chunkBuf.byteSize(),
-                    outHandle, outRowCount, outBytesUsed);
+            int rc =
+                    linker.frsVecIterPrefixOpen(
+                            db.handle(),
+                            cf.handle(),
+                            prefix,
+                            (int) prefix.byteSize(),
+                            chunkBuf,
+                            (int) chunkBuf.byteSize(),
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
 
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
             if (code != FrsErrorCode.OK) {
                 perIterArena.close();
-                future.completeExceptionally(
-                        new FrsException(code, row, new byte[0]));
+                future.completeExceptionally(new FrsException(code, row, new byte[0]));
                 if (metrics != null) {
-                    metrics.recordFfiError(
-                            VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", code);
+                    metrics.recordFfiError(VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", code);
                 }
                 continue;
             }
@@ -529,16 +527,94 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     /**
-     * Dispatches an ITER_RANGE batch via {@code frs_vec_iter_range_open} FFI.
+     * Dispatches an ITER_RANGE batch via {@code frs_vec_iter_range_open} FFI (P9).
      *
-     * <p>Real implementation lands in P9.
+     * <p>For each request in the buffer, opens a native range-bounded iterator over [lo, hi), wraps
+     * it in an {@link FrsIterHandle}, registers it with the {@link SlotArenaScope}, and completes
+     * the request's future with an {@link IterRangeRequest.IterFirstChunk} carrying the handle and
+     * first-chunk row count.
+     *
+     * <p>Requires {@link #setSlotScope(SlotArenaScope)} to have been called beforehand; throws
+     * {@link IllegalStateException} if the scope is not set.
      *
      * @param buffer the ITER_RANGE batch buffer populated by the classifier
-     * @throws UnsupportedOperationException always (P9 pending)
      */
     public void dispatchIterRange(IterRangeBatchBuffer buffer) {
-        throw new UnsupportedOperationException(
-                "ITER_RANGE dispatch lands in P9");
+        if (slotScope == null) {
+            throw new IllegalStateException(
+                    "SlotArenaScope not set on VectorizedExecutor — call setSlotScope() "
+                            + "before dispatching ITER_RANGE requests");
+        }
+        long t0 = System.nanoTime();
+        int rowsTotal = 0;
+        long bytesIn = 0;
+
+        List<MemorySegment> loSlices = buffer.loSlices();
+        List<MemorySegment> hiSlices = buffer.hiSlices();
+        List<MemorySegment> chunkBufSlices = buffer.chunkBufSlices();
+        List<CompletableFuture<IterRangeRequest.IterFirstChunk>> futures = buffer.futures();
+
+        for (int row = 0; row < buffer.count(); row++) {
+            MemorySegment lo = loSlices.get(row);
+            MemorySegment hi = hiSlices.get(row);
+            MemorySegment chunkBuf = chunkBufSlices.get(row);
+            CompletableFuture<IterRangeRequest.IterFirstChunk> future = futures.get(row);
+
+            // Allocate out-params in a per-iterator Arena; closed when FrsIterHandle.close() fires.
+            Arena perIterArena = Arena.ofShared();
+            MemorySegment outHandle = perIterArena.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment outRowCount = perIterArena.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = perIterArena.allocate(ValueLayout.JAVA_INT);
+
+            int rc =
+                    linker.frsVecIterRangeOpen(
+                            db.handle(),
+                            cf.handle(),
+                            lo,
+                            (int) lo.byteSize(),
+                            hi,
+                            (int) hi.byteSize(),
+                            chunkBuf,
+                            (int) chunkBuf.byteSize(),
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
+
+            FrsErrorCode code = FrsErrorCode.fromU32(rc);
+            if (code != FrsErrorCode.OK) {
+                perIterArena.close();
+                future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                if (metrics != null) {
+                    metrics.recordFfiError(
+                            VectorizedStateRequest.Kind.ITER_RANGE, MIXED_STATE, code);
+                }
+                continue;
+            }
+
+            long nativeHandle = outHandle.get(ValueLayout.JAVA_LONG, 0);
+            int firstChunkRows = outRowCount.get(ValueLayout.JAVA_INT, 0);
+            int firstChunkBytes = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+            rowsTotal += firstChunkRows;
+            bytesIn += firstChunkBytes;
+
+            long jHandleId = nextIterHandleId.incrementAndGet();
+            FrsIterHandle fh =
+                    new FrsIterHandle(jHandleId, nativeHandle, linker, perIterArena, slotScope);
+            slotScope.registerIter(fh);
+            if (metrics != null) {
+                metrics.recordIterHandlesOpened();
+            }
+            future.complete(new IterRangeRequest.IterFirstChunk(fh, firstChunkRows));
+        }
+
+        if (metrics != null) {
+            metrics.recordDispatch(
+                    VectorizedStateRequest.Kind.ITER_RANGE,
+                    MIXED_STATE,
+                    rowsTotal,
+                    bytesIn,
+                    System.nanoTime() - t0);
+        }
     }
 
     // -----------------------------------------------------------------
