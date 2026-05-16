@@ -158,6 +158,11 @@ public class VectorizedExecutor implements StateExecutor {
             executeDeletes(classifier);
             executeGets(classifier);
             executeIters(classifier);
+            // Dispatch vectorized APPEND_MERGE requests (P6-B, ListState path).
+            AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
+            if (amBuf != null && !amBuf.isEmpty()) {
+                dispatchAppendMerge(amBuf);
+            }
             // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is non-null/non-empty.
             IterPrefixBatchBuffer ipBuf = classifier.iterPrefixBuffer();
             if (ipBuf != null && !ipBuf.isEmpty()) {
@@ -179,6 +184,10 @@ public class VectorizedExecutor implements StateExecutor {
         executeDeletes(single);
         executeGets(single);
         executeIters(single);
+        AppendMergeBatchBuffer amBuf = single.appendMergeBuffer();
+        if (amBuf != null && !amBuf.isEmpty()) {
+            dispatchAppendMerge(amBuf);
+        }
         IterPrefixBatchBuffer ipBuf = single.iterPrefixBuffer();
         if (ipBuf != null && !ipBuf.isEmpty()) {
             dispatchIterPrefix(ipBuf);
@@ -335,18 +344,105 @@ public class VectorizedExecutor implements StateExecutor {
     // -----------------------------------------------------------------
 
     /**
-     * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI.
+     * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI (P6-B).
      *
-     * <p>Real implementation lands in P6 (umbrella spec §3 Trace B). Until then, any attempt to
-     * execute an APPEND_MERGE batch fails cleanly so callers discover the gap at test time rather
-     * than silently producing wrong results.
+     * <p>Per-request dispatch: for each request in the buffer, allocates a small scratch
+     * {@link Arena} to hold the {@code operand_ptrs} and {@code operand_lens} arrays, then calls
+     * {@code frs_vec_merge_append} with the key and N operand slices. V1 uses one FFI call per
+     * request; true multi-request batching is V1.x.
+     *
+     * <p>Each request carries N value slices (one per list element). For {@link
+     * org.apache.flink.state.forstrs.state.ForStRsListStateV2#addAll(java.util.List)}, N &gt; 1 so
+     * the call is effectively batched at the element level even in this per-request form.
      *
      * @param buffer the APPEND_MERGE batch buffer populated by the classifier
-     * @throws UnsupportedOperationException always (P6 pending)
      */
     public void dispatchAppendMerge(AppendMergeBatchBuffer buffer) {
-        throw new UnsupportedOperationException(
-                "APPEND_MERGE dispatch lands in P6 (umbrella spec §3 Trace B)");
+        int count = buffer.count();
+        if (count == 0) {
+            return;
+        }
+        long t0 = System.nanoTime();
+        int rowsProcessed = 0;
+        long bytesIn = 0;
+
+        ColumnarBatchBuffer keyBuf = buffer.keyBuffer();
+        List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
+        List<CompletableFuture<Void>> futures = buffer.futures();
+
+        for (int row = 0; row < count; row++) {
+            MemorySegment[] vs = valueSliceLists.get(row);
+            CompletableFuture<Void> future = futures.get(row);
+
+            // Extract key slice from the columnar key buffer.
+            int keyStart = keyBuf.offsetsSegment().get(
+                    ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+            int keyEnd = keyBuf.offsetsSegment().get(
+                    ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+            int keyLen = keyEnd - keyStart;
+            MemorySegment keyPtr = keyBuf.dataSegment().asSlice(keyStart, keyLen);
+
+            bytesIn += keyLen;
+            for (MemorySegment v : vs) {
+                bytesIn += v.byteSize();
+            }
+
+            // Build operand_ptrs and operand_lens arrays in a per-row scratch Arena.
+            // Value slices may be heap segments; copy each into native memory so
+            // the operand_ptrs array holds stable native addresses for the FFI call.
+            // Bounded allocation: typically a handful of operands per call.
+            Arena scratch = Arena.ofConfined();
+            try {
+                MemorySegment ptrs = scratch.allocate(ValueLayout.ADDRESS, vs.length);
+                MemorySegment lens = scratch.allocate(ValueLayout.JAVA_INT, vs.length);
+                for (int i = 0; i < vs.length; i++) {
+                    long vLen = vs[i].byteSize();
+                    MemorySegment nativeV = scratch.allocate(vLen);
+                    MemorySegment.copy(vs[i], 0L, nativeV, 0L, vLen);
+                    ptrs.setAtIndex(ValueLayout.ADDRESS, i, nativeV);
+                    lens.setAtIndex(ValueLayout.JAVA_INT, i, (int) vLen);
+                }
+                int rc = linker.frsVecMergeAppend(
+                        db.handle(), cf.handle(),
+                        keyPtr, keyLen,
+                        ptrs, lens, vs.length);
+                FrsErrorCode code = FrsErrorCode.fromU32(rc);
+                if (code == FrsErrorCode.OK) {
+                    future.complete(null);
+                    rowsProcessed += vs.length;
+                } else if (code.isFailProcess()) {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE,
+                                "_mixed", code);
+                    }
+                    FrsEnginePanicError panicErr = new FrsEnginePanicError(
+                            code, "kind=APPEND_MERGE row=" + row);
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
+                    }
+                    future.completeExceptionally(panicErr);
+                } else {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE,
+                                "_mixed", code);
+                    }
+                    future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                }
+            } finally {
+                scratch.close();
+            }
+        }
+
+        if (metrics != null) {
+            metrics.recordDispatch(
+                    VectorizedStateRequest.Kind.APPEND_MERGE,
+                    MIXED_STATE,
+                    rowsProcessed,
+                    bytesIn,
+                    System.nanoTime() - t0);
+        }
     }
 
     /**

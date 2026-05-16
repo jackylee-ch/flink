@@ -210,6 +210,7 @@ public final class ForStRsLinker {
     private final MethodHandle frsVecIterPrefixNext;
     private final MethodHandle frsVecIterPrefixClose;
     private final MethodHandle frsVecIterPrefixAbort;
+    private final MethodHandle frsVecMergeAppend;
 
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
@@ -877,6 +878,7 @@ public final class ForStRsLinker {
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
         this.frsVecIterPrefixAbort = bind("frs_vec_iter_prefix_abort",
                 FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        this.frsVecMergeAppend = bind("frs_vec_merge_append", FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS, ValueLayout.JAVA_INT)); // P6-B
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -3042,9 +3044,7 @@ public final class ForStRsLinker {
         return new FrsCfHandle(this, cfHandle);
     }
 
-    // ------------------------------------------------------------------
     // 10. Vectorized chunked iterator (P3-A/P3-B, spec §1 §b + §2 component E)
-    // ------------------------------------------------------------------
 
     /** Opens a prefix-scan iterator and fills the first chunk. Returns native error code. */
     public int frsVecIterPrefixOpen(
@@ -3093,4 +3093,7 @@ public final class ForStRsLinker {
             throw new RuntimeException("frs_vec_iter_prefix_abort failed", t);
         }
     }
+
+    /** Appends N merge operands for key (P6-B §1 §a). Returns native error code. */
+    public int frsVecMergeAppend(MemorySegment db, MemorySegment cf, MemorySegment keyPtr, int keyLen, MemorySegment operandPtrs, MemorySegment operandLens, int numOperands) { try { return (int) frsVecMergeAppend.invokeExact(db, cf, keyPtr, keyLen, operandPtrs, operandLens, numOperands); } catch (Throwable t) { throw new RuntimeException("frs_vec_merge_append failed", t); } }
 }
