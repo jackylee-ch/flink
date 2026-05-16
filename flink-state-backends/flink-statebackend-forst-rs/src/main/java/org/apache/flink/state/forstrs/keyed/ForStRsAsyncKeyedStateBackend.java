@@ -46,7 +46,9 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
+import org.apache.flink.state.forstrs.state.ForStRsAggregatingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsMapStateV2;
+import org.apache.flink.state.forstrs.state.ForStRsReducingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsValueStateV2;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
@@ -54,8 +56,10 @@ import javax.annotation.Nonnull;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.RunnableFuture;
@@ -76,6 +80,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
+
+    /**
+     * Registry of live ReducingState V2 instances (umbrella spec §3 Trace E).
+     *
+     * <p>Each instance is registered on construction so that {@link #snapshot} can call
+     * {@code flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
+     */
+    private final List<ForStRsReducingStateV2<?>> registeredReducingStates = new ArrayList<>();
+
+    /**
+     * Registry of live AggregatingState V2 instances (umbrella spec §3 Trace E).
+     *
+     * <p>Each instance is registered on construction so that {@link #snapshot} can call
+     * {@code flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
+     */
+    private final List<ForStRsAggregatingStateV2<?, ?, ?>> registeredAggregatingStates =
+            new ArrayList<>();
     private SlotArenaScope slotArenaScope;
     private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
@@ -172,15 +193,90 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         return dispatchMetrics;
     }
 
+    /**
+     * Registers a {@link ForStRsReducingStateV2} instance so that {@link #snapshot} includes it in
+     * the Trace E barrier drain (§3 Trace E).
+     *
+     * <p>Called by {@code ForStRsReducingStateV2} on construction when a backend reference is
+     * available. V1: callers pass {@code this} backend reference after construction.
+     *
+     * @param state the ReducingState V2 instance to register
+     */
+    public void registerReducingState(ForStRsReducingStateV2<?> state) {
+        registeredReducingStates.add(state);
+    }
+
+    /**
+     * Registers a {@link ForStRsAggregatingStateV2} instance so that {@link #snapshot} includes it
+     * in the Trace E barrier drain (§3 Trace E).
+     *
+     * <p>Called by {@code ForStRsAggregatingStateV2} on construction when a backend reference is
+     * available. V1: callers pass {@code this} backend reference after construction.
+     *
+     * @param state the AggregatingState V2 instance to register
+     */
+    public void registerAggregatingState(ForStRsAggregatingStateV2<?, ?, ?> state) {
+        registeredAggregatingStates.add(state);
+    }
+
     @Override
     public KeyGroupRange getKeyGroupRange() {
         return keyGroupRange;
     }
 
+    /**
+     * Takes a checkpoint snapshot (umbrella spec §3 Trace E — barrier drain).
+     *
+     * <h3>Trace E: RMW barrier drain sequence</h3>
+     *
+     * <pre>
+     *   PHASE-1 flush: flush all managed executors to push in-flight batches to the engine.
+     *   flushRmwCacheDirty: walk every registered Reducing/Aggregating V2 state, call
+     *     flushOnBarrier() to serialize dirty accumulators and enqueue PUTs to the classifier.
+     *   PHASE-2 flush: flush managed executors again to drain the PUTs just enqueued above.
+     * </pre>
+     *
+     * <p>V1 best-effort: full async-state continuation awaiting (waiting for every in-flight GET
+     * and PUT future) requires deeper Flink async-state runtime integration, deferred to P11.
+     * The double-flush pattern is a conservative approximation that ensures any dirty cached
+     * accumulators are serialized and submitted before the engine snapshot is taken.
+     *
+     * <p>The underlying engine snapshot path is currently a placeholder (throws
+     * {@link UnsupportedOperationException}) — the drain logic is structural and will be
+     * activated when the engine snapshot integration lands in P11.
+     */
     @Override
     public RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot(
             long id, long ts, @Nonnull CheckpointStreamFactory f, @Nonnull CheckpointOptions o) {
-        throw new UnsupportedOperationException("snapshot TODO");
+        // PHASE-1 flush: kick all in-flight batches already queued in managed executors.
+        // This ensures any in-progress vectorized GET/PUT batches are dispatched to the engine
+        // before we begin draining the RMW caches.
+        managedExecutors.forEach(VectorizedExecutor::flushDirty);
+
+        // flushRmwCacheDirty: for every registered RMW state, flush dirty cache entries.
+        // This serializes any accumulated (but not yet submitted) RMW results and enqueues
+        // PUT requests to the classifier (deferred to P11 for real submission wiring).
+        for (ForStRsReducingStateV2<?> s : registeredReducingStates) {
+            s.flushOnBarrier();
+        }
+        for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
+            s.flushOnBarrier();
+        }
+
+        // PHASE-2 flush: drain the PUTs just enqueued by the RMW cache flushes above.
+        // A second pass is needed because flushOnBarrier() may have submitted new PUT requests
+        // to the classifier which were not yet dispatched by PHASE-1.
+        managedExecutors.forEach(VectorizedExecutor::flushDirty);
+
+        // flushOpenWriteBuffers: SP6 staged writes (MapState/ValueState V2).
+        // V1 simplification: the double flushDirty above covers any remaining in-flight requests.
+        // Real two-phase await requires deeper integration with Flink's async-state runtime;
+        // deferred to P11.
+        managedExecutors.forEach(VectorizedExecutor::flushDirty);
+
+        // Engine snapshot: P11 will invoke the actual ForSt-RS engine checkpoint here.
+        // For now, throw to signal the path is not yet connected.
+        throw new UnsupportedOperationException("snapshot TODO — engine snapshot integration in P11");
     }
 
     @Override
