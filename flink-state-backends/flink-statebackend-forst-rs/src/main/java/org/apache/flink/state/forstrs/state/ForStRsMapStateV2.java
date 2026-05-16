@@ -1,0 +1,255 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.state.forstrs.state;
+
+import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.state.v2.MapState;
+import org.apache.flink.api.common.state.v2.State;
+import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.api.java.tuple.Tuple2;
+import org.apache.flink.core.memory.DataInputDeserializer;
+import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.asyncprocessing.RecordContext;
+import org.apache.flink.runtime.asyncprocessing.StateRequest;
+import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
+import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.state.v2.AbstractMapState;
+import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
+import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
+import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
+import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.ForStRsIterableState;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+
+/**
+ * V2 async MapState for ForSt-RS. Key encoding appends the serialized user key to the composite
+ * prefix: {@code "k/" + serialize(K) + "/" + stateName + "/" + serialize(UK)}.
+ */
+@Internal
+public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, UV>
+        implements MapState<UK, UV>,
+                ForStRsInnerTable<K, N, UV>,
+                ForStRsIterableState<K, N, UK, UV> {
+
+    private static final byte[] KEY_PREFIX = "k/".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] SLASH = "/".getBytes(StandardCharsets.UTF_8);
+
+    private final String stateName;
+    private final byte[] stateNameBytes;
+    private final TypeSerializer<K> keySerializer;
+    private final TypeSerializer<UK> userKeySerializer;
+    private final TypeSerializer<UV> userValueSerializer;
+    private final DataOutputSerializer keyOut = new DataOutputSerializer(128);
+    private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
+    private final DataInputDeserializer valueIn = new DataInputDeserializer();
+
+    @SuppressWarnings("unchecked")
+    public ForStRsMapStateV2(
+            StateRequestHandler stateRequestHandler,
+            String stateName,
+            TypeSerializer<K> keySerializer,
+            TypeSerializer<UK> userKeySerializer,
+            TypeSerializer<UV> userValueSerializer) {
+        super(stateRequestHandler, (TypeSerializer<UV>) userValueSerializer);
+        this.stateName = stateName;
+        this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
+        this.keySerializer = keySerializer;
+        this.userKeySerializer = userKeySerializer;
+        this.userValueSerializer = userValueSerializer;
+    }
+
+    @Override
+    public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
+        RecordContext<K> ctx = request.getRecordContext();
+        Object payload = request.getPayload();
+        StateRequestType type = request.getRequestType();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (type == StateRequestType.MAP_GET
+                    || type == StateRequestType.MAP_PUT
+                    || type == StateRequestType.MAP_CONTAINS
+                    || type == StateRequestType.MAP_REMOVE) {
+                @SuppressWarnings("unchecked")
+                UK userKey =
+                        (UK)
+                                (type == StateRequestType.MAP_PUT
+                                        ? ((Tuple2<?, ?>) payload).f0
+                                        : payload);
+                userKeySerializer.serialize(userKey, keyOut);
+            }
+            return keyOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize key", e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public byte[] serializeValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            valueOut.clear();
+            userValueSerializer.serialize((UV) value, valueOut);
+            return valueOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize map value", e);
+        }
+    }
+
+    @Override
+    public Object deserializeValue(byte[] raw) {
+        if (raw == null || raw.length == 0) {
+            return null;
+        }
+        try {
+            valueIn.setBuffer(raw);
+            return userValueSerializer.deserialize(valueIn);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize map value", e);
+        }
+    }
+
+    @Override
+    public ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request) {
+        byte[] key = serializeKey(request);
+        return new ForStRsDBGetRequest<>(key, request, this);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request) {
+        byte[] key = serializeKey(request);
+        byte[] value = null;
+        StateRequestType type = request.getRequestType();
+        if (type == StateRequestType.MAP_PUT) {
+            Tuple2<?, ?> tuple = (Tuple2<?, ?>) request.getPayload();
+            value = serializeValue(tuple.f1);
+        }
+        return new ForStRsDBPutRequest<>(key, value, request);
+    }
+
+    // -- Vectorized serialization (writes directly into off-heap buffer) --
+
+    @Override
+    public int serializeKeyInto(StateRequest<K, N, ?, ?> request, ColumnarBatchBuffer dest) {
+        RecordContext<K> ctx = request.getRecordContext();
+        Object payload = request.getPayload();
+        StateRequestType type = request.getRequestType();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (type == StateRequestType.MAP_GET
+                    || type == StateRequestType.MAP_PUT
+                    || type == StateRequestType.MAP_CONTAINS
+                    || type == StateRequestType.MAP_REMOVE) {
+                @SuppressWarnings("unchecked")
+                UK userKey =
+                        (UK)
+                                (type == StateRequestType.MAP_PUT
+                                        ? ((Tuple2<?, ?>) payload).f0
+                                        : payload);
+                userKeySerializer.serialize(userKey, keyOut);
+            }
+            return dest.append(keyOut.getSharedBuffer(), 0, keyOut.length());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize key", e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public int serializeValueInto(StateRequest<K, N, ?, ?> request, ColumnarBatchBuffer dest) {
+        if (request.getRequestType() != StateRequestType.MAP_PUT) {
+            return dest.appendEmpty();
+        }
+        Tuple2<?, ?> tuple = (Tuple2<?, ?>) request.getPayload();
+        if (tuple == null || tuple.f1 == null) {
+            return dest.appendEmpty();
+        }
+        try {
+            valueOut.clear();
+            userValueSerializer.serialize((UV) tuple.f1, valueOut);
+            return dest.append(valueOut.getSharedBuffer(), 0, valueOut.length());
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize map value", e);
+        }
+    }
+
+    // --- ForStRsIterableState implementation ---
+
+    @Override
+    public byte[] getIterPrefix(StateRequest<K, N, ?, ?> request) {
+        RecordContext<K> ctx = request.getRecordContext();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            return keyOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize iter prefix", e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public UK deserializeUserKey(byte[] rawKey, int userKeyOffset) {
+        try {
+            DataInputDeserializer in =
+                    new DataInputDeserializer(rawKey, userKeyOffset, rawKey.length - userKeyOffset);
+            return userKeySerializer.deserialize(in);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize user key", e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public UV deserializeUserValue(byte[] rawValue) {
+        if (rawValue == null || rawValue.length == 0) {
+            return null;
+        }
+        return (UV) deserializeValue(rawValue);
+    }
+
+    @Override
+    public StateRequestHandler getStateRequestHandler() {
+        return stateRequestHandler;
+    }
+
+    @Override
+    public State asState() {
+        return this;
+    }
+}
