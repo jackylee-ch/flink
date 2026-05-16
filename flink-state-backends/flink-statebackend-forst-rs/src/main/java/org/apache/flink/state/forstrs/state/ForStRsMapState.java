@@ -23,13 +23,17 @@ import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
+import org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView;
+import org.apache.flink.state.forstrs.v1sync.MemorySegmentDataOutputView;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -83,9 +87,51 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final DataOutputSerializer valueOutBuffer;
     private final DataInputDeserializer inputBuffer;
 
-    private final Map<ByteArrayKey, byte[]> writeCache = new HashMap<>();
+    /**
+     * SP6 Phase 6.3 — off-heap value staging.
+     *
+     * <p>The on-heap {@code Map<ByteArrayKey, byte[]>} writeCache used to allocate two byte[]s per
+     * put (one for the value payload returned by {@code DataOutputSerializer.getCopyOfBuffer()}
+     * and one for the composite key). On Nexmark Q3 with ~500K puts per slot the value-payload
+     * alloc was the dominant heap pressure source.
+     *
+     * <p>The new path: per-put, the value is serialized DIRECTLY into a reusable off-heap
+     * {@code valueStaging} segment via {@link MemorySegmentDataOutputView}. The writeCache
+     * stores a tiny {@link OffHeapSlice} record (24 bytes total) holding the byte offset +
+     * length into the staging segment instead of the byte[] payload. Reads from the writeCache
+     * deserialize directly off-heap via {@link MemorySegmentDataInputView}.
+     *
+     * <p>The composite-key byte[] is still allocated (for {@link ByteArrayKey} HashMap lookup);
+     * eliminating it would require a primitive-keyed hashtable + off-heap-aware equals.
+     * Deferred to a follow-up cut.
+     */
+    private final Map<ByteArrayKey, OffHeapSlice> writeCache = new HashMap<>();
+
     private final Map<ByteArrayKey, byte[]> readCache = new HashMap<>(256);
     private int writeCacheCount = 0;
+
+    /** Lazily-allocated. Released on close(). */
+    private Arena offHeapArena;
+
+    private MemorySegment valueStaging;
+    private int valueStagingPos;
+    private int valueStagingCap;
+    private MemorySegmentDataOutputView valueOutputView;
+    private MemorySegmentDataInputView valueInputView;
+
+    /** Initial value-staging size; grows on demand (with bulk copy preserving prior offsets). */
+    private static final int VALUE_STAGING_INITIAL = 64 * 1024;
+
+    /** Tiny record holding an off-heap slice (offset, length) into {@link #valueStaging}. */
+    static final class OffHeapSlice {
+        final int offset;
+        final int length;
+
+        OffHeapSlice(int offset, int length) {
+            this.offset = offset;
+            this.length = length;
+        }
+    }
 
     static final class ByteArrayKey {
         final byte[] bytes;
@@ -158,14 +204,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     public UV get(UK key) throws IOException {
         byte[] compositeKey = composite(key);
         ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
-        byte[] cached = writeCache.get(cacheKey);
+        OffHeapSlice cached = writeCache.get(cacheKey);
         if (cached != null) {
-            inputBuffer.setBuffer(cached);
-            return valueSerializer.deserialize(inputBuffer);
+            // Off-heap fast path: deserialize directly from valueStaging segment.
+            valueInputView.rewind(valueStaging, cached.offset, cached.length);
+            return valueSerializer.deserialize(valueInputView);
         }
-        cached = readCache.get(cacheKey);
-        if (cached != null) {
-            inputBuffer.setBuffer(cached);
+        byte[] heapCached = readCache.get(cacheKey);
+        if (heapCached != null) {
+            inputBuffer.setBuffer(heapCached);
             return valueSerializer.deserialize(inputBuffer);
         }
         byte[] raw = linker.getFast(db, cf, compositeKey);
@@ -179,15 +226,46 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void put(UK key, UV value) throws IOException {
-        valueOutBuffer.clear();
-        valueSerializer.serialize(value, valueOutBuffer);
-        byte[] payload = valueOutBuffer.getCopyOfBuffer();
+        ensureOffHeapStaging();
+        // Serialize value DIRECTLY into the off-heap staging region. No byte[] payload alloc
+        // (vs the prior `valueOutBuffer.getCopyOfBuffer()` path which alloc'd one byte[] per put).
+        int startOffset = valueStagingPos;
+        valueOutputView.reset(valueStaging, startOffset);
+        try {
+            valueSerializer.serialize(value, valueOutputView);
+        } catch (IOException overflow) {
+            // Off-heap staging too small. Grow + retry once (preserves offsets via bulk copy).
+            growValueStaging();
+            valueOutputView.reset(valueStaging, startOffset);
+            valueSerializer.serialize(value, valueOutputView);
+        }
+        int len = valueOutputView.position() - startOffset;
+        valueStagingPos += len;
+
         byte[] compositeKey = composite(key);
-        writeCache.put(new ByteArrayKey(compositeKey), payload);
+        writeCache.put(new ByteArrayKey(compositeKey), new OffHeapSlice(startOffset, len));
         writeCacheCount++;
         if (writeCacheCount >= MAP_WRITE_BUFFER_THRESHOLD) {
             flushMapWriteCache();
         }
+    }
+
+    private void ensureOffHeapStaging() {
+        if (offHeapArena == null) {
+            offHeapArena = Arena.ofShared();
+            valueStagingCap = VALUE_STAGING_INITIAL;
+            valueStaging = offHeapArena.allocate(valueStagingCap);
+            valueOutputView = new MemorySegmentDataOutputView();
+            valueInputView = new MemorySegmentDataInputView();
+        }
+    }
+
+    private void growValueStaging() {
+        int newCap = Math.max(valueStagingCap * 2, valueStagingCap + VALUE_STAGING_INITIAL);
+        MemorySegment grown = offHeapArena.allocate(newCap);
+        MemorySegment.copy(valueStaging, 0L, grown, 0L, valueStagingPos);
+        valueStaging = grown;
+        valueStagingCap = newCap;
     }
 
     @Override
@@ -374,14 +452,28 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         byte[][] keys = new byte[count][];
         byte[][] values = new byte[count][];
         int i = 0;
-        for (Map.Entry<ByteArrayKey, byte[]> entry : writeCache.entrySet()) {
+        for (Map.Entry<ByteArrayKey, OffHeapSlice> entry : writeCache.entrySet()) {
             keys[i] = entry.getKey().bytes;
-            values[i] = entry.getValue();
+            // Extract from off-heap staging into a heap byte[] for the legacy batchPut FFI.
+            // Future optimization (SP6 Phase 6.3.2): stage keys+values directly into a
+            // ColumnarBatchBuffer pair and call linker.vectorizedBatchPut to avoid this copy.
+            OffHeapSlice slice = entry.getValue();
+            byte[] v = new byte[slice.length];
+            MemorySegment.copy(
+                    valueStaging,
+                    java.lang.foreign.ValueLayout.JAVA_BYTE,
+                    slice.offset,
+                    v,
+                    0,
+                    slice.length);
+            values[i] = v;
             i++;
         }
         linker.batchPut(db, cf, keys, values);
         writeCache.clear();
         writeCacheCount = 0;
+        // Reset off-heap staging cursor for the next batch — writeCache offsets are all gone.
+        valueStagingPos = 0;
     }
 
     public void flush() {
