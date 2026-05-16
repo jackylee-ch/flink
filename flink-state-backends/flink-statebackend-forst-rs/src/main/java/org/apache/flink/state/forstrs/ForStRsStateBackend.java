@@ -68,8 +68,36 @@ public class ForStRsStateBackend implements StateBackend {
     private static final long serialVersionUID = 1L;
 
     @Override
+    public boolean supportsAsyncKeyedStateBackend() {
+        return true;
+    }
+
+    @Override
     public String getName() {
         return "forst-rs";
+    }
+
+    @Override
+    public <K> org.apache.flink.runtime.state.AsyncKeyedStateBackend<K> createAsyncKeyedStateBackend(
+            StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
+        Arena arena = Arena.ofShared();
+        ForStRsLinker linker = new ForStRsLinker(arena);
+        Environment env = parameters.getEnv();
+        File tmpRoot = env.getTaskManagerInfo().getTmpWorkingDirectory();
+        Path dbRoot = tmpRoot.toPath().resolve("forst-rs-async");
+        Files.createDirectories(dbRoot);
+        String fileSafeOpId = parameters.getOperatorIdentifier().replaceAll("[^a-zA-Z0-9\\-]", "_");
+        Path localDbPath = dbRoot.resolve(fileSafeOpId + "-" + UUID.randomUUID());
+        FrsDb db = linker.dbOpen(arena, localDbPath.toString());
+        FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+        return new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
+                arena,
+                linker,
+                db,
+                cf,
+                parameters.getKeySerializer(),
+                parameters.getKeyGroupRange(),
+                true);
     }
 
     @Override

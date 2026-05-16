@@ -34,6 +34,7 @@ import org.apache.flink.util.CloseableIterator;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Set;
@@ -120,6 +121,30 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * internalIndex) after deserialisation. May be {@code null} when no rebinding is required.
      */
     private final LongFunction<T> rebinder;
+
+    // ------------------------------------------------------------------
+    // Poll-ahead cache (vectorized perf path — SP3)
+    //
+    // The legacy hot path was: each poll() opens an iterator, reads one
+    // entry, closes the iterator, then deletes the key — ≈ 4 FFI crossings
+    // per poll. On Q5's ~460M timer ops this dominates runtime.
+    //
+    // The cache batches the READ side: on a miss we call
+    // `linker.prefixGetAll(prefix, REFILL_BATCH)` which returns N entries in
+    // one FFI roundtrip. Subsequent poll()/peek() within the same key-group
+    // serve from the cache until exhausted. We still issue one
+    // `linker.delete` per poll for now (correctness-first; batched delete is
+    // a follow-up).
+    //
+    // The cache is INVALIDATED on any mutating call (add, remove, removeAll)
+    // because such calls may shift the min-element. isEmpty / size /
+    // iterator / getSubsetForKeyGroup also invalidate to keep semantics
+    // simple — they go straight to the engine through the existing paths.
+    // ------------------------------------------------------------------
+
+    private static final int REFILL_BATCH = 128;
+    private final ArrayDeque<Entry> pollCache = new ArrayDeque<>();
+    private int cachedKg = -1; // -1 = cache invalid / empty
 
     /**
      * Constructs a queue rooted at {@code stateName} that scans the supplied {@code keyGroupRange}
@@ -270,6 +295,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         int kg = currentKeyGroupSupplier.getAsInt();
         byte[] key = encode(kg, element);
         linker.put(db, cf, key, EMPTY_VALUE);
+        invalidateCache();
         return true;
     }
 
@@ -280,24 +306,27 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // Engine-level delete is idempotent; we report based on whether the key existed.
         byte[] existing = linker.get(db, cf, key);
         linker.delete(db, cf, key);
+        invalidateCache();
         return existing != null;
     }
 
     @Override
     public T poll() {
         int kg = currentKeyGroupSupplier.getAsInt();
-        Entry head = headEntry(kg);
+        Entry head = cachedHeadEntry(kg);
         if (head == null) {
             return null;
         }
+        // Remove from engine + remove from cache front (cachedHeadEntry left it in place).
         linker.delete(db, cf, head.composite);
+        pollCache.pollFirst();
         return head.element;
     }
 
     @Override
     public T peek() {
         int kg = currentKeyGroupSupplier.getAsInt();
-        Entry head = headEntry(kg);
+        Entry head = cachedHeadEntry(kg);
         return head == null ? null : head.element;
     }
 
@@ -307,7 +336,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         for (int kg = keyGroupRange.getStartKeyGroup();
                 kg <= keyGroupRange.getEndKeyGroup();
                 kg++) {
-            if (headEntry(kg) != null) {
+            if (cachedHeadEntry(kg) != null) {
                 return false;
             }
         }
@@ -316,6 +345,9 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public int size() {
+        // size walks all entries; cache state is irrelevant. Flush cache to keep
+        // engine view consistent (no stale-cache view from another kg).
+        invalidateCache();
         int n = 0;
         for (int kg = keyGroupRange.getStartKeyGroup();
                 kg <= keyGroupRange.getEndKeyGroup();
@@ -337,11 +369,13 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public CloseableIterator<T> iterator() {
+        invalidateCache();
         return new MultiKeyGroupIterator();
     }
 
     @Override
     public Set<T> getSubsetForKeyGroup(int keyGroup) {
+        invalidateCache();
         Set<T> out = new LinkedHashSet<>();
         try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(keyGroup), arena)) {
             while (true) {
@@ -378,6 +412,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 removed++;
             }
         }
+        invalidateCache();
         return removed;
     }
 
@@ -385,7 +420,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     // Implementation helpers
     // ------------------------------------------------------------------
 
-    /** A composite-key + decoded-element tuple returned by {@link #headEntry(int)}. */
+    /** A composite-key + decoded-element tuple returned by {@link #cachedHeadEntry(int)}. */
     private final class Entry {
         final byte[] composite;
         final T element;
@@ -396,15 +431,42 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         }
     }
 
-    /** Returns the head (lowest-timestamp) entry for {@code kg} or {@code null} when empty. */
-    private Entry headEntry(int kg) {
-        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
-            ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
-            if (e == null) {
-                return null;
-            }
-            return new Entry(e.key(), decodeElement(e.key()));
+    /**
+     * Returns the head entry for {@code kg}, populating the poll-ahead cache from the engine on a
+     * miss. The returned entry stays at the front of {@link #pollCache} so that subsequent
+     * {@link #peek()} calls are idempotent; {@link #poll()} pops it after the engine delete
+     * succeeds.
+     */
+    private Entry cachedHeadEntry(int kg) {
+        if (cachedKg != kg) {
+            pollCache.clear();
+            cachedKg = kg;
         }
+        if (pollCache.isEmpty()) {
+            refillCache(kg);
+        }
+        return pollCache.peekFirst();
+    }
+
+    /**
+     * Refills {@link #pollCache} from the engine for {@code kg} via a single {@code prefixGetAll}
+     * roundtrip (capacity {@link #REFILL_BATCH}). On any error the cache is left empty.
+     */
+    private void refillCache(int kg) {
+        ForStRsLinker.IteratorEntry[] entries =
+                linker.prefixGetAll(db, cf, keyGroupPrefix(kg), REFILL_BATCH);
+        if (entries == null || entries.length == 0) {
+            return;
+        }
+        for (ForStRsLinker.IteratorEntry e : entries) {
+            pollCache.addLast(new Entry(e.key(), decodeElement(e.key())));
+        }
+    }
+
+    /** Invalidates the poll-ahead cache. Cheap (just clears the deque). */
+    private void invalidateCache() {
+        pollCache.clear();
+        cachedKg = -1;
     }
 
     private int sizeForKeyGroup(int kg) {
