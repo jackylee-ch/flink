@@ -171,7 +171,8 @@ class ForStRsKeyGroupedSerializerTest {
         int[] testInputs = {0, 1, -1, Integer.MAX_VALUE, Integer.MIN_VALUE, 42, -999};
         for (int input : testInputs) {
             int result = ForStRsKeyGroupedSerializer.scalarMurmurHash(input);
-            assertTrue(result >= 0, "murmurHash(" + input + ") should be non-negative, got " + result);
+            assertTrue(
+                    result >= 0, "murmurHash(" + input + ") should be non-negative, got " + result);
         }
     }
 }

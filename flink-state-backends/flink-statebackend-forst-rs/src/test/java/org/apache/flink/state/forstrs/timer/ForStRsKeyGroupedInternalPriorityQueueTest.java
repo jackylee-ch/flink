@@ -222,6 +222,37 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
     // Tests
     // ------------------------------------------------------------------
 
+    /**
+     * Micro-bench (NOT a regression test — measurement only). Adds N timers into a single
+     * key-group then drains them via {@code poll()}. Prints throughput so SP3's poll-ahead cache
+     * gain can be compared against a baseline build (stash the cache changes, rerun this test).
+     */
+    @Test
+    void pollThroughputMicrobench() {
+        final int N = 50_000;
+        var q = newQueue("bench", 0, new KeyGroupRange(0, 0));
+        long t0 = System.nanoTime();
+        for (int i = 0; i < N; i++) {
+            q.add(new TestElement(i, i));
+        }
+        long t1 = System.nanoTime();
+        int polled = 0;
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            polled++;
+        }
+        long t2 = System.nanoTime();
+        long addNs = t1 - t0;
+        long pollNs = t2 - t1;
+        double addThru = (double) N * 1e9 / addNs;
+        double pollThru = (double) polled * 1e9 / pollNs;
+        System.out.printf(
+                "MICROBENCH N=%d add_throughput=%.0f ops/s poll_throughput=%.0f ops/s "
+                        + "add_ns=%d poll_ns=%d%n",
+                N, addThru, pollThru, addNs, pollNs);
+        assertEquals(N, polled);
+    }
+
     /** 1. Add then poll returns the same element. */
     @Test
     void addThenPollReturnsElement() {
