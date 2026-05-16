@@ -1,6 +1,6 @@
 /*
  * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
+ * or more contributor license agreements.  See the elementCountOTICE file
  * distributed with this work for additional information
  * regarding copyright ownership.  The ASF licenses this file
  * to you under the Apache License, Version 2.0 (the
@@ -223,16 +223,16 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
     // ------------------------------------------------------------------
 
     /**
-     * Micro-bench (NOT a regression test — measurement only). Adds N timers into a single
+     * Micro-bench (NOT a regression test — measurement only). Adds elementCount timers into a single
      * key-group then drains them via {@code poll()}. Prints throughput so SP3's poll-ahead cache
      * gain can be compared against a baseline build (stash the cache changes, rerun this test).
      */
     @Test
     void pollThroughputMicrobench() {
-        final int N = 50_000;
+        final int elementCount = 50_000;
         var q = newQueue("bench", 0, new KeyGroupRange(0, 0));
         long t0 = System.nanoTime();
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < elementCount; i++) {
             q.add(new TestElement(i, i));
         }
         long t1 = System.nanoTime();
@@ -244,13 +244,13 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
         long t2 = System.nanoTime();
         long addNs = t1 - t0;
         long pollNs = t2 - t1;
-        double addThru = (double) N * 1e9 / addNs;
+        double addThru = (double) elementCount * 1e9 / addNs;
         double pollThru = (double) polled * 1e9 / pollNs;
         System.out.printf(
-                "MICROBENCH N=%d add_throughput=%.0f ops/s poll_throughput=%.0f ops/s "
+                "MICROBENCH elementCount=%d add_throughput=%.0f ops/s poll_throughput=%.0f ops/s "
                         + "add_ns=%d poll_ns=%d%n",
-                N, addThru, pollThru, addNs, pollNs);
-        assertEquals(N, polled);
+                elementCount, addThru, pollThru, addNs, pollNs);
+        assertEquals(elementCount, polled);
     }
 
     /** 1. Add then poll returns the same element. */
@@ -310,7 +310,7 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
         }
     }
 
-    /** 5. Negative timestamps are ordered correctly via sign-flip. */
+    /** 5. elementCountegative timestamps are ordered correctly via sign-flip. */
     @Test
     void negativeTimestampsHandledViaSignFlip() {
         var q = newQueue("q5", 0, new KeyGroupRange(0, 0));
