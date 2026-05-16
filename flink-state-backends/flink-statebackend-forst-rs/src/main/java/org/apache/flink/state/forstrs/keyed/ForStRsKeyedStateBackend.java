@@ -24,6 +24,7 @@ import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
@@ -97,6 +98,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     /** Initial buffer size for currentKey serialization (grows on demand). */
     private static final int DEFAULT_KEY_BUFFER = 32;
 
+    private static final long DEFAULT_SLOT_TURN_BYTES = 8L * 1024 * 1024;
+    private static final long DEFAULT_SLOT_CACHE_BYTES = 64L * 1024 * 1024;
+
     /**
      * Marker prefix for the keyed namespace, kept short to minimize per-record bytes. Keeping it
      * fixed across all keyed states owned by this backend means we can later introduce a separate
@@ -112,6 +116,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private final FrsCfHandle defaultCf;
     private final TypeSerializer<K> keySerializer;
     private final boolean ownsResources;
+    private SlotArenaScope slotArenaScope;
 
     private final DataOutputSerializer keyOutBuffer = new DataOutputSerializer(DEFAULT_KEY_BUFFER);
 
@@ -242,6 +247,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         this.defaultCf = defaultCf;
         this.keySerializer = keySerializer;
         this.ownsResources = ownsResources;
+        this.slotArenaScope =
+                SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
     }
 
     // ------------------------------------------------------------------
@@ -601,6 +608,17 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
     }
 
+    /**
+     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after
+     * {@link #close()} or {@link #dispose()} so stale callers fail loudly.
+     */
+    public SlotArenaScope slotArenaScope() {
+        if (slotArenaScope == null) {
+            throw new IllegalStateException("Backend disposed");
+        }
+        return slotArenaScope;
+    }
+
     /** Returns the linker — exposed so tests can issue lower-level FFM calls if needed. */
     public ForStRsLinker getLinker() {
         return linker;
@@ -787,6 +805,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         flushWriteBuffer();
         flushAllMapStates();
         stateCache.clear();
+        if (slotArenaScope != null) {
+            slotArenaScope.closeSlot();
+            slotArenaScope = null;
+        }
         if (!ownsResources) {
             return;
         }

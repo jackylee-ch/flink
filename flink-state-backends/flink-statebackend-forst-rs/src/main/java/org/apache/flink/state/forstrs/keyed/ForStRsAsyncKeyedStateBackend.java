@@ -37,6 +37,7 @@ import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
+import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
@@ -58,6 +59,9 @@ import java.util.concurrent.RunnableFuture;
 @Internal
 public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<K> {
 
+    private static final long DEFAULT_SLOT_TURN_BYTES = 8L * 1024 * 1024;
+    private static final long DEFAULT_SLOT_CACHE_BYTES = 64L * 1024 * 1024;
+
     private final Arena arena;
     private final ForStRsLinker linker;
     private final FrsDb db;
@@ -68,6 +72,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
+    private SlotArenaScope slotArenaScope;
     private boolean disposed = false;
 
     public ForStRsAsyncKeyedStateBackend(
@@ -86,6 +91,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         this.keySerializer = keySerializer;
         this.keyGroupRange = keyGroupRange;
         this.ownsResources = ownsResources;
+        this.slotArenaScope =
+                SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
     }
 
     @Override
@@ -201,6 +208,17 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         return "forst-rs-async";
     }
 
+    /**
+     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after
+     * {@link #dispose()} so stale callers fail loudly.
+     */
+    public SlotArenaScope slotArenaScope() {
+        if (slotArenaScope == null) {
+            throw new IllegalStateException("Backend disposed");
+        }
+        return slotArenaScope;
+    }
+
     @Override
     public void dispose() {
         if (disposed) {
@@ -211,6 +229,10 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         managedExecutors.forEach(VectorizedExecutor::shutdown);
         managedExecutors.clear();
         stateCache.clear();
+        if (slotArenaScope != null) {
+            slotArenaScope.closeSlot();
+            slotArenaScope = null;
+        }
     }
 
     @Override
