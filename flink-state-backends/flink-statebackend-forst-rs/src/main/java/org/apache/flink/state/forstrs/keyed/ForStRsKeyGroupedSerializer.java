@@ -188,10 +188,9 @@ public final class ForStRsKeyGroupedSerializer<K> {
      * modulo uses bitwise AND when {@code maxParallelism} is a power of 2 (the common Flink
      * default), falling back to scalar modulo otherwise.
      *
-     * <p><b>Performance note.</b> The benefit is proportional to batch size and SIMD width. On
-     * AVX2 (8 int lanes), a batch of 64 keys processes 8 hashes per cycle vs 1 in the scalar path.
-     * The method falls back gracefully to scalar for tail elements and non-power-of-2
-     * maxParallelism.
+     * <p><b>Performance note.</b> The benefit is proportional to batch size and SIMD width. On AVX2
+     * (8 int lanes), a batch of 64 keys processes 8 hashes per cycle vs 1 in the scalar path. The
+     * method falls back gracefully to scalar for tail elements and non-power-of-2 maxParallelism.
      *
      * <p><b>Design decision: Arrow flush path.</b> The Arrow C Data Interface zero-copy flush was
      * evaluated but not implemented here. The write-buffer already uses pre-allocated
@@ -202,9 +201,9 @@ public final class ForStRsKeyGroupedSerializer<K> {
      *
      * <p><b>Design decision: ScopedValue.</b> JDK 25's {@code ScopedValue} (JEP 481) was evaluated
      * for replacing the ThreadLocal buffer pool. ScopedValue has immutable-within-scope semantics
-     * and requires a {@code runWhere} block, making it unsuitable for per-call mutable buffer reuse.
-     * ThreadLocal remains the correct pattern for pooling mutable buffers that are reset and reused
-     * across calls.
+     * and requires a {@code runWhere} block, making it unsuitable for per-call mutable buffer
+     * reuse. ThreadLocal remains the correct pattern for pooling mutable buffers that are reset and
+     * reused across calls.
      *
      * @param serializedKeys array of pre-serialized key byte arrays
      * @param maxParallelism the maximum parallelism (number of key-groups)

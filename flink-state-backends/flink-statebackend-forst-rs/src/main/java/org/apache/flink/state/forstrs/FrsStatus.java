@@ -37,7 +37,10 @@ public enum FrsStatus {
     BUSY(11),
     TIMED_OUT(12),
     EXPIRED(13),
-    INCOMPLETE(14);
+    INCOMPLETE(14),
+    INTERNAL(15),
+    FALLBACK(16),
+    BUFFER_TOO_SMALL(17);
 
     private final int code;
 
