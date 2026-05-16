@@ -138,6 +138,7 @@ public final class ForStRsLinker {
     // `crates/forst-rs-ffi/src/lib.rs` and `DbImpl::batch_put_arrow` in
     // `crates/forst-rs-engine/src/db.rs`.
     private final MethodHandle frsBatchPutArrow;
+    private final MethodHandle frsBatchGetArrow;
 
     // --- 4. Memory management ---
     private final MethodHandle frsBytesFree;
@@ -157,6 +158,23 @@ public final class ForStRsLinker {
     private final MethodHandle frsIteratorClose;
     private final MethodHandle frsPrefixLookupOpen;
     private final MethodHandle frsPrefixLookupClose;
+    private final MethodHandle frsPrefixGetAll;
+    private final MethodHandle frsBatchPrefixScan;
+
+    // --- 6b. Vectorized batch ops (caller-owned Arrow BinaryArray buffers) ---
+    // See spec docs/superpowers/specs/2026-05-15-forst-rs-vectorized-executor-design.md §C4.
+    // All inputs are (offsets:i32[count+1], data:u8[]) plus count. No allocation
+    // crosses the FFM boundary — the caller owns every buffer.
+    private final MethodHandle frsVectorizedBatchGet;
+    private final MethodHandle frsVectorizedBatchPut;
+    private final MethodHandle frsVectorizedBatchDelete;
+
+    // --- 6c. Explicit WriteBatch (SP4) — Java-held handle for atomic batches.
+    private final MethodHandle frsWritebatchOpen;
+    private final MethodHandle frsWritebatchPut;
+    private final MethodHandle frsWritebatchDelete;
+    private final MethodHandle frsWritebatchCommit;
+    private final MethodHandle frsWritebatchClose;
 
     // --- 7. TTL compaction filter ---
     private final MethodHandle frsCfSetCompactionFilterTtl;
@@ -426,6 +444,18 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // array (FFI_ArrowArray*)
                                 ValueLayout.ADDRESS)); // schema (FFI_ArrowSchema*)
 
+        this.frsBatchGetArrow =
+                bind(
+                        "frs_batch_get_arrow",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // keys_array (FFI_ArrowArray*)
+                                ValueLayout.ADDRESS, // keys_schema (FFI_ArrowSchema*)
+                                ValueLayout.ADDRESS, // out_array (FFI_ArrowArray*)
+                                ValueLayout.ADDRESS)); // out_schema (FFI_ArrowSchema*)
+
         // 4. Memory management — bound critical because every get/lookup_kv path
         // calls frs_bytes_free on its 24-byte FrsBytes out struct, which is now
         // a heap segment passed via MemorySegment.ofArray(byte[24]).
@@ -480,6 +510,8 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG, // out_buf_cap
                                 ValueLayout.ADDRESS)); // out_val_len ptr
 
+        // frs_get_fast: same signature as frs_get_into_buf but skips catch_unwind
+        // and Arc::clone on the FFI hot path. ~1.5µs faster per call.
         this.frsGetFast =
                 bindCritical(
                         "frs_get_fast",
@@ -541,6 +573,141 @@ public final class ForStRsLinker {
                 bind(
                         "frs_prefix_lookup_close",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+
+        this.frsPrefixGetAll =
+                bind(
+                        "frs_prefix_get_all",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // prefix ptr
+                                ValueLayout.JAVA_LONG, // prefix_len (usize)
+                                ValueLayout.JAVA_LONG, // max_count (usize)
+                                ValueLayout.ADDRESS, // out_keys (FrsBytes[])
+                                ValueLayout.ADDRESS, // out_values (FrsBytes[])
+                                ValueLayout.ADDRESS)); // out_count (*mut usize)
+
+        this.frsBatchPrefixScan =
+                bind(
+                        "frs_batch_prefix_scan",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // prefixes (*const *const u8)
+                                ValueLayout.ADDRESS, // prefix_lens (*const usize)
+                                ValueLayout.JAVA_LONG, // prefix_count (usize)
+                                ValueLayout.JAVA_LONG, // max_per_prefix (usize)
+                                ValueLayout.ADDRESS, // out_keys (FrsBytes[])
+                                ValueLayout.ADDRESS, // out_values (FrsBytes[])
+                                ValueLayout.ADDRESS, // out_counts (*mut usize)
+                                ValueLayout.ADDRESS)); // out_total (*mut usize)
+
+        // 6b. Vectorized batch ops — caller-owned Arrow BinaryArray buffers.
+        // Native signature (frs_vectorized_batch_get):
+        //   int frs_vectorized_batch_get(
+        //     FrsDb, FrsCfHandle,
+        //     *const i32 key_offsets, *const u8 key_data, usize count,
+        //     *mut i32 out_offsets, *mut u8 out_data, *mut u8 out_validity,
+        //     usize out_data_cap, *mut usize out_data_len);
+        this.frsVectorizedBatchGet =
+                bind(
+                        "frs_vectorized_batch_get",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key_offsets (*const i32)
+                                ValueLayout.ADDRESS, // key_data    (*const u8)
+                                ValueLayout.JAVA_LONG, // count     (usize)
+                                ValueLayout.ADDRESS, // out_offsets (*mut i32)
+                                ValueLayout.ADDRESS, // out_data    (*mut u8)
+                                ValueLayout.ADDRESS, // out_validity(*mut u8)
+                                ValueLayout.JAVA_LONG, // out_data_cap (usize)
+                                ValueLayout.ADDRESS)); // out_data_len (*mut usize)
+
+        // Native signature (frs_vectorized_batch_put):
+        //   int frs_vectorized_batch_put(
+        //     FrsDb, FrsCfHandle,
+        //     *const i32 key_offsets, *const u8 key_data,
+        //     *const i32 val_offsets, *const u8 val_data,
+        //     usize count);
+        this.frsVectorizedBatchPut =
+                bind(
+                        "frs_vectorized_batch_put",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key_offsets (*const i32)
+                                ValueLayout.ADDRESS, // key_data    (*const u8)
+                                ValueLayout.ADDRESS, // val_offsets (*const i32)
+                                ValueLayout.ADDRESS, // val_data    (*const u8)
+                                ValueLayout.JAVA_LONG)); // count   (usize)
+
+        // Native signature (frs_vectorized_batch_delete):
+        //   int frs_vectorized_batch_delete(
+        //     FrsDb, FrsCfHandle,
+        //     *const i32 key_offsets, *const u8 key_data, usize count);
+        this.frsVectorizedBatchDelete =
+                bind(
+                        "frs_vectorized_batch_delete",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key_offsets
+                                ValueLayout.ADDRESS, // key_data
+                                ValueLayout.JAVA_LONG)); // count
+
+        // 6c. Explicit WriteBatch — Java holds a handle so it can stage cross-CF
+        // puts/deletes and commit atomically.
+        this.frsWritebatchOpen =
+                bind(
+                        "frs_writebatch_open",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS)); // out_handle (FrsWriteBatch*)
+
+        this.frsWritebatchPut =
+                bind(
+                        "frs_writebatch_put",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // wb handle
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key_offsets
+                                ValueLayout.ADDRESS, // key_data
+                                ValueLayout.ADDRESS, // val_offsets
+                                ValueLayout.ADDRESS, // val_data
+                                ValueLayout.JAVA_LONG)); // count
+
+        this.frsWritebatchDelete =
+                bind(
+                        "frs_writebatch_delete",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // wb handle
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key_offsets
+                                ValueLayout.ADDRESS, // key_data
+                                ValueLayout.JAVA_LONG)); // count
+
+        this.frsWritebatchCommit =
+                bind(
+                        "frs_writebatch_commit",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // wb handle
+                                ValueLayout.ADDRESS)); // db
+
+        this.frsWritebatchClose =
+                bind(
+                        "frs_writebatch_close",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS)); // wb handle
 
         // 7. TTL compaction filter — Flink-shaped per-CF filter that drops entries
         // older than ttl_ms. Engine-side enforcement runs at flush + L0→L1 compaction;
@@ -1376,6 +1543,514 @@ public final class ForStRsLinker {
         check(rc, "frs_batch_put_arrow");
     }
 
+    /**
+     * Batch get using the existing batchGet path but with reduced allocation: reuses a
+     * pre-allocated output segment across calls. Returns values as byte[][] but avoids Arena
+     * allocation overhead by using a shared Arena.
+     */
+    public byte[][] batchGetReuse(FrsDb db, FrsCfHandle cf, byte[][] keys, Arena sharedArena) {
+        int count = keys.length;
+        if (count == 0) {
+            return new byte[0][];
+        }
+        MemorySegment keyPtrs = sharedArena.allocate(ValueLayout.ADDRESS, count);
+        MemorySegment keyLens = sharedArena.allocate(ValueLayout.JAVA_LONG, count);
+        MemorySegment[] keySegs = new MemorySegment[count];
+        for (int i = 0; i < count; i++) {
+            keySegs[i] = sharedArena.allocate(keys[i].length);
+            MemorySegment.copy(keys[i], 0, keySegs[i], ValueLayout.JAVA_BYTE, 0, keys[i].length);
+            keyPtrs.setAtIndex(ValueLayout.ADDRESS, i, keySegs[i]);
+            keyLens.setAtIndex(ValueLayout.JAVA_LONG, i, (long) keys[i].length);
+        }
+        MemorySegment outValues = sharedArena.allocate(FRS_BYTES_LAYOUT.byteSize() * count);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsBatchGet.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyPtrs,
+                                    keyLens,
+                                    (long) count,
+                                    outValues);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
+        }
+        check(rc, "frs_batch_get");
+        byte[][] results = new byte[count][];
+        long stride = FRS_BYTES_LAYOUT.byteSize();
+        for (int i = 0; i < count; i++) {
+            MemorySegment slot = outValues.asSlice(i * stride, stride);
+            results[i] = copyAndFree(slot, "frs_batch_get/value");
+        }
+        return results;
+    }
+
+    private static final long ARROW_SCHEMA_BYTES = 72L;
+    private static final long ARROW_ARRAY_BYTES = 80L;
+
+    /**
+     * Arrow-based batch get: stages keys as Arrow BinaryArray, calls frs_batch_get_arrow, reads
+     * results from the returned Arrow StructArray. Zero-copy on the return path — values are read
+     * directly from the contiguous Arrow buffer via offset arithmetic.
+     */
+    public byte[][] batchGetArrow(FrsDb db, FrsCfHandle cf, byte[][] keys) {
+        int count = keys.length;
+        if (count == 0) {
+            return new byte[0][];
+        }
+        try (Arena local = Arena.ofConfined()) {
+            long ptrSz = ValueLayout.ADDRESS.byteSize();
+
+            // Build release stub (no-op — we own all memory in the local arena)
+            MemorySegment releaseStub = buildArrowReleaseStub(local);
+
+            // Stage keys as Arrow BinaryArray: offsets[count+1] + data
+            int totalKeyBytes = 0;
+            for (byte[] k : keys) {
+                totalKeyBytes += k.length;
+            }
+            MemorySegment keyOffsets = local.allocate((count + 1) * 4L, 4L);
+            MemorySegment keyData = local.allocate(totalKeyBytes);
+            int off = 0;
+            for (int i = 0; i < count; i++) {
+                keyOffsets.set(ValueLayout.JAVA_INT, 4L * i, off);
+                MemorySegment.copy(keys[i], 0, keyData, ValueLayout.JAVA_BYTE, off, keys[i].length);
+                off += keys[i].length;
+            }
+            keyOffsets.set(ValueLayout.JAVA_INT, 4L * count, off);
+
+            // BinaryArray buffers: [validity(NULL), offsets, data]
+            MemorySegment keyBufs = local.allocate(3 * ptrSz);
+            keyBufs.set(ValueLayout.ADDRESS, 0, MemorySegment.NULL);
+            keyBufs.set(ValueLayout.ADDRESS, ptrSz, keyOffsets);
+            keyBufs.set(ValueLayout.ADDRESS, 2 * ptrSz, keyData);
+
+            // Build FFI_ArrowArray for keys
+            MemorySegment keysArray = local.allocate(ARROW_ARRAY_BYTES);
+            writeArrowArray(keysArray, count, 0, 0, 3, 0, keyBufs, MemorySegment.NULL, releaseStub);
+
+            // Build FFI_ArrowSchema for keys (format "z" = Binary)
+            MemorySegment fmtBinary = cstring(local, "z");
+            MemorySegment keysSchema = local.allocate(ARROW_SCHEMA_BYTES);
+            writeArrowSchema(
+                    keysSchema,
+                    fmtBinary,
+                    MemorySegment.NULL,
+                    0L,
+                    0,
+                    MemorySegment.NULL,
+                    releaseStub);
+
+            // Allocate output structs
+            MemorySegment outArray = local.allocate(ARROW_ARRAY_BYTES);
+            MemorySegment outSchema = local.allocate(ARROW_SCHEMA_BYTES);
+
+            // Call frs_batch_get_arrow
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsBatchGetArrow.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keysArray,
+                                        keysSchema,
+                                        outArray,
+                                        outSchema);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_batch_get_arrow threw: " + t.getMessage());
+            }
+            check(rc, "frs_batch_get_arrow");
+
+            // Parse returned StructArray: children[0] = value (Binary nullable), children[1] =
+            // found (Boolean)
+            // StructArray layout: n_children=2, children points to [valueArray, foundArray]
+            long nChildren = outArray.get(ValueLayout.JAVA_LONG, 32);
+            MemorySegment childrenPtr =
+                    outArray.get(ValueLayout.ADDRESS, 48).reinterpret(nChildren * ptrSz);
+
+            // Value child (BinaryArray): buffers = [validity, offsets, data]
+            MemorySegment valueArrayPtr =
+                    childrenPtr.get(ValueLayout.ADDRESS, 0).reinterpret(ARROW_ARRAY_BYTES);
+            long valueNBuffers = valueArrayPtr.get(ValueLayout.JAVA_LONG, 24);
+            MemorySegment valueBufsPtr =
+                    valueArrayPtr.get(ValueLayout.ADDRESS, 40).reinterpret(valueNBuffers * ptrSz);
+
+            MemorySegment validityPtr = valueBufsPtr.get(ValueLayout.ADDRESS, 0);
+            MemorySegment valueOffsetsPtr =
+                    valueBufsPtr.get(ValueLayout.ADDRESS, ptrSz).reinterpret((count + 1) * 4L);
+            MemorySegment valueDataPtr = valueBufsPtr.get(ValueLayout.ADDRESS, 2 * ptrSz);
+
+            // Read values from Arrow buffer — zero-copy read via offset arithmetic
+            byte[][] results = new byte[count][];
+            for (int i = 0; i < count; i++) {
+                // Check validity bitmap
+                boolean isNull;
+                if (validityPtr.address() == 0L) {
+                    isNull = false; // no validity bitmap = all valid
+                } else {
+                    MemorySegment validitySeg = validityPtr.reinterpret((count + 7) / 8);
+                    int byteIdx = i / 8;
+                    int bitIdx = i % 8;
+                    isNull = (validitySeg.get(ValueLayout.JAVA_BYTE, byteIdx) & (1 << bitIdx)) == 0;
+                }
+                if (isNull) {
+                    results[i] = null;
+                } else {
+                    int start = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * i);
+                    int end = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * (i + 1));
+                    int len = end - start;
+                    results[i] = new byte[len];
+                    MemorySegment dataSeg = valueDataPtr.reinterpret((long) end);
+                    MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, start, results[i], 0, len);
+                }
+            }
+
+            // Release the output Arrow structs (call the release callback)
+            MemorySegment outRelease = outArray.get(ValueLayout.ADDRESS, 64);
+            if (outRelease.address() != 0L) {
+                try {
+                    Linker.nativeLinker()
+                            .downcallHandle(
+                                    outRelease, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS))
+                            .invokeExact(outArray);
+                } catch (Throwable ignored) {
+                }
+            }
+            MemorySegment outSchemaRelease = outSchema.get(ValueLayout.ADDRESS, 56);
+            if (outSchemaRelease.address() != 0L) {
+                try {
+                    Linker.nativeLinker()
+                            .downcallHandle(
+                                    outSchemaRelease,
+                                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS))
+                            .invokeExact(outSchema);
+                } catch (Throwable ignored) {
+                }
+            }
+
+            return results;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Vectorized batch ops (caller-owned Arrow BinaryArray buffers)
+    //
+    // These accept pre-staged off-heap (offsets, data) segments built by
+    // the Java-side {@code ColumnarBatchBuffer} and dispatch the entire
+    // batch via a single FFM downcall — see spec
+    // 2026-05-15-forst-rs-vectorized-executor-design.md §C4.
+    //
+    // Status:
+    //   OK                  — success; outputs valid
+    //   BUFFER_TOO_SMALL    — out_data_cap insufficient; caller may grow
+    //                         to *outDataLenSeg(asLong) bytes and retry
+    //   any other negative  — engine error (mapped via {@link #check})
+    // -----------------------------------------------------------------
+
+    /**
+     * Vectorized batch GET. Pass pre-staged off-heap {@link MemorySegment}s for input
+     * key_offsets/key_data and caller-allocated output buffers (offsets/data/validity). On success
+     * the caller should consult {@code outDataLenSeg.get(JAVA_LONG, 0)} for the total bytes
+     * actually written into {@code outDataSeg}.
+     *
+     * <p>Returns the raw FFI status code so the caller can distinguish OK vs BUFFER_TOO_SMALL
+     * without an exception. Callers that don't need that distinction can use {@link
+     * #vectorizedBatchGetChecked} instead.
+     */
+    public int vectorizedBatchGet(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            long count,
+            MemorySegment outOffsetsSeg,
+            MemorySegment outDataSeg,
+            MemorySegment outValiditySeg,
+            long outDataCap,
+            MemorySegment outDataLenSeg) {
+        try {
+            return (int)
+                    frsVectorizedBatchGet.invokeExact(
+                            db.handle(),
+                            cf.handle(),
+                            keyOffsetsSeg,
+                            keyDataSeg,
+                            count,
+                            outOffsetsSeg,
+                            outDataSeg,
+                            outValiditySeg,
+                            outDataCap,
+                            outDataLenSeg);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_vectorized_batch_get threw: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Vectorized batch GET that throws on any non-OK status. The {@code BUFFER_TOO_SMALL} case is
+     * surfaced as a regular {@link FrsBackendException}; callers that want a retry loop should use
+     * {@link #vectorizedBatchGet} and check the status directly.
+     */
+    public void vectorizedBatchGetChecked(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            long count,
+            MemorySegment outOffsetsSeg,
+            MemorySegment outDataSeg,
+            MemorySegment outValiditySeg,
+            long outDataCap,
+            MemorySegment outDataLenSeg) {
+        int rc =
+                vectorizedBatchGet(
+                        db,
+                        cf,
+                        keyOffsetsSeg,
+                        keyDataSeg,
+                        count,
+                        outOffsetsSeg,
+                        outDataSeg,
+                        outValiditySeg,
+                        outDataCap,
+                        outDataLenSeg);
+        check(rc, "frs_vectorized_batch_get");
+    }
+
+    /** Vectorized batch PUT. */
+    public void vectorizedBatchPut(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            MemorySegment valOffsetsSeg,
+            MemorySegment valDataSeg,
+            long count) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsVectorizedBatchPut.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    valOffsetsSeg,
+                                    valDataSeg,
+                                    count);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_vectorized_batch_put threw: " + t.getMessage());
+        }
+        check(rc, "frs_vectorized_batch_put");
+    }
+
+    /** Vectorized batch DELETE. */
+    public void vectorizedBatchDelete(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            long count) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsVectorizedBatchDelete.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    count);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_vectorized_batch_delete threw: " + t.getMessage());
+        }
+        check(rc, "frs_vectorized_batch_delete");
+    }
+
+    // -----------------------------------------------------------------
+    // Explicit WriteBatch (SP4)
+    //
+    // Pattern:
+    //   long h = linker.writebatchOpen(arena);
+    //   linker.writebatchPut(h, cf, kOffs, kData, vOffs, vData, n);
+    //   linker.writebatchDelete(h, cf, dOffs, dData, m);
+    //   linker.writebatchCommit(h, db);  // h is invalid after this returns
+    // -----------------------------------------------------------------
+
+    /** Opens a fresh WriteBatch handle. Returns the raw native pointer as a long. */
+    public long writebatchOpen(Arena arena) {
+        MemorySegment out = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsWritebatchOpen.invokeExact(out);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_writebatch_open threw: " + t.getMessage());
+        }
+        check(rc, "frs_writebatch_open");
+        return out.get(ValueLayout.ADDRESS, 0).address();
+    }
+
+    /** Appends a vectorized put batch to the WriteBatch. */
+    public void writebatchPut(
+            long handle,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            MemorySegment valOffsetsSeg,
+            MemorySegment valDataSeg,
+            long count) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsWritebatchPut.invokeExact(
+                                    MemorySegment.ofAddress(handle),
+                                    cf.handle(),
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    valOffsetsSeg,
+                                    valDataSeg,
+                                    count);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_writebatch_put threw: " + t.getMessage());
+        }
+        check(rc, "frs_writebatch_put");
+    }
+
+    /** Appends a vectorized delete batch to the WriteBatch. */
+    public void writebatchDelete(
+            long handle,
+            FrsCfHandle cf,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            long count) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsWritebatchDelete.invokeExact(
+                                    MemorySegment.ofAddress(handle),
+                                    cf.handle(),
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    count);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_writebatch_delete threw: " + t.getMessage());
+        }
+        check(rc, "frs_writebatch_delete");
+    }
+
+    /** Commits the WriteBatch atomically. The handle is invalid after this returns. */
+    public void writebatchCommit(long handle, FrsDb db) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsWritebatchCommit.invokeExact(
+                                    MemorySegment.ofAddress(handle), db.handle());
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_writebatch_commit threw: " + t.getMessage());
+        }
+        check(rc, "frs_writebatch_commit");
+    }
+
+    /** Drops the WriteBatch without committing. Safe on a 0/invalid handle. */
+    public void writebatchClose(long handle) {
+        int rc;
+        try {
+            rc = (int) frsWritebatchClose.invokeExact(MemorySegment.ofAddress(handle));
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_writebatch_close threw: " + t.getMessage());
+        }
+        check(rc, "frs_writebatch_close");
+    }
+
+    private static void writeArrowArray(
+            MemorySegment seg,
+            long length,
+            long nullCount,
+            long offset,
+            long nBuffers,
+            long nChildren,
+            MemorySegment buffers,
+            MemorySegment children,
+            MemorySegment release) {
+        seg.set(ValueLayout.JAVA_LONG, 0, length);
+        seg.set(ValueLayout.JAVA_LONG, 8, nullCount);
+        seg.set(ValueLayout.JAVA_LONG, 16, offset);
+        seg.set(ValueLayout.JAVA_LONG, 24, nBuffers);
+        seg.set(ValueLayout.JAVA_LONG, 32, nChildren);
+        seg.set(ValueLayout.ADDRESS, 40, buffers);
+        seg.set(ValueLayout.ADDRESS, 48, children);
+        seg.set(ValueLayout.ADDRESS, 56, MemorySegment.NULL);
+        seg.set(ValueLayout.ADDRESS, 64, release);
+        seg.set(ValueLayout.ADDRESS, 72, MemorySegment.NULL);
+    }
+
+    private static void writeArrowSchema(
+            MemorySegment seg,
+            MemorySegment format,
+            MemorySegment name,
+            long flags,
+            long nChildren,
+            MemorySegment children,
+            MemorySegment release) {
+        seg.set(ValueLayout.ADDRESS, 0, format);
+        seg.set(ValueLayout.ADDRESS, 8, name != null ? name : MemorySegment.NULL);
+        seg.set(ValueLayout.ADDRESS, 16, MemorySegment.NULL);
+        seg.set(ValueLayout.JAVA_LONG, 24, flags);
+        seg.set(ValueLayout.JAVA_LONG, 32, nChildren);
+        seg.set(ValueLayout.ADDRESS, 40, children != null ? children : MemorySegment.NULL);
+        seg.set(ValueLayout.ADDRESS, 48, MemorySegment.NULL);
+        seg.set(ValueLayout.ADDRESS, 56, release);
+        seg.set(ValueLayout.ADDRESS, 64, MemorySegment.NULL);
+    }
+
+    private static MemorySegment cstring(Arena arena, String s) {
+        byte[] bytes = s.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        MemorySegment seg = arena.allocate(bytes.length + 1L);
+        MemorySegment.copy(bytes, 0, seg, ValueLayout.JAVA_BYTE, 0, bytes.length);
+        seg.set(ValueLayout.JAVA_BYTE, bytes.length, (byte) 0);
+        return seg;
+    }
+
+    private MemorySegment buildArrowReleaseStub(Arena arena) {
+        try {
+            java.lang.invoke.MethodHandle target =
+                    java.lang.invoke.MethodHandles.lookup()
+                            .findStatic(
+                                    ForStRsLinker.class,
+                                    "arrowNoopRelease",
+                                    java.lang.invoke.MethodType.methodType(
+                                            void.class, MemorySegment.class));
+            return Linker.nativeLinker()
+                    .upcallStub(target, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS), arena);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to build Arrow release stub", e);
+        }
+    }
+
+    @SuppressWarnings("unused")
+    private static void arrowNoopRelease(MemorySegment self) {
+        if (self.address() != 0L) {
+            MemorySegment view = self.reinterpret(ARROW_ARRAY_BYTES);
+            view.set(ValueLayout.ADDRESS, 64, MemorySegment.NULL);
+        }
+    }
+
     /** Deletes {@code key} from the column family. No-op if absent. */
     public void delete(FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
@@ -1488,8 +2163,10 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Fast-path get: uses frs_get_fast which skips catch_unwind and Arc::clone on the Rust side.
-     * Same semantics as getIntoBuf but lower per-call overhead (~500ns vs ~4.6µs).
+     * Fast-path equivalent of {@link #getIntoBuf}: same wire shape, but the Rust side skips
+     * {@code catch_unwind} + {@code Arc::clone}, saving ~1.5µs per call. Safe when the caller
+     * guarantees the {@code db} handle outlives the call — which is true for the lifetime of a
+     * Flink TaskExecutor (the backend holds the db open until close).
      */
     public byte[] getFast(FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
@@ -1513,10 +2190,13 @@ public final class ForStRsLinker {
             throw new FrsBackendException(
                     FrsStatus.PANIC, "frs_get_fast threw: " + t.getMessage());
         }
-        if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL
-            return getIntoBuf(db, cf, key);
+        if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL → fall back to general get
+            return get(db, cf, key);
         }
-        check(rc, "frs_get_fast");
+        if (rc != 0) {
+            // Caller-side fallback (no exception): get_fast trades robustness for speed.
+            return get(db, cf, key);
+        }
         long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
         if (valLen == 0) {
             return null;
@@ -1572,6 +2252,133 @@ public final class ForStRsLinker {
         }
         MemorySegment handle = outIter.get(ValueLayout.ADDRESS, 0);
         return new FrsIterator(this, handle, true);
+    }
+
+    /**
+     * Returns all key-value pairs matching {@code prefix} in a single FFM call. Much faster than
+     * iterator-based prefix scan for small result sets.
+     */
+    public IteratorEntry[] prefixGetAll(FrsDb db, FrsCfHandle cf, byte[] prefix, int maxCount) {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment prefixSeg;
+            long prefixLen;
+            if (prefix == null || prefix.length == 0) {
+                prefixSeg = MemorySegment.NULL;
+                prefixLen = 0L;
+            } else {
+                prefixSeg = local.allocate(prefix.length);
+                MemorySegment.copy(prefix, 0, prefixSeg, ValueLayout.JAVA_BYTE, 0, prefix.length);
+                prefixLen = prefix.length;
+            }
+            MemorySegment outKeys = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxCount);
+            MemorySegment outValues = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxCount);
+            MemorySegment outCount = local.allocate(ValueLayout.JAVA_LONG);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsPrefixGetAll.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        prefixSeg,
+                                        prefixLen,
+                                        (long) maxCount,
+                                        outKeys,
+                                        outValues,
+                                        outCount);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_prefix_get_all threw: " + t.getMessage());
+            }
+            check(rc, "frs_prefix_get_all");
+            int count = (int) outCount.get(ValueLayout.JAVA_LONG, 0);
+            IteratorEntry[] result = new IteratorEntry[count];
+            long stride = FRS_BYTES_LAYOUT.byteSize();
+            for (int i = 0; i < count; i++) {
+                MemorySegment keySlot = outKeys.asSlice(i * stride, stride);
+                MemorySegment valSlot = outValues.asSlice(i * stride, stride);
+                byte[] keyCopy = copyAndFree(keySlot, "frs_prefix_get_all/key");
+                byte[] valCopy = copyAndFree(valSlot, "frs_prefix_get_all/value");
+                result[i] = new IteratorEntry(keyCopy, valCopy);
+            }
+            return result;
+        }
+    }
+
+    /**
+     * Batch prefix scan: takes N prefixes, returns all entries for each in a single FFM call.
+     * Returns a 2D array where result[i] contains the entries for prefix[i].
+     */
+    public IteratorEntry[][] batchPrefixScan(
+            FrsDb db, FrsCfHandle cf, byte[][] prefixes, int maxPerPrefix) {
+        int n = prefixes.length;
+        if (n == 0) {
+            return new IteratorEntry[0][];
+        }
+        int maxTotal = n * maxPerPrefix;
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment prefixPtrs = local.allocate(ValueLayout.ADDRESS, n);
+            MemorySegment prefixLens = local.allocate(ValueLayout.JAVA_LONG, n);
+            MemorySegment[] prefixSegs = new MemorySegment[n];
+            for (int i = 0; i < n; i++) {
+                if (prefixes[i] != null && prefixes[i].length > 0) {
+                    prefixSegs[i] = local.allocate(prefixes[i].length);
+                    MemorySegment.copy(
+                            prefixes[i],
+                            0,
+                            prefixSegs[i],
+                            ValueLayout.JAVA_BYTE,
+                            0,
+                            prefixes[i].length);
+                    prefixPtrs.setAtIndex(ValueLayout.ADDRESS, i, prefixSegs[i]);
+                    prefixLens.setAtIndex(ValueLayout.JAVA_LONG, i, (long) prefixes[i].length);
+                } else {
+                    prefixPtrs.setAtIndex(ValueLayout.ADDRESS, i, MemorySegment.NULL);
+                    prefixLens.setAtIndex(ValueLayout.JAVA_LONG, i, 0L);
+                }
+            }
+            MemorySegment outKeys = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxTotal);
+            MemorySegment outValues = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxTotal);
+            MemorySegment outCounts = local.allocate(ValueLayout.JAVA_LONG, n);
+            MemorySegment outTotal = local.allocate(ValueLayout.JAVA_LONG);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsBatchPrefixScan.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        prefixPtrs,
+                                        prefixLens,
+                                        (long) n,
+                                        (long) maxPerPrefix,
+                                        outKeys,
+                                        outValues,
+                                        outCounts,
+                                        outTotal);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_batch_prefix_scan threw: " + t.getMessage());
+            }
+            check(rc, "frs_batch_prefix_scan");
+            int total = (int) outTotal.get(ValueLayout.JAVA_LONG, 0);
+            long stride = FRS_BYTES_LAYOUT.byteSize();
+            IteratorEntry[][] results = new IteratorEntry[n][];
+            int offset = 0;
+            for (int i = 0; i < n; i++) {
+                int count = (int) outCounts.getAtIndex(ValueLayout.JAVA_LONG, i);
+                results[i] = new IteratorEntry[count];
+                for (int j = 0; j < count; j++) {
+                    MemorySegment keySlot = outKeys.asSlice((offset + j) * stride, stride);
+                    MemorySegment valSlot = outValues.asSlice((offset + j) * stride, stride);
+                    byte[] keyCopy = copyAndFree(keySlot, "frs_batch_prefix_scan/key");
+                    byte[] valCopy = copyAndFree(valSlot, "frs_batch_prefix_scan/value");
+                    results[i][j] = new IteratorEntry(keyCopy, valCopy);
+                }
+                offset += count;
+            }
+            return results;
+        }
     }
 
     /** Repositions the iterator at the first key {@code >=} {@code key}. */
