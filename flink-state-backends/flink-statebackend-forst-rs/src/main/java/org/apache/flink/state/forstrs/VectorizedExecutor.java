@@ -24,9 +24,13 @@ import org.apache.flink.runtime.asyncprocessing.AsyncRequestContainer;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.rpc.FatalErrorHandler;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.ffm.FrsEnginePanicError;
+import org.apache.flink.state.forstrs.ffm.FrsErrorCode;
+import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -54,6 +58,12 @@ public class VectorizedExecutor implements StateExecutor {
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final Arena arena;
+
+    // Optional metrics + fatal-handler — set via setters after construction so that
+    // backends that don't yet have a MetricGroup can still instantiate the executor.
+    // Phase P5 will plumb MetricGroup through backend constructors and make these final.
+    private DispatchMetrics metrics;
+    private FatalErrorHandler fatalHandler;
 
     // Long-lived classifier-side buffers (reused across batches via reset()).
     private final ColumnarBatchBuffer getKeys;
@@ -84,6 +94,27 @@ public class VectorizedExecutor implements StateExecutor {
         this.outDataCap = INITIAL_OUT_DATA_CAP;
         this.outData = arena.allocate(outDataCap);
         this.outDataLenSeg = arena.allocate(ValueLayout.JAVA_LONG);
+    }
+
+    // -----------------------------------------------------------------
+    // Optional wiring (P4)
+    // -----------------------------------------------------------------
+
+    /**
+     * Attach dispatch metrics. Call immediately after construction; thread-safe for single-writer
+     * scenarios (the backend thread that owns this executor).
+     */
+    public void setDispatchMetrics(DispatchMetrics m) {
+        this.metrics = m;
+    }
+
+    /**
+     * Attach a FatalErrorHandler for fail-process error escalation (PANIC_CAUGHT / UNKNOWN).
+     * If not set, fail-process errors are still thrown as {@link FrsEnginePanicError} — Flink's
+     * default uncaught-exception handler will catch them at the task level.
+     */
+    public void setFatalHandler(FatalErrorHandler fh) {
+        this.fatalHandler = fh;
     }
 
     @Override
@@ -141,11 +172,18 @@ public class VectorizedExecutor implements StateExecutor {
     // Op-type executors
     // -----------------------------------------------------------------
 
+    /**
+     * Aggregate stateName for old-style Flink-runtime batches that mix multiple state names.
+     * The new-style VectorizedStateRequest path (P5+) will provide per-state attribution.
+     */
+    private static final String MIXED_STATE = "_mixed";
+
     private void executePuts(VectorizedClassifier c) {
         int n = c.putCount();
         if (n == 0) {
             return;
         }
+        long t0 = System.nanoTime();
         linker.vectorizedBatchPut(
                 db,
                 cf,
@@ -154,6 +192,10 @@ public class VectorizedExecutor implements StateExecutor {
                 c.putValues().offsetsSegment(),
                 c.putValues().dataSegment(),
                 n);
+        long latencyNs = System.nanoTime() - t0;
+        if (metrics != null) {
+            metrics.recordDispatch(VectorizedStateRequest.Kind.PUT, MIXED_STATE, n, 0L, latencyNs);
+        }
         StateRequest<?, ?, ?, ?>[] reqs = c.putRequests();
         for (int i = 0; i < n; i++) {
             completePut(reqs[i]);
@@ -184,6 +226,7 @@ public class VectorizedExecutor implements StateExecutor {
         }
         ensureOutCapacity(n);
 
+        long t0 = System.nanoTime();
         // Retry-with-growth loop: if out_data buffer is too small, grow and retry.
         while (true) {
             int rc =
@@ -199,6 +242,11 @@ public class VectorizedExecutor implements StateExecutor {
                             outDataCap,
                             outDataLenSeg);
             if (rc == FRS_STATUS_OK) {
+                long latencyNs = System.nanoTime() - t0;
+                if (metrics != null) {
+                    metrics.recordDispatch(
+                            VectorizedStateRequest.Kind.GET, MIXED_STATE, n, 0L, latencyNs);
+                }
                 break;
             }
             if (rc == FRS_STATUS_BUFFER_TOO_SMALL) {
@@ -207,6 +255,20 @@ public class VectorizedExecutor implements StateExecutor {
                 outData = arena.allocate(newCap);
                 outDataCap = newCap;
                 continue;
+            }
+            // Non-OK, non-BUFFER_TOO_SMALL: classify via FrsErrorCode.
+            FrsErrorCode errCode = FrsErrorCode.fromU32(rc);
+            if (metrics != null) {
+                metrics.recordFfiError(VectorizedStateRequest.Kind.GET, MIXED_STATE, errCode);
+            }
+            if (errCode.isFailProcess()) {
+                FrsEnginePanicError panicErr =
+                        new FrsEnginePanicError(
+                                errCode, "kind=GET state=" + MIXED_STATE + " rc=" + rc);
+                if (fatalHandler != null) {
+                    fatalHandler.onFatalError(panicErr);
+                }
+                throw panicErr;
             }
             throw new FrsBackendException(
                     FrsStatus.fromCode(rc), "frs_vectorized_batch_get rc=" + rc);

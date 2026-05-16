@@ -36,6 +36,8 @@ import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
@@ -43,6 +45,7 @@ import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
 import org.apache.flink.state.forstrs.state.ForStRsMapStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsValueStateV2;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
@@ -77,6 +80,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
 
+    /**
+     * Per-backend dispatch metrics (umbrella spec §1 §c, component 8).
+     *
+     * <p>Placeholder: initialized with {@link UnregisteredMetricsGroup} until the backend
+     * constructor is extended to accept a real {@link MetricGroup} from the Flink runtime.
+     * Phase P5 will inject MetricGroup via constructor once the backend is fully integrated.
+     */
+    private final DispatchMetrics dispatchMetrics;
+
     public ForStRsAsyncKeyedStateBackend(
             Arena arena,
             ForStRsLinker linker,
@@ -97,6 +109,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
         this.iterWatchdog = new IterLifetimeWatchdog(slotArenaScope);
         this.iterWatchdog.start();
+        // Phase P5: replace UnregisteredMetricsGroup with real MetricGroup from the
+        // TaskExecutorEnvironment / RuntimeEnvironment once the backend is fully integrated.
+        this.dispatchMetrics = new DispatchMetrics(new UnregisteredMetricsGroup());
     }
 
     @Override
@@ -147,8 +162,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     @Override
     public StateExecutor createStateExecutor() {
         var e = new VectorizedExecutor(linker, db, defaultCf, arena);
+        e.setDispatchMetrics(dispatchMetrics);
         managedExecutors.add(e);
         return e;
+    }
+
+    /** Returns the per-backend dispatch metrics. Exposed for testing and monitoring integration. */
+    public DispatchMetrics dispatchMetrics() {
+        return dispatchMetrics;
     }
 
     @Override
