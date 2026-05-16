@@ -25,8 +25,11 @@ import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
 
+import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Classifies incoming state requests into op-type-partitioned columnar buffers, replacing the
@@ -50,6 +53,13 @@ import java.util.List;
  * are serialized via the RecordContext lock, so a single batch contains at most one in-flight op
  * per logical state key. Within a batch the executor may reorder by op type freely (spec §
  * Correctness Invariants).
+ *
+ * <p><b>Extension (P2 Batch C):</b> {@link #submitVectorized(VectorizedStateRequest)} accepts
+ * the sealed {@link VectorizedStateRequest} hierarchy directly (the off-heap, new-style path).
+ * The three new kinds are routed to {@link AppendMergeBatchBuffer}, {@link IterPrefixBatchBuffer},
+ * and {@link IterRangeBatchBuffer} respectively. The APPEND_MERGE-ListState-only guard (spec §1
+ * §a) is enforced at submission time: callers must first register list-state names via
+ * {@link #registerListState(String)}.
  */
 @Internal
 public class VectorizedClassifier
@@ -61,6 +71,33 @@ public class VectorizedClassifier
     private final ColumnarBatchBuffer putKeys;
     private final ColumnarBatchBuffer putValues;
     private final ColumnarBatchBuffer deleteKeys;
+
+    // -- New-style (VectorizedStateRequest / off-heap) batch buffers for P2 Batch C kinds --
+
+    /**
+     * Buffer for APPEND_MERGE requests (ListState-only, spec §1 §a).
+     * Wired to FFI in P6.
+     */
+    private AppendMergeBatchBuffer appendMergeBuffer;
+
+    /**
+     * Buffer for ITER_PREFIX requests.
+     * Wired to FFI in P3.
+     */
+    private IterPrefixBatchBuffer iterPrefixBuffer;
+
+    /**
+     * Buffer for ITER_RANGE requests.
+     * Wired to FFI in P9.
+     */
+    private IterRangeBatchBuffer iterRangeBuffer;
+
+    /**
+     * Registry of state names that belong to a {@code ListState}.
+     * Used by the APPEND_MERGE guard (spec §1 §a).
+     * Thread-safe; populated once per state primitive registration, not on the hot path.
+     */
+    private final Set<String> listStateNames = ConcurrentHashMap.newKeySet();
 
     private StateRequest<?, ?, ?, ?>[] getRequests;
     private ForStRsInnerTable<?, ?, ?>[] getTables;
@@ -87,6 +124,25 @@ public class VectorizedClassifier
         this.getTables = new ForStRsInnerTable<?, ?, ?>[INIT_SLOTS];
         this.putRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.deleteRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
+        // appendMergeBuffer / iterPrefixBuffer / iterRangeBuffer are lazy-initialized by
+        // initNewKindBuffers(Arena) to avoid requiring an Arena here.
+    }
+
+    /**
+     * Initialises the three new-kind buffers (APPEND_MERGE, ITER_PREFIX, ITER_RANGE).
+     * Must be called before {@link #submitVectorized(VectorizedStateRequest)} is used.
+     * Idempotent — safe to call multiple times with the same arena.
+     */
+    public void initNewKindBuffers(Arena arena) {
+        if (appendMergeBuffer == null) {
+            appendMergeBuffer = new AppendMergeBatchBuffer(arena);
+        }
+        if (iterPrefixBuffer == null) {
+            iterPrefixBuffer = new IterPrefixBatchBuffer();
+        }
+        if (iterRangeBuffer == null) {
+            iterRangeBuffer = new IterRangeBatchBuffer();
+        }
     }
 
     public void reset() {
@@ -98,6 +154,145 @@ public class VectorizedClassifier
         putCount = 0;
         deleteCount = 0;
         iterRequests.clear();
+        if (appendMergeBuffer != null) {
+            appendMergeBuffer.reset();
+        }
+        if (iterPrefixBuffer != null) {
+            iterPrefixBuffer.reset();
+        }
+        if (iterRangeBuffer != null) {
+            iterRangeBuffer.reset();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // New-style (VectorizedStateRequest / off-heap) submission path
+    // -----------------------------------------------------------------
+
+    /**
+     * Submits a {@link VectorizedStateRequest} via the off-heap dispatch path.
+     *
+     * <p>This is the entry point for the sealed interface hierarchy (post-P2.4). It coexists with
+     * the existing {@link #offer(StateRequest)} Flink-runtime path; both may be used in the same
+     * batch.
+     *
+     * <p><b>Spec §1 §a guard:</b> APPEND_MERGE is ListState-only. If the request's
+     * {@link VectorizedStateRequest#stateName()} is not registered via
+     * {@link #registerListState(String)}, an {@link IllegalArgumentException} is thrown at
+     * classification time.
+     *
+     * @throws IllegalStateException if the new-kind buffers have not been initialised via
+     *     {@link #initNewKindBuffers(Arena)}
+     * @throws IllegalArgumentException if an APPEND_MERGE request targets a non-list state
+     */
+    public void submitVectorized(VectorizedStateRequest req) {
+        switch (req.kind()) {
+            case APPEND_MERGE:
+                // §1 §a guard: APPEND_MERGE is ListState-only.
+                if (!isListStateName(req.stateName())) {
+                    throw new IllegalArgumentException(
+                            "APPEND_MERGE is ListState-only per spec §1 §a — got stateName="
+                                    + req.stateName()
+                                    + ". Reducing/Aggregating state must use the RMW cache path"
+                                    + " (GET + combine + PUT, spec §3 Trace A).");
+                }
+                ensureAppendMergeBuffer();
+                appendMergeBuffer.append((AppendMergeRequest) req);
+                break;
+            case ITER_PREFIX:
+                ensureIterPrefixBuffer();
+                iterPrefixBuffer.append((IterPrefixRequest) req);
+                break;
+            case ITER_RANGE:
+                ensureIterRangeBuffer();
+                iterRangeBuffer.append((IterRangeRequest) req);
+                break;
+            case GET:
+            case PUT:
+            case DELETE:
+                // These kinds are handled by the existing Flink-runtime offer() path.
+                // If callers submit new-style GET/PUT/DELETE via submitVectorized(), they
+                // must first wrap them appropriately. For now, reject with a clear message
+                // to avoid silent mis-routing until P5 wires the full new-style path.
+                throw new UnsupportedOperationException(
+                        "GET/PUT/DELETE via submitVectorized() is not yet supported. "
+                                + "Use the existing offer(StateRequest) Flink-runtime path. "
+                                + "Full new-style GET/PUT/DELETE routing lands in P5.");
+            default:
+                throw new UnsupportedOperationException("Unknown kind: " + req.kind());
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // ListState registry (§1 §a guard)
+    // -----------------------------------------------------------------
+
+    /**
+     * Registers {@code stateName} as belonging to a {@code ListState}.
+     * After registration, APPEND_MERGE requests for this name are accepted.
+     * Call once when the ListState primitive is created.
+     */
+    public void registerListState(String stateName) {
+        listStateNames.add(stateName);
+    }
+
+    /**
+     * Removes {@code stateName} from the list-state registry.
+     * Call when the ListState primitive is closed/destroyed.
+     */
+    public void unregisterListState(String stateName) {
+        listStateNames.remove(stateName);
+    }
+
+    /**
+     * Returns {@code true} if {@code stateName} is registered as a ListState.
+     */
+    public boolean isListStateName(String stateName) {
+        return listStateNames.contains(stateName);
+    }
+
+    // -----------------------------------------------------------------
+    // Accessors for new-kind buffers (used by VectorizedExecutor)
+    // -----------------------------------------------------------------
+
+    /** Returns the APPEND_MERGE buffer, or {@code null} if not yet initialised. */
+    public AppendMergeBatchBuffer appendMergeBuffer() {
+        return appendMergeBuffer;
+    }
+
+    /** Returns the ITER_PREFIX buffer, or {@code null} if not yet initialised. */
+    public IterPrefixBatchBuffer iterPrefixBuffer() {
+        return iterPrefixBuffer;
+    }
+
+    /** Returns the ITER_RANGE buffer, or {@code null} if not yet initialised. */
+    public IterRangeBatchBuffer iterRangeBuffer() {
+        return iterRangeBuffer;
+    }
+
+    // -----------------------------------------------------------------
+    // Lazy init helpers (fail-fast when buffers not configured)
+    // -----------------------------------------------------------------
+
+    private void ensureAppendMergeBuffer() {
+        if (appendMergeBuffer == null) {
+            throw new IllegalStateException(
+                    "AppendMerge buffer not initialised — call initNewKindBuffers(Arena) first");
+        }
+    }
+
+    private void ensureIterPrefixBuffer() {
+        if (iterPrefixBuffer == null) {
+            throw new IllegalStateException(
+                    "IterPrefix buffer not initialised — call initNewKindBuffers(Arena) first");
+        }
+    }
+
+    private void ensureIterRangeBuffer() {
+        if (iterRangeBuffer == null) {
+            throw new IllegalStateException(
+                    "IterRange buffer not initialised — call initNewKindBuffers(Arena) first");
+        }
     }
 
     @Override

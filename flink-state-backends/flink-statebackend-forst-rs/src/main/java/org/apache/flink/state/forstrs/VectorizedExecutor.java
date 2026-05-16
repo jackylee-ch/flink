@@ -242,6 +242,51 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     // -----------------------------------------------------------------
+    // New-kind dispatch stubs (P2 Batch C) — real FFI wiring in later PRs
+    // -----------------------------------------------------------------
+
+    /**
+     * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI.
+     *
+     * <p>Real implementation lands in P6 (umbrella spec §3 Trace B). Until then, any attempt to
+     * execute an APPEND_MERGE batch fails cleanly so callers discover the gap at test time rather
+     * than silently producing wrong results.
+     *
+     * @param buffer the APPEND_MERGE batch buffer populated by the classifier
+     * @throws UnsupportedOperationException always (P6 pending)
+     */
+    public void dispatchAppendMerge(AppendMergeBatchBuffer buffer) {
+        throw new UnsupportedOperationException(
+                "APPEND_MERGE dispatch lands in P6 (umbrella spec §3 Trace B)");
+    }
+
+    /**
+     * Dispatches an ITER_PREFIX batch via {@code frs_vec_iter_prefix_open} FFI.
+     *
+     * <p>Real implementation lands in P3 (umbrella spec §3 Trace D).
+     *
+     * @param buffer the ITER_PREFIX batch buffer populated by the classifier
+     * @throws UnsupportedOperationException always (P3 pending)
+     */
+    public void dispatchIterPrefix(IterPrefixBatchBuffer buffer) {
+        throw new UnsupportedOperationException(
+                "ITER_PREFIX dispatch lands in P3 (umbrella spec §3 Trace D)");
+    }
+
+    /**
+     * Dispatches an ITER_RANGE batch via {@code frs_vec_iter_range_open} FFI.
+     *
+     * <p>Real implementation lands in P9.
+     *
+     * @param buffer the ITER_RANGE batch buffer populated by the classifier
+     * @throws UnsupportedOperationException always (P9 pending)
+     */
+    public void dispatchIterRange(IterRangeBatchBuffer buffer) {
+        throw new UnsupportedOperationException(
+                "ITER_RANGE dispatch lands in P9");
+    }
+
+    // -----------------------------------------------------------------
     // Future completion
     // -----------------------------------------------------------------
 
