@@ -24,6 +24,7 @@ import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
@@ -212,6 +213,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private long keyGeneration;
 
     private boolean closed = false;
+    private IterLifetimeWatchdog iterWatchdog;
 
     /**
      * Constructs a backend that <i>owns</i> the supplied resources — {@link #close()} will close
@@ -249,6 +251,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         this.ownsResources = ownsResources;
         this.slotArenaScope =
                 SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
+        this.iterWatchdog = new IterLifetimeWatchdog(slotArenaScope);
+        this.iterWatchdog.start();
     }
 
     // ------------------------------------------------------------------
@@ -805,6 +809,10 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         flushWriteBuffer();
         flushAllMapStates();
         stateCache.clear();
+        if (iterWatchdog != null) {
+            iterWatchdog.stop();
+            iterWatchdog = null;
+        }
         if (slotArenaScope != null) {
             slotArenaScope.closeSlot();
             slotArenaScope = null;

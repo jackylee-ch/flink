@@ -204,6 +204,13 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbDropCf;
     private final MethodHandle frsDbIngestExternalSst;
 
+    // --- 10. Vectorized chunked iterator (P3-A/P3-B, spec §1 §b + §2 component E) ---
+    // FrsDb / FrsCfHandle are *mut c_void → ADDRESS; iterator handle is u64 scalar → JAVA_LONG.
+    private final MethodHandle frsVecIterPrefixOpen;
+    private final MethodHandle frsVecIterPrefixNext;
+    private final MethodHandle frsVecIterPrefixClose;
+    private final MethodHandle frsVecIterPrefixAbort;
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
@@ -846,6 +853,30 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // sst_paths (const char**)
                                 ValueLayout.JAVA_LONG)); // count (usize → JAVA_LONG)
+
+        // 10. Vectorized chunked iterator (P3-A/P3-B, spec §1 §b + §2 component E)
+        this.frsVecIterPrefixOpen = bind("frs_vec_iter_prefix_open", FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS,   // db
+                ValueLayout.ADDRESS,   // cf
+                ValueLayout.ADDRESS,   // prefix_ptr
+                ValueLayout.JAVA_INT,  // prefix_len (u32)
+                ValueLayout.ADDRESS,   // chunk_buf_ptr
+                ValueLayout.JAVA_INT,  // chunk_buf_cap (u32)
+                ValueLayout.ADDRESS,   // out_handle (*mut u64)
+                ValueLayout.ADDRESS,   // out_row_count (*mut u32)
+                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
+        this.frsVecIterPrefixNext = bind("frs_vec_iter_prefix_next", FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_LONG, // handle (u64 scalar)
+                ValueLayout.ADDRESS,   // chunk_buf_ptr
+                ValueLayout.JAVA_INT,  // chunk_buf_cap (u32)
+                ValueLayout.ADDRESS,   // out_row_count (*mut u32)
+                ValueLayout.ADDRESS)); // out_bytes_used (*mut u32)
+        this.frsVecIterPrefixClose = bind("frs_vec_iter_prefix_close",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        this.frsVecIterPrefixAbort = bind("frs_vec_iter_prefix_abort",
+                FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
     }
 
     private MethodHandle bind(String name, FunctionDescriptor descriptor) {
@@ -3009,5 +3040,57 @@ public final class ForStRsLinker {
         }
         MemorySegment cfHandle = outCf.get(ValueLayout.ADDRESS, 0);
         return new FrsCfHandle(this, cfHandle);
+    }
+
+    // ------------------------------------------------------------------
+    // 10. Vectorized chunked iterator (P3-A/P3-B, spec §1 §b + §2 component E)
+    // ------------------------------------------------------------------
+
+    /** Opens a prefix-scan iterator and fills the first chunk. Returns native error code. */
+    public int frsVecIterPrefixOpen(
+            MemorySegment db, MemorySegment cf,
+            MemorySegment prefix, int prefixLen,
+            MemorySegment chunkBuf, int chunkBufCap,
+            MemorySegment outHandle, MemorySegment outRowCount, MemorySegment outBytesUsed) {
+        try {
+            return (int) frsVecIterPrefixOpen.invokeExact(
+                    db, cf, prefix, prefixLen, chunkBuf, chunkBufCap,
+                    outHandle, outRowCount, outBytesUsed);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_open failed", t);
+        }
+    }
+
+    /** Pulls the next chunk from an open iterator. Returns native error code. */
+    public int frsVecIterPrefixNext(
+            long handle, MemorySegment chunkBuf, int chunkBufCap,
+            MemorySegment outRowCount, MemorySegment outBytesUsed) {
+        try {
+            return (int) frsVecIterPrefixNext.invokeExact(
+                    handle, chunkBuf, chunkBufCap, outRowCount, outBytesUsed);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_next failed", t);
+        }
+    }
+
+    /** Releases the native iterator handle. Returns native error code. */
+    public int frsVecIterPrefixClose(long handle) {
+        try {
+            return (int) frsVecIterPrefixClose.invokeExact(handle);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_close failed", t);
+        }
+    }
+
+    /**
+     * Watchdog hook: marks handle as aborted so subsequent next() returns empty.
+     * Returns native error code (201 = ITER_CURSOR_INVALID if handle unknown).
+     */
+    public int frsVecIterPrefixAbort(long handle) {
+        try {
+            return (int) frsVecIterPrefixAbort.invokeExact(handle);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_abort failed", t);
+        }
     }
 }

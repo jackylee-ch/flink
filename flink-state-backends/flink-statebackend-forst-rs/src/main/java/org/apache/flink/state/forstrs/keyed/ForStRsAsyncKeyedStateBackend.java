@@ -37,6 +37,7 @@ import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
+import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
@@ -73,6 +74,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
     private SlotArenaScope slotArenaScope;
+    private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
 
     public ForStRsAsyncKeyedStateBackend(
@@ -93,6 +95,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         this.ownsResources = ownsResources;
         this.slotArenaScope =
                 SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
+        this.iterWatchdog = new IterLifetimeWatchdog(slotArenaScope);
+        this.iterWatchdog.start();
     }
 
     @Override
@@ -229,6 +233,10 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         managedExecutors.forEach(VectorizedExecutor::shutdown);
         managedExecutors.clear();
         stateCache.clear();
+        if (iterWatchdog != null) {
+            iterWatchdog.stop();
+            iterWatchdog = null;
+        }
         if (slotArenaScope != null) {
             slotArenaScope.closeSlot();
             slotArenaScope = null;
