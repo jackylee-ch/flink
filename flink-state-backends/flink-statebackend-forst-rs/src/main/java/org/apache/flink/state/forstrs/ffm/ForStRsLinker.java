@@ -102,6 +102,9 @@ public final class ForStRsLinker {
     private final Linker linker;
     private final SymbolLookup lookup;
 
+    // --- 0. ABI version negotiation ---
+    private final MethodHandle frsAbiVersion;
+
     // --- 1. Lifecycle ---
     private final MethodHandle frsDbOpen;
     private final MethodHandle frsDbOpenMemory;
@@ -212,6 +215,12 @@ public final class ForStRsLinker {
             System.loadLibrary("forst_rs_ffi");
             this.lookup = SymbolLookup.loaderLookup();
         }
+
+        // 0. ABI version negotiation
+        this.frsAbiVersion =
+                bind(
+                        "frs_abi_version",
+                        FunctionDescriptor.of(ValueLayout.JAVA_INT));
 
         // 1. Lifecycle
         this.frsDbOpen =
@@ -1020,6 +1029,18 @@ public final class ForStRsLinker {
             throw new FrsBackendException(
                     FrsStatus.PANIC,
                     "frs_db_write_buffer_manager_current_bytes threw: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Returns the FRS_ABI_VERSION from the loaded native lib.
+     * Compare against {@link FrsAbi#EXPECTED_ABI_VERSION} at backend init.
+     */
+    public int frsAbiVersion() {
+        try {
+            return (int) frsAbiVersion.invokeExact();
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_abi_version FFI call failed", t);
         }
     }
 
