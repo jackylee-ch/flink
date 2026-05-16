@@ -30,5 +30,19 @@ package org.apache.flink.state.forstrs.ffm;
  */
 public final class FrsAbi {
     public static final int EXPECTED_ABI_VERSION = 1;
+
     private FrsAbi() {}
+
+    /**
+     * Verifies that the native lib's ABI version matches EXPECTED_ABI_VERSION.
+     *
+     * @param versionSupplier a supplier that returns the native lib's FRS_ABI_VERSION
+     * @throws FrsAbiMismatchException if versions do not match
+     */
+    public static void verifyAgainst(java.util.function.IntSupplier versionSupplier) {
+        int actual = versionSupplier.getAsInt();
+        if (actual != EXPECTED_ABI_VERSION) {
+            throw new FrsAbiMismatchException(actual, EXPECTED_ABI_VERSION);
+        }
+    }
 }

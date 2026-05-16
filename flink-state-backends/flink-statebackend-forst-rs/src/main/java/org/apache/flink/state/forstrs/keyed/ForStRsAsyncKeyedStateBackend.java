@@ -37,6 +37,7 @@ import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
+import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
@@ -77,6 +78,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             TypeSerializer<K> keySerializer,
             KeyGroupRange keyGroupRange,
             boolean ownsResources) {
+        FrsAbi.verifyAgainst(linker::frsAbiVersion);
         this.arena = arena;
         this.linker = linker;
         this.db = db;

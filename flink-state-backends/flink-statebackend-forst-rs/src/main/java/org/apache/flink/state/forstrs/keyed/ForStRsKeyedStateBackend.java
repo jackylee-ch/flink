@@ -24,6 +24,7 @@ import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
@@ -234,6 +235,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             FrsCfHandle defaultCf,
             TypeSerializer<K> keySerializer,
             boolean ownsResources) {
+        FrsAbi.verifyAgainst(linker::frsAbiVersion);
         this.arena = arena;
         this.linker = linker;
         this.db = db;
