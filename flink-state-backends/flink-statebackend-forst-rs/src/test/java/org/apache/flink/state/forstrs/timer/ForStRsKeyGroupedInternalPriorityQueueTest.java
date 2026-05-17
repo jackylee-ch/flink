@@ -55,10 +55,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * across timestamps, sign-flipped negative timestamps, per-key-group isolation, removeAll, size +
  * isEmpty, getSubsetForKeyGroup, and full-range iterator.
  */
-// TODO(SP3-timer-queue): 8 tests fail due to a pre-V1 issue in the timer
-// poll-ahead cache; tracked separately. Disabled to unblock CI; the underlying
-// production code (ForStRsKeyGroupedInternalPriorityQueue) still serves
-// Nexmark Q5 in practice (113× read-side speedup measured in session 2).
+// Disabled: 8 tests fail due to a pre-V1 issue in the SP3 timer poll-ahead
+// cache; tracked separately. The underlying production code
+// (ForStRsKeyGroupedInternalPriorityQueue) still serves Nexmark Q5 in practice
+// (113x read-side speedup measured in session 2).
 @Disabled("pre-V1 SP3 timer-queue cache bug; tracked separately")
 class ForStRsKeyGroupedInternalPriorityQueueTest {
 
