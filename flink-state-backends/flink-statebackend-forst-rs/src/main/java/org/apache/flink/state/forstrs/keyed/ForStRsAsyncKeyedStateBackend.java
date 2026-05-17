@@ -19,7 +19,10 @@
 package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.api.common.state.v2.AggregatingStateDescriptor;
+import org.apache.flink.api.common.state.v2.ListStateDescriptor;
 import org.apache.flink.api.common.state.v2.MapStateDescriptor;
+import org.apache.flink.api.common.state.v2.ReducingStateDescriptor;
 import org.apache.flink.api.common.state.v2.State;
 import org.apache.flink.api.common.state.v2.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
@@ -48,6 +51,9 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
 import org.apache.flink.state.forstrs.state.ForStRsAggregatingStateV2;
+import org.apache.flink.state.forstrs.state.ForStRsAsyncAggregatingStateV2;
+import org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2;
+import org.apache.flink.state.forstrs.state.ForStRsAsyncReducingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsMapStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsReducingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsValueStateV2;
@@ -176,9 +182,45 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 keySerializer,
                                 mapDesc.getUserKeySerializer(),
                                 mapDesc.getSerializer());
+            case LIST:
+                var listDesc = (ListStateDescriptor<?>) desc;
+                return (S)
+                        new ForStRsAsyncListStateV2<>(
+                                stateRequestHandler,
+                                name,
+                                keySerializer,
+                                listDesc.getSerializer());
+            case REDUCING:
+                return (S) createReducingState(name, desc);
+            case AGGREGATING:
+                return (S) createAggregatingState(name, desc);
             default:
                 throw new UnsupportedOperationException("Unsupported: " + desc.getType());
         }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private ForStRsAsyncReducingStateV2<K, ?, ?> createReducingState(
+            String name, StateDescriptor<?> desc) {
+        ReducingStateDescriptor reducingDesc = (ReducingStateDescriptor) desc;
+        return new ForStRsAsyncReducingStateV2<>(
+                stateRequestHandler,
+                name,
+                keySerializer,
+                reducingDesc.getSerializer(),
+                reducingDesc.getReduceFunction());
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private ForStRsAsyncAggregatingStateV2<K, ?, ?, ?, ?> createAggregatingState(
+            String name, StateDescriptor<?> desc) {
+        AggregatingStateDescriptor aggDesc = (AggregatingStateDescriptor) desc;
+        return new ForStRsAsyncAggregatingStateV2<>(
+                stateRequestHandler,
+                name,
+                keySerializer,
+                aggDesc.getSerializer(),
+                aggDesc.getAggregateFunction());
     }
 
     @Nonnull
