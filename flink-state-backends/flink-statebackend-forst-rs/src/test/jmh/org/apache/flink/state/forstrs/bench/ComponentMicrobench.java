@@ -117,10 +117,10 @@ public class ComponentMicrobench {
     public long encodeKeyInto() {
         long off = (bumpOffset + 63) & ~63L;
         turnRegion.set(java.lang.foreign.ValueLayout.JAVA_SHORT, off, (short) 42);
-        // Inline state-name + separators
-        turnRegion.set(java.lang.foreign.ValueLayout.JAVA_LONG, off + 2, 0x2F6D795374617465L); // "/myState"
+        // Inline state-name + separators — use UNALIGNED longs since key layout is not 8B-aligned
+        turnRegion.set(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, off + 2, 0x2F6D795374617465L); // "/myState"
         turnRegion.set(java.lang.foreign.ValueLayout.JAVA_BYTE, off + 10, (byte) '/');
-        turnRegion.set(java.lang.foreign.ValueLayout.JAVA_LONG, off + 12, 0xDEADBEEFCAFEBABEL);
+        turnRegion.set(java.lang.foreign.ValueLayout.JAVA_LONG_UNALIGNED, off + 12, 0xDEADBEEFCAFEBABEL);
         bumpOffset = off + 28;
         if (bumpOffset > SLOT_TURN_BYTES - 4096) {
             bumpOffset = 0;

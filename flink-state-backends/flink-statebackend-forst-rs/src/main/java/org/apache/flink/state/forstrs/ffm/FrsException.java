@@ -19,10 +19,9 @@
 package org.apache.flink.state.forstrs.ffm;
 
 /**
- * Single typed exception for all frs_vec_* FFI returns that aren't OK.
- * Callers switch on `code()` rather than message text. Subclasses (e.g.
- * FrsIteratorExpiredException) provide caller-friendly type names but
- * carry the same payload.
+ * Single typed exception for all frs_vec_* FFI returns that aren't OK. Callers switch on `code()`
+ * rather than message text. Subclasses (e.g. FrsIteratorExpiredException) provide caller-friendly
+ * type names but carry the same payload.
  *
  * <p>See umbrella spec §4 for the error contract.
  */
@@ -33,8 +32,13 @@ public class FrsException extends RuntimeException {
 
     public FrsException(FrsErrorCode code, int rowIndex, byte[] detail) {
         super(
-            "FrsException code=" + code + " row=" + rowIndex
-                + " detail=" + (detail == null ? 0 : detail.length) + "B");
+                "FrsException code="
+                        + code
+                        + " row="
+                        + rowIndex
+                        + " detail="
+                        + (detail == null ? 0 : detail.length)
+                        + "B");
         this.code = code;
         this.rowIndex = rowIndex;
         this.detail = detail == null ? new byte[0] : detail.clone();

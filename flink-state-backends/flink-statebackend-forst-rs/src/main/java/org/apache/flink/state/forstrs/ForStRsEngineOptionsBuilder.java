@@ -21,13 +21,13 @@ package org.apache.flink.state.forstrs;
 import org.apache.flink.annotation.PublicEvolving;
 
 /**
- * Mutable builder for the engine options passed to {@code frs_db_open_with_options}. Plain POJO
- * — pluggable {@link ForStRsOptionsFactory} implementations read defaults and overwrite the
- * fields they want to change.
+ * Mutable builder for the engine options passed to {@code frs_db_open_with_options}. Plain POJO —
+ * pluggable {@link ForStRsOptionsFactory} implementations read defaults and overwrite the fields
+ * they want to change.
  *
- * <p>All sizes are bytes; zero means "engine default" (the Rust side picks). The advisory knobs
- * are accepted but currently ignored by the engine — see {@link ForStRsConfigurableOptions} for
- * which ones are live.
+ * <p>All sizes are bytes; zero means "engine default" (the Rust side picks). The advisory knobs are
+ * accepted but currently ignored by the engine — see {@link ForStRsConfigurableOptions} for which
+ * ones are live.
  */
 @PublicEvolving
 public final class ForStRsEngineOptionsBuilder {

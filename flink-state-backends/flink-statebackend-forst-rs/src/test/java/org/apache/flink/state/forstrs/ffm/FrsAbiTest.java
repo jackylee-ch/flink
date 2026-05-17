@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.ffm;
 
 import org.junit.jupiter.api.Test;
+
 import java.lang.foreign.Arena;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;

@@ -433,9 +433,8 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     /**
      * Returns the head entry for {@code kg}, populating the poll-ahead cache from the engine on a
-     * miss. The returned entry stays at the front of {@link #pollCache} so that subsequent
-     * {@link #peek()} calls are idempotent; {@link #poll()} pops it after the engine delete
-     * succeeds.
+     * miss. The returned entry stays at the front of {@link #pollCache} so that subsequent {@link
+     * #peek()} calls are idempotent; {@link #poll()} pops it after the engine delete succeeds.
      */
     private Entry cachedHeadEntry(int kg) {
         if (cachedKg != kg) {

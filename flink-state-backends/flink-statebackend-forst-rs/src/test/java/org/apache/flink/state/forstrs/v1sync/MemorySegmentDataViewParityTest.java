@@ -32,9 +32,9 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Parity test: write a typed sequence through MemorySegmentDataOutputView (off-heap), then read
- * it back through MemorySegmentDataInputView. Cross-check by writing the same sequence through
- * Flink's stock DataOutputSerializer and reading via DataInputDeserializer.
+ * Parity test: write a typed sequence through MemorySegmentDataOutputView (off-heap), then read it
+ * back through MemorySegmentDataInputView. Cross-check by writing the same sequence through Flink's
+ * stock DataOutputSerializer and reading via DataInputDeserializer.
  *
  * <p>This is the key correctness gate for SP6 — every Flink TypeSerializer must round-trip
  * identically through the off-heap views vs the on-heap stock pair.
@@ -96,8 +96,7 @@ class MemorySegmentDataViewParityTest {
             // Byte-level parity.
             byte[] offHeapBytes = new byte[writtenOffHeap];
             for (int i = 0; i < writtenOffHeap; i++) {
-                offHeapBytes[i] =
-                        seg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i);
+                offHeapBytes[i] = seg.get(java.lang.foreign.ValueLayout.JAVA_BYTE, i);
             }
             assertArrayEquals(stockBytes, offHeapBytes, "off-heap bytes match on-heap bytes");
 

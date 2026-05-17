@@ -29,23 +29,23 @@ import java.lang.foreign.ValueLayout;
 /**
  * SP6 — off-heap {@link DataOutputView} backed by a JDK 25 FFM {@link MemorySegment}.
  *
- * <p>Used on the V1 sync hot path: a {@code TypeSerializer.serialize(value, view)} call writes
- * its bytes <b>directly</b> into the off-heap region, with no intermediate {@code byte[]} on
- * the Java heap. The view is rewound via {@link #reset(MemorySegment, int)} per call; the
- * backing segment is owned by the caller (typically the per-state composite-key staging region
- * or the executor's write-buffer payload).
+ * <p>Used on the V1 sync hot path: a {@code TypeSerializer.serialize(value, view)} call writes its
+ * bytes <b>directly</b> into the off-heap region, with no intermediate {@code byte[]} on the Java
+ * heap. The view is rewound via {@link #reset(MemorySegment, int)} per call; the backing segment is
+ * owned by the caller (typically the per-state composite-key staging region or the executor's
+ * write-buffer payload).
  *
- * <p><b>Endianness.</b> All multi-byte writes are big-endian to match Flink's standard
- * {@code DataOutputSerializer} / {@code DataInputDeserializer} pair. This is the wire format
- * every Flink {@link org.apache.flink.api.common.typeutils.TypeSerializer} produces.
+ * <p><b>Endianness.</b> All multi-byte writes are big-endian to match Flink's standard {@code
+ * DataOutputSerializer} / {@code DataInputDeserializer} pair. This is the wire format every Flink
+ * {@link org.apache.flink.api.common.typeutils.TypeSerializer} produces.
  *
- * <p><b>Growth.</b> This view does NOT grow the segment; the caller is responsible for sizing.
- * If a write would exceed the segment, an {@link IOException} is thrown so the caller can
- * grow + retry. This matches the contract of {@code DataOutputSerializer} when its capacity
- * is exhausted, but with explicit ownership of the buffer.
+ * <p><b>Growth.</b> This view does NOT grow the segment; the caller is responsible for sizing. If a
+ * write would exceed the segment, an {@link IOException} is thrown so the caller can grow + retry.
+ * This matches the contract of {@code DataOutputSerializer} when its capacity is exhausted, but
+ * with explicit ownership of the buffer.
  *
- * <p><b>Pooling.</b> A new instance is cheap (one object + int field) but pools may reuse a
- * single instance across calls. Always call {@link #reset(MemorySegment, int)} before use.
+ * <p><b>Pooling.</b> A new instance is cheap (one object + int field) but pools may reuse a single
+ * instance across calls. Always call {@link #reset(MemorySegment, int)} before use.
  *
  * <p>Not thread-safe — same single-threaded-per-slot contract as the rest of the V1 sync path.
  */

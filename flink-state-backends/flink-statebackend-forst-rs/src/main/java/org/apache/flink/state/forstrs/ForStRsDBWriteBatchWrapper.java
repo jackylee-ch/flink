@@ -26,19 +26,17 @@ import org.apache.flink.state.forstrs.ffm.FrsDb;
 import java.lang.foreign.Arena;
 
 /**
- * Atomic write-batch wrapper — mirrors the surface of forst's {@code
- * ForStDBWriteBatchWrapper} on top of the vectorized FFI {@code frs_writebatch_*}
- * symbols (see {@code crates/forst-rs-ffi/src/lib.rs}).
+ * Atomic write-batch wrapper — mirrors the surface of forst's {@code ForStDBWriteBatchWrapper} on
+ * top of the vectorized FFI {@code frs_writebatch_*} symbols (see {@code
+ * crates/forst-rs-ffi/src/lib.rs}).
  *
- * <p>Two staging buffers (puts and deletes) accumulate keys + values until {@link
- * #flush} or {@link #commit} is called. {@link #flushIfFull} auto-flushes when
- * either staging buffer hits {@link #thresholdEntries} entries or
- * {@link #thresholdBytes} of accumulated bytes.
+ * <p>Two staging buffers (puts and deletes) accumulate keys + values until {@link #flush} or {@link
+ * #commit} is called. {@link #flushIfFull} auto-flushes when either staging buffer hits {@link
+ * #thresholdEntries} entries or {@link #thresholdBytes} of accumulated bytes.
  *
- * <p>{@code flush} dispatches the staged entries into the engine WriteBatch handle.
- * {@code commit} flushes once more then commits the engine WriteBatch atomically;
- * the handle is invalid after commit. {@code close} drops the handle and any
- * staged entries that were not flushed/committed.
+ * <p>{@code flush} dispatches the staged entries into the engine WriteBatch handle. {@code commit}
+ * flushes once more then commits the engine WriteBatch atomically; the handle is invalid after
+ * commit. {@code close} drops the handle and any staged entries that were not flushed/committed.
  *
  * <p>Thread-safety: not thread-safe. Mirrors forst's contract.
  */
@@ -68,13 +66,7 @@ public final class ForStRsDBWriteBatchWrapper implements AutoCloseable {
 
     public ForStRsDBWriteBatchWrapper(
             ForStRsLinker linker, FrsDb db, Arena arena, FrsCfHandle defaultCf) {
-        this(
-                linker,
-                db,
-                arena,
-                defaultCf,
-                DEFAULT_THRESHOLD_ENTRIES,
-                DEFAULT_THRESHOLD_BYTES);
+        this(linker, db, arena, defaultCf, DEFAULT_THRESHOLD_ENTRIES, DEFAULT_THRESHOLD_BYTES);
     }
 
     public ForStRsDBWriteBatchWrapper(
@@ -128,8 +120,8 @@ public final class ForStRsDBWriteBatchWrapper implements AutoCloseable {
     }
 
     /**
-     * Returns {@code true} if the staging buffers are empty. Useful for callers that want to skip
-     * a commit roundtrip when nothing was staged.
+     * Returns {@code true} if the staging buffers are empty. Useful for callers that want to skip a
+     * commit roundtrip when nothing was staged.
      */
     public boolean isEmpty() {
         return putKeys.count() == 0 && deleteKeys.count() == 0;

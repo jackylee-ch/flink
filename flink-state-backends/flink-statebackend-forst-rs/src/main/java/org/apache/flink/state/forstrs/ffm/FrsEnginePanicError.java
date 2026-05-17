@@ -20,8 +20,8 @@ package org.apache.flink.state.forstrs.ffm;
 
 /**
  * Fatal Forst-RS engine error — used for fail-process codes (PANIC_CAUGHT, UNKNOWN) per umbrella
- * spec §4. Subclasses {@link Error}, not RuntimeException, so it bypasses operator-level
- * try/catch and propagates straight to Flink's FatalErrorHandler.
+ * spec §4. Subclasses {@link Error}, not RuntimeException, so it bypasses operator-level try/catch
+ * and propagates straight to Flink's FatalErrorHandler.
  *
  * <p>When raised, the engine state in this process is suspect (catch_unwind doesn't guarantee Rust
  * internal invariants survive a panic). The TaskExecutor is restarted; Flink reschedules the
@@ -34,11 +34,7 @@ public final class FrsEnginePanicError extends Error {
     private final FrsErrorCode code;
 
     public FrsEnginePanicError(FrsErrorCode code, String detail) {
-        super(
-                "Forst-RS engine fatal: "
-                        + code
-                        + " — "
-                        + (detail == null ? "" : detail));
+        super("Forst-RS engine fatal: " + code + " — " + (detail == null ? "" : detail));
         this.code = code;
     }
 

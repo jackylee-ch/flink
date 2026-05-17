@@ -19,14 +19,12 @@
 package org.apache.flink.state.forstrs.ffm;
 
 /**
- * Thrown when the iterator watchdog (umbrella spec §1 §b) drops the
- * native iterator's snapshot before the consumer finished. Wraps
- * FrsErrorCode.ITER_EXPIRED.
+ * Thrown when the iterator watchdog (umbrella spec §1 §b) drops the native iterator's snapshot
+ * before the consumer finished. Wraps FrsErrorCode.ITER_EXPIRED.
  *
- * <p>Per spec §4 Severe-2, the dispatch layer does NOT auto-reopen the
- * iterator: a new iterator would see a different snapshot, and the
- * consumer has already advanced past observed rows. The operator must
- * fail and Flink restart re-issues the iterator on the next attempt.
+ * <p>Per spec §4 Severe-2, the dispatch layer does NOT auto-reopen the iterator: a new iterator
+ * would see a different snapshot, and the consumer has already advanced past observed rows. The
+ * operator must fail and Flink restart re-issues the iterator on the next attempt.
  */
 public class FrsIteratorExpiredException extends FrsException {
     public FrsIteratorExpiredException(int rowIndex) {

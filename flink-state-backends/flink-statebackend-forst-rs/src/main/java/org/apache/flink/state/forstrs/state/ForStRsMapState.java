@@ -23,7 +23,6 @@ import org.apache.flink.api.common.state.MapState;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
-import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
@@ -91,19 +90,19 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
      * SP6 Phase 6.3 — off-heap value staging.
      *
      * <p>The on-heap {@code Map<ByteArrayKey, byte[]>} writeCache used to allocate two byte[]s per
-     * put (one for the value payload returned by {@code DataOutputSerializer.getCopyOfBuffer()}
-     * and one for the composite key). On Nexmark Q3 with ~500K puts per slot the value-payload
-     * alloc was the dominant heap pressure source.
+     * put (one for the value payload returned by {@code DataOutputSerializer.getCopyOfBuffer()} and
+     * one for the composite key). On Nexmark Q3 with ~500K puts per slot the value-payload alloc
+     * was the dominant heap pressure source.
      *
-     * <p>The new path: per-put, the value is serialized DIRECTLY into a reusable off-heap
-     * {@code valueStaging} segment via {@link MemorySegmentDataOutputView}. The writeCache
-     * stores a tiny {@link OffHeapSlice} record (24 bytes total) holding the byte offset +
-     * length into the staging segment instead of the byte[] payload. Reads from the writeCache
-     * deserialize directly off-heap via {@link MemorySegmentDataInputView}.
+     * <p>The new path: per-put, the value is serialized DIRECTLY into a reusable off-heap {@code
+     * valueStaging} segment via {@link MemorySegmentDataOutputView}. The writeCache stores a tiny
+     * {@link OffHeapSlice} record (24 bytes total) holding the byte offset + length into the
+     * staging segment instead of the byte[] payload. Reads from the writeCache deserialize directly
+     * off-heap via {@link MemorySegmentDataInputView}.
      *
      * <p>The composite-key byte[] is still allocated (for {@link ByteArrayKey} HashMap lookup);
-     * eliminating it would require a primitive-keyed hashtable + off-heap-aware equals.
-     * Deferred to a follow-up cut.
+     * eliminating it would require a primitive-keyed hashtable + off-heap-aware equals. Deferred to
+     * a follow-up cut.
      */
     private final Map<ByteArrayKey, OffHeapSlice> writeCache = new HashMap<>();
 

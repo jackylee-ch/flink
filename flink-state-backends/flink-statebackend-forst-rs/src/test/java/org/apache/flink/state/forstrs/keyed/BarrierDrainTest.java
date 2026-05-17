@@ -23,8 +23,8 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Structural smoke-tests for the Trace E barrier drain registry in
- * {@link ForStRsAsyncKeyedStateBackend} (umbrella spec §3 Trace E).
+ * Structural smoke-tests for the Trace E barrier drain registry in {@link
+ * ForStRsAsyncKeyedStateBackend} (umbrella spec §3 Trace E).
  */
 class BarrierDrainTest {
 
@@ -40,6 +40,7 @@ class BarrierDrainTest {
             }
         }
         assertTrue(reducing, "ForStRsAsyncKeyedStateBackend.registerReducingState must exist");
-        assertTrue(aggregating, "ForStRsAsyncKeyedStateBackend.registerAggregatingState must exist");
+        assertTrue(
+                aggregating, "ForStRsAsyncKeyedStateBackend.registerAggregatingState must exist");
     }
 }

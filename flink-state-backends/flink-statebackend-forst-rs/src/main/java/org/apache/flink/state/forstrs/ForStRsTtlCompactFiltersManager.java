@@ -59,20 +59,12 @@ public final class ForStRsTtlCompactFiltersManager {
      * tear down a prior registration. {@code timestampOffset} is the byte offset of the embedded
      * timestamp in the serialized value (0 for value-state, list-element offset for list-state).
      */
-    public void setTtlForState(
-            String stateName,
-            long ttlMs,
-            int stateType,
-            long timestampOffset) {
+    public void setTtlForState(String stateName, long ttlMs, int stateType, long timestampOffset) {
         setTtlForState(stateName, defaultCf, ttlMs, stateType, timestampOffset);
     }
 
     public void setTtlForState(
-            String stateName,
-            FrsCfHandle cf,
-            long ttlMs,
-            int stateType,
-            long timestampOffset) {
+            String stateName, FrsCfHandle cf, long ttlMs, int stateType, long timestampOffset) {
         linker.setCompactionFilterTtl(db, cf, ttlMs, stateType, timestampOffset);
         registrations.put(stateName, new TtlRegistration(cf, ttlMs, stateType, timestampOffset));
     }
@@ -85,14 +77,11 @@ public final class ForStRsTtlCompactFiltersManager {
 
     /**
      * Maps a Flink {@link StateTtlConfig} onto the engine TTL surface. Update / visibility
-     * semantics are enforced at the Flink runtime layer; this manager only installs the
-     * background compaction filter that physically removes expired entries.
+     * semantics are enforced at the Flink runtime layer; this manager only installs the background
+     * compaction filter that physically removes expired entries.
      */
     public void register(
-            String stateName,
-            StateTtlConfig ttlConfig,
-            int stateType,
-            long timestampOffset) {
+            String stateName, StateTtlConfig ttlConfig, int stateType, long timestampOffset) {
         if (ttlConfig == null || !ttlConfig.isEnabled()) {
             return;
         }

@@ -23,6 +23,8 @@ import org.apache.flink.api.common.state.v2.MapStateDescriptor;
 import org.apache.flink.api.common.state.v2.State;
 import org.apache.flink.api.common.state.v2.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.metrics.MetricGroup;
+import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
@@ -36,13 +38,11 @@ import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
-import org.apache.flink.metrics.MetricGroup;
-import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
-import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.metrics.DispatchMetrics;
@@ -84,19 +84,20 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     /**
      * Registry of live ReducingState V2 instances (umbrella spec §3 Trace E).
      *
-     * <p>Each instance is registered on construction so that {@link #snapshot} can call
-     * {@code flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
+     * <p>Each instance is registered on construction so that {@link #snapshot} can call {@code
+     * flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
      */
     private final List<ForStRsReducingStateV2<?>> registeredReducingStates = new ArrayList<>();
 
     /**
      * Registry of live AggregatingState V2 instances (umbrella spec §3 Trace E).
      *
-     * <p>Each instance is registered on construction so that {@link #snapshot} can call
-     * {@code flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
+     * <p>Each instance is registered on construction so that {@link #snapshot} can call {@code
+     * flushOnBarrier()} to drain dirty RMW accumulators before the engine snapshot runs.
      */
     private final List<ForStRsAggregatingStateV2<?, ?, ?>> registeredAggregatingStates =
             new ArrayList<>();
+
     private SlotArenaScope slotArenaScope;
     private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
@@ -105,8 +106,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * Per-backend dispatch metrics (umbrella spec §1 §c, component 8).
      *
      * <p>Placeholder: initialized with {@link UnregisteredMetricsGroup} until the backend
-     * constructor is extended to accept a real {@link MetricGroup} from the Flink runtime.
-     * Phase P5 will inject MetricGroup via constructor once the backend is fully integrated.
+     * constructor is extended to accept a real {@link MetricGroup} from the Flink runtime. Phase P5
+     * will inject MetricGroup via constructor once the backend is fully integrated.
      */
     private final DispatchMetrics dispatchMetrics;
 
@@ -237,13 +238,13 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * </pre>
      *
      * <p>V1 best-effort: full async-state continuation awaiting (waiting for every in-flight GET
-     * and PUT future) requires deeper Flink async-state runtime integration, deferred to P11.
-     * The double-flush pattern is a conservative approximation that ensures any dirty cached
+     * and PUT future) requires deeper Flink async-state runtime integration, deferred to P11. The
+     * double-flush pattern is a conservative approximation that ensures any dirty cached
      * accumulators are serialized and submitted before the engine snapshot is taken.
      *
-     * <p>The underlying engine snapshot path is currently a placeholder (throws
-     * {@link UnsupportedOperationException}) — the drain logic is structural and will be
-     * activated when the engine snapshot integration lands in P11.
+     * <p>The underlying engine snapshot path is currently a placeholder (throws {@link
+     * UnsupportedOperationException}) — the drain logic is structural and will be activated when
+     * the engine snapshot integration lands in P11.
      */
     @Override
     public RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot(
@@ -276,7 +277,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
         // Engine snapshot: P11 will invoke the actual ForSt-RS engine checkpoint here.
         // For now, throw to signal the path is not yet connected.
-        throw new UnsupportedOperationException("snapshot TODO — engine snapshot integration in P11");
+        throw new UnsupportedOperationException(
+                "snapshot TODO — engine snapshot integration in P11");
     }
 
     @Override
@@ -330,8 +332,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     }
 
     /**
-     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after
-     * {@link #dispose()} so stale callers fail loudly.
+     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after {@link
+     * #dispose()} so stale callers fail loudly.
      */
     public SlotArenaScope slotArenaScope() {
         if (slotArenaScope == null) {

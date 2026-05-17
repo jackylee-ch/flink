@@ -19,21 +19,23 @@
 package org.apache.flink.state.forstrs.ffm;
 
 /**
- * Thrown at backend init when the loaded libforst_rs_ffi reports an ABI
- * version different from the Java side's compile-time EXPECTED_ABI_VERSION.
+ * Thrown at backend init when the loaded libforst_rs_ffi reports an ABI version different from the
+ * Java side's compile-time EXPECTED_ABI_VERSION.
  *
- * <p>Surfaces as a startup-time RuntimeException so the backend fails fast
- * before any state op runs. In production, this is fatal at the
- * TaskExecutor level via FatalErrorHandler (wired in P4).
+ * <p>Surfaces as a startup-time RuntimeException so the backend fails fast before any state op
+ * runs. In production, this is fatal at the TaskExecutor level via FatalErrorHandler (wired in P4).
  */
 public class FrsAbiMismatchException extends RuntimeException {
     private final int actualVersion;
     private final int expectedVersion;
 
     public FrsAbiMismatchException(int actual, int expected) {
-        super("Forst-RS native ABI mismatch: native lib reports version "
-            + actual + " but Java side expects version " + expected
-            + ". Verify libforst_rs_ffi matches the deployed Java jar.");
+        super(
+                "Forst-RS native ABI mismatch: native lib reports version "
+                        + actual
+                        + " but Java side expects version "
+                        + expected
+                        + ". Verify libforst_rs_ffi matches the deployed Java jar.");
         this.actualVersion = actual;
         this.expectedVersion = expected;
     }

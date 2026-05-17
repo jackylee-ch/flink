@@ -35,8 +35,8 @@ import java.util.concurrent.atomic.AtomicLong;
  * <p>Namespace:
  *
  * <ul>
- *   <li>{@code flink.state.forstrs.dispatch.<kind>.<stateName>.*} where {@code <kind>} ∈ {get,
- *       put, delete, append_merge, iter_prefix, iter_range}
+ *   <li>{@code flink.state.forstrs.dispatch.<kind>.<stateName>.*} where {@code <kind>} ∈ {get, put,
+ *       delete, append_merge, iter_prefix, iter_range}
  *   <li>{@code flink.state.forstrs.iter.*} for per-slot iterator stats
  * </ul>
  *
@@ -69,8 +69,7 @@ public final class DispatchMetrics {
         this.idleTimeouts = iterGroup.counter("idle_timeouts");
         this.maxLifetimeAborts = iterGroup.counter("max_lifetime_aborts");
         this.snapshotHeldMs =
-                iterGroup.histogram(
-                        "snapshot_held_ms", new DescriptiveStatisticsHistogram(500));
+                iterGroup.histogram("snapshot_held_ms", new DescriptiveStatisticsHistogram(500));
         iterGroup.gauge("handles_open", iterHandlesOpen::get);
     }
 
@@ -178,12 +177,7 @@ public final class DispatchMetrics {
             this.overflow = new PerState(kindGroup.addGroup("overflow"));
         }
 
-        void record(
-                String stateName,
-                long rows,
-                long bytesIn,
-                long latencyNs,
-                Counter capCounter) {
+        void record(String stateName, long rows, long bytesIn, long latencyNs, Counter capCounter) {
             PerState ps = perState.get(stateName);
             if (ps == null) {
                 if (perState.size() >= MAX_STATE_NAMES) {
@@ -191,8 +185,9 @@ public final class DispatchMetrics {
                     overflow.record(rows, bytesIn, latencyNs);
                     return;
                 }
-                ps = perState.computeIfAbsent(
-                        stateName, sn -> new PerState(kindGroup.addGroup(sn)));
+                ps =
+                        perState.computeIfAbsent(
+                                stateName, sn -> new PerState(kindGroup.addGroup(sn)));
             }
             ps.record(rows, bytesIn, latencyNs);
         }
@@ -205,8 +200,9 @@ public final class DispatchMetrics {
                     overflow.recordError(code);
                     return;
                 }
-                ps = perState.computeIfAbsent(
-                        stateName, sn -> new PerState(kindGroup.addGroup(sn)));
+                ps =
+                        perState.computeIfAbsent(
+                                stateName, sn -> new PerState(kindGroup.addGroup(sn)));
             }
             ps.recordError(code);
         }

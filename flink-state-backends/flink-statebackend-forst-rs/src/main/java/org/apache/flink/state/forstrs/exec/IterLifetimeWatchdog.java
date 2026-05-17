@@ -30,9 +30,9 @@ import java.util.concurrent.atomic.AtomicLong;
  * Per-backend scheduled task that enforces the V1 iterator lifetime bound (umbrella spec §1 §b):
  *
  * <ul>
- *   <li>{@link #DEFAULT_IDLE_TIMEOUT_MS} (30 000 ms) — handle has been idle since its last
- *       {@link FrsIterHandle#next} call. Catches leaks where the operator thread opened an iterator
- *       and abandoned it without closing (e.g. early return / exception path).
+ *   <li>{@link #DEFAULT_IDLE_TIMEOUT_MS} (30 000 ms) — handle has been idle since its last {@link
+ *       FrsIterHandle#next} call. Catches leaks where the operator thread opened an iterator and
+ *       abandoned it without closing (e.g. early return / exception path).
  *   <li>{@link #DEFAULT_MAX_LIFETIME_MS} (300 000 ms) — absolute ceiling from handle open time.
  *       Defense against tight-loop consumers that keep calling {@code next()} but block RocksDB
  *       compaction GC by holding a live snapshot indefinitely.
@@ -40,12 +40,12 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p><b>Threading contract.</b> On breach, the watchdog ONLY calls {@link
  * FrsIterHandle#requestClose()} on the handle; the operator thread observes the flag at the next
- * {@link FrsIterHandle#next} call and performs the actual native close. This keeps all FFI calls
- * on the operator thread (FFM {@link java.lang.foreign.Arena#ofShared()} is safe to close from any
+ * {@link FrsIterHandle#next} call and performs the actual native close. This keeps all FFI calls on
+ * the operator thread (FFM {@link java.lang.foreign.Arena#ofShared()} is safe to close from any
  * thread, but the engine's snapshot release is single-threaded per slot).
  *
- * <p>Sweep cadence: 50 ms. Aggressive enough to catch leaks within &lt;50 ms of the idle/max
- * breach without being CPU-heavy.
+ * <p>Sweep cadence: 50 ms. Aggressive enough to catch leaks within &lt;50 ms of the idle/max breach
+ * without being CPU-heavy.
  */
 public final class IterLifetimeWatchdog {
 
@@ -82,9 +82,9 @@ public final class IterLifetimeWatchdog {
     /**
      * Creates a watchdog with caller-supplied thresholds.
      *
-     * @param scope       the per-slot Arena scope whose iter registry is swept
-     * @param idleMs      idle timeout in milliseconds
-     * @param maxMs       absolute max lifetime in milliseconds
+     * @param scope the per-slot Arena scope whose iter registry is swept
+     * @param idleMs idle timeout in milliseconds
+     * @param maxMs absolute max lifetime in milliseconds
      */
     public IterLifetimeWatchdog(SlotArenaScope scope, long idleMs, long maxMs) {
         this.scope = scope;
@@ -93,18 +93,20 @@ public final class IterLifetimeWatchdog {
     }
 
     /**
-     * Starts the watchdog sweep thread. Idempotent — second and subsequent calls are no-ops if
-     * the watchdog is already running.
+     * Starts the watchdog sweep thread. Idempotent — second and subsequent calls are no-ops if the
+     * watchdog is already running.
      */
     public void start() {
         if (executor != null) {
             return; // already started
         }
-        executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "forst-rs-iter-watchdog");
-            t.setDaemon(true);
-            return t;
-        });
+        executor =
+                Executors.newSingleThreadScheduledExecutor(
+                        r -> {
+                            Thread t = new Thread(r, "forst-rs-iter-watchdog");
+                            t.setDaemon(true);
+                            return t;
+                        });
         executor.scheduleAtFixedRate(
                 this::sweep, SWEEP_PERIOD_MS, SWEEP_PERIOD_MS, TimeUnit.MILLISECONDS);
     }

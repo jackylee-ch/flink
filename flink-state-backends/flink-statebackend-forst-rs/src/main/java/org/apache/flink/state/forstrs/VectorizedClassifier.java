@@ -54,16 +54,15 @@ import java.util.concurrent.ConcurrentHashMap;
  * per logical state key. Within a batch the executor may reorder by op type freely (spec §
  * Correctness Invariants).
  *
- * <p><b>Extension (P2 Batch C):</b> {@link #submitVectorized(VectorizedStateRequest)} accepts
- * the sealed {@link VectorizedStateRequest} hierarchy directly (the off-heap, new-style path).
- * The three new kinds are routed to {@link AppendMergeBatchBuffer}, {@link IterPrefixBatchBuffer},
- * and {@link IterRangeBatchBuffer} respectively. The APPEND_MERGE-ListState-only guard (spec §1
- * §a) is enforced at submission time: callers must first register list-state names via
- * {@link #registerListState(String)}.
+ * <p><b>Extension (P2 Batch C):</b> {@link #submitVectorized(VectorizedStateRequest)} accepts the
+ * sealed {@link VectorizedStateRequest} hierarchy directly (the off-heap, new-style path). The
+ * three new kinds are routed to {@link AppendMergeBatchBuffer}, {@link IterPrefixBatchBuffer}, and
+ * {@link IterRangeBatchBuffer} respectively. The APPEND_MERGE-ListState-only guard (spec §1 §a) is
+ * enforced at submission time: callers must first register list-state names via {@link
+ * #registerListState(String)}.
  */
 @Internal
-public class VectorizedClassifier
-        implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
+public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
 
     private static final int INIT_SLOTS = 256;
 
@@ -74,28 +73,19 @@ public class VectorizedClassifier
 
     // -- New-style (VectorizedStateRequest / off-heap) batch buffers for P2 Batch C kinds --
 
-    /**
-     * Buffer for APPEND_MERGE requests (ListState-only, spec §1 §a).
-     * Wired to FFI in P6.
-     */
+    /** Buffer for APPEND_MERGE requests (ListState-only, spec §1 §a). Wired to FFI in P6. */
     private AppendMergeBatchBuffer appendMergeBuffer;
 
-    /**
-     * Buffer for ITER_PREFIX requests.
-     * Wired to FFI in P3.
-     */
+    /** Buffer for ITER_PREFIX requests. Wired to FFI in P3. */
     private IterPrefixBatchBuffer iterPrefixBuffer;
 
-    /**
-     * Buffer for ITER_RANGE requests.
-     * Wired to FFI in P9.
-     */
+    /** Buffer for ITER_RANGE requests. Wired to FFI in P9. */
     private IterRangeBatchBuffer iterRangeBuffer;
 
     /**
-     * Registry of state names that belong to a {@code ListState}.
-     * Used by the APPEND_MERGE guard (spec §1 §a).
-     * Thread-safe; populated once per state primitive registration, not on the hot path.
+     * Registry of state names that belong to a {@code ListState}. Used by the APPEND_MERGE guard
+     * (spec §1 §a). Thread-safe; populated once per state primitive registration, not on the hot
+     * path.
      */
     private final Set<String> listStateNames = ConcurrentHashMap.newKeySet();
 
@@ -129,9 +119,9 @@ public class VectorizedClassifier
     }
 
     /**
-     * Initialises the three new-kind buffers (APPEND_MERGE, ITER_PREFIX, ITER_RANGE).
-     * Must be called before {@link #submitVectorized(VectorizedStateRequest)} is used.
-     * Idempotent — safe to call multiple times with the same arena.
+     * Initialises the three new-kind buffers (APPEND_MERGE, ITER_PREFIX, ITER_RANGE). Must be
+     * called before {@link #submitVectorized(VectorizedStateRequest)} is used. Idempotent — safe to
+     * call multiple times with the same arena.
      */
     public void initNewKindBuffers(Arena arena) {
         if (appendMergeBuffer == null) {
@@ -176,13 +166,12 @@ public class VectorizedClassifier
      * the existing {@link #offer(StateRequest)} Flink-runtime path; both may be used in the same
      * batch.
      *
-     * <p><b>Spec §1 §a guard:</b> APPEND_MERGE is ListState-only. If the request's
-     * {@link VectorizedStateRequest#stateName()} is not registered via
-     * {@link #registerListState(String)}, an {@link IllegalArgumentException} is thrown at
-     * classification time.
+     * <p><b>Spec §1 §a guard:</b> APPEND_MERGE is ListState-only. If the request's {@link
+     * VectorizedStateRequest#stateName()} is not registered via {@link #registerListState(String)},
+     * an {@link IllegalArgumentException} is thrown at classification time.
      *
-     * @throws IllegalStateException if the new-kind buffers have not been initialised via
-     *     {@link #initNewKindBuffers(Arena)}
+     * @throws IllegalStateException if the new-kind buffers have not been initialised via {@link
+     *     #initNewKindBuffers(Arena)}
      * @throws IllegalArgumentException if an APPEND_MERGE request targets a non-list state
      */
     public void submitVectorized(VectorizedStateRequest req) {
@@ -228,25 +217,23 @@ public class VectorizedClassifier
     // -----------------------------------------------------------------
 
     /**
-     * Registers {@code stateName} as belonging to a {@code ListState}.
-     * After registration, APPEND_MERGE requests for this name are accepted.
-     * Call once when the ListState primitive is created.
+     * Registers {@code stateName} as belonging to a {@code ListState}. After registration,
+     * APPEND_MERGE requests for this name are accepted. Call once when the ListState primitive is
+     * created.
      */
     public void registerListState(String stateName) {
         listStateNames.add(stateName);
     }
 
     /**
-     * Removes {@code stateName} from the list-state registry.
-     * Call when the ListState primitive is closed/destroyed.
+     * Removes {@code stateName} from the list-state registry. Call when the ListState primitive is
+     * closed/destroyed.
      */
     public void unregisterListState(String stateName) {
         listStateNames.remove(stateName);
     }
 
-    /**
-     * Returns {@code true} if {@code stateName} is registered as a ListState.
-     */
+    /** Returns {@code true} if {@code stateName} is registered as a ListState. */
     public boolean isListStateName(String stateName) {
         return listStateNames.contains(stateName);
     }

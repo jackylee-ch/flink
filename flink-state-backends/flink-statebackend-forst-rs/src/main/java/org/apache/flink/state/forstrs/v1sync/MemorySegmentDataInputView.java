@@ -29,10 +29,10 @@ import java.lang.foreign.ValueLayout;
 /**
  * SP6 — off-heap {@link DataInputView} backed by a JDK 25 FFM {@link MemorySegment}.
  *
- * <p>Used on the V1 sync read path: state.get() fills an off-heap result buffer via
- * {@code frs_get_into_buf}, then {@link #rewind(MemorySegment, int, int)} points this view at
- * the populated region and {@code TypeSerializer.deserialize(view)} reads bytes directly off-heap.
- * No intermediate {@code byte[]} on the Java heap.
+ * <p>Used on the V1 sync read path: state.get() fills an off-heap result buffer via {@code
+ * frs_get_into_buf}, then {@link #rewind(MemorySegment, int, int)} points this view at the
+ * populated region and {@code TypeSerializer.deserialize(view)} reads bytes directly off-heap. No
+ * intermediate {@code byte[]} on the Java heap.
  *
  * <p>Endianness matches Flink's {@code DataInputDeserializer} (big-endian for multi-byte reads).
  * UTF reads use the same modified-UTF-8 format as {@code java.io.DataInputStream.readUTF}.
@@ -65,8 +65,7 @@ public final class MemorySegmentDataInputView implements DataInputView {
 
     private byte readByteUnsafe() throws EOFException {
         if (position >= limit) {
-            throw new EOFException(
-                    "MemorySegmentDataInputView underflow at position " + position);
+            throw new EOFException("MemorySegmentDataInputView underflow at position " + position);
         }
         return segment.get(ValueLayout.JAVA_BYTE, position++);
     }

@@ -33,8 +33,8 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 /**
- * V2 ListState primitive backed by {@code APPEND_MERGE} for additive operations and {@code GET}
- * for reads. Per umbrella spec §1 §a, §2 component 11, §3 Trace B.
+ * V2 ListState primitive backed by {@code APPEND_MERGE} for additive operations and {@code GET} for
+ * reads. Per umbrella spec §1 §a, §2 component 11, §3 Trace B.
  *
  * <p>This is a <em>standalone</em> class (V1 scope-down) that demonstrates the APPEND_MERGE
  * dispatch proof-of-concept without wiring into the full Flink async-state execution framework.
@@ -42,11 +42,11 @@ import java.util.concurrent.CompletableFuture;
  *
  * <h3>Storage encoding per operand</h3>
  *
- * <p>Each merge operand submitted to the engine has the form
- * {@code [count: i32 BE][elem_0_bytes]...[elem_{count-1}_bytes]}, mirroring the format used by
- * {@link ForStRsListState}. The engine's merge operator concatenates operand byte streams. The
- * {@link #get(byte[])} decoder re-parses the concatenated stream by reading successive
- * {@code (count, elem*)} tuples.
+ * <p>Each merge operand submitted to the engine has the form {@code [count: i32
+ * BE][elem_0_bytes]...[elem_{count-1}_bytes]}, mirroring the format used by {@link
+ * ForStRsListState}. The engine's merge operator concatenates operand byte streams. The {@link
+ * #get(byte[])} decoder re-parses the concatenated stream by reading successive {@code (count,
+ * elem*)} tuples.
  *
  * <h3>APPEND_MERGE semantics (spec §1 §a)</h3>
  *
@@ -71,14 +71,14 @@ public class ForStRsListStateV2<V> {
     /**
      * Creates a new {@code ForStRsListStateV2}.
      *
-     * <p>The {@code classifier} must have been initialised for new-kind buffers via
-     * {@link VectorizedClassifier#initNewKindBuffers} before the first {@link #add} /
-     * {@link #addAll} call. This constructor registers {@code stateName} in the classifier's
-     * list-state registry so APPEND_MERGE for this name is accepted.
+     * <p>The {@code classifier} must have been initialised for new-kind buffers via {@link
+     * VectorizedClassifier#initNewKindBuffers} before the first {@link #add} / {@link #addAll}
+     * call. This constructor registers {@code stateName} in the classifier's list-state registry so
+     * APPEND_MERGE for this name is accepted.
      *
-     * @param stateName      logical state name; must be unique within the enclosing operator
+     * @param stateName logical state name; must be unique within the enclosing operator
      * @param elementSerializer serializer for individual list elements
-     * @param classifier     the classifier that this state submits APPEND_MERGE requests to
+     * @param classifier the classifier that this state submits APPEND_MERGE requests to
      */
     public ForStRsListStateV2(
             String stateName,
@@ -98,12 +98,12 @@ public class ForStRsListStateV2<V> {
     /**
      * Appends a single element to the list for {@code compositeKey}.
      *
-     * <p>Encodes the element as a one-element operand {@code [count=1][elem_bytes]} and submits
-     * an {@link AppendMergeRequest} to the classifier. The future completes when the batch
-     * containing this request is dispatched.
+     * <p>Encodes the element as a one-element operand {@code [count=1][elem_bytes]} and submits an
+     * {@link AppendMergeRequest} to the classifier. The future completes when the batch containing
+     * this request is dispatched.
      *
-     * @param compositeKey   pre-encoded storage key (e.g. {@code "k/" + K + "/" + stateName + "/"})
-     * @param value          element to append; must not be null
+     * @param compositeKey pre-encoded storage key (e.g. {@code "k/" + K + "/" + stateName + "/"})
+     * @param value element to append; must not be null
      * @return future that completes when the merge has been applied
      * @throws NullPointerException if {@code value} is null
      */
@@ -114,8 +114,8 @@ public class ForStRsListStateV2<V> {
         }
         MemorySegment keySlice = MemorySegment.ofArray(compositeKey);
         MemorySegment vSlice = encodeOneElement(value);
-        AppendMergeRequest req = new AppendMergeRequest(
-                stateName, keySlice, new MemorySegment[]{vSlice});
+        AppendMergeRequest req =
+                new AppendMergeRequest(stateName, keySlice, new MemorySegment[] {vSlice});
         classifier.submitVectorized(req);
         return req.future();
     }
@@ -124,13 +124,13 @@ public class ForStRsListStateV2<V> {
      * Appends multiple elements to the list for {@code compositeKey} in a single merge run.
      *
      * <p>All N elements are packed into one {@link AppendMergeRequest} as N value slices (each
-     * slice is one {@code [count=1][elem_bytes]} operand). This means the FFI call sees N
-     * operands at once, which is more efficient than N separate {@link #add} calls.
+     * slice is one {@code [count=1][elem_bytes]} operand). This means the FFI call sees N operands
+     * at once, which is more efficient than N separate {@link #add} calls.
      *
      * <p>An empty {@code values} list is a no-op (returns a completed future).
      *
-     * @param compositeKey   pre-encoded storage key
-     * @param values         elements to append; must not be null and must not contain null elements
+     * @param compositeKey pre-encoded storage key
+     * @param values elements to append; must not be null and must not contain null elements
      * @return future that completes when the merge has been applied
      * @throws NullPointerException if {@code values} or any element is null
      */
@@ -163,9 +163,9 @@ public class ForStRsListStateV2<V> {
     /**
      * Decodes a merged byte array (from a GET result) into a {@code List<V>}.
      *
-     * <p>The merged value is a concatenation of one or more operands, each of the form
-     * {@code [count: i32 BE][elem_0_bytes]...[elem_{count-1}_bytes]}. This decoder reads
-     * successive {@code (count, elem*)} tuples until the buffer is exhausted.
+     * <p>The merged value is a concatenation of one or more operands, each of the form {@code
+     * [count: i32 BE][elem_0_bytes]...[elem_{count-1}_bytes]}. This decoder reads successive {@code
+     * (count, elem*)} tuples until the buffer is exhausted.
      *
      * @param raw merged bytes returned by the engine; may be null or empty
      * @return decoded list; never null (returns an empty list for null/empty input)
@@ -194,8 +194,8 @@ public class ForStRsListStateV2<V> {
     }
 
     /**
-     * Encodes a list for a full-replacement PUT (used by {@code update()} semantics: DELETE
-     * old value, then PUT this encoded value, or issue as a PUT directly).
+     * Encodes a list for a full-replacement PUT (used by {@code update()} semantics: DELETE old
+     * value, then PUT this encoded value, or issue as a PUT directly).
      *
      * <p>Encoded as {@code [count: i32 BE][elem_0_bytes]...[elem_{count-1}_bytes]} (a single
      * operand that replaces the existing merged value when stored via PUT rather than merge).
@@ -224,8 +224,8 @@ public class ForStRsListStateV2<V> {
     }
 
     /**
-     * Unregisters this state's name from the classifier's list-state registry.
-     * Call when the state primitive is closed/destroyed.
+     * Unregisters this state's name from the classifier's list-state registry. Call when the state
+     * primitive is closed/destroyed.
      */
     public void close() {
         classifier.unregisterListState(stateName);
@@ -236,10 +236,9 @@ public class ForStRsListStateV2<V> {
     // -----------------------------------------------------------------
 
     /**
-     * Encodes a single element as a one-element operand:
-     * {@code [count=1: i32 BE][elem_bytes]}.
-     * Returns a heap {@link MemorySegment} whose bytes are copied into native scratch
-     * memory during {@link org.apache.flink.state.forstrs.VectorizedExecutor#dispatchAppendMerge}.
+     * Encodes a single element as a one-element operand: {@code [count=1: i32 BE][elem_bytes]}.
+     * Returns a heap {@link MemorySegment} whose bytes are copied into native scratch memory during
+     * {@link org.apache.flink.state.forstrs.VectorizedExecutor#dispatchAppendMerge}.
      */
     private MemorySegment encodeOneElement(V value) {
         DataOutputSerializer out = new DataOutputSerializer(64);

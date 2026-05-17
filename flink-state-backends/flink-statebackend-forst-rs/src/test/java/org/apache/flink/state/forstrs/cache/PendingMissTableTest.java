@@ -20,8 +20,8 @@ package org.apache.flink.state.forstrs.cache;
 
 import org.junit.jupiter.api.Test;
 
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -32,8 +32,15 @@ class PendingMissTableTest {
     void firstMissCreatesEntry() {
         PendingMissTable<Integer, Integer> table = new PendingMissTable<>();
         AtomicInteger getsIssued = new AtomicInteger();
-        Object key = new byte[]{1, 2, 3};
-        table.beginOrJoin("rstate", key, 10, () -> { getsIssued.incrementAndGet(); return null; });
+        Object key = new byte[] {1, 2, 3};
+        table.beginOrJoin(
+                "rstate",
+                key,
+                10,
+                () -> {
+                    getsIssued.incrementAndGet();
+                    return null;
+                });
         assertEquals(1, getsIssued.get(), "first miss must issue one GET");
         assertEquals(1, table.activeMissCount());
     }
@@ -42,10 +49,31 @@ class PendingMissTableTest {
     void subsequentMissesOnSameKeyJoinConvoy() {
         PendingMissTable<Integer, Integer> table = new PendingMissTable<>();
         AtomicInteger getsIssued = new AtomicInteger();
-        Object key = new byte[]{1, 2, 3};
-        table.beginOrJoin("rstate", key, 10, () -> { getsIssued.incrementAndGet(); return null; });
-        table.beginOrJoin("rstate", key, 20, () -> { getsIssued.incrementAndGet(); return null; });
-        table.beginOrJoin("rstate", key, 30, () -> { getsIssued.incrementAndGet(); return null; });
+        Object key = new byte[] {1, 2, 3};
+        table.beginOrJoin(
+                "rstate",
+                key,
+                10,
+                () -> {
+                    getsIssued.incrementAndGet();
+                    return null;
+                });
+        table.beginOrJoin(
+                "rstate",
+                key,
+                20,
+                () -> {
+                    getsIssued.incrementAndGet();
+                    return null;
+                });
+        table.beginOrJoin(
+                "rstate",
+                key,
+                30,
+                () -> {
+                    getsIssued.incrementAndGet();
+                    return null;
+                });
         assertEquals(1, getsIssued.get(), "ALL three calls must coalesce into one GET");
         assertEquals(1, table.activeMissCount());
         assertEquals(3, table.pendingInputsCount("rstate", key));
@@ -54,15 +82,15 @@ class PendingMissTableTest {
     @Test
     void resolveFoldsInOrder() {
         PendingMissTable<Integer, Integer> table = new PendingMissTable<>();
-        Object key = new byte[]{1, 2, 3};
+        Object key = new byte[] {1, 2, 3};
         CopyOnWriteArrayList<Integer> acks = new CopyOnWriteArrayList<>();
         table.beginOrJoin("rstate", key, 10, () -> null);
         table.beginOrJoin("rstate", key, 20, () -> null);
         table.beginOrJoin("rstate", key, 30, () -> null);
         // Simulate engine returning null (key didn't exist before this convoy)
-        Integer finalAcc = table.resolve("rstate", key, null,
-                (acc, in) -> acc == null ? in : acc + in,
-                acks::add);
+        Integer finalAcc =
+                table.resolve(
+                        "rstate", key, null, (acc, in) -> acc == null ? in : acc + in, acks::add);
         assertEquals(Integer.valueOf(60), finalAcc);
         assertEquals(3, acks.size());
         // All acks should carry the final accumulator value (60)
@@ -74,13 +102,18 @@ class PendingMissTableTest {
     @Test
     void combinerThrowFailsConvoy() {
         PendingMissTable<Integer, Integer> table = new PendingMissTable<>();
-        Object key = new byte[]{9, 9};
+        Object key = new byte[] {9, 9};
         CopyOnWriteArrayList<Throwable> failures = new CopyOnWriteArrayList<>();
         table.beginOrJoin("rstate", key, 1, () -> null);
         table.beginOrJoin("rstate", key, 2, () -> null);
         table.beginOrJoin("rstate", key, 3, () -> null);
-        table.resolveWithFailureHandler("rstate", key, null,
-                (acc, in) -> { throw new RuntimeException("bad combiner"); },
+        table.resolveWithFailureHandler(
+                "rstate",
+                key,
+                null,
+                (acc, in) -> {
+                    throw new RuntimeException("bad combiner");
+                },
                 ack -> {},
                 failures::add);
         // All three callers must be notified of the failure

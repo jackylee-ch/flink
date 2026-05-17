@@ -29,9 +29,9 @@ import org.apache.flink.configuration.MemorySize;
  * {@code frs_db_open_with_options}.
  *
  * <p>Production runtime tuning is fed in via {@link ForStRsConfigurableOptionsFactory#applyTo}
- * which translates each {@link ConfigOption} into the corresponding {@code FrsEngineOptions}
- * field. Knobs that the engine does not yet honour are documented as "advisory" — they're parsed
- * but ignored.
+ * which translates each {@link ConfigOption} into the corresponding {@code FrsEngineOptions} field.
+ * Knobs that the engine does not yet honour are documented as "advisory" — they're parsed but
+ * ignored.
  */
 @Internal
 public final class ForStRsConfigurableOptions {

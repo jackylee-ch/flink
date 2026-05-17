@@ -19,11 +19,12 @@
 package org.apache.flink.state.forstrs.ffm;
 
 import org.junit.jupiter.api.Test;
+
 import java.lang.foreign.Arena;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class FrsAbiVerifyTest {
 
@@ -39,9 +40,8 @@ class FrsAbiVerifyTest {
     @Test
     void verifyAbiThrowsOnMismatch() {
         // Simulate mismatch via a supplier that returns a wrong version
-        FrsAbiMismatchException ex = assertThrows(
-            FrsAbiMismatchException.class,
-            () -> FrsAbi.verifyAgainst(() -> 999));
+        FrsAbiMismatchException ex =
+                assertThrows(FrsAbiMismatchException.class, () -> FrsAbi.verifyAgainst(() -> 999));
         assertEquals(999, ex.getActualVersion());
         assertEquals(FrsAbi.EXPECTED_ABI_VERSION, ex.getExpectedVersion());
     }

@@ -25,8 +25,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 /**
  * Unit tests for {@link IterLifetimeWatchdog}.
  *
- * <p>Real behavioral tests (handle idle-detection, max-lifetime breach) land in P5 when handles
- * can be opened against a real engine. Here we verify:
+ * <p>Real behavioral tests (handle idle-detection, max-lifetime breach) land in P5 when handles can
+ * be opened against a real engine. Here we verify:
  *
  * <ul>
  *   <li>Watchdog is constructible, startable, and stoppable.
@@ -43,7 +43,8 @@ class IterLifetimeWatchdogTest {
         wd.start();
         Thread.sleep(100); // let one sweep run
         assertEquals(0, wd.idleTimeoutsCount(), "no handles — no idle timeouts expected");
-        assertEquals(0, wd.maxLifetimeAbortsCount(), "no handles — no max-lifetime aborts expected");
+        assertEquals(
+                0, wd.maxLifetimeAbortsCount(), "no handles — no max-lifetime aborts expected");
         wd.stop();
         scope.closeSlot();
     }

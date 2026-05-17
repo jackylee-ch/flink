@@ -22,8 +22,8 @@ import java.util.ArrayDeque;
 import java.util.Deque;
 
 /**
- * Per-(stateName, key) convoy of in-flight RMW inputs awaiting a single GET resolution.
- * Umbrella spec §15 (PendingMiss component).
+ * Per-(stateName, key) convoy of in-flight RMW inputs awaiting a single GET resolution. Umbrella
+ * spec §15 (PendingMiss component).
  *
  * <p>Package-private — only accessed via {@link PendingMissTable}.
  *

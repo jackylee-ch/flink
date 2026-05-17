@@ -37,7 +37,8 @@ public final class DeleteRequest implements VectorizedStateRequest {
 
     /**
      * @param stateName state name for classifier grouping and per-state metrics
-     * @param keySlice off-heap key slice; valid for the duration of the owning {@link SlotArenaScope}
+     * @param keySlice off-heap key slice; valid for the duration of the owning {@link
+     *     SlotArenaScope}
      */
     public DeleteRequest(String stateName, MemorySegment keySlice) {
         this.stateName = stateName;

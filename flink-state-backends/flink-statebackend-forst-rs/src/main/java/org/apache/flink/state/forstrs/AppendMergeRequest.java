@@ -30,8 +30,8 @@ import java.util.concurrent.CompletableFuture;
  * GET+combine+PUT via the RMW cache (P7), not append-merge. Violating callers will receive an
  * {@link IllegalArgumentException} at classification time.
  *
- * <p>Carries N operand slices ({@link #valueSlices()}) that are appended as a single merge run
- * into the engine's merge operator for the target key.
+ * <p>Carries N operand slices ({@link #valueSlices()}) that are appended as a single merge run into
+ * the engine's merge operator for the target key.
  */
 public final class AppendMergeRequest implements VectorizedStateRequest {
 
@@ -42,7 +42,8 @@ public final class AppendMergeRequest implements VectorizedStateRequest {
 
     /**
      * @param stateName state name for classifier grouping and per-state metrics
-     * @param keySlice off-heap key slice; valid for the duration of the owning {@link SlotArenaScope}
+     * @param keySlice off-heap key slice; valid for the duration of the owning {@link
+     *     SlotArenaScope}
      * @param valueSlices N operand slices to append as a single merge run; each slice is one list
      *     element serialized to bytes
      */

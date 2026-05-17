@@ -39,8 +39,7 @@ public class ForStRsStateExecutor implements StateExecutor {
     private final FrsCfHandle cf;
     private final Arena arena;
 
-    public ForStRsStateExecutor(
-            ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
+    public ForStRsStateExecutor(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         this.linker = linker;
         this.db = db;
         this.cf = cf;

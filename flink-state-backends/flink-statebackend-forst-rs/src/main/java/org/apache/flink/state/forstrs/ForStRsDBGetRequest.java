@@ -21,6 +21,7 @@ package org.apache.flink.state.forstrs;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -29,8 +30,8 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>Implements {@link VectorizedStateRequest} as Kind.GET. The {@link #future()} method returns
  * {@code null} because completion is handled via Flink's internal {@code InternalAsyncFuture}
- * (pre-{@link VectorizedStateRequest} completion path). Use {@link #complete(byte[])} instead.
- * The {@link #stateName()} method returns {@code "unknown"} as a V1 transition placeholder; callers
+ * (pre-{@link VectorizedStateRequest} completion path). Use {@link #complete(byte[])} instead. The
+ * {@link #stateName()} method returns {@code "unknown"} as a V1 transition placeholder; callers
  * that need accurate per-state attribution should call {@link #setStateName(String)} after
  * construction.
  */

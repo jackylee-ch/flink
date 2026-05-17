@@ -23,9 +23,9 @@ import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.ReadableConfig;
 
 /**
- * Resolved memory configuration for a forst-rs backend instance — mirrors forst's
- * {@code ForStMemoryConfiguration}. Captures the WriteBufferManager budget and the block-cache
- * capacity as they will be passed to the engine's {@code frs_db_open_with_options}.
+ * Resolved memory configuration for a forst-rs backend instance — mirrors forst's {@code
+ * ForStMemoryConfiguration}. Captures the WriteBufferManager budget and the block-cache capacity as
+ * they will be passed to the engine's {@code frs_db_open_with_options}.
  *
  * <p>Constructed by {@link #fromConfig(ReadableConfig)} via {@link ForStRsConfigurableOptions}.
  */

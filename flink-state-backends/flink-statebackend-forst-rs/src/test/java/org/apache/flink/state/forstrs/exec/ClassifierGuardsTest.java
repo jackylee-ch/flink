@@ -33,9 +33,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Verifies the classifier enforces spec §1 §a: APPEND_MERGE is ListState-only.
- * Reducing/Aggregating state must use the RMW cache path (GET + combine + PUT),
- * not append-merge.
+ * Verifies the classifier enforces spec §1 §a: APPEND_MERGE is ListState-only. Reducing/Aggregating
+ * state must use the RMW cache path (GET + combine + PUT), not append-merge.
  */
 class ClassifierGuardsTest {
 
@@ -45,22 +44,25 @@ class ClassifierGuardsTest {
             MemorySegment k = arena.allocate(16, 8);
             MemorySegment v = arena.allocate(32, 8);
             // Build a request — should not throw at construction
-            AppendMergeRequest req = new AppendMergeRequest(
-                "myListState", k, new MemorySegment[]{v});
+            AppendMergeRequest req =
+                    new AppendMergeRequest("myListState", k, new MemorySegment[] {v});
             assertEquals(VectorizedStateRequest.Kind.APPEND_MERGE, req.kind());
 
             // Build a classifier, register the list-state name, and verify submission succeeds.
-            VectorizedClassifier classifier = new VectorizedClassifier(
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena));
+            VectorizedClassifier classifier =
+                    new VectorizedClassifier(
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena));
             classifier.initNewKindBuffers(arena);
             classifier.registerListState("myListState");
 
             // Submission must not throw.
             classifier.submitVectorized(req);
-            assertEquals(1, classifier.appendMergeBuffer().count(),
+            assertEquals(
+                    1,
+                    classifier.appendMergeBuffer().count(),
                     "AppendMerge buffer should have one entry after submit");
         }
     }
@@ -69,22 +71,25 @@ class ClassifierGuardsTest {
     void appendMergeRejectedForNonListStateName() {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment k = arena.allocate(16, 8);
-            AppendMergeRequest req = new AppendMergeRequest(
-                "reducingState", k, new MemorySegment[0]);
+            AppendMergeRequest req =
+                    new AppendMergeRequest("reducingState", k, new MemorySegment[0]);
 
-            VectorizedClassifier classifier = new VectorizedClassifier(
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena));
+            VectorizedClassifier classifier =
+                    new VectorizedClassifier(
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena));
             classifier.initNewKindBuffers(arena);
             // "reducingState" is NOT registered as a list state — guard must fire.
 
-            IllegalArgumentException ex = assertThrows(
-                    IllegalArgumentException.class,
-                    () -> classifier.submitVectorized(req),
-                    "Classifier must reject APPEND_MERGE for non-list state names");
-            assertTrue(ex.getMessage().contains("ListState-only"),
+            IllegalArgumentException ex =
+                    assertThrows(
+                            IllegalArgumentException.class,
+                            () -> classifier.submitVectorized(req),
+                            "Classifier must reject APPEND_MERGE for non-list state names");
+            assertTrue(
+                    ex.getMessage().contains("ListState-only"),
                     "Exception message must mention ListState-only restriction");
         }
     }
@@ -96,31 +101,35 @@ class ClassifierGuardsTest {
         // stateName, and that the classifier's registry lookup honours it correctly.
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment k = arena.allocate(16, 8);
-            AppendMergeRequest req = new AppendMergeRequest(
-                "auctionsByCategory", k, new MemorySegment[0]);
+            AppendMergeRequest req =
+                    new AppendMergeRequest("auctionsByCategory", k, new MemorySegment[0]);
             assertEquals("auctionsByCategory", req.stateName());
 
             // Registry-based approach: isListStateName returns false before registration,
             // true after.
-            VectorizedClassifier classifier = new VectorizedClassifier(
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena),
-                    new ColumnarBatchBuffer(arena));
+            VectorizedClassifier classifier =
+                    new VectorizedClassifier(
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena));
             classifier.initNewKindBuffers(arena);
 
             // Before registration: not a list state.
-            assertTrue(!classifier.isListStateName("auctionsByCategory"),
+            assertTrue(
+                    !classifier.isListStateName("auctionsByCategory"),
                     "Unregistered name must not be recognised as list state");
 
             // After registration: is a list state.
             classifier.registerListState("auctionsByCategory");
-            assertTrue(classifier.isListStateName("auctionsByCategory"),
+            assertTrue(
+                    classifier.isListStateName("auctionsByCategory"),
                     "Registered name must be recognised as list state");
 
             // After unregistration: no longer a list state.
             classifier.unregisterListState("auctionsByCategory");
-            assertTrue(!classifier.isListStateName("auctionsByCategory"),
+            assertTrue(
+                    !classifier.isListStateName("auctionsByCategory"),
                     "Unregistered name must not be recognised as list state after removal");
         }
     }

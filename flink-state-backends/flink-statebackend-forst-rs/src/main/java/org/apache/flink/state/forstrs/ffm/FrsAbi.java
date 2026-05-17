@@ -19,14 +19,13 @@
 package org.apache.flink.state.forstrs.ffm;
 
 /**
- * V1 ABI version contract. EXPECTED_ABI_VERSION is checked at backend
- * init against the value returned by frs_abi_version() in the loaded
- * native lib. Mismatch indicates rolling-deploy version skew — Java jar
- * and libforst_rs_ffi.{dylib,so} are out of step.
+ * V1 ABI version contract. EXPECTED_ABI_VERSION is checked at backend init against the value
+ * returned by frs_abi_version() in the loaded native lib. Mismatch indicates rolling-deploy version
+ * skew — Java jar and libforst_rs_ffi.{dylib,so} are out of step.
  *
- * <p>Bump EXPECTED_ABI_VERSION whenever any FFI layout changes (struct
- * field add/remove, enum variant add/remove, function signature change).
- * The Rust side maintains FRS_ABI_VERSION in lockstep.
+ * <p>Bump EXPECTED_ABI_VERSION whenever any FFI layout changes (struct field add/remove, enum
+ * variant add/remove, function signature change). The Rust side maintains FRS_ABI_VERSION in
+ * lockstep.
  */
 public final class FrsAbi {
     public static final int EXPECTED_ABI_VERSION = 1;

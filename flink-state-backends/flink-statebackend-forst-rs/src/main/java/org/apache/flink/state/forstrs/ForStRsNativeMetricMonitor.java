@@ -26,14 +26,14 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 /**
- * Registers engine-native metric gauges on a Flink {@link MetricGroup} — mirror of forst's
- * {@code ForStNativeMetricMonitor}. Each gauge is a thin Java callback that calls into the
- * already-bound FFI symbols at scrape time, so registering the monitor has near-zero steady-state
- * cost when no scraper is connected.
+ * Registers engine-native metric gauges on a Flink {@link MetricGroup} — mirror of forst's {@code
+ * ForStNativeMetricMonitor}. Each gauge is a thin Java callback that calls into the already-bound
+ * FFI symbols at scrape time, so registering the monitor has near-zero steady-state cost when no
+ * scraper is connected.
  *
  * <p>Toggled per-metric via {@link ForStRsNativeMetricOptions}. The metric group lives for the
- * lifetime of the backend; gauges hold weak references to the linker + db so they don't keep
- * the engine alive past disposal.
+ * lifetime of the backend; gauges hold weak references to the linker + db so they don't keep the
+ * engine alive past disposal.
  */
 @Internal
 public final class ForStRsNativeMetricMonitor {
@@ -54,8 +54,7 @@ public final class ForStRsNativeMetricMonitor {
         }
         if (cfg.get(ForStRsNativeMetricOptions.MONITOR_WBM_CURRENT_BYTES)) {
             group.gauge(
-                    "write-buffer-manager.current-bytes",
-                    (Gauge<Long>) this::pollWbmCurrentBytes);
+                    "write-buffer-manager.current-bytes", (Gauge<Long>) this::pollWbmCurrentBytes);
         }
         // MONITOR_L0_FILE_COUNT is parsed but not yet wired — frs_l0_file_count exists on the
         // FFI side but the Java linker doesn't bind it. Follow-up: add `linker.l0FileCount(db)`

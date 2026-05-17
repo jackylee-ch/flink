@@ -65,15 +65,15 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         return Kind.ITER_PREFIX;
     }
 
-    /** V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called. */
+    /**
+     * V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called.
+     */
     @Override
     public String stateName() {
         return stateName;
     }
 
-    /**
-     * Sets the state name for classifier grouping and per-state metrics.
-     */
+    /** Sets the state name for classifier grouping and per-state metrics. */
     public void setStateName(String stateName) {
         this.stateName = stateName;
     }

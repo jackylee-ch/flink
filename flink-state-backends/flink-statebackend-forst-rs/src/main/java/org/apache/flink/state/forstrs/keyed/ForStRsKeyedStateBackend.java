@@ -26,8 +26,8 @@ import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
-import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
@@ -613,8 +613,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
-     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after
-     * {@link #close()} or {@link #dispose()} so stale callers fail loudly.
+     * Returns the per-slot Arena scope. Throws {@link IllegalStateException} if called after {@link
+     * #close()} or {@link #dispose()} so stale callers fail loudly.
      */
     public SlotArenaScope slotArenaScope() {
         if (slotArenaScope == null) {

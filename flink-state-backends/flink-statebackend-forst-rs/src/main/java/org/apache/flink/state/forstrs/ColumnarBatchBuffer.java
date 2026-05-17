@@ -96,8 +96,8 @@ public final class ColumnarBatchBuffer {
 
     /**
      * Appends the contents of a {@link DataOutputSerializer}'s shared backing buffer. Avoids the
-     * intermediate {@code getCopyOfBuffer()} byte[] allocation that the legacy
-     * {@code serializeKey} → {@code byte[]} path incurs.
+     * intermediate {@code getCopyOfBuffer()} byte[] allocation that the legacy {@code serializeKey}
+     * → {@code byte[]} path incurs.
      */
     public int append(DataOutputSerializer ser) {
         return append(ser.getSharedBuffer(), 0, ser.length());

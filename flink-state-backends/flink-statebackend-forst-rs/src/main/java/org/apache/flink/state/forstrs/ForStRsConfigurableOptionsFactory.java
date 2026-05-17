@@ -23,13 +23,13 @@ import org.apache.flink.configuration.MemorySize;
 import org.apache.flink.configuration.ReadableConfig;
 
 /**
- * Default {@link ForStRsOptionsFactory} that reads each engine knob from the supplied Flink
- * {@link ReadableConfig} using the {@link ForStRsConfigurableOptions} keys. Mirrors forst's
- * {@code DefaultConfigurableOptionsFactory}.
+ * Default {@link ForStRsOptionsFactory} that reads each engine knob from the supplied Flink {@link
+ * ReadableConfig} using the {@link ForStRsConfigurableOptions} keys. Mirrors forst's {@code
+ * DefaultConfigurableOptionsFactory}.
  *
  * <p>Honoured today: {@code writeBufferSize}, {@code maxWriteBufferNumber}, {@code
- * writeBufferManagerCapacity}, {@code blockCacheCapacity}, {@code maxBackgroundCompactions},
- * {@code maxBackgroundFlushes}. Advisory: target-file-size, level-size-multiplier, block-size.
+ * writeBufferManagerCapacity}, {@code blockCacheCapacity}, {@code maxBackgroundCompactions}, {@code
+ * maxBackgroundFlushes}. Advisory: target-file-size, level-size-multiplier, block-size.
  */
 @PublicEvolving
 public final class ForStRsConfigurableOptionsFactory implements ForStRsOptionsFactory {
@@ -43,8 +43,7 @@ public final class ForStRsConfigurableOptionsFactory implements ForStRsOptionsFa
     }
 
     @Override
-    public ForStRsEngineOptionsBuilder createForStRsOptions(
-            ForStRsEngineOptionsBuilder defaults) {
+    public ForStRsEngineOptionsBuilder createForStRsOptions(ForStRsEngineOptionsBuilder defaults) {
         defaults.writeBufferSize =
                 config.get(ForStRsConfigurableOptions.WRITE_BUFFER_SIZE).getBytes();
         defaults.maxWriteBufferNumber =

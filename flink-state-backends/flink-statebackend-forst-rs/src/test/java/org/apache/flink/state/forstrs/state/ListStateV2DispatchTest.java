@@ -27,15 +27,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * P6-B structural tests for {@link ForStRsListStateV2}.
  *
  * <p>Verifies that the class exists in the expected package and exposes the required APPEND_MERGE
- * methods. Full end-to-end integration tests against a running ForSt-RS engine are deferred to
- * P11 (integration test suite).
+ * methods. Full end-to-end integration tests against a running ForSt-RS engine are deferred to P11
+ * (integration test suite).
  */
 class ListStateV2DispatchTest {
 
     @Test
     void listStateV2ClassExists() {
-        assertNotNull(ForStRsListStateV2.class,
-                "ForStRsListStateV2 must exist in the state package");
+        assertNotNull(
+                ForStRsListStateV2.class, "ForStRsListStateV2 must exist in the state package");
     }
 
     @Test

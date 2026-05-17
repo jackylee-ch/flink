@@ -39,14 +39,13 @@ class MapStateV2DispatchTest {
 
     @Test
     void mapStateV2ClassExists() {
-        assertNotNull(ForStRsMapStateV2.class,
-                "ForStRsMapStateV2 must exist in the state package");
+        assertNotNull(ForStRsMapStateV2.class, "ForStRsMapStateV2 must exist in the state package");
     }
 
     @Test
     void valueStateV2ClassExists() {
-        assertNotNull(ForStRsValueStateV2.class,
-                "ForStRsValueStateV2 must exist in the state package");
+        assertNotNull(
+                ForStRsValueStateV2.class, "ForStRsValueStateV2 must exist in the state package");
     }
 
     @Test
@@ -60,7 +59,8 @@ class MapStateV2DispatchTest {
         }
         // ForStRsIterableState.getIterPrefix must be implemented — it is used by
         // VectorizedClassifier.buildIterRequest() to construct ForStRsDBIterRequest.
-        assertTrue(found,
+        assertTrue(
+                found,
                 "ForStRsMapStateV2 must implement getIterPrefix() from ForStRsIterableState");
     }
 
@@ -73,7 +73,8 @@ class MapStateV2DispatchTest {
                 break;
             }
         }
-        assertTrue(found,
+        assertTrue(
+                found,
                 "ForStRsMapStateV2 must implement deserializeUserKey() from ForStRsIterableState");
     }
 
@@ -86,7 +87,8 @@ class MapStateV2DispatchTest {
                 break;
             }
         }
-        assertTrue(found,
+        assertTrue(
+                found,
                 "ForStRsMapStateV2 must implement serializeKeyInto() from ForStRsInnerTable "
                         + "(off-heap vectorized path)");
     }
@@ -100,34 +102,39 @@ class MapStateV2DispatchTest {
                 break;
             }
         }
-        assertTrue(found,
+        assertTrue(
+                found,
                 "ForStRsValueStateV2 must implement serializeKeyInto() (SP6 off-heap staging)");
     }
 
     @Test
     void vectorizedExecutorHasSetSlotScopeMethod() throws Exception {
         // Verify the setter added in P5 is present — required for ITER_PREFIX dispatch.
-        Method m = VectorizedExecutor.class.getMethod("setSlotScope",
-                org.apache.flink.state.forstrs.exec.SlotArenaScope.class);
+        Method m =
+                VectorizedExecutor.class.getMethod(
+                        "setSlotScope", org.apache.flink.state.forstrs.exec.SlotArenaScope.class);
         assertNotNull(m, "VectorizedExecutor must expose setSlotScope(SlotArenaScope)");
     }
 
     @Test
     void vectorizedExecutorHasDispatchIterPrefixMethod() throws Exception {
         // Verify the real (non-stub) dispatchIterPrefix signature is present.
-        Method m = VectorizedExecutor.class.getDeclaredMethod(
-                "dispatchIterPrefix",
-                org.apache.flink.state.forstrs.IterPrefixBatchBuffer.class);
-        assertNotNull(m, "VectorizedExecutor must declare dispatchIterPrefix(IterPrefixBatchBuffer)");
+        Method m =
+                VectorizedExecutor.class.getDeclaredMethod(
+                        "dispatchIterPrefix",
+                        org.apache.flink.state.forstrs.IterPrefixBatchBuffer.class);
+        assertNotNull(
+                m, "VectorizedExecutor must declare dispatchIterPrefix(IterPrefixBatchBuffer)");
     }
 
     @Test
     void iterPrefixRequestCarriesIterFirstChunk() {
         // Structural check: IterFirstChunk record must carry handle + firstChunkRows.
-        IterPrefixRequest req = new IterPrefixRequest(
-                "testState",
-                java.lang.foreign.MemorySegment.NULL,
-                java.lang.foreign.MemorySegment.NULL);
+        IterPrefixRequest req =
+                new IterPrefixRequest(
+                        "testState",
+                        java.lang.foreign.MemorySegment.NULL,
+                        java.lang.foreign.MemorySegment.NULL);
         assertNotNull(req.future(), "IterPrefixRequest must expose a CompletableFuture");
         // Verify IterFirstChunk record fields exist via reflection.
         boolean handleField = false;

@@ -24,10 +24,10 @@ import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.ReadableConfig;
 
 /**
- * Toggles for the engine's native-metric monitor — mirror of forst's
- * {@code ForStNativeMetricOptions}. Each flag turns one Flink-side gauge on or off. They default
- * to {@code true} for the cheap-to-read counters and {@code false} for any future counter that
- * would require a per-scrape FFI roundtrip.
+ * Toggles for the engine's native-metric monitor — mirror of forst's {@code
+ * ForStNativeMetricOptions}. Each flag turns one Flink-side gauge on or off. They default to {@code
+ * true} for the cheap-to-read counters and {@code false} for any future counter that would require
+ * a per-scrape FFI roundtrip.
  */
 @PublicEvolving
 public final class ForStRsNativeMetricOptions {

@@ -29,9 +29,9 @@ import java.util.concurrent.CompletableFuture;
  * Batch buffer for ITER_PREFIX requests.
  *
  * <p>Accumulates {@link IterPrefixRequest} entries. Each entry carries a prefix-bytes slice and a
- * caller-owned chunk-output buffer. Batch dispatch of prefix iterators is deferred to P3
- * ({@code frs_vec_iter_prefix_open} FFI). Until then, the executor reads entries sequentially from
- * this buffer and throws {@link UnsupportedOperationException}.
+ * caller-owned chunk-output buffer. Batch dispatch of prefix iterators is deferred to P3 ({@code
+ * frs_vec_iter_prefix_open} FFI). Until then, the executor reads entries sequentially from this
+ * buffer and throws {@link UnsupportedOperationException}.
  *
  * <p>Column layout: prefix slices are stored as raw {@link MemorySegment} references (not copied)
  * because they remain valid for the duration of the owning {@link

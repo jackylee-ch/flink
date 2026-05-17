@@ -23,8 +23,8 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 /**
- * Runtime view over the engine's shared memory resources — mirror of forst's
- * {@code ForStSharedResources}. Exposes the WriteBufferManager capacity and current usage so the
+ * Runtime view over the engine's shared memory resources — mirror of forst's {@code
+ * ForStSharedResources}. Exposes the WriteBufferManager capacity and current usage so the
  * native-metric monitor (and any operator-level back-pressure logic) can poll without a fresh FFI
  * binding at every callsite.
  *

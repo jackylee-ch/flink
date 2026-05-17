@@ -40,11 +40,11 @@ class ReducingAggregatingCacheTest {
     @Test
     void hitAndMissSemantics() {
         List<byte[]> flushedKeys = new ArrayList<>();
-        ReducingAggregatingCache<Integer, Integer> cache = new ReducingAggregatingCache<>(
-                (acc, in) -> acc == null ? in : acc + in,
-                (k, v) -> flushedKeys.add(k));
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(
+                        (acc, in) -> acc == null ? in : acc + in, (k, v) -> flushedKeys.add(k));
 
-        byte[] key = new byte[]{1, 2, 3};
+        byte[] key = new byte[] {1, 2, 3};
 
         // Initial state: miss
         assertFalse(cache.contains(key));
@@ -67,12 +67,16 @@ class ReducingAggregatingCacheTest {
     void flushAllDirtyCallsCallback() {
         List<byte[]> flushedKeys = new ArrayList<>();
         List<Integer> flushedVals = new ArrayList<>();
-        ReducingAggregatingCache<Integer, Integer> cache = new ReducingAggregatingCache<>(
-                Integer::sum,
-                (k, v) -> { flushedKeys.add(k); flushedVals.add(v); });
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(
+                        Integer::sum,
+                        (k, v) -> {
+                            flushedKeys.add(k);
+                            flushedVals.add(v);
+                        });
 
-        byte[] k1 = new byte[]{1};
-        byte[] k2 = new byte[]{2};
+        byte[] k1 = new byte[] {1};
+        byte[] k2 = new byte[] {2};
         cache.put(k1, 100);
         cache.put(k2, 200);
 
@@ -89,27 +93,24 @@ class ReducingAggregatingCacheTest {
     void lruEvictionFlushesEldestDirtyEntry() {
         List<byte[]> evicted = new ArrayList<>();
         // Very small capacity: 2 entries max
-        ReducingAggregatingCache<Integer, Integer> cache = new ReducingAggregatingCache<>(
-                Integer::sum,
-                (k, v) -> evicted.add(k),
-                2);
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(Integer::sum, (k, v) -> evicted.add(k), 2);
 
-        cache.put(new byte[]{1}, 1);
-        cache.put(new byte[]{2}, 2);
+        cache.put(new byte[] {1}, 1);
+        cache.put(new byte[] {2}, 2);
         // Adding a third entry evicts the eldest (key {1})
-        cache.put(new byte[]{3}, 3);
+        cache.put(new byte[] {3}, 3);
 
         // Eviction should have triggered the flush callback for key {1}
         assertEquals(1, evicted.size());
-        assertArrayEquals(new byte[]{1}, evicted.get(0));
+        assertArrayEquals(new byte[] {1}, evicted.get(0));
     }
 
     @Test
     void clearDropsEntries() {
-        ReducingAggregatingCache<Integer, Integer> cache = new ReducingAggregatingCache<>(
-                Integer::sum,
-                (k, v) -> {});
-        cache.put(new byte[]{1}, 42);
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(Integer::sum, (k, v) -> {});
+        cache.put(new byte[] {1}, 42);
         assertEquals(1, cache.size());
         cache.clear();
         assertEquals(0, cache.size());

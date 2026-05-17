@@ -19,8 +19,8 @@
 package org.apache.flink.state.forstrs.ffm;
 
 /**
- * Java-side mirror of Rust's FrsErrorCode (in libforst_rs_ffi).
- * Numeric values MUST match the Rust enum exactly — see spec §4.
+ * Java-side mirror of Rust's FrsErrorCode (in libforst_rs_ffi). Numeric values MUST match the Rust
+ * enum exactly — see spec §4.
  */
 public enum FrsErrorCode {
     OK(0),

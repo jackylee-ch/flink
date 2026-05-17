@@ -31,8 +31,8 @@ import java.io.IOException;
 import java.util.Optional;
 
 /**
- * V2 ReducingState using cache-mediated read-modify-write (umbrella spec §2 component 12 +
- * §3 Trace C).
+ * V2 ReducingState using cache-mediated read-modify-write (umbrella spec §2 component 12 + §3 Trace
+ * C).
  *
  * <h3>RMW protocol</h3>
  *
@@ -73,12 +73,12 @@ public class ForStRsReducingStateV2<T> {
     /**
      * Creates a new {@code ForStRsReducingStateV2}.
      *
-     * @param stateName       logical state name; must be unique within the operator
+     * @param stateName logical state name; must be unique within the operator
      * @param valueSerializer serializer for T; used for value serialization on flush
-     * @param reduceFn        the user-provided ReduceFunction; must be thread-safe (it's only
-     *                        called on the operator thread in V1)
-     * @param classifier      the dispatch classifier (receives PUT requests on flush)
-     * @param slotScope       the slot Arena scope (reserved for P11 off-heap value staging)
+     * @param reduceFn the user-provided ReduceFunction; must be thread-safe (it's only called on
+     *     the operator thread in V1)
+     * @param classifier the dispatch classifier (receives PUT requests on flush)
+     * @param slotScope the slot Arena scope (reserved for P11 off-heap value staging)
      */
     public ForStRsReducingStateV2(
             String stateName,
@@ -92,16 +92,17 @@ public class ForStRsReducingStateV2<T> {
         this.classifier = classifier;
         this.slotScope = slotScope;
         this.pendingMisses = new PendingMissTable<>();
-        this.cache = new ReducingAggregatingCache<>(
-                (acc, in) -> {
-                    try {
-                        return reduceFn.reduce(acc, in);
-                    } catch (Exception e) {
-                        throw new RuntimeException(
-                                "ForStRsReducingStateV2: ReduceFunction threw", e);
-                    }
-                },
-                (keyBytes, acc) -> flushEntry(keyBytes, acc));
+        this.cache =
+                new ReducingAggregatingCache<>(
+                        (acc, in) -> {
+                            try {
+                                return reduceFn.reduce(acc, in);
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "ForStRsReducingStateV2: ReduceFunction threw", e);
+                            }
+                        },
+                        (keyBytes, acc) -> flushEntry(keyBytes, acc));
     }
 
     // -----------------------------------------------------------------
@@ -111,13 +112,13 @@ public class ForStRsReducingStateV2<T> {
     /**
      * Adds {@code value} to the current accumulator for {@code compositeKey}.
      *
-     * <p>Cache hit: folds in-place on the operator thread — zero engine I/O.
-     * Cache miss: enqueues a GET request (first miss) or joins the existing convoy (subsequent
-     * misses on same key while GET is in flight).
+     * <p>Cache hit: folds in-place on the operator thread — zero engine I/O. Cache miss: enqueues a
+     * GET request (first miss) or joins the existing convoy (subsequent misses on same key while
+     * GET is in flight).
      *
-     * @param compositeKey pre-encoded storage key (caller must generate composite key, e.g.
-     *                     {@code "k/" + K + "/" + stateName + "/"})
-     * @param value        the value to add; ignored if null
+     * @param compositeKey pre-encoded storage key (caller must generate composite key, e.g. {@code
+     *     "k/" + K + "/" + stateName + "/"})
+     * @param value the value to add; ignored if null
      */
     public void add(byte[] compositeKey, T value) {
         if (value == null) {
@@ -128,19 +129,24 @@ public class ForStRsReducingStateV2<T> {
             return;
         }
         // Cache miss — enqueue or join convoy
-        pendingMisses.beginOrJoin(stateName, compositeKey, value, () -> {
-            // V1 structural placeholder: real GET submission wired in P11.
-            // In the full implementation this calls classifier.submitGetForRmw(compositeKey)
-            // which resolves via pendingMisses.resolve() in the GET completion callback.
-            return null;
-        });
+        pendingMisses.beginOrJoin(
+                stateName,
+                compositeKey,
+                value,
+                () -> {
+                    // V1 structural placeholder: real GET submission wired in P11.
+                    // In the full implementation this calls
+                    // classifier.submitGetForRmw(compositeKey)
+                    // which resolves via pendingMisses.resolve() in the GET completion callback.
+                    return null;
+                });
     }
 
     /**
      * Returns the current accumulator for {@code compositeKey}, or {@code null} on miss.
      *
-     * <p>V1: only cache-resident entries are returned. Engine GET wiring for non-cached entries
-     * is deferred to P11.
+     * <p>V1: only cache-resident entries are returned. Engine GET wiring for non-cached entries is
+     * deferred to P11.
      *
      * @param compositeKey pre-encoded storage key
      */
@@ -149,8 +155,8 @@ public class ForStRsReducingStateV2<T> {
     }
 
     /**
-     * Clears the state for {@code compositeKey}. Inserts a null tombstone in the cache (dirty,
-     * will be flushed as a DELETE on the next barrier).
+     * Clears the state for {@code compositeKey}. Inserts a null tombstone in the cache (dirty, will
+     * be flushed as a DELETE on the next barrier).
      *
      * <p>V1: engine DELETE submission is deferred to P11.
      *
@@ -162,9 +168,9 @@ public class ForStRsReducingStateV2<T> {
     }
 
     /**
-     * Flushes all dirty cache entries via the classifier (§3 Trace E barrier path).
-     * Entries are serialized and submitted as PUT requests. Entries with a null accumulator
-     * are submitted as DELETE requests (representing cleared state).
+     * Flushes all dirty cache entries via the classifier (§3 Trace E barrier path). Entries are
+     * serialized and submitted as PUT requests. Entries with a null accumulator are submitted as
+     * DELETE requests (representing cleared state).
      *
      * <p>Called by the checkpoint barrier handler before snapshotting.
      */
@@ -186,14 +192,14 @@ public class ForStRsReducingStateV2<T> {
     // -----------------------------------------------------------------
 
     /**
-     * Invoked by the cache flush callback on LRU eviction or {@link #flushOnBarrier()}.
-     * Serializes the accumulator and submits a PUT to the classifier.
+     * Invoked by the cache flush callback on LRU eviction or {@link #flushOnBarrier()}. Serializes
+     * the accumulator and submits a PUT to the classifier.
      *
      * <p>V1 simplification: uses heap-based DataOutputSerializer; off-heap staging via
      * SlotArenaScope is wired in P11 once the full GET/PUT round-trip is integrated.
      *
      * @param keyBytes composite key bytes
-     * @param acc      accumulator to flush (null means DELETE)
+     * @param acc accumulator to flush (null means DELETE)
      */
     private void flushEntry(byte[] keyBytes, T acc) {
         if (acc == null) {

@@ -223,9 +223,10 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
     // ------------------------------------------------------------------
 
     /**
-     * Micro-bench (NOT a regression test — measurement only). Adds elementCount timers into a single
-     * key-group then drains them via {@code poll()}. Prints throughput so SP3's poll-ahead cache
-     * gain can be compared against a baseline build (stash the cache changes, rerun this test).
+     * Micro-bench (NOT a regression test — measurement only). Adds elementCount timers into a
+     * single key-group then drains them via {@code poll()}. Prints throughput so SP3's poll-ahead
+     * cache gain can be compared against a baseline build (stash the cache changes, rerun this
+     * test).
      */
     @Test
     void pollThroughputMicrobench() {

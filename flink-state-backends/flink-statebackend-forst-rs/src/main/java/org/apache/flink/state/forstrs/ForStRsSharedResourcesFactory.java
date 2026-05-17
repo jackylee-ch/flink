@@ -24,13 +24,13 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 /**
- * Factory for {@link ForStRsSharedResources} — mirrors forst's
- * {@code ForStSharedResourcesFactory}. Resolves the memory configuration from a Flink config and
- * binds it to a freshly-opened engine handle.
+ * Factory for {@link ForStRsSharedResources} — mirrors forst's {@code ForStSharedResourcesFactory}.
+ * Resolves the memory configuration from a Flink config and binds it to a freshly-opened engine
+ * handle.
  *
- * <p>In a future cycle this factory will become the place where per-TaskSlot sharing is
- * implemented (one shared block-cache + WBM across multiple keyed backends in the same slot).
- * Today each backend gets its own engine + its own shared-resources view.
+ * <p>In a future cycle this factory will become the place where per-TaskSlot sharing is implemented
+ * (one shared block-cache + WBM across multiple keyed backends in the same slot). Today each
+ * backend gets its own engine + its own shared-resources view.
  */
 @Internal
 public final class ForStRsSharedResourcesFactory {

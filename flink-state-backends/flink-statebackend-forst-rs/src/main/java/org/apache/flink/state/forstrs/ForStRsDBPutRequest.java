@@ -20,6 +20,7 @@ package org.apache.flink.state.forstrs;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
+
 import java.util.concurrent.CompletableFuture;
 
 /**
@@ -27,8 +28,8 @@ import java.util.concurrent.CompletableFuture;
  * bytes and a reference to the original StateRequest.
  *
  * <p>Implements {@link VectorizedStateRequest} as Kind.PUT. The {@link #future()} method returns
- * {@code null} because completion is handled via Flink's internal {@code InternalAsyncFuture}.
- * Use {@link #complete()} instead.
+ * {@code null} because completion is handled via Flink's internal {@code InternalAsyncFuture}. Use
+ * {@link #complete()} instead.
  */
 @Internal
 public non-sealed class ForStRsDBPutRequest<K, N, V> implements VectorizedStateRequest {
@@ -61,15 +62,15 @@ public non-sealed class ForStRsDBPutRequest<K, N, V> implements VectorizedStateR
         return Kind.PUT;
     }
 
-    /** V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called. */
+    /**
+     * V1 transition placeholder — returns {@code "unknown"} unless {@link #setStateName} called.
+     */
     @Override
     public String stateName() {
         return stateName;
     }
 
-    /**
-     * Sets the state name for classifier grouping and per-state metrics.
-     */
+    /** Sets the state name for classifier grouping and per-state metrics. */
     public void setStateName(String stateName) {
         this.stateName = stateName;
     }

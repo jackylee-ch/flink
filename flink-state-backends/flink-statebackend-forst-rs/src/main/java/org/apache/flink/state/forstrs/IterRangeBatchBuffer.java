@@ -29,9 +29,9 @@ import java.util.concurrent.CompletableFuture;
  * Batch buffer for ITER_RANGE requests.
  *
  * <p>Accumulates {@link IterRangeRequest} entries. Each entry carries lo/hi bound slices plus a
- * caller-owned chunk-output buffer. Batch dispatch of range iterators is deferred to P9
- * ({@code frs_vec_iter_range_open} FFI). Until then, the executor reads entries sequentially from
- * this buffer and throws {@link UnsupportedOperationException}.
+ * caller-owned chunk-output buffer. Batch dispatch of range iterators is deferred to P9 ({@code
+ * frs_vec_iter_range_open} FFI). Until then, the executor reads entries sequentially from this
+ * buffer and throws {@link UnsupportedOperationException}.
  *
  * <p>Column layout: lo/hi slices are stored as raw {@link MemorySegment} references (not copied)
  * because they remain valid for the duration of the owning {@link

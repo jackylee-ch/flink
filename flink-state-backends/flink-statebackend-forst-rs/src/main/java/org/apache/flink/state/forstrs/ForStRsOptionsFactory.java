@@ -22,16 +22,16 @@ import org.apache.flink.annotation.PublicEvolving;
 
 /**
  * User-pluggable factory for customising the engine-options struct that the {@link
- * ForStRsStateBackend} passes to {@code frs_db_open_with_options}. Mirrors forst's
- * {@code ForStOptionsFactory}.
+ * ForStRsStateBackend} passes to {@code frs_db_open_with_options}. Mirrors forst's {@code
+ * ForStOptionsFactory}.
  *
  * <p>Implementations can override individual fields on the supplied {@link
- * ForStRsEngineOptionsBuilder}; the framework supplies defaults derived from the Flink
- * {@code Configuration} and from {@link ForStRsConfigurableOptions}, so a factory typically only
- * touches the knobs it wants to override.
+ * ForStRsEngineOptionsBuilder}; the framework supplies defaults derived from the Flink {@code
+ * Configuration} and from {@link ForStRsConfigurableOptions}, so a factory typically only touches
+ * the knobs it wants to override.
  *
- * <p>For most users {@link ForStRsConfigurableOptionsFactory} (auto-wired by the backend from
- * the Flink {@code Configuration}) is sufficient and no custom factory is needed.
+ * <p>For most users {@link ForStRsConfigurableOptionsFactory} (auto-wired by the backend from the
+ * Flink {@code Configuration}) is sufficient and no custom factory is needed.
  */
 @PublicEvolving
 @FunctionalInterface

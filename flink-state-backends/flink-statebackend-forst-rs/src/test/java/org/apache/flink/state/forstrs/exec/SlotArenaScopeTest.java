@@ -78,8 +78,8 @@ class SlotArenaScopeTest {
         scope.exitTurn();
 
         scope.enterTurn();
-        assertEquals(0, scope.overflowArenaCountForCurrentTurn(),
-            "exit must close overflow arenas");
+        assertEquals(
+                0, scope.overflowArenaCountForCurrentTurn(), "exit must close overflow arenas");
         scope.exitTurn();
     }
 
@@ -97,8 +97,8 @@ class SlotArenaScopeTest {
     void allocateTurnRespectsAlignment() {
         scope.enterTurn();
         // First alloc may be at offset 0 (already 64-aligned); force misalignment
-        MemorySegment a = scope.allocateTurn(7, 64);  // 7B unaligned tail
-        MemorySegment b = scope.allocateTurn(8, 8);   // next should align to 8
+        MemorySegment a = scope.allocateTurn(7, 64); // 7B unaligned tail
+        MemorySegment b = scope.allocateTurn(8, 8); // next should align to 8
         assertEquals(0L, b.address() & 7L, "8-byte aligned");
         scope.exitTurn();
     }
@@ -108,7 +108,7 @@ class SlotArenaScopeTest {
         scope.closeSlot();
         // Second close must not throw
         scope.closeSlot();
-        scope = null;  // suppress @AfterEach
+        scope = null; // suppress @AfterEach
     }
 
     @Test

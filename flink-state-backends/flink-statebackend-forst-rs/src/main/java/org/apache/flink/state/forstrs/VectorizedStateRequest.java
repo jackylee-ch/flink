@@ -32,9 +32,9 @@ import java.util.concurrent.CompletableFuture;
  * to reside in the same package when the unnamed module is in use (no {@code module-info.java}).
  * The three pre-existing concrete classes ({@link ForStRsDBGetRequest}, {@link
  * ForStRsDBPutRequest}, {@link ForStRsDBIterRequest}) are in {@code
- * org.apache.flink.state.forstrs}, so this interface lives here too. The four new subtypes
- * ({@link DeleteRequest}, {@link AppendMergeRequest}, {@link IterPrefixRequest}, {@link
- * IterRangeRequest}) are also placed in this package for the same reason.
+ * org.apache.flink.state.forstrs}, so this interface lives here too. The four new subtypes ({@link
+ * DeleteRequest}, {@link AppendMergeRequest}, {@link IterPrefixRequest}, {@link IterRangeRequest})
+ * are also placed in this package for the same reason.
  *
  * <p>The three pre-existing concrete classes were introduced before this interface and complete
  * their futures via Flink's {@code InternalAsyncFuture} rather than a {@code CompletableFuture}.
@@ -42,8 +42,8 @@ import java.util.concurrent.CompletableFuture;
  * Flink-internal completion path". The four new subtypes are pure off-heap types that expose a real
  * {@code CompletableFuture}.
  *
- * <p>V1.x will introduce classifier-internal sub-kinds (GET_SAME_KEY / GET_CROSS_KEY,
- * POINT_DELETE / PREFIX_DELETE) without breaking this Java-facing API.
+ * <p>V1.x will introduce classifier-internal sub-kinds (GET_SAME_KEY / GET_CROSS_KEY, POINT_DELETE
+ * / PREFIX_DELETE) without breaking this Java-facing API.
  */
 public sealed interface VectorizedStateRequest
         permits ForStRsDBGetRequest,

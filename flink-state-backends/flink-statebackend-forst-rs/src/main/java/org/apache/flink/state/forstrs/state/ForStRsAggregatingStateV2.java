@@ -31,8 +31,8 @@ import java.io.IOException;
 import java.util.Optional;
 
 /**
- * V2 AggregatingState using cache-mediated read-modify-write (umbrella spec §2 component 13 +
- * §3 Trace C).
+ * V2 AggregatingState using cache-mediated read-modify-write (umbrella spec §2 component 13 + §3
+ * Trace C).
  *
  * <h3>RMW protocol</h3>
  *
@@ -68,7 +68,7 @@ import java.util.Optional;
  * running engine. The {@link #add(byte[], Object)} and {@link #flushOnBarrier()} contracts are
  * fully implemented at the cache level.
  *
- * @param <IN>  the input type
+ * @param <IN> the input type
  * @param <ACC> the accumulator type
  * @param <OUT> the output type returned by {@link #get(byte[])}
  */
@@ -86,12 +86,12 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
     /**
      * Creates a new {@code ForStRsAggregatingStateV2}.
      *
-     * @param stateName       logical state name; must be unique within the operator
-     * @param accSerializer   serializer for ACC; used for value serialization on flush
-     * @param aggFn           the user-provided AggregateFunction; must be thread-safe (it's only
-     *                        called on the operator thread in V1)
-     * @param classifier      the dispatch classifier (receives PUT requests on flush)
-     * @param slotScope       the slot Arena scope (reserved for P11 off-heap value staging)
+     * @param stateName logical state name; must be unique within the operator
+     * @param accSerializer serializer for ACC; used for value serialization on flush
+     * @param aggFn the user-provided AggregateFunction; must be thread-safe (it's only called on
+     *     the operator thread in V1)
+     * @param classifier the dispatch classifier (receives PUT requests on flush)
+     * @param slotScope the slot Arena scope (reserved for P11 off-heap value staging)
      */
     public ForStRsAggregatingStateV2(
             String stateName,
@@ -107,9 +107,10 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
         this.pendingMisses = new PendingMissTable<>();
         // Cache combiner: (acc, in) -> aggFn.add(in, acc) — note AggregateFunction.add signature
         // is add(IN value, ACC accumulator) -> ACC, so we adapt the (acc, in) BiFunction order.
-        this.cache = new ReducingAggregatingCache<>(
-                (acc, in) -> aggFn.add(in, acc),
-                (keyBytes, acc) -> flushEntry(keyBytes, acc));
+        this.cache =
+                new ReducingAggregatingCache<>(
+                        (acc, in) -> aggFn.add(in, acc),
+                        (keyBytes, acc) -> flushEntry(keyBytes, acc));
     }
 
     // -----------------------------------------------------------------
@@ -119,13 +120,12 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
     /**
      * Adds {@code value} to the current accumulator for {@code compositeKey}.
      *
-     * <p>Cache hit: folds in-place on the operator thread via {@code aggFn.add(value, acc)} —
-     * zero engine I/O.
-     * Cache miss: enqueues a GET request (first miss) or joins the existing convoy (subsequent
-     * misses on the same key while GET is in flight).
+     * <p>Cache hit: folds in-place on the operator thread via {@code aggFn.add(value, acc)} — zero
+     * engine I/O. Cache miss: enqueues a GET request (first miss) or joins the existing convoy
+     * (subsequent misses on the same key while GET is in flight).
      *
      * @param compositeKey pre-encoded storage key
-     * @param value        the value to add; ignored if null
+     * @param value the value to add; ignored if null
      */
     public void add(byte[] compositeKey, IN value) {
         if (value == null) {
@@ -136,12 +136,17 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
             return;
         }
         // Cache miss — enqueue or join convoy
-        pendingMisses.beginOrJoin(stateName, compositeKey, value, () -> {
-            // V1 structural placeholder: real GET submission wired in P11.
-            // On GET resolve: fold all queued inputs starting from aggFn.createAccumulator()
-            // if the engine returned null (key absent), then call cache.put().
-            return null;
-        });
+        pendingMisses.beginOrJoin(
+                stateName,
+                compositeKey,
+                value,
+                () -> {
+                    // V1 structural placeholder: real GET submission wired in P11.
+                    // On GET resolve: fold all queued inputs starting from
+                    // aggFn.createAccumulator()
+                    // if the engine returned null (key absent), then call cache.put().
+                    return null;
+                });
     }
 
     /**
@@ -149,8 +154,8 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
      *
      * <p>Runs {@code aggFn.getResult(acc)} to convert the stored ACC to OUT.
      *
-     * <p>V1: only cache-resident entries are returned. Engine GET wiring for non-cached entries
-     * is deferred to P11.
+     * <p>V1: only cache-resident entries are returned. Engine GET wiring for non-cached entries is
+     * deferred to P11.
      *
      * @param compositeKey pre-encoded storage key
      */
@@ -163,8 +168,8 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
     }
 
     /**
-     * Clears the state for {@code compositeKey}. Inserts a null tombstone in the cache (dirty,
-     * will be flushed as a DELETE on the next barrier).
+     * Clears the state for {@code compositeKey}. Inserts a null tombstone in the cache (dirty, will
+     * be flushed as a DELETE on the next barrier).
      *
      * <p>V1: engine DELETE submission is deferred to P11.
      *
@@ -176,9 +181,9 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
     }
 
     /**
-     * Flushes all dirty cache entries via the classifier (§3 Trace E barrier path).
-     * Entries are serialized and submitted as PUT requests. Entries with a null accumulator
-     * are submitted as DELETE requests (representing cleared state).
+     * Flushes all dirty cache entries via the classifier (§3 Trace E barrier path). Entries are
+     * serialized and submitted as PUT requests. Entries with a null accumulator are submitted as
+     * DELETE requests (representing cleared state).
      *
      * <p>Called by the checkpoint barrier handler before snapshotting.
      */
@@ -200,14 +205,14 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
     // -----------------------------------------------------------------
 
     /**
-     * Invoked by the cache flush callback on LRU eviction or {@link #flushOnBarrier()}.
-     * Serializes the accumulator and submits a PUT to the classifier.
+     * Invoked by the cache flush callback on LRU eviction or {@link #flushOnBarrier()}. Serializes
+     * the accumulator and submits a PUT to the classifier.
      *
      * <p>V1 simplification: uses heap-based DataOutputSerializer; off-heap staging via
      * SlotArenaScope is wired in P11 once the full GET/PUT round-trip is integrated.
      *
      * @param keyBytes composite key bytes
-     * @param acc      accumulator to flush (null means DELETE)
+     * @param acc accumulator to flush (null means DELETE)
      */
     private void flushEntry(byte[] keyBytes, ACC acc) {
         if (acc == null) {

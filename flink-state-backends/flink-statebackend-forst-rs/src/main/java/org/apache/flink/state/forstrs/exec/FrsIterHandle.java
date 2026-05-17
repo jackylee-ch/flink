@@ -31,15 +31,15 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Java-side handle for a native vectorized prefix-scan iterator. Wraps a per-iterator Arena plus
- * the opaque u64 handle ID returned by {@code frs_vec_iter_prefix_open}. Implements
- * {@link AutoCloseable} so try-with-resources or {@link SlotArenaScope#exitTurn()} can release it.
+ * the opaque u64 handle ID returned by {@code frs_vec_iter_prefix_open}. Implements {@link
+ * AutoCloseable} so try-with-resources or {@link SlotArenaScope#exitTurn()} can release it.
  *
  * <p><b>Watchdog interaction.</b> {@link IterLifetimeWatchdog} sets {@link #closeRequested} on
  * idle/max-lifetime breach; the operator thread observes the flag at the next {@link #next} call
  * and performs the native close. This keeps all FFI calls on the operator thread.
  *
- * <p><b>Spec §1 §b.</b> Handles do NOT outlive a single async-v2 turn.
- * {@link SlotArenaScope#exitTurn()} force-closes any leaked handles.
+ * <p><b>Spec §1 §b.</b> Handles do NOT outlive a single async-v2 turn. {@link
+ * SlotArenaScope#exitTurn()} force-closes any leaked handles.
  */
 public final class FrsIterHandle implements AutoCloseable {
 
@@ -52,8 +52,8 @@ public final class FrsIterHandle implements AutoCloseable {
     private final ForStRsLinker linker;
 
     /**
-     * Per-iterator Arena for scratch out-parameter segments (outRc, outBu). Closed on handle
-     * close so the scratch memory is reclaimed promptly rather than waiting for the slot Arena.
+     * Per-iterator Arena for scratch out-parameter segments (outRc, outBu). Closed on handle close
+     * so the scratch memory is reclaimed promptly rather than waiting for the slot Arena.
      */
     private final Arena perIterArena;
 
@@ -66,8 +66,8 @@ public final class FrsIterHandle implements AutoCloseable {
     private final long openedAtMs;
 
     /**
-     * Set by {@link IterLifetimeWatchdog} when the handle is idle or exceeds max lifetime.
-     * Observed by {@link #next} on the operator thread.
+     * Set by {@link IterLifetimeWatchdog} when the handle is idle or exceeds max lifetime. Observed
+     * by {@link #next} on the operator thread.
      */
     private final AtomicBoolean closeRequested = new AtomicBoolean(false);
 
@@ -118,8 +118,8 @@ public final class FrsIterHandle implements AutoCloseable {
      * Pulls the next chunk of rows into a caller-owned buffer.
      *
      * <p>If the watchdog has set {@link #closeRequested}, this method closes the handle and throws
-     * {@link FrsIteratorExpiredException} — so the operator thread performs the native close
-     * rather than the watchdog thread (keeps all FFI calls single-threaded per slot).
+     * {@link FrsIteratorExpiredException} — so the operator thread performs the native close rather
+     * than the watchdog thread (keeps all FFI calls single-threaded per slot).
      *
      * @param chunkBuf caller-owned native buffer to receive row data; its {@link
      *     MemorySegment#byteSize()} is used as the capacity passed to the native call
@@ -140,12 +140,9 @@ public final class FrsIterHandle implements AutoCloseable {
         // Scratch out-params reuse the per-iterator Arena (cheap bump allocation).
         MemorySegment outRc = perIterArena.allocate(ValueLayout.JAVA_INT);
         MemorySegment outBu = perIterArena.allocate(ValueLayout.JAVA_INT);
-        int rc = linker.frsVecIterPrefixNext(
-                nativeHandleId,
-                chunkBuf,
-                (int) chunkBuf.byteSize(),
-                outRc,
-                outBu);
+        int rc =
+                linker.frsVecIterPrefixNext(
+                        nativeHandleId, chunkBuf, (int) chunkBuf.byteSize(), outRc, outBu);
         lastNextNs.set(System.nanoTime());
         if (rc != FrsErrorCode.OK.code()) {
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
@@ -159,8 +156,8 @@ public final class FrsIterHandle implements AutoCloseable {
     }
 
     /**
-     * Requests that this handle be closed. Called by {@link IterLifetimeWatchdog} only — the
-     * actual native close is deferred to the next {@link #next} call on the operator thread.
+     * Requests that this handle be closed. Called by {@link IterLifetimeWatchdog} only — the actual
+     * native close is deferred to the next {@link #next} call on the operator thread.
      */
     public void requestClose() {
         closeRequested.set(true);
@@ -170,8 +167,8 @@ public final class FrsIterHandle implements AutoCloseable {
      * Closes this handle, releasing the native iterator and the per-iterator Arena. Idempotent —
      * subsequent calls are no-ops.
      *
-     * <p>Unregisters from the {@link SlotArenaScope} so the slot does not attempt a double-close
-     * at turn boundary.
+     * <p>Unregisters from the {@link SlotArenaScope} so the slot does not attempt a double-close at
+     * turn boundary.
      */
     @Override
     public void close() {

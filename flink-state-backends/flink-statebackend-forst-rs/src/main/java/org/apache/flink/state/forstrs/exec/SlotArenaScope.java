@@ -125,8 +125,8 @@ public final class SlotArenaScope {
     }
 
     /**
-     * Exits the current async-v2 turn. Closes any outstanding iter handles, restores the turn
-     * bump offset to the mark set at {@link #enterTurn()}, and closes all per-turn overflow Arenas.
+     * Exits the current async-v2 turn. Closes any outstanding iter handles, restores the turn bump
+     * offset to the mark set at {@link #enterTurn()}, and closes all per-turn overflow Arenas.
      *
      * <p>Graceful no-op if the scope has already been closed.
      */

@@ -36,11 +36,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Unit tests for the sealed {@link VectorizedStateRequest} hierarchy (P2.4 v2, spec §1).
  *
  * <p><b>Package placement note:</b> the sealed interface lives in {@code
- * org.apache.flink.state.forstrs} (not {@code .exec}) because Java sealed interfaces in the
- * unnamed module require all permitted subtypes to be in the same package (JEP 409). The three
- * pre-existing concrete classes are in the parent package, so the interface must live there too.
- * This test class remains in {@code .exec} as specified; it imports the interface from the parent
- * package.
+ * org.apache.flink.state.forstrs} (not {@code .exec}) because Java sealed interfaces in the unnamed
+ * module require all permitted subtypes to be in the same package (JEP 409). The three pre-existing
+ * concrete classes are in the parent package, so the interface must live there too. This test class
+ * remains in {@code .exec} as specified; it imports the interface from the parent package.
  */
 class VectorizedStateRequestTest {
 

@@ -33,10 +33,10 @@ import java.util.function.Supplier;
  * while a GET is in flight join the convoy as additional pendingInputs.
  *
  * <p>Backed by ConcurrentHashMap because the operator thread issues add() concurrently with the GET
- * continuation that resolves the miss (the resolution may happen on a Flink async-state continuation
- * thread).
+ * continuation that resolves the miss (the resolution may happen on a Flink async-state
+ * continuation thread).
  *
- * @param <IN>  the input type supplied by add() callers (e.g. the value being reduced)
+ * @param <IN> the input type supplied by add() callers (e.g. the value being reduced)
  * @param <ACC> the accumulator type produced by the combiner
  */
 public class PendingMissTable<IN, ACC> {
@@ -52,17 +52,20 @@ public class PendingMissTable<IN, ACC> {
      * {@code input} to the convoy queue silently — {@code issueGet} is NOT called again.
      *
      * @param stateName logical state name
-     * @param key       raw key (byte[] or any Object; byte[] keys are compared by content)
-     * @param input     the input value being added by the caller
-     * @param issueGet  called exactly once on the first miss to enqueue the GET
+     * @param key raw key (byte[] or any Object; byte[] keys are compared by content)
+     * @param input the input value being added by the caller
+     * @param issueGet called exactly once on the first miss to enqueue the GET
      */
     public void beginOrJoin(String stateName, Object key, IN input, Supplier<Void> issueGet) {
         MissKey mk = MissKey.of(stateName, key);
         boolean[] created = {false};
-        PendingMiss<IN, ACC> pm = pendingMisses.computeIfAbsent(mk, k -> {
-            created[0] = true;
-            return new PendingMiss<>();
-        });
+        PendingMiss<IN, ACC> pm =
+                pendingMisses.computeIfAbsent(
+                        mk,
+                        k -> {
+                            created[0] = true;
+                            return new PendingMiss<>();
+                        });
         // Add input AFTER the entry is visible in the map, before issueGet.
         // computeIfAbsent returns the same object for concurrent callers once it's inserted,
         // so pendingInputs.add() is safe here: the convoy object itself is not replaced,
@@ -80,10 +83,10 @@ public class PendingMissTable<IN, ACC> {
      * accumulator), then removes the entry from the table.
      *
      * @param stateName logical state name
-     * @param key       raw key
-     * @param priorAcc  accumulator value returned by the engine (null if key was absent)
-     * @param combiner  {@code (acc, in) -> acc'} — must not throw
-     * @param ack       called once per queued input with the final folded accumulator
+     * @param key raw key
+     * @param priorAcc accumulator value returned by the engine (null if key was absent)
+     * @param combiner {@code (acc, in) -> acc'} — must not throw
+     * @param ack called once per queued input with the final folded accumulator
      * @return the final folded accumulator, or {@code priorAcc} if no entry existed
      */
     public ACC resolve(
@@ -114,11 +117,11 @@ public class PendingMissTable<IN, ACC> {
      * convoy fails: all chained callers receive the throwable via {@code errorHandler}; the pending
      * entry is removed; the cache is NOT written.
      *
-     * @param stateName    logical state name
-     * @param key          raw key
-     * @param priorAcc     accumulator from engine (null if key was absent)
-     * @param combiner     {@code (acc, in) -> acc'} — may throw
-     * @param ack          called once per queued input on success (receives final acc)
+     * @param stateName logical state name
+     * @param key raw key
+     * @param priorAcc accumulator from engine (null if key was absent)
+     * @param combiner {@code (acc, in) -> acc'} — may throw
+     * @param ack called once per queued input on success (receives final acc)
      * @param errorHandler called once per queued input on failure (receives the Throwable)
      * @return the final folded accumulator on success, or {@code null} on failure
      */

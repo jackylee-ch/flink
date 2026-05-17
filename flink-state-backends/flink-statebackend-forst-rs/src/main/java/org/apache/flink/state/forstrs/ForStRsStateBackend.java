@@ -78,8 +78,9 @@ public class ForStRsStateBackend implements StateBackend {
     }
 
     @Override
-    public <K> org.apache.flink.runtime.state.AsyncKeyedStateBackend<K> createAsyncKeyedStateBackend(
-            StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
+    public <K>
+            org.apache.flink.runtime.state.AsyncKeyedStateBackend<K> createAsyncKeyedStateBackend(
+                    StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
         Arena arena = Arena.ofShared();
         ForStRsLinker linker = new ForStRsLinker(arena);
         Environment env = parameters.getEnv();
