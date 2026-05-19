@@ -122,14 +122,25 @@ public class ForStRsStateRequestClassifier
         StateRequestType type = request.getRequestType();
         StateRequestType originalType = type;
         FrsIterator existingIter = null;
+        long existingVecHandle = 0L;
         if (type == StateRequestType.ITERATOR_LOADING) {
-            Tuple2<StateRequestType, FrsIterator> payload =
-                    (Tuple2<StateRequestType, FrsIterator>) request.getPayload();
+            Tuple2<StateRequestType, ForStRsMapIterator.IterContinuation> payload =
+                    (Tuple2<StateRequestType, ForStRsMapIterator.IterContinuation>)
+                            request.getPayload();
             originalType = payload.f0;
-            existingIter = payload.f1;
+            ForStRsMapIterator.IterContinuation continuation = payload.f1;
+            if (continuation != null) {
+                existingIter = continuation.iter;
+                existingVecHandle = continuation.vecHandle;
+            }
         }
         byte[] prefix = iterableState.getIterPrefix(request);
-        return new ForStRsDBIterRequest<>(
-                prefix, request, originalType, iterableState, existingIter);
+        ForStRsDBIterRequest<?, ?, ?, ?> req =
+                new ForStRsDBIterRequest<>(
+                        prefix, request, originalType, iterableState, existingIter);
+        if (existingVecHandle != 0L) {
+            req.setExistingVecHandle(existingVecHandle);
+        }
+        return req;
     }
 }

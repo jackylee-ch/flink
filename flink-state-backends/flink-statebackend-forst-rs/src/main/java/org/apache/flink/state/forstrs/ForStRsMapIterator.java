@@ -41,6 +41,10 @@ public class ForStRsMapIterator<T> extends AbstractStateIterator<T> {
     private final StateRequestType originalRequestType;
     @Nullable private final FrsIterator frsIterator;
 
+    /** Non-zero if the continuation uses the vectorized iter path (frs_vec_iter_prefix_*). */
+    private final long continuationVecHandle;
+
+    /** Legacy ctor — retains {@link FrsIterator} continuation handle. */
     public ForStRsMapIterator(
             State originalState,
             StateRequestType originalRequestType,
@@ -48,10 +52,34 @@ public class ForStRsMapIterator<T> extends AbstractStateIterator<T> {
             Collection<T> partialResult,
             boolean encounterEnd,
             @Nullable FrsIterator frsIterator) {
+        this(
+                originalState,
+                originalRequestType,
+                stateHandler,
+                partialResult,
+                encounterEnd,
+                frsIterator,
+                0L);
+    }
+
+    /**
+     * Full ctor — carries either a {@link FrsIterator} legacy handle or a vectorized native handle
+     * for continuation. Exactly one is expected to be set; both null/zero means the iterator has
+     * already drained.
+     */
+    public ForStRsMapIterator(
+            State originalState,
+            StateRequestType originalRequestType,
+            StateRequestHandler stateHandler,
+            Collection<T> partialResult,
+            boolean encounterEnd,
+            @Nullable FrsIterator frsIterator,
+            long continuationVecHandle) {
         super(originalState, StateRequestType.ITERATOR_LOADING, stateHandler, partialResult);
         this.originalRequestType = originalRequestType;
         this.encounterEnd = encounterEnd;
         this.frsIterator = frsIterator;
+        this.continuationVecHandle = continuationVecHandle;
     }
 
     @Override
@@ -61,6 +89,20 @@ public class ForStRsMapIterator<T> extends AbstractStateIterator<T> {
 
     @Override
     protected Object nextPayloadForContinuousLoading() {
-        return Tuple2.of(originalRequestType, frsIterator);
+        // Payload carries: (original type, legacy FrsIterator, vec handle).
+        // The classifier picks whichever continuation form is set.
+        return Tuple2.of(
+                originalRequestType, new IterContinuation(frsIterator, continuationVecHandle));
+    }
+
+    /** Payload carrier for continuation-loading: either {@link #iter} or {@link #vecHandle}. */
+    public static final class IterContinuation {
+        @Nullable public final FrsIterator iter;
+        public final long vecHandle;
+
+        public IterContinuation(@Nullable FrsIterator iter, long vecHandle) {
+            this.iter = iter;
+            this.vecHandle = vecHandle;
+        }
     }
 }
