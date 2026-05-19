@@ -36,6 +36,26 @@ public interface ForStRsIterableState<K, N, UK, UV> {
 
     UV deserializeUserValue(byte[] rawValue);
 
+    /**
+     * Slice-based user-key decode (Commit B). Default implementation materializes the slice via
+     * {@link IteratorEntryView#keyBytes()} and delegates to the legacy byte[] decoder, preserving
+     * backwards compatibility for state implementations that have not yet been updated.
+     * Implementations may override to avoid the {@code byte[]} materialization.
+     */
+    default UK deserializeUserKey(IteratorEntryView view, int userKeyPrefixOffset) {
+        return deserializeUserKey(view.keyBytes(), userKeyPrefixOffset);
+    }
+
+    /**
+     * Slice-based user-value decode (Commit B). Default implementation materializes the slice via
+     * {@link IteratorEntryView#valueBytes()} (which returns {@code null} for empty values) and
+     * delegates to the legacy byte[] decoder. Implementations may override to avoid the {@code
+     * byte[]} materialization.
+     */
+    default UV deserializeUserValue(IteratorEntryView view) {
+        return deserializeUserValue(view.valueBytes());
+    }
+
     StateRequestHandler getStateRequestHandler();
 
     State asState();

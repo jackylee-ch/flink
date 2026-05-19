@@ -49,8 +49,11 @@ import java.util.concurrent.CompletableFuture;
  * <p>Implements {@link VectorizedStateRequest} as Kind.ITER_PREFIX. The {@link #future()} method
  * returns {@code null} because completion is handled via Flink's {@code InternalAsyncFuture}.
  *
- * <p>Per-entry {@code IteratorEntry} byte[] copy semantics are preserved here. Commit B will
- * introduce a slice-based view to isolate the allocation cost.
+ * <p>Commit B: the per-entry byte[] copy has been replaced by {@link IteratorEntryView}, a (offset,
+ * length) slice into the chunk {@link MemorySegment}. The drain loop produces views synchronously
+ * decoded into UK/UV instances inside {@link #completeWithEntries}, eliminating {@code 2 × N ×
+ * byte[]} allocations per chunk. The inner {@code DataInputDeserializer byte[]} copy remains
+ * (deferred to V1.2 / MemorySegment-backed DataInputView).
  */
 @Internal
 public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements VectorizedStateRequest {
@@ -132,6 +135,13 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         return prefix;
     }
 
+    /**
+     * Legacy entry point that accepts a fully-materialized {@code IteratorEntry[]} array. Retained
+     * for backwards compatibility with callers outside the chunked vec-iter path; currently unused
+     * (the chunked path goes through {@link #process}). Converts each entry into a heap-backed
+     * {@link IteratorEntryView} (wrapping a small heap {@link MemorySegment}) so it can feed the
+     * unified view-based {@link #completeWithEntries} decoder.
+     */
     @SuppressWarnings("unchecked")
     public void completeBatch(
             ForStRsLinker.IteratorEntry[] entries,
@@ -145,8 +155,23 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                     .complete(isEmpty);
             return;
         }
+        ArrayList<IteratorEntryView> views = new ArrayList<>(entries.length);
+        for (ForStRsLinker.IteratorEntry e : entries) {
+            byte[] k = e.key();
+            byte[] v = e.value();
+            int klen = k == null ? 0 : k.length;
+            int vlen = v == null ? 0 : v.length;
+            MemorySegment seg = arena.allocate(klen + vlen);
+            if (klen > 0) {
+                MemorySegment.copy(k, 0, seg, ValueLayout.JAVA_BYTE, 0, klen);
+            }
+            if (vlen > 0) {
+                MemorySegment.copy(v, 0, seg, ValueLayout.JAVA_BYTE, klen, vlen);
+            }
+            views.add(new IteratorEntryView(seg, 0, klen, klen, vlen));
+        }
         boolean encounterEnd = (entries.length < CACHE_SIZE_LIMIT);
-        completeWithEntries(entries, encounterEnd, null);
+        completeWithEntries(views, encounterEnd, null);
     }
 
     @SuppressWarnings("unchecked")
@@ -208,7 +233,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             firstChunkFromOpen = true;
         }
 
-        ArrayList<ForStRsLinker.IteratorEntry> drained = new ArrayList<>();
+        ArrayList<IteratorEntryView> drained = new ArrayList<>();
         boolean exhausted = false;
         try {
             // Step 1 (open-path only): consume the first chunk that frs_vec_iter_prefix_open
@@ -221,7 +246,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 int firstRowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
                 int firstBytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
                 if (firstRowCount > 0) {
-                    parseChunkInto(chunkBuf, firstRowCount, firstBytesUsed, drained);
+                    parseChunkInto(chunkBuf, firstRowCount, firstBytesUsed, drained, arena);
                 }
             }
 
@@ -247,7 +272,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                     exhausted = true;
                     break;
                 }
-                parseChunkInto(chunkBuf, rowCount, bytesUsed, drained);
+                parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, arena);
             } while (drained.size() < CACHE_SIZE_LIMIT);
         } catch (Throwable t) {
             // Any escape (parse failure, FrsBackendException, anything) must release the native
@@ -262,8 +287,6 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             throw t;
         }
 
-        ForStRsLinker.IteratorEntry[] entries = drained.toArray(new ForStRsLinker.IteratorEntry[0]);
-
         // encounterEnd is true ONLY when Rust reported out_row_count == 0 (true exhaustion).
         // Soft-cap-reached returns the current batch and stashes the handle for continuation.
         boolean encounterEnd = exhausted;
@@ -274,7 +297,12 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         }
         this.existingVecHandle = continuationHandle;
 
-        completeWithEntries(entries, encounterEnd, null);
+        // Decode views into UK/UV. Each view references a per-chunk arena-allocated snapshot
+        // segment (see parseChunkInto). The reusable chunkBuf is overwritten on each next()
+        // call, but the snapshots are NOT — they remain immutable for the lifetime of the
+        // arena, which the caller closes only after this method returns. So views from
+        // earlier chunks survive subsequent next() calls without corruption.
+        completeWithEntries(drained, encounterEnd, null);
     }
 
     /**
@@ -332,48 +360,62 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
     }
 
     /**
-     * Parses a chunk buffer written by Rust's {@code write_chunk_into_buf} and appends the
-     * resulting {@link ForStRsLinker.IteratorEntry} records to {@code out}. Layout per row: {@code
-     * [u32 klen LE][u32 vlen LE][key bytes][value bytes]}. Per-entry byte[] copy semantics are
-     * preserved (Commit B introduces the slice-based view).
+     * Parses a chunk buffer written by Rust's {@code write_chunk_into_buf} and appends one {@link
+     * IteratorEntryView} per row to {@code out}. Layout per row: {@code [u32 klen LE][u32 vlen
+     * LE][key bytes][value bytes]}.
+     *
+     * <p>Correctness note: the views must reference a stable byte range that is NOT overwritten by
+     * subsequent {@code frs_vec_iter_prefix_next} calls (which reuse {@code chunkBuf} as the
+     * destination). We therefore copy this chunk's {@code bytesUsed} bytes into a freshly-allocated
+     * per-chunk arena snapshot and make the views reference the snapshot. The snapshot is immutable
+     * for the lifetime of the arena, so views from chunk #1 survive chunk #2's drain. Cost is one
+     * {@code arena.allocate(bytesUsed)} plus one bulk copy per chunk — independent of row count and
+     * bounded by {@code O(chunks_per_drain × bytesUsed_per_chunk)}; far cheaper than the legacy
+     * per-entry byte[] copy this commit replaced.
      */
     private static void parseChunkInto(
             MemorySegment chunkBuf,
             int rowCount,
             int bytesUsed,
-            ArrayList<ForStRsLinker.IteratorEntry> out) {
-        long off = 0;
+            ArrayList<IteratorEntryView> out,
+            Arena arena) {
+        // Snapshot the chunk into a stable per-chunk arena segment. chunkBuf is reused as the
+        // destination of every frs_vec_iter_prefix_next call, so views referencing it directly
+        // would observe data corruption once the next() overwrites it.
+        MemorySegment chunkSnapshot = arena.allocate(bytesUsed);
+        MemorySegment.copy(chunkBuf, 0, chunkSnapshot, 0, bytesUsed);
+
+        int off = 0;
         for (int i = 0; i < rowCount; i++) {
-            int klen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+            int klen = chunkSnapshot.get(ValueLayout.JAVA_INT_UNALIGNED, off);
             off += 4;
-            int vlen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+            int vlen = chunkSnapshot.get(ValueLayout.JAVA_INT_UNALIGNED, off);
             off += 4;
-            byte[] keyCopy = new byte[klen];
-            MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, keyCopy, 0, klen);
+            int keyOff = off;
             off += klen;
-            byte[] valCopy = new byte[vlen];
-            MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, valCopy, 0, vlen);
+            int valOff = off;
             off += vlen;
-            out.add(new ForStRsLinker.IteratorEntry(keyCopy, valCopy));
+            out.add(new IteratorEntryView(chunkSnapshot, keyOff, klen, valOff, vlen));
         }
-        // bytesUsed paranoia check (asserts only under -ea; Commit B will harden this).
+        // bytesUsed paranoia check (asserts only under -ea).
         assert off == bytesUsed : "chunk parse off=" + off + " != bytesUsed=" + bytesUsed;
     }
 
     @SuppressWarnings("unchecked")
     private void completeWithEntries(
-            ForStRsLinker.IteratorEntry[] entries,
+            ArrayList<IteratorEntryView> views,
             boolean encounterEnd,
             @Nullable FrsIterator continuationIter) {
         int prefixLen = prefix.length;
         StateRequestHandler handler = iterableState.getStateRequestHandler();
+        int n = views.size();
 
         switch (originalRequestType) {
             case MAP_ITER:
-                Collection<Map.Entry<UK, UV>> mapEntries = new ArrayList<>(entries.length);
-                for (ForStRsLinker.IteratorEntry e : entries) {
-                    UK uk = iterableState.deserializeUserKey(e.key(), prefixLen);
-                    UV uv = iterableState.deserializeUserValue(e.value());
+                Collection<Map.Entry<UK, UV>> mapEntries = new ArrayList<>(n);
+                for (IteratorEntryView v : views) {
+                    UK uk = iterableState.deserializeUserKey(v, prefixLen);
+                    UV uv = iterableState.deserializeUserValue(v);
                     if (uv != null) {
                         mapEntries.add(new SimpleEntry<>(uk, uv));
                     }
@@ -393,9 +435,9 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 break;
 
             case MAP_ITER_KEY:
-                Collection<UK> keys = new ArrayList<>(entries.length);
-                for (ForStRsLinker.IteratorEntry e : entries) {
-                    UK uk = iterableState.deserializeUserKey(e.key(), prefixLen);
+                Collection<UK> keys = new ArrayList<>(n);
+                for (IteratorEntryView v : views) {
+                    UK uk = iterableState.deserializeUserKey(v, prefixLen);
                     keys.add(uk);
                 }
                 ForStRsMapIterator<UK> keyIter =
@@ -413,9 +455,9 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 break;
 
             case MAP_ITER_VALUE:
-                Collection<UV> values = new ArrayList<>(entries.length);
-                for (ForStRsLinker.IteratorEntry e : entries) {
-                    UV uv = iterableState.deserializeUserValue(e.value());
+                Collection<UV> values = new ArrayList<>(n);
+                for (IteratorEntryView v : views) {
+                    UV uv = iterableState.deserializeUserValue(v);
                     if (uv != null) {
                         values.add(uv);
                     }

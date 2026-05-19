@@ -35,8 +35,11 @@ import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
 import org.apache.flink.state.forstrs.ForStRsIterableState;
+import org.apache.flink.state.forstrs.IteratorEntryView;
 
 import java.io.IOException;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 
 /**
@@ -241,6 +244,48 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             return null;
         }
         return (UV) deserializeValue(rawValue);
+    }
+
+    // --- Slice-based decoders (Commit B): skip the outer per-entry byte[] copy by reading the
+    // key/value range directly out of the chunk MemorySegment. The inner DataInputDeserializer
+    // still consumes a byte[] (Flink's serializer contract); eliminating that final alloc requires
+    // a MemorySegment-backed DataInputView and is deferred to V1.2. ---
+
+    @Override
+    public UK deserializeUserKey(IteratorEntryView view, int userKeyPrefixOffset) {
+        try {
+            int rangeLen = view.keyLength() - userKeyPrefixOffset;
+            byte[] buf = new byte[rangeLen];
+            MemorySegment.copy(
+                    view.chunkBuf(),
+                    ValueLayout.JAVA_BYTE,
+                    view.keyOffset() + userKeyPrefixOffset,
+                    buf,
+                    0,
+                    rangeLen);
+            DataInputDeserializer in = new DataInputDeserializer(buf, 0, rangeLen);
+            return userKeySerializer.deserialize(in);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize user key from view", e);
+        }
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public UV deserializeUserValue(IteratorEntryView view) {
+        if (view.isValueEmpty()) {
+            return null;
+        }
+        try {
+            int len = view.valueLength();
+            byte[] buf = new byte[len];
+            MemorySegment.copy(
+                    view.chunkBuf(), ValueLayout.JAVA_BYTE, view.valueOffset(), buf, 0, len);
+            DataInputDeserializer in = new DataInputDeserializer(buf, 0, len);
+            return (UV) userValueSerializer.deserialize(in);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to deserialize user value from view", e);
+        }
     }
 
     @Override
