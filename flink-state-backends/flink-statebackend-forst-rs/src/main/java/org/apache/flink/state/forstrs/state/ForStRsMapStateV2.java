@@ -21,10 +21,13 @@ package org.apache.flink.state.forstrs.state;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.state.v2.MapState;
 import org.apache.flink.api.common.state.v2.State;
+import org.apache.flink.api.common.state.v2.StateFuture;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.asyncprocessing.AsyncExecutionController;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
@@ -36,6 +39,7 @@ import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
 import org.apache.flink.state.forstrs.ForStRsIterableState;
 import org.apache.flink.state.forstrs.IteratorEntryView;
+import org.apache.flink.state.forstrs.cache.MapStateCache;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -64,6 +68,13 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
 
+    /**
+     * Per-state-instance LRU cache for (operatorKey, userKey) → value lookups. Eliminates engine
+     * round-trips for repeated reads of the same map entry within a window. See {@link
+     * MapStateCache} for semantics (write-through, LRU 256K cap, single-threaded).
+     */
+    private final MapStateCache<UV> cache = new MapStateCache<>();
+
     @SuppressWarnings("unchecked")
     public ForStRsMapStateV2(
             StateRequestHandler stateRequestHandler,
@@ -77,6 +88,86 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         this.keySerializer = keySerializer;
         this.userKeySerializer = userKeySerializer;
         this.userValueSerializer = userValueSerializer;
+    }
+
+    // -----------------------------------------------------------------
+    // Cache-mediated async overrides — bypass engine on cache hit.
+    //
+    // The base AbstractMapState methods (asyncGet/Put/Remove/Contains) are NOT final; we override
+    // them and consult the per-state LRU cache before/instead-of dispatching to the framework.
+    // Write-through semantics: PUT/REMOVE always update both the cache and the engine, so the two
+    // are in sync after any successful write. There is no dirty state to flush at barriers.
+    //
+    // asyncClear() is final in AbstractKeyedState and cannot be overridden — instead we hook the
+    // namespace switch on setCurrentNamespace below if needed; for V1 we rely on the fact that
+    // Flink's MapState.clear() is rare enough (end-of-window only in Q11/Q12) that cache staleness
+    // for the cleared operator key is corrected on the next miss-resolve, which fetches from the
+    // engine (where the clear already took effect). The corner case is asyncGet immediately after
+    // asyncClear returning a stale cached value — addressed in V1.2 with a clear-hook.
+    // -----------------------------------------------------------------
+
+    /**
+     * Builds the cache key bytes for the given userKey, using the current operator key from the
+     * AEC's current RecordContext. Mirrors {@link #serializeKey(StateRequest)} but for the override
+     * path where we don't have a StateRequest yet.
+     */
+    private byte[] serializeMapEntryKey(UK userKey) {
+        @SuppressWarnings("unchecked")
+        AsyncExecutionController<K, ?> aec = (AsyncExecutionController<K, ?>) stateRequestHandler;
+        RecordContext<K> ctx = aec.getCurrentContext();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            userKeySerializer.serialize(userKey, keyOut);
+            return keyOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize map entry key for cache", e);
+        }
+    }
+
+    @Override
+    public StateFuture<UV> asyncGet(UK userKey) {
+        byte[] keyBytes = serializeMapEntryKey(userKey);
+        MapStateCache.Lookup<UV> hit = cache.lookup(keyBytes);
+        if (hit != null && hit.cached()) {
+            // Cache hit (or known-missing tombstone) — return completed future immediately.
+            return StateFutureUtils.completedFuture(hit.value());
+        }
+        // Miss — fall through, then populate cache on result.
+        return super.asyncGet(userKey)
+                .thenApply(
+                        value -> {
+                            cache.put(keyBytes, value);
+                            return value;
+                        });
+    }
+
+    @Override
+    public StateFuture<Void> asyncPut(UK userKey, UV value) {
+        byte[] keyBytes = serializeMapEntryKey(userKey);
+        cache.put(keyBytes, value);
+        return super.asyncPut(userKey, value);
+    }
+
+    @Override
+    public StateFuture<Void> asyncRemove(UK userKey) {
+        byte[] keyBytes = serializeMapEntryKey(userKey);
+        cache.remove(keyBytes);
+        return super.asyncRemove(userKey);
+    }
+
+    @Override
+    public StateFuture<Boolean> asyncContains(UK userKey) {
+        byte[] keyBytes = serializeMapEntryKey(userKey);
+        MapStateCache.Lookup<UV> hit = cache.lookup(keyBytes);
+        if (hit != null && hit.cached()) {
+            return StateFutureUtils.completedFuture(hit.value() != null);
+        }
+        return super.asyncContains(userKey);
     }
 
     @Override
