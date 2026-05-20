@@ -98,6 +98,7 @@ public class ForStRsStateBackend implements StateBackend {
                 cf,
                 parameters.getKeySerializer(),
                 parameters.getKeyGroupRange(),
+                parameters.getNumberOfKeyGroups(),
                 true);
     }
 

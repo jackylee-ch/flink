@@ -52,6 +52,7 @@ import org.apache.flink.runtime.state.StateHandleID;
 import org.apache.flink.runtime.state.StateSnapshotTransformer.StateSnapshotTransformFactory;
 import org.apache.flink.runtime.state.UncompressedStreamCompressionDecorator;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueSetFactory;
 import org.apache.flink.runtime.state.metrics.LatencyTrackingStateConfig;
 import org.apache.flink.runtime.state.metrics.SizeTrackingStateConfig;
 import org.apache.flink.runtime.state.ttl.TtlTimeProvider;
@@ -97,6 +98,28 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
 
     private static final Logger LOG =
             LoggerFactory.getLogger(ForStRsAbstractKeyedStateBackend.class);
+
+    /**
+     * Timer-service backing-store selector. HEAP uses Flink's in-memory {@link
+     * HeapPriorityQueueSetFactory}; FORSTRS uses the engine-backed {@link
+     * ForStRsKeyGroupedInternalPriorityQueue}.
+     *
+     * <p>Default is HEAP: per {@code project_q12_heap_timer_beats_forst}, the engine-backed timer
+     * queue incurs per-timer FFM crossings that dominate Q11/Q12 wall-clock; switching to HEAP
+     * recovers the v3.3 baselines (Q11 = 76.5 s, Q12 = 35.5 s).
+     *
+     * <p>Override via {@code -Dforst.rs.timer-service.factory=FORSTRS}.
+     */
+    private enum TimerServiceFactory {
+        HEAP,
+        FORSTRS
+    }
+
+    private static TimerServiceFactory pickTimerFactory() {
+        String prop =
+                System.getProperty("forst.rs.timer-service.factory", "HEAP").trim().toUpperCase();
+        return "FORSTRS".equals(prop) ? TimerServiceFactory.FORSTRS : TimerServiceFactory.HEAP;
+    }
 
     /** A delegate L5 backend (existing simple Closeable) that owns the actual FFM handles. */
     private final ForStRsKeyedStateBackend<K> delegate;
@@ -477,6 +500,14 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     public <T extends HeapPriorityQueueElement & PriorityComparable<? super T> & Keyed<?>>
             KeyGroupedInternalPriorityQueue<T> create(
                     String stateName, TypeSerializer<T> byteOrderedElementSerializer) {
+        if (pickTimerFactory() == TimerServiceFactory.HEAP) {
+            // HEAP timer factory — see TimerServiceFactory javadoc above for why this is the
+            // default. The engine-backed path remains available via
+            // -Dforst.rs.timer-service.factory=FORSTRS.
+            return new HeapPriorityQueueSetFactory(
+                            getKeyGroupRange(), getNumberOfKeyGroups(), 128)
+                    .create(stateName, byteOrderedElementSerializer);
+        }
         return createInternalPriorityQueue(stateName, byteOrderedElementSerializer);
     }
 

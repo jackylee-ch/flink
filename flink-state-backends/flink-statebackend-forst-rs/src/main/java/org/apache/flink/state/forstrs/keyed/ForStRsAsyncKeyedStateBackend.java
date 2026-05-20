@@ -41,6 +41,7 @@ import org.apache.flink.runtime.state.PriorityComparable;
 import org.apache.flink.runtime.state.DoneFuture;
 import org.apache.flink.runtime.state.SnapshotResult;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
+import org.apache.flink.runtime.state.heap.HeapPriorityQueueSetFactory;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
@@ -83,7 +84,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final FrsCfHandle defaultCf;
     private final TypeSerializer<K> keySerializer;
     private final KeyGroupRange keyGroupRange;
+    private final int totalKeyGroups;
     private final boolean ownsResources;
+
+    /**
+     * Timer-service backing-store selector. HEAP uses Flink's in-memory {@link
+     * HeapPriorityQueueSetFactory}; FORSTRS uses the engine-backed {@link
+     * ForStRsKeyGroupedInternalPriorityQueue}.
+     *
+     * <p>Default is HEAP: per {@code project_q12_heap_timer_beats_forst}, the engine-backed timer
+     * queue incurs per-timer FFM crossings that dominate Q11/Q12 wall-clock; switching to HEAP
+     * recovers the v3.3 baselines.
+     *
+     * <p>Override via {@code -Dforst.rs.timer-service.factory=FORSTRS}.
+     */
+    private enum TimerServiceFactory {
+        HEAP,
+        FORSTRS
+    }
+
+    private static TimerServiceFactory pickTimerFactory() {
+        String prop =
+                System.getProperty("forst.rs.timer-service.factory", "HEAP").trim().toUpperCase();
+        return "FORSTRS".equals(prop) ? TimerServiceFactory.FORSTRS : TimerServiceFactory.HEAP;
+    }
+
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
@@ -126,6 +151,26 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             TypeSerializer<K> keySerializer,
             KeyGroupRange keyGroupRange,
             boolean ownsResources) {
+        this(
+                arena,
+                linker,
+                db,
+                defaultCf,
+                keySerializer,
+                keyGroupRange,
+                keyGroupRange.getNumberOfKeyGroups(),
+                ownsResources);
+    }
+
+    public ForStRsAsyncKeyedStateBackend(
+            Arena arena,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle defaultCf,
+            TypeSerializer<K> keySerializer,
+            KeyGroupRange keyGroupRange,
+            int totalKeyGroups,
+            boolean ownsResources) {
         FrsAbi.verifyAgainst(linker::frsAbiVersion);
         this.arena = arena;
         this.linker = linker;
@@ -133,6 +178,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         this.defaultCf = defaultCf;
         this.keySerializer = keySerializer;
         this.keyGroupRange = keyGroupRange;
+        this.totalKeyGroups = totalKeyGroups;
         this.ownsResources = ownsResources;
         this.slotArenaScope =
                 SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
@@ -362,6 +408,11 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                     @Nonnull String n,
                     @Nonnull TypeSerializer<T> s,
                     boolean allowFutureMetadataUpdates) {
+        if (pickTimerFactory() == TimerServiceFactory.HEAP) {
+            // HEAP timer factory — see TimerServiceFactory javadoc. Engine-backed timer queue
+            // remains available via -Dforst.rs.timer-service.factory=FORSTRS.
+            return new HeapPriorityQueueSetFactory(keyGroupRange, totalKeyGroups, 128).create(n, s);
+        }
         return new ForStRsKeyGroupedInternalPriorityQueue<>(
                 linker,
                 db,
