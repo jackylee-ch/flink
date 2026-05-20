@@ -41,6 +41,7 @@ import java.lang.foreign.ValueLayout;
 public final class ArrowBinaryBuffer implements AutoCloseable {
 
     public static final int MAX_CAPACITY = 65536;
+    public static final int MAX_CAPACITY_MAP_STATE = 524288; // matches legacy MAP_WRITE_BUFFER_THRESHOLD
     public static final int MIN_CAPACITY = 1024;
 
     private static final int EMPTY_SLOT = -1;
@@ -60,6 +61,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     private MemorySegment flushValuePtrs;
     private MemorySegment flushValueLens;
 
+    private final int maxCapacity;
     private int capacity;
     private int size;
     private int flushHighWaterMark; // flush triggers when size >= this
@@ -69,7 +71,12 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     private long valueDataCapacity;
 
     public ArrowBinaryBuffer(int initialCapacity) {
+        this(initialCapacity, MAX_CAPACITY);
+    }
+
+    public ArrowBinaryBuffer(int initialCapacity, int maxCapacity) {
         this.capacity = Math.max(initialCapacity, 8);
+        this.maxCapacity = maxCapacity;
         this.arena = Arena.ofShared();
         allocate(this.capacity, 64 /* avg key bytes */, 64 /* avg value bytes */);
     }
@@ -159,17 +166,17 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
             return existing;
         }
         if (size >= capacity) {
-            if (capacity < MAX_CAPACITY) {
-                resize(Math.min(capacity * 2, MAX_CAPACITY));
+            if (capacity < maxCapacity) {
+                resize(Math.min(capacity * 2, maxCapacity));
             }
-            // If we're at MAX_CAPACITY OR still full after resize, the CALLER must flush
+            // If we're at maxCapacity OR still full after resize, the CALLER must flush
             // before inserting more. needsFlush() exposes this state for callers to check
             // BEFORE calling insert. We throw here only as a safety net; the well-behaved
             // path is caller-side: if (buf.needsFlush()) buf.flushTo(...); buf.insert(...).
             if (size >= capacity) {
                 throw new IllegalStateException(
-                        "ArrowBinaryBuffer at MAX_CAPACITY="
-                                + MAX_CAPACITY
+                        "ArrowBinaryBuffer at maxCapacity="
+                                + maxCapacity
                                 + " — caller must flushTo(...) before next insert");
             }
         }
@@ -232,7 +239,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
      * {@link #flushTo} when true.
      */
     public boolean needsFlush() {
-        return size >= capacity && capacity >= MAX_CAPACITY;
+        return size >= capacity && capacity >= maxCapacity;
     }
 
     /**
@@ -342,6 +349,88 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         return valueLengths.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
     }
 
+    /** Returns the byte offset into {@link #keyDataSegment()} for row {@code row}'s key. */
+    public int keyOffsetOf(int row) {
+        return keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+    }
+
+    /** Returns the byte length of row {@code row}'s key. */
+    public int keyLengthOf(int row) {
+        int kStart = keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+        int kEnd = keyOffsets.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+        return kEnd - kStart;
+    }
+
+    /**
+     * Returns true if the row at index {@code row} is live (i.e., not tombstoned by a prior
+     * {@link #remove}). Linear scan of the hash index; used by iter walkers that need to know
+     * which row slots are still valid for emission.
+     *
+     * <p>NOTE: O(capacity) per call. If you're walking all rows, prefer caller-side tombstone
+     * tracking. Used by iter-merge in MapState which walks the full statebuf once per scan.
+     */
+    public boolean isRowLive(int row) {
+        int slots = capacity * 2;
+        for (int i = 0; i < slots; i++) {
+            int r =
+                    hashIndex.get(
+                            ValueLayout.JAVA_INT,
+                            (long) i * 2 * Integer.BYTES + Integer.BYTES);
+            if (r == row) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Iterates the hash index slots and yields the live row ids in slot order. Convenience for
+     * iter-merge walkers that want a deterministic, tombstone-free row enumeration without
+     * paying O(capacity) per row in {@link #isRowLive}.
+     */
+    public int[] liveRows() {
+        int[] tmp = new int[size];
+        int n = 0;
+        int slots = capacity * 2;
+        for (int i = 0; i < slots && n < size; i++) {
+            int r =
+                    hashIndex.get(
+                            ValueLayout.JAVA_INT,
+                            (long) i * 2 * Integer.BYTES + Integer.BYTES);
+            if (r == EMPTY_SLOT || r == TOMBSTONE) {
+                continue;
+            }
+            tmp[n++] = r;
+        }
+        if (n == size) {
+            return tmp;
+        }
+        int[] out = new int[n];
+        System.arraycopy(tmp, 0, out, 0, n);
+        return out;
+    }
+
+    /**
+     * Removes the row at the given slot from the hash index (marks it tombstone). Used by iter
+     * walkers that need to delete-by-row (clear() flow).
+     */
+    public void tombstoneRow(int row) {
+        int slots = capacity * 2;
+        for (int i = 0; i < slots; i++) {
+            int r =
+                    hashIndex.get(
+                            ValueLayout.JAVA_INT,
+                            (long) i * 2 * Integer.BYTES + Integer.BYTES);
+            if (r == row) {
+                hashIndex.set(
+                        ValueLayout.JAVA_INT,
+                        (long) i * 2 * Integer.BYTES + Integer.BYTES,
+                        TOMBSTONE);
+                return;
+            }
+        }
+    }
+
     private int hash(MemorySegment seg, long offset, int len) {
         // Java byte[] hashCode equivalent for a MemorySegment range.
         int h = 1;
@@ -425,8 +514,8 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     }
 
     private void resize(int newCapacity) {
-        if (newCapacity > MAX_CAPACITY) {
-            newCapacity = MAX_CAPACITY;
+        if (newCapacity > maxCapacity) {
+            newCapacity = maxCapacity;
         }
         // Allocate fresh storage and rebuild — keeps the implementation simple. Rare event.
         Arena oldArena = arena;

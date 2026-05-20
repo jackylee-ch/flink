@@ -411,6 +411,23 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (existing != null) {
             return existing;
         }
+        // 1c.1: wire the off-heap ForStRsMapState constructor with a per-instance
+        // ArrowBinaryBuffer + ArrowBinaryBufferAutoTuner. Composite-key encoder uses the per-
+        // thread scratch MemorySegment owned by this backend (shared with ValueState — both
+        // wait for the encoder + value-serialize to complete before the scratch region is
+        // reusable, and only one state operation is in flight per slot).
+        ForStRsKeyGroupedSerializer<K> kgSer = new ForStRsKeyGroupedSerializer<>(keySerializer);
+        // MapState gets a larger per-instance cap (matches legacy MAP_WRITE_BUFFER_THRESHOLD)
+        // to avoid Q19-style high-cardinality top-N RMW thrashing the FFI boundary at the
+        // ValueState default of 65536. Tuner relies on insert()'s own maxCapacity guard —
+        // it may suggest grows past the cap, but insert silently keeps capacity at maxCapacity.
+        ArrowBinaryBuffer buf =
+                new ArrowBinaryBuffer(
+                        ArrowBinaryBuffer.MIN_CAPACITY,
+                        ArrowBinaryBuffer.MAX_CAPACITY_MAP_STATE);
+        ArrowBinaryBufferAutoTuner tuner =
+                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+        ownedBuffers.add(buf);
         ForStRsMapState<UK, UV> created =
                 new ForStRsMapState<>(
                         linker,
@@ -418,8 +435,14 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                         defaultCf,
                         keySer,
                         valueSer,
-                        () -> buildPrefix(stateName),
-                        (uk) -> buildCompositeMapKey(stateName, keySer, uk));
+                        scratchArenaTL::get,
+                        kgSer,
+                        stateName,
+                        offheapKeyGroupSupplier,
+                        offheapKeySupplier,
+                        buf,
+                        tuner,
+                        () -> buildPrefix(stateName));
         mapStateRegistry.put(stateName, created);
         return created;
     }
@@ -873,11 +896,12 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             return;
         }
         closed = true;
-        // 1b.3: drain off-heap ValueState buffers BEFORE closing the underlying ArrowBinaryBuffers.
-        // Without this, any value-state writes that never crossed the auto-flush threshold are
-        // silently lost on shutdown.
+        // 1b.3 + 1c.1: drain off-heap ValueState AND MapState buffers BEFORE closing the
+        // underlying ArrowBinaryBuffers. Without this, any state writes that never crossed the
+        // auto-flush threshold are silently lost on shutdown.
         flushAllOffHeapValueStateBuffers();
-        // Release off-heap ArrowBinaryBuffers owned by ValueState instances (1b.2).
+        flushAllMapStates();
+        // Release off-heap ArrowBinaryBuffers owned by ValueState + MapState instances.
         for (ArrowBinaryBuffer b : ownedBuffers) {
             try {
                 b.close();
@@ -888,7 +912,6 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         ownedBuffers.clear();
         // Flush any buffered writes before releasing resources.
         flushWriteBuffer();
-        flushAllMapStates();
         stateCache.clear();
         if (iterWatchdog != null) {
             iterWatchdog.stop();

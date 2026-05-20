@@ -33,13 +33,16 @@ import org.apache.flink.state.forstrs.v1sync.MemorySegmentDataOutputView;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.AbstractMap;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.function.Supplier;
 
@@ -85,6 +88,21 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final DataOutputSerializer keyOutBuffer;
     private final DataOutputSerializer valueOutBuffer;
     private final DataInputDeserializer inputBuffer;
+
+    // ------------------------------------------------------------------
+    // Off-heap (Arrow) mode fields (1c.1). All null in legacy modes.
+    // ------------------------------------------------------------------
+
+    private final java.util.function.Supplier<MemorySegment> scratchArenaSupplier;
+    private final org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<Object>
+            kgSerializerOffheap;
+    private final byte[] stateNameBytesOffheap;
+    private final java.util.function.IntSupplier keyGroupSupplier;
+    private final java.util.function.Supplier<Object> keySupplier;
+    private final ArrowBinaryBuffer statebuf;
+    private final ArrowBinaryBufferAutoTuner tuner;
+    private final MemorySegmentDataInputView offheapInputView;
+    private final MemorySegmentDataOutputView offheapOutputView;
 
     /**
      * SP6 Phase 6.3 — off-heap value staging.
@@ -171,6 +189,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         this.keyOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.valueOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
+        this.scratchArenaSupplier = null;
+        this.kgSerializerOffheap = null;
+        this.stateNameBytesOffheap = null;
+        this.keyGroupSupplier = null;
+        this.keySupplier = null;
+        this.statebuf = null;
+        this.tuner = null;
+        this.offheapInputView = null;
+        this.offheapOutputView = null;
     }
 
     /**
@@ -197,10 +224,115 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         this.keyOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.valueOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
         this.inputBuffer = new DataInputDeserializer();
+        this.scratchArenaSupplier = null;
+        this.kgSerializerOffheap = null;
+        this.stateNameBytesOffheap = null;
+        this.keyGroupSupplier = null;
+        this.keySupplier = null;
+        this.statebuf = null;
+        this.tuner = null;
+        this.offheapInputView = null;
+        this.offheapOutputView = null;
+    }
+
+    /**
+     * Off-heap (Arrow) mode constructor (1c.1) — zero byte[] allocation on the hot path for
+     * {@link #get(Object) get} / {@link #put(Object, Object) put} / {@link #remove(Object)
+     * remove} / {@link #contains(Object) contains}.
+     *
+     * <p>Composite keys (kg+K+stateName+SEP+mapKey) are encoded into a per-thread scratch
+     * {@link MemorySegment} per call via {@link
+     * org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer#encodeForMapOffheap};
+     * values are stored in {@code statebuf}'s off-heap Arrow regions; native fall-through uses
+     * {@link ForStRsLinker#getPinnedSegment} / {@link ForStRsLinker#deleteSegment} with the same
+     * scratch segment.
+     *
+     * <p>Iterators ({@link #entries}, {@link #keys}, {@link #values}, {@link #isEmpty}) and
+     * {@link #clear()} use an iter-no-flush merge: they walk live statebuf rows for entries
+     * whose composite-key begins with this map's prefix (statebuf takes precedence — newer
+     * writes), then walk the engine for the remaining rows. This avoids the per-iter
+     * batchPut stall that regressed Q19 by ~60% in an earlier 1c.1 attempt.
+     */
+    @SuppressWarnings("unchecked")
+    public ForStRsMapState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<UK> keySerializer,
+            TypeSerializer<UV> valueSerializer,
+            java.util.function.Supplier<MemorySegment> scratchArenaSupplier,
+            org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<?> kgSerializer,
+            String stateName,
+            java.util.function.IntSupplier keyGroupSupplier,
+            java.util.function.Supplier<Object> keySupplier,
+            ArrowBinaryBuffer statebuf,
+            ArrowBinaryBufferAutoTuner tuner,
+            Supplier<byte[]> prefixComputer) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.keyPrefix = null;
+        // prefixComputer is still needed by iterators/clear/isEmpty (legacy paths) so we keep
+        // it even in off-heap mode. The compositeKeyComputer is null because the off-heap path
+        // builds the composite key directly into the scratch MemorySegment.
+        this.prefixComputer = prefixComputer;
+        this.compositeKeyComputer = null;
+        this.keySerializer = keySerializer;
+        this.valueSerializer = valueSerializer;
+        this.keyOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.valueOutBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+        this.scratchArenaSupplier = scratchArenaSupplier;
+        this.kgSerializerOffheap =
+                (org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<Object>)
+                        kgSerializer;
+        this.stateNameBytesOffheap =
+                stateName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        this.keyGroupSupplier = keyGroupSupplier;
+        this.keySupplier = keySupplier;
+        this.statebuf = statebuf;
+        this.tuner = tuner;
+        this.offheapInputView = new MemorySegmentDataInputView();
+        this.offheapOutputView = new MemorySegmentDataOutputView();
     }
 
     @Override
     public UV get(UK key) throws IOException {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — ZERO byte[] allocation on the hot path.
+            MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForMapOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            keySerializer,
+                            key,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            int row = statebuf.find(scratch, keyOff, keyLen);
+            tuner.observeRead(row >= 0);
+            if (row >= 0) {
+                offheapInputView.rewind(
+                        statebuf.valueDataSegment(),
+                        statebuf.valueOffsetOf(row),
+                        statebuf.valueLengthOf(row));
+                return valueSerializer.deserialize(offheapInputView);
+            }
+            // Miss → native getPinnedSegment, writing result into scratch after the key.
+            int valOff = keyOff + keyLen;
+            int valMax = (int) (scratch.byteSize() - valOff);
+            int valLen =
+                    linker.getPinnedSegment(
+                            db, cf, scratch, keyOff, keyLen, scratch, valOff, valMax);
+            if (valLen < 0) {
+                return null;
+            }
+            offheapInputView.rewind(scratch, valOff, valLen);
+            return valueSerializer.deserialize(offheapInputView);
+        }
         byte[] compositeKey = composite(key);
         ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
         OffHeapSlice cached = writeCache.get(cacheKey);
@@ -225,6 +357,32 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void put(UK key, UV value) throws IOException {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — ZERO byte[] allocation on the hot path.
+            MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForMapOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            keySerializer,
+                            key,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            int valOff = keyOff + keyLen;
+            offheapOutputView.reset(scratch, valOff);
+            valueSerializer.serialize(value, offheapOutputView);
+            int valLen = offheapOutputView.position() - valOff;
+            // Drain to engine before insert if the buffer is at capacity (forced) or has
+            // reached the high-water mark (opportunistic). Same pattern as 1b.3 ValueState.
+            if (statebuf.needsFlush() || statebuf.shouldAutoFlush()) {
+                statebuf.flushTo(linker, db, cf);
+            }
+            statebuf.insert(scratch, keyOff, keyLen, scratch, valOff, valLen);
+            return;
+        }
         ensureOffHeapStaging();
         // Serialize value DIRECTLY into the off-heap staging region. No byte[] payload alloc
         // (vs the prior `valueOutBuffer.getCopyOfBuffer()` path which alloc'd one byte[] per put).
@@ -279,6 +437,24 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void remove(UK key) {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — drop from buffer + issue native delete.
+            MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForMapOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            keySerializer,
+                            key,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            statebuf.remove(scratch, keyOff, keyLen);
+            linker.deleteSegment(db, cf, scratch, keyOff, keyLen);
+            return;
+        }
         byte[] compositeKey = composite(key);
         ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
         writeCache.remove(cacheKey);
@@ -288,6 +464,30 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public boolean contains(UK key) throws IOException {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — buffer-first, then native existence probe.
+            MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForMapOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            keySerializer,
+                            key,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            int row = statebuf.find(scratch, keyOff, keyLen);
+            tuner.observeRead(row >= 0);
+            if (row >= 0) {
+                return true;
+            }
+            int valOff = keyOff + keyLen;
+            int valMax = (int) (scratch.byteSize() - valOff);
+            return linker.getPinnedSegment(db, cf, scratch, keyOff, keyLen, scratch, valOff, valMax)
+                    >= 0;
+        }
         byte[] compositeKey = composite(key);
         ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
         if (writeCache.containsKey(cacheKey)) {
@@ -329,6 +529,18 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public boolean isEmpty() throws IOException {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — check statebuf for any row matching this map's prefix WITHOUT
+            // pre-flushing. If found we're done; otherwise consult engine.
+            byte[] prefix = currentPrefix();
+            if (statebufHasPrefix(prefix)) {
+                return false;
+            }
+            try (Arena arena = Arena.ofShared();
+                    FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
+                return linker.iteratorNext(iter) == null;
+            }
+        }
         if (!writeCache.isEmpty()) {
             byte[] prefix = currentPrefix();
             for (ByteArrayKey k : writeCache.keySet()) {
@@ -346,6 +558,33 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     @Override
     public void clear() {
+        if (statebuf != null) {
+            // 1c.1 off-heap mode — tombstone all statebuf rows matching this map's prefix, then
+            // delete any engine-resident keys via the legacy iterator+delete loop. No flush of
+            // pending writes — the tombstones cover them.
+            byte[] prefix = currentPrefix();
+            int[] liveRows = statebuf.liveRows();
+            MemorySegment kd = statebuf.keyDataSegment();
+            for (int row : liveRows) {
+                int kOff = statebuf.keyOffsetOf(row);
+                int kLen = statebuf.keyLengthOf(row);
+                if (segmentStartsWith(kd, kOff, kLen, prefix)) {
+                    statebuf.tombstoneRow(row);
+                }
+            }
+            List<byte[]> compositeKeys = new ArrayList<>();
+            try (Arena arena = Arena.ofShared();
+                    FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
+                ForStRsLinker.IteratorEntry entry;
+                while ((entry = linker.iteratorNext(iter)) != null) {
+                    compositeKeys.add(entry.key());
+                }
+            }
+            for (byte[] k : compositeKeys) {
+                linker.delete(db, cf, k);
+            }
+            return;
+        }
         flushMapWriteCache();
         byte[] prefix = currentPrefix();
         writeCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
@@ -363,7 +602,108 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         }
     }
 
+    /**
+     * Returns true if any live statebuf row's key begins with {@code prefix}. O(liveRows).
+     */
+    private boolean statebufHasPrefix(byte[] prefix) {
+        if (statebuf == null || statebuf.size() == 0) {
+            return false;
+        }
+        int[] liveRows = statebuf.liveRows();
+        MemorySegment kd = statebuf.keyDataSegment();
+        for (int row : liveRows) {
+            int kOff = statebuf.keyOffsetOf(row);
+            int kLen = statebuf.keyLengthOf(row);
+            if (segmentStartsWith(kd, kOff, kLen, prefix)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean segmentStartsWith(
+            MemorySegment seg, int segOff, int segLen, byte[] prefix) {
+        if (segLen < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, (long) (segOff + i)) != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     private void forEachEntry(EntryVisitor<UK, UV> visitor, boolean loadValues) throws IOException {
+        if (statebuf != null) {
+            // 1c.1 off-heap iter-no-flush: merge statebuf with engine WITHOUT pre-flushing.
+            //
+            //   1) Walk statebuf — emit rows whose composite-key begins with this map's prefix.
+            //      Record the (mapKey bytes) in a Set so engine rows for the same userKey are
+            //      shadowed by the (newer) statebuf entry.
+            //   2) Walk engine via prefixLookupOpen — emit entries whose mapKey is NOT in seen.
+            //
+            // Avoids the per-iter batchPut stall observed in Q19 (60% regression on first 1c.1).
+            byte[] prefix = currentPrefix();
+            Set<ByteArrayKey> seenMapKeys = new HashSet<>();
+            int[] liveRows = statebuf.liveRows();
+            MemorySegment kd = statebuf.keyDataSegment();
+            MemorySegment vd = statebuf.valueDataSegment();
+            for (int row : liveRows) {
+                int kOff = statebuf.keyOffsetOf(row);
+                int kLen = statebuf.keyLengthOf(row);
+                if (!segmentStartsWith(kd, kOff, kLen, prefix)) {
+                    continue;
+                }
+                int mapKeyOff = kOff + prefix.length;
+                int mapKeyLen = kLen - prefix.length;
+                // Materialize mapKey bytes for the dedup set + UK deserialization. This is a
+                // small alloc (mapKeyLen bytes per row) but is bounded by statebuf size and
+                // happens only during iter — not on the hot put/get path.
+                byte[] mapKeyBytes = new byte[mapKeyLen];
+                MemorySegment.copy(
+                        kd, ValueLayout.JAVA_BYTE, mapKeyOff, mapKeyBytes, 0, mapKeyLen);
+                seenMapKeys.add(new ByteArrayKey(mapKeyBytes));
+                inputBuffer.setBuffer(mapKeyBytes, 0, mapKeyLen);
+                UK uk = keySerializer.deserialize(inputBuffer);
+                UV uv = null;
+                if (loadValues) {
+                    int vOff = statebuf.valueOffsetOf(row);
+                    int vLen = statebuf.valueLengthOf(row);
+                    byte[] vBytes = new byte[vLen];
+                    MemorySegment.copy(vd, ValueLayout.JAVA_BYTE, vOff, vBytes, 0, vLen);
+                    inputBuffer.setBuffer(vBytes);
+                    uv = valueSerializer.deserialize(inputBuffer);
+                }
+                visitor.accept(uk, uv);
+            }
+            try (Arena arena = Arena.ofShared();
+                    FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
+                ForStRsLinker.IteratorEntry entry;
+                while ((entry = linker.iteratorNext(iter)) != null) {
+                    byte[] composite = entry.key();
+                    if (composite.length < prefix.length) {
+                        throw new IOException(
+                                "Encountered composite key shorter than prefix during MapState scan");
+                    }
+                    int mapKeyLen = composite.length - prefix.length;
+                    byte[] mapKeyBytes = new byte[mapKeyLen];
+                    System.arraycopy(composite, prefix.length, mapKeyBytes, 0, mapKeyLen);
+                    if (seenMapKeys.contains(new ByteArrayKey(mapKeyBytes))) {
+                        continue;
+                    }
+                    inputBuffer.setBuffer(mapKeyBytes, 0, mapKeyLen);
+                    UK uk = keySerializer.deserialize(inputBuffer);
+                    UV uv = null;
+                    if (loadValues) {
+                        inputBuffer.setBuffer(entry.value());
+                        uv = valueSerializer.deserialize(inputBuffer);
+                    }
+                    visitor.accept(uk, uv);
+                }
+            }
+            return;
+        }
         flushMapWriteCache();
         byte[] prefix = currentPrefix();
         try (Arena arena = Arena.ofShared();
@@ -444,6 +784,11 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     }
 
     private void flushMapWriteCache() {
+        // 1c.1: in off-heap mode, drain the per-instance ArrowBinaryBuffer to the engine. The
+        // legacy writeCache is always empty in off-heap mode so the rest of this method is a no-op.
+        if (statebuf != null && statebuf.size() > 0) {
+            statebuf.flushTo(linker, db, cf);
+        }
         if (writeCache.isEmpty()) {
             return;
         }
@@ -478,5 +823,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     public void flush() {
         flushMapWriteCache();
         readCache.clear();
+    }
+
+    /**
+     * 1c.1: drains the off-heap buffer to the engine and clears it. Called by the owning backend
+     * on snapshot/close. No-op in legacy modes (where {@code statebuf} is null).
+     */
+    public void flushStateBuffer() {
+        if (statebuf != null && statebuf.size() > 0) {
+            statebuf.flushTo(linker, db, cf);
+        }
     }
 }
