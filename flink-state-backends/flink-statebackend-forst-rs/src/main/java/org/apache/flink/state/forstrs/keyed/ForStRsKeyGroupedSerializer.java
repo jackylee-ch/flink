@@ -85,6 +85,62 @@ public final class ForStRsKeyGroupedSerializer<K> {
         return out.getCopyOfBuffer();
     }
 
+    /**
+     * Off-heap variant of {@link #encodeForState}. Writes the composite key {@code [kg(2 BE)]
+     * [serialized userKey] [SEP] [stateName UTF-8] [SEP]} into the supplied {@code scratchArena}
+     * starting at {@code startOffset}. Returns the (offset, length) packed as a long: {@code
+     * (offset << 32) | length}.
+     *
+     * <p>Caller provides pre-encoded UTF-8 bytes of the state name to avoid the per-call {@code
+     * String.getBytes(UTF_8)} allocation (cache once at state-instance construction).
+     *
+     * <p>Uses {@link DataOutputSerializer#getSharedBuffer()} for zero-copy access to the thread-
+     * local serialization buffer, eliminating the per-call {@code byte[]} allocation in {@link
+     * #encodeForState}.
+     *
+     * @return long-packed {@code (startOffset << 32) | totalLen}
+     */
+    public long encodeForStateOffheap(
+            int keyGroup,
+            K userKey,
+            byte[] preEncodedStateNameBytes,
+            java.lang.foreign.MemorySegment scratchArena,
+            long startOffset) {
+        validateKeyGroup(keyGroup);
+        DataOutputSerializer out = POOL.get();
+        out.clear();
+        try {
+            keySerializer.serialize(userKey, out);
+        } catch (IOException e) {
+            throw new RuntimeException("encodeForStateOffheap failed: " + e.getMessage(), e);
+        }
+        int userKeyLen = out.length();
+        byte[] userKeyBuf = out.getSharedBuffer();
+        long off = startOffset;
+        scratchArena.set(
+                java.lang.foreign.ValueLayout.JAVA_BYTE,
+                off++,
+                (byte) ((keyGroup >>> 8) & 0xFF));
+        scratchArena.set(
+                java.lang.foreign.ValueLayout.JAVA_BYTE, off++, (byte) (keyGroup & 0xFF));
+        for (int i = 0; i < userKeyLen; i++) {
+            scratchArena.set(
+                    java.lang.foreign.ValueLayout.JAVA_BYTE, off + i, userKeyBuf[i]);
+        }
+        off += userKeyLen;
+        scratchArena.set(java.lang.foreign.ValueLayout.JAVA_BYTE, off++, SEP);
+        for (int i = 0; i < preEncodedStateNameBytes.length; i++) {
+            scratchArena.set(
+                    java.lang.foreign.ValueLayout.JAVA_BYTE,
+                    off + i,
+                    preEncodedStateNameBytes[i]);
+        }
+        off += preEncodedStateNameBytes.length;
+        scratchArena.set(java.lang.foreign.ValueLayout.JAVA_BYTE, off++, SEP);
+        int totalLen = (int) (off - startOffset);
+        return ((long) startOffset << 32) | (long) totalLen;
+    }
+
     public <UK> byte[] encodeForMap(
             int keyGroup,
             K userKey,
