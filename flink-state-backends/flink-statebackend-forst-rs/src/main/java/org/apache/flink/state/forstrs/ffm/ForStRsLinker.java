@@ -1355,6 +1355,76 @@ public final class ForStRsLinker {
     }
 
     /**
+     * Segment-based variant of {@link #getPinned}. Key passed as caller-owned (segment, offset,
+     * length) tuple. Result is written into the caller-provided {@code outSegment} starting at
+     * {@code outOffset}; the actual length is returned as a positive int, or -1 if the key was not
+     * found.
+     *
+     * <p>This is the zero-byte[]-allocation entry point for V1-sync ValueState.value(). Currently
+     * routes through legacy byte[] API and copies the result into outSegment; a follow-up commit
+     * will add a direct frs_get_pinned_segment FFI.
+     */
+    public int getPinnedSegment(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keySegment,
+            long keyOffset,
+            int keyLen,
+            MemorySegment outSegment,
+            long outOffset,
+            int outMaxLen) {
+        byte[] keyBytes = new byte[keyLen];
+        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
+        byte[] raw = getPinned(db, cf, keyBytes);
+        if (raw == null) {
+            // Fallback: try getFast for non-inline values.
+            raw = getFast(db, cf, keyBytes);
+            if (raw == null) {
+                return -1;
+            }
+        }
+        if (raw.length > outMaxLen) {
+            throw new IllegalArgumentException(
+                    "out segment too small: need " + raw.length + " bytes, got " + outMaxLen);
+        }
+        MemorySegment.copy(raw, 0, outSegment, ValueLayout.JAVA_BYTE, outOffset, raw.length);
+        return raw.length;
+    }
+
+    /**
+     * Segment-based variant of {@link #put}. Caller-owned segments for both key and value. Routes
+     * through legacy byte[]-taking put until a direct FFI is added.
+     */
+    public void putSegment(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keySegment,
+            long keyOffset,
+            int keyLen,
+            MemorySegment valueSegment,
+            long valueOffset,
+            int valueLen) {
+        byte[] keyBytes = new byte[keyLen];
+        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
+        byte[] valBytes = new byte[valueLen];
+        MemorySegment.copy(
+                valueSegment, ValueLayout.JAVA_BYTE, valueOffset, valBytes, 0, valueLen);
+        put(db, cf, keyBytes, valBytes);
+    }
+
+    /** Segment-based delete (key only). */
+    public void deleteSegment(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment keySegment,
+            long keyOffset,
+            int keyLen) {
+        byte[] keyBytes = new byte[keyLen];
+        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
+        delete(db, cf, keyBytes);
+    }
+
+    /**
      * Combined get + put in one FFM call. Returns the old value ({@code null} if the key did not
      * exist before the put). The put always succeeds regardless of whether the key existed.
      *
