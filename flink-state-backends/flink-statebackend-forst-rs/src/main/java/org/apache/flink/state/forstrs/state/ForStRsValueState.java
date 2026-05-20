@@ -82,6 +82,22 @@ public class ForStRsValueState<T> implements ValueState<T> {
     /** Deletes from the shared write buffer + issues native delete. */
     private final Consumer<byte[]> writeBufferDelete;
 
+    // ------------------------------------------------------------------
+    // Off-heap (Arrow) mode fields (1b.1). All null in legacy byte[] mode.
+    // ------------------------------------------------------------------
+
+    private final java.util.function.Supplier<java.lang.foreign.MemorySegment> scratchArenaSupplier;
+    private final org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<Object>
+            kgSerializerOffheap;
+    private final byte[] stateNameBytesOffheap;
+    private final java.util.function.IntSupplier keyGroupSupplier;
+    private final java.util.function.Supplier<Object> keySupplier;
+    private final ArrowBinaryBuffer statebuf;
+    private final ArrowBinaryBufferAutoTuner tuner;
+    private final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView offheapInputView;
+    private final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataOutputView
+            offheapOutputView;
+
     /**
      * Legacy / stepping-stone constructor: caller supplies the ForSt key directly as a fixed
      * prefix. No write-buffer support.
@@ -103,6 +119,15 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.writeBufferGet = null;
         this.writeBufferPut = null;
         this.writeBufferDelete = null;
+        this.scratchArenaSupplier = null;
+        this.kgSerializerOffheap = null;
+        this.stateNameBytesOffheap = null;
+        this.keyGroupSupplier = null;
+        this.keySupplier = null;
+        this.statebuf = null;
+        this.tuner = null;
+        this.offheapInputView = null;
+        this.offheapOutputView = null;
     }
 
     /**
@@ -129,6 +154,15 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.writeBufferGet = writeBufferGet;
         this.writeBufferPut = writeBufferPut;
         this.writeBufferDelete = writeBufferDelete;
+        this.scratchArenaSupplier = null;
+        this.kgSerializerOffheap = null;
+        this.stateNameBytesOffheap = null;
+        this.keyGroupSupplier = null;
+        this.keySupplier = null;
+        this.statebuf = null;
+        this.tuner = null;
+        this.offheapInputView = null;
+        this.offheapOutputView = null;
     }
 
     /**
@@ -153,6 +187,75 @@ public class ForStRsValueState<T> implements ValueState<T> {
         this.writeBufferGet = null;
         this.writeBufferPut = null;
         this.writeBufferDelete = null;
+        this.scratchArenaSupplier = null;
+        this.kgSerializerOffheap = null;
+        this.stateNameBytesOffheap = null;
+        this.keyGroupSupplier = null;
+        this.keySupplier = null;
+        this.statebuf = null;
+        this.tuner = null;
+        this.offheapInputView = null;
+        this.offheapOutputView = null;
+    }
+
+    /**
+     * Off-heap (Arrow) mode constructor (1b.1) — zero byte[] allocation on hot path.
+     *
+     * <p>Composite keys are encoded into a per-thread scratch {@link
+     * java.lang.foreign.MemorySegment} per call; values are stored in {@code statebuf}'s off-heap
+     * Arrow regions; native fall-through uses {@link
+     * ForStRsLinker#getPinnedSegment} / {@link ForStRsLinker#putSegment} / {@link
+     * ForStRsLinker#deleteSegment} with caller-owned MemorySegments.
+     *
+     * @param scratchArenaSupplier supplies a per-thread scratch MemorySegment (encoder writes
+     *     starting at offset 0; remaining capacity used for value (de)serialization)
+     * @param kgSerializer key-group serializer for composite key encoding
+     * @param stateName state name (UTF-8 bytes are cached once here)
+     * @param keyGroupSupplier supplies the current key-group from the backend
+     * @param keySupplier supplies the current user-key from the backend (cast to Object — the raw
+     *     type is unavoidable since ForStRsValueState is itself parameterized only on the VALUE
+     *     type)
+     * @param statebuf off-heap Arrow buffer owned by this state instance
+     * @param tuner hit-rate-driven grow/shrink policy
+     */
+    @SuppressWarnings("unchecked")
+    public ForStRsValueState(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            TypeSerializer<T> serializer,
+            java.util.function.Supplier<java.lang.foreign.MemorySegment> scratchArenaSupplier,
+            org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<?> kgSerializer,
+            String stateName,
+            java.util.function.IntSupplier keyGroupSupplier,
+            java.util.function.Supplier<Object> keySupplier,
+            ArrowBinaryBuffer statebuf,
+            ArrowBinaryBufferAutoTuner tuner) {
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.serializer = serializer;
+        this.keyPrefix = null;
+        this.keyComputer = null;
+        this.outputBuffer = new DataOutputSerializer(DEFAULT_OUTPUT_BUFFER);
+        this.inputBuffer = new DataInputDeserializer();
+        this.writeBufferGet = null;
+        this.writeBufferPut = null;
+        this.writeBufferDelete = null;
+        this.scratchArenaSupplier = scratchArenaSupplier;
+        this.kgSerializerOffheap =
+                (org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer<Object>)
+                        kgSerializer;
+        this.stateNameBytesOffheap =
+                stateName.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        this.keyGroupSupplier = keyGroupSupplier;
+        this.keySupplier = keySupplier;
+        this.statebuf = statebuf;
+        this.tuner = tuner;
+        this.offheapInputView =
+                new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+        this.offheapOutputView =
+                new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataOutputView();
     }
 
     // Deferred-put optimization: when value() is followed by update() for the
@@ -165,6 +268,39 @@ public class ForStRsValueState<T> implements ValueState<T> {
 
     @Override
     public T value() throws IOException {
+        if (statebuf != null) {
+            // Off-heap mode (1b.1) — ZERO byte[] allocation on the hot path.
+            java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForStateOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            int row = statebuf.find(scratch, keyOff, keyLen);
+            tuner.observeRead(row >= 0);
+            if (row >= 0) {
+                offheapInputView.rewind(
+                        statebuf.valueDataSegment(),
+                        statebuf.valueOffsetOf(row),
+                        statebuf.valueLengthOf(row));
+                return serializer.deserialize(offheapInputView);
+            }
+            // Miss → native getPinnedSegment, write result into scratch after the key.
+            int resultOff = keyOff + keyLen;
+            int resultMaxLen = (int) (scratch.byteSize() - resultOff);
+            int resultLen =
+                    linker.getPinnedSegment(
+                            db, cf, scratch, keyOff, keyLen, scratch, resultOff, resultMaxLen);
+            if (resultLen < 0) {
+                return null;
+            }
+            offheapInputView.rewind(scratch, resultOff, resultLen);
+            return serializer.deserialize(offheapInputView);
+        }
         lastValueKey = computeKey();
         // Check write buffer first (serves repeated reads for same key — 0 native calls)
         if (writeBufferGet != null) {
@@ -193,6 +329,25 @@ public class ForStRsValueState<T> implements ValueState<T> {
             clear();
             return;
         }
+        if (statebuf != null) {
+            // Off-heap mode (1b.1) — ZERO byte[] allocation on the hot path.
+            java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForStateOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            int valStart = keyOff + keyLen;
+            offheapOutputView.reset(scratch, valStart);
+            serializer.serialize(value, offheapOutputView);
+            int valLen = offheapOutputView.position() - valStart;
+            statebuf.insert(scratch, keyOff, keyLen, scratch, valStart, valLen);
+            return;
+        }
         outputBuffer.clear();
         serializer.serialize(value, outputBuffer);
         byte[] payload = outputBuffer.getCopyOfBuffer();
@@ -209,6 +364,21 @@ public class ForStRsValueState<T> implements ValueState<T> {
 
     @Override
     public void clear() {
+        if (statebuf != null) {
+            java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
+            long encoded =
+                    kgSerializerOffheap.encodeForStateOffheap(
+                            keyGroupSupplier.getAsInt(),
+                            keySupplier.get(),
+                            stateNameBytesOffheap,
+                            scratch,
+                            0L);
+            int keyOff = (int) (encoded >>> 32);
+            int keyLen = (int) (encoded & 0xFFFFFFFFL);
+            statebuf.remove(scratch, keyOff, keyLen);
+            linker.deleteSegment(db, cf, scratch, keyOff, keyLen);
+            return;
+        }
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
         if (writeBufferDelete != null) {
             writeBufferDelete.accept(key);
