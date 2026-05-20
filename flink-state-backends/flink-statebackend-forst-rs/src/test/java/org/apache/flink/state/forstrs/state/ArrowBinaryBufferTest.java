@@ -26,6 +26,7 @@ import java.lang.foreign.ValueLayout;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -139,6 +140,77 @@ class ArrowBinaryBufferTest {
             // Insert again into the cleared buffer.
             int row = buf.insert(k, 0, 1, v, 0, 1);
             assertTrue(row >= 0);
+            buf.close();
+        }
+    }
+
+    @Test
+    void clearAfterInserts() {
+        try (Arena arena = Arena.ofConfined()) {
+            ArrowBinaryBuffer buf = new ArrowBinaryBuffer(1024);
+            for (int i = 0; i < 10; i++) {
+                MemorySegment k = writeIntoArena(arena, new byte[] {(byte) i});
+                MemorySegment v = writeIntoArena(arena, new byte[] {(byte) (i + 100)});
+                buf.insert(k, 0, 1, v, 0, 1);
+            }
+            assertEquals(10, buf.size());
+            buf.clear();
+            assertEquals(0, buf.size());
+            buf.close();
+        }
+    }
+
+    @Test
+    void shouldAutoFlushFiresAtHighWaterMark() {
+        try (Arena arena = Arena.ofConfined()) {
+            // Tiny capacity so we trigger high-water mark quickly.
+            ArrowBinaryBuffer buf = new ArrowBinaryBuffer(8);
+            // High-water mark is capacity / 2 = 4.
+            assertFalse(buf.shouldAutoFlush(), "no auto-flush when empty");
+            for (int i = 0; i < 4; i++) {
+                MemorySegment k = writeIntoArena(arena, new byte[] {(byte) i});
+                MemorySegment v = writeIntoArena(arena, new byte[] {(byte) (i + 100)});
+                buf.insert(k, 0, 1, v, 0, 1);
+            }
+            // After 4 inserts at capacity 8, size >= flushHighWaterMark=4 → should auto-flush.
+            assertTrue(buf.shouldAutoFlush(), "auto-flush should fire at half-capacity");
+            buf.close();
+        }
+    }
+
+    @Test
+    void overwriteDoesNotCorruptAdjacentRows() {
+        // Regression: previously, overwriting row N's value updated valueOffsets[N+1]
+        // (the Arrow-style end-offset), which is row (N+1)'s START offset. Reading row
+        // (N+1) then returned garbled bytes and downstream deserializers tripped EOF.
+        // Fix: sidecar valueLengths[] makes overwrite local to row N.
+        try (Arena arena = Arena.ofConfined()) {
+            ArrowBinaryBuffer buf = new ArrowBinaryBuffer(64);
+            MemorySegment k1 = writeIntoArena(arena, new byte[] {1});
+            MemorySegment k2 = writeIntoArena(arena, new byte[] {2});
+            MemorySegment k3 = writeIntoArena(arena, new byte[] {3});
+            MemorySegment vShort = writeIntoArena(arena, new byte[] {10});
+            MemorySegment vLong = writeIntoArena(arena, new byte[] {20, 21, 22, 23, 24});
+
+            buf.insert(k1, 0, 1, vShort, 0, 1);
+            buf.insert(k2, 0, 1, vShort, 0, 1);
+            buf.insert(k3, 0, 1, vShort, 0, 1);
+
+            // Overwrite row1's value with a LONGER value. This used to corrupt row2's offset.
+            buf.insert(k1, 0, 1, vLong, 0, 5);
+
+            assertArrayEquals(
+                    new byte[] {20, 21, 22, 23, 24},
+                    buf.copyValue(buf.find(k1, 0, 1)),
+                    "row1 must hold the new long value");
+            assertArrayEquals(
+                    new byte[] {10},
+                    buf.copyValue(buf.find(k2, 0, 1)),
+                    "row2 must still hold its original short value (was: corruption bug)");
+            assertArrayEquals(
+                    new byte[] {10},
+                    buf.copyValue(buf.find(k3, 0, 1)),
+                    "row3 must still hold its original short value");
             buf.close();
         }
     }

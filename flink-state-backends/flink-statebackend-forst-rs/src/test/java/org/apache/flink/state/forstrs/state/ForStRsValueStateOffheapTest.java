@@ -32,6 +32,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 
 /** Unit tests for 1b.1 off-heap mode of {@link ForStRsValueState}. */
@@ -115,6 +116,35 @@ class ForStRsValueStateOffheapTest {
             state.update(5L);
             state.clear();
             assertNull(state.value());
+        } finally {
+            buf.close();
+        }
+    }
+
+    @Test
+    void writesPersistToEngineAfterFlush() throws Exception {
+        ArrowBinaryBuffer buf = new ArrowBinaryBuffer(1024);
+        try {
+            ForStRsValueState<Long> state = newState(buf);
+            for (long k = 1; k <= 100; k++) {
+                currentKey = k;
+                state.update(k * 10);
+            }
+            // Explicitly flush. After flush, buffer is empty but engine has all 100 writes.
+            state.flushStateBuffer();
+            // Open a fresh state instance with EMPTY buffer; reads must hit the engine.
+            ArrowBinaryBuffer freshBuf = new ArrowBinaryBuffer(1024);
+            try {
+                ForStRsValueState<Long> state2 = newState(freshBuf);
+                for (long k = 1; k <= 100; k++) {
+                    currentKey = k;
+                    Long v = state2.value();
+                    assertNotNull(v, "key " + k + " missing after flush");
+                    assertEquals(k * 10, v, "wrong value for key " + k);
+                }
+            } finally {
+                freshBuf.close();
+            }
         } finally {
             buf.close();
         }

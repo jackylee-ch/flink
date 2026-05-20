@@ -345,6 +345,12 @@ public class ForStRsValueState<T> implements ValueState<T> {
             offheapOutputView.reset(scratch, valStart);
             serializer.serialize(value, offheapOutputView);
             int valLen = offheapOutputView.position() - valStart;
+            // 1b.3: drain to engine before insert if the buffer is at capacity (forced) or has
+            // reached the high-water mark (opportunistic). Without this, MAX_CAPACITY=65536
+            // overflows under Q11-style high-cardinality keys and the job hangs.
+            if (statebuf.needsFlush() || statebuf.shouldAutoFlush()) {
+                statebuf.flushTo(linker, db, cf);
+            }
             statebuf.insert(scratch, keyOff, keyLen, scratch, valStart, valLen);
             return;
         }
@@ -386,6 +392,16 @@ public class ForStRsValueState<T> implements ValueState<T> {
             linker.delete(db, cf, key);
         }
         lastValueKey = null;
+    }
+
+    /**
+     * Drains the off-heap buffer to the engine and clears it. Called by the owning backend on
+     * snapshot/close. No-op in legacy byte[] mode (where {@code statebuf} is null).
+     */
+    public void flushStateBuffer() {
+        if (statebuf != null) {
+            statebuf.flushTo(linker, db, cf);
+        }
     }
 
     /**

@@ -31,6 +31,8 @@ import org.apache.flink.state.forstrs.ffm.FrsAbi;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
+import org.apache.flink.state.forstrs.state.ArrowBinaryBuffer;
+import org.apache.flink.state.forstrs.state.ArrowBinaryBufferAutoTuner;
 import org.apache.flink.state.forstrs.state.ForStRsAggregatingState;
 import org.apache.flink.state.forstrs.state.ForStRsListState;
 import org.apache.flink.state.forstrs.state.ForStRsMapState;
@@ -201,6 +203,40 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             flushArena.allocate(
                     (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.JAVA_LONG.byteSize());
 
+    // ------------------------------------------------------------------
+    // Off-heap (Arrow) state plumbing (Task 1b.2).
+    //
+    // Wires ForStRsValueState's new off-heap constructor:
+    //   - scratchArenaTL: per-thread scratch MemorySegment used by the
+    //     composite-key encoder; reset by each ValueState entry point
+    //     (encoder writes from offset 0). 64 KB plenty for Q5 / Q11 / Q13.
+    //   - offheapKeyGroupSupplier: this backend is a stepping-stone that
+    //     does not yet track Flink key-group; suppling 0 keeps key encoding
+    //     stable (all keys land in the same key-group prefix) and matches
+    //     the regime used in ForStRsValueStateOffheapTest.
+    //   - offheapKeySupplier: hands the off-heap encoder the current key
+    //     object (read on each call via getCurrentKey()).
+    //   - ownedBuffers: ArrowBinaryBuffers created by getValueState(...);
+    //     closed by close() to release off-heap memory.
+    // ------------------------------------------------------------------
+
+    /**
+     * Per-thread scratch off-heap memory for V1-sync off-heap state operations. Reset by each
+     * ValueState entry point (encoder writes from offset 0). 64 KB is plenty for Q5 (max composite
+     * key ~100 B + value ~16 B; reused across the 5 panes within one event).
+     */
+    private final ThreadLocal<MemorySegment> scratchArenaTL =
+            ThreadLocal.withInitial(() -> Arena.ofShared().allocate(65536));
+
+    /** Suppliers passed to off-heap ForStRsValueState. */
+    private final java.util.function.IntSupplier offheapKeyGroupSupplier = () -> 0;
+
+    private final java.util.function.Supplier<Object> offheapKeySupplier =
+            () -> (Object) getCurrentKey();
+
+    /** ArrowBinaryBuffers owned by this backend, closed in {@link #close()}. */
+    private final java.util.List<ArrowBinaryBuffer> ownedBuffers = new java.util.ArrayList<>();
+
     private K currentKey;
     private byte[] currentKeyBytes;
 
@@ -279,8 +315,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         this.currentKeyBytes = serialized;
         // Bump generation so adapters know their cached state is stale.
         this.keyGeneration++;
-        // Invalidate the per-state cache because every entry's keyPrefix encodes the old key.
-        this.stateCache.clear();
+        // ValueState now lazily computes composite keys per call from currentKeyBytes
+        // (kgSerializer.encodeForStateOffheap) via the off-heap path; instance survives
+        // setCurrentKey. setCurrentKey only bumps keyGeneration for stale-adapter detection.
     }
 
     /** Returns the current key (last successfully {@code setCurrentKey}-ed value, or null). */
@@ -317,17 +354,28 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (existing != null) {
             return existing;
         }
-        byte[] prefix = buildPrefix(stateName);
+        // Task 1b.2: wire the off-heap ForStRsValueState constructor with a per-instance
+        // ArrowBinaryBuffer + ArrowBinaryBufferAutoTuner. The composite-key encoder uses
+        // the per-thread scratch MemorySegment owned by this backend. The state instance
+        // survives setCurrentKey because the encoder reads the current key on each call.
+        ForStRsKeyGroupedSerializer<K> kgSer = new ForStRsKeyGroupedSerializer<>(keySerializer);
+        ArrowBinaryBuffer buf = new ArrowBinaryBuffer(ArrowBinaryBuffer.MIN_CAPACITY);
+        ArrowBinaryBufferAutoTuner tuner =
+                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+        ownedBuffers.add(buf);
         ForStRsValueState<T> created =
                 new ForStRsValueState<>(
                         linker,
                         db,
                         defaultCf,
-                        prefix,
                         valueSerializer,
-                        this::getFromWriteBuffer,
-                        this::putToWriteBuffer,
-                        this::deleteFromWriteBuffer);
+                        scratchArenaTL::get,
+                        kgSer,
+                        stateName,
+                        offheapKeyGroupSupplier,
+                        offheapKeySupplier,
+                        buf,
+                        tuner);
         stateCache.put(valueStateCacheKey(stateName), created);
         return created;
     }
@@ -437,6 +485,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // Flush buffered writes so the count reflects all pending mutations.
         flushWriteBuffer();
         flushAllMapStates();
+        flushAllOffHeapValueStateBuffers();
         long count = 0;
         try (Arena local = Arena.ofShared();
                 org.apache.flink.state.forstrs.ffm.FrsIterator iter =
@@ -471,6 +520,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // Flush buffered writes before checkpoint — correctness requirement.
         flushWriteBuffer();
         flushAllMapStates();
+        flushAllOffHeapValueStateBuffers();
         linker.createCheckpoint(db, targetDir.toString());
         return targetDir;
     }
@@ -533,6 +583,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // Flush buffered writes so the scan reflects all pending mutations.
         flushWriteBuffer();
         flushAllMapStates();
+        flushAllOffHeapValueStateBuffers();
         byte[] nameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         byte[] tailMarker = new byte[1 + nameBytes.length + 1];
         tailMarker[0] = (byte) '/';
@@ -771,6 +822,23 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     }
 
     /**
+     * 1b.3: Flushes all off-heap ArrowBinaryBuffers owned by ValueState instances in {@code
+     * stateCache} so their buffered writes reach the engine. Without this, checkpoint/close
+     * silently drops every buffered value-state write — a correctness bug.
+     */
+    public void flushAllOffHeapValueStateBuffers() {
+        for (Object v : stateCache.values()) {
+            if (v instanceof ForStRsValueState<?> vs) {
+                try {
+                    vs.flushStateBuffer();
+                } catch (Throwable ignore) {
+                    // best-effort; one state's failure must not block the rest.
+                }
+            }
+        }
+    }
+
+    /**
      * Wrapper for {@code byte[]} that provides value-based {@code hashCode}/{@code equals} so it
      * can serve as a HashMap key. The hash is computed once at construction.
      */
@@ -805,6 +873,19 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             return;
         }
         closed = true;
+        // 1b.3: drain off-heap ValueState buffers BEFORE closing the underlying ArrowBinaryBuffers.
+        // Without this, any value-state writes that never crossed the auto-flush threshold are
+        // silently lost on shutdown.
+        flushAllOffHeapValueStateBuffers();
+        // Release off-heap ArrowBinaryBuffers owned by ValueState instances (1b.2).
+        for (ArrowBinaryBuffer b : ownedBuffers) {
+            try {
+                b.close();
+            } catch (Throwable ignore) {
+                // best-effort; close() continues with the rest of the chain.
+            }
+        }
+        ownedBuffers.clear();
         // Flush any buffered writes before releasing resources.
         flushWriteBuffer();
         flushAllMapStates();
