@@ -230,6 +230,11 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 mapDesc.getSerializer());
             case LIST:
                 var listDesc = (ListStateDescriptor<?>) desc;
+                // V3.2 (V20 sub-spec §5): register the ListState name with every managed
+                // executor so the per-batch classifier routes LIST_ADD via APPEND_MERGE.
+                for (VectorizedExecutor exec : managedExecutors) {
+                    exec.registerListState(name);
+                }
                 return (S)
                         new ForStRsAsyncListStateV2<>(
                                 stateRequestHandler,

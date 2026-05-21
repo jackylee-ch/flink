@@ -99,6 +99,11 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private StateRequest<?, ?, ?, ?>[] deleteRequests;
     private int deleteCount;
 
+    // V3.1: parallel StateRequest list for APPEND_MERGE so future completion can be
+    // plumbed back to the Flink-runtime async future at dispatch end (Option Z, §4.3).
+    private StateRequest<?, ?, ?, ?>[] appendMergeRequests;
+    private int appendMergeCount;
+
     private final List<ForStRsDBIterRequest<?, ?, ?, ?>> iterRequests = new ArrayList<>();
 
     public VectorizedClassifier(
@@ -114,6 +119,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         this.getTables = new ForStRsInnerTable<?, ?, ?>[INIT_SLOTS];
         this.putRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.deleteRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
+        this.appendMergeRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         // appendMergeBuffer / iterPrefixBuffer / iterRangeBuffer are lazy-initialized by
         // initNewKindBuffers(Arena) to avoid requiring an Arena here.
     }
@@ -143,6 +149,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         getCount = 0;
         putCount = 0;
         deleteCount = 0;
+        appendMergeCount = 0;
         iterRequests.clear();
         if (appendMergeBuffer != null) {
             appendMergeBuffer.reset();
@@ -303,10 +310,25 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
             case AGGREGATING_GET:
                 recordGet(table, (StateRequest) stateRequest);
                 break;
-            case VALUE_UPDATE:
             case LIST_ADD:
-            case LIST_UPDATE:
             case LIST_ADD_ALL:
+                // V3.1: LIST_ADD / LIST_ADD_ALL on a registered ListState routes to
+                // APPEND_MERGE instead of destructive PUT. Falls back to PUT if the
+                // state is not registered (shouldn't happen via the public API, but
+                // defensive).
+                if (stateRequest.getPayload() == null) {
+                    recordDelete(table, (StateRequest) stateRequest);
+                } else {
+                    String name = table.getStateName();
+                    if (name != null && listStateNames.contains(name)) {
+                        recordAppendMerge(table, (StateRequest) stateRequest);
+                    } else {
+                        recordPut(table, (StateRequest) stateRequest);
+                    }
+                }
+                break;
+            case VALUE_UPDATE:
+            case LIST_UPDATE:
             case MAP_PUT:
             case MAP_PUT_ALL:
             case REDUCING_ADD:
@@ -338,7 +360,11 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     @Override
     public boolean isEmpty() {
-        return getCount == 0 && putCount == 0 && deleteCount == 0 && iterRequests.isEmpty();
+        return getCount == 0
+                && putCount == 0
+                && deleteCount == 0
+                && appendMergeCount == 0
+                && iterRequests.isEmpty();
     }
 
     public int getCount() {
@@ -413,6 +439,56 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         table.serializeKeyInto(request, deleteKeys);
         deleteRequests[deleteCount] = request;
         deleteCount++;
+    }
+
+    /**
+     * V3.1: route a LIST_ADD / LIST_ADD_ALL request through APPEND_MERGE rather than the
+     * destructive PUT path. Constructs an {@link AppendMergeRequest} whose key + operand are
+     * heap-backed {@link MemorySegment}s; {@link VectorizedExecutor#dispatchAppendMergeBatch}
+     * copies them into off-heap buffers before the FFI call.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private <K, N, V> void recordAppendMerge(
+            ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
+        ensureAppendMergeBuffer();
+        ensureAppendMergeCapacity();
+        byte[] keyBytes = table.serializeKey(request);
+        byte[] valBytes = table.serializeValue(request.getPayload());
+        if (valBytes == null) {
+            // Defensive: null payload should already have been routed to recordDelete by the
+            // offer() switch. Fall through to recordDelete here for safety.
+            recordDelete(table, request);
+            return;
+        }
+        java.lang.foreign.MemorySegment keySlice = java.lang.foreign.MemorySegment.ofArray(keyBytes);
+        java.lang.foreign.MemorySegment valSlice = java.lang.foreign.MemorySegment.ofArray(valBytes);
+        AppendMergeRequest amReq =
+                new AppendMergeRequest(
+                        table.getStateName(),
+                        keySlice,
+                        new java.lang.foreign.MemorySegment[] {valSlice});
+        appendMergeBuffer.append(amReq);
+        appendMergeRequests[appendMergeCount] = request;
+        appendMergeCount++;
+    }
+
+    private void ensureAppendMergeCapacity() {
+        if (appendMergeCount < appendMergeRequests.length) {
+            return;
+        }
+        int newCap = appendMergeRequests.length << 1;
+        StateRequest<?, ?, ?, ?>[] r = new StateRequest<?, ?, ?, ?>[newCap];
+        System.arraycopy(appendMergeRequests, 0, r, 0, appendMergeRequests.length);
+        appendMergeRequests = r;
+    }
+
+    /** V3.1 accessor — parallel to {@link #putRequests()} / {@link #deleteRequests()}. */
+    public StateRequest<?, ?, ?, ?>[] appendMergeRequests() {
+        return appendMergeRequests;
+    }
+
+    public int appendMergeCount() {
+        return appendMergeCount;
     }
 
     private void ensureGetCapacity() {

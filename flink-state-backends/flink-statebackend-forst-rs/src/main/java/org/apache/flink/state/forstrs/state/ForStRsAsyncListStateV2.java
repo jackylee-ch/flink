@@ -87,8 +87,13 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
     }
 
     // ---------------------------------------------------------------
-    // ForStRsInnerTable — key serialization
+    // ForStRsInnerTable — key serialization + state-name lookup (V20.2)
     // ---------------------------------------------------------------
+
+    @Override
+    public String getStateName() {
+        return stateName;
+    }
 
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
@@ -204,10 +209,22 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         }
         try {
             valueIn.setBuffer(raw);
-            int count = valueIn.readInt();
-            List<V> list = new ArrayList<>(count);
-            for (int i = 0; i < count; i++) {
-                list.add(elementSerializer.deserialize(valueIn));
+            // V20.1 / Format B: loop [count][elems*] chunks until EOF. Backward-compatible
+            // with legacy v3.8 single-chunk [count=1][elem] payloads (reads one chunk,
+            // hits EOF, returns the singleton). Required for V3 (LIST_ADD → APPEND_MERGE)
+            // because the engine merge-operator concatenates operand bytes verbatim,
+            // producing a multi-chunk payload after K appends.
+            List<V> list = new ArrayList<>();
+            while (valueIn.available() > 0) {
+                int count = valueIn.readInt();
+                if (count < 0) {
+                    throw new IOException(
+                            "ForStRsAsyncListStateV2: negative count in merged payload: "
+                                    + count);
+                }
+                for (int i = 0; i < count; i++) {
+                    list.add(elementSerializer.deserialize(valueIn));
+                }
             }
             return new CompleteStateIterator<>(list);
         } catch (IOException e) {

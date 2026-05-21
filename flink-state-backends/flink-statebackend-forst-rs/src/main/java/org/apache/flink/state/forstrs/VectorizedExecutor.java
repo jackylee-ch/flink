@@ -80,6 +80,13 @@ public class VectorizedExecutor implements StateExecutor {
     private final ColumnarBatchBuffer putValues;
     private final ColumnarBatchBuffer deleteKeys;
 
+    // V3.1 (V20 sub-spec §5): long-lived registry of ListState names. A fresh classifier is
+    // created per batch by createRequestContainer(); the registry is passed in so APPEND_MERGE
+    // routing persists across batches. Backend calls registerListState() once per state primitive
+    // at creation time.
+    private final java.util.Set<String> listStateNames =
+            java.util.concurrent.ConcurrentHashMap.newKeySet();
+
     // Reusable output buffers for the GET path.
     private MemorySegment outOffsets;
     private MemorySegment outValidity;
@@ -139,11 +146,27 @@ public class VectorizedExecutor implements StateExecutor {
     public AsyncRequestContainer<StateRequest<?, ?, ?, ?>> createRequestContainer() {
         // Each batch gets its own classifier that wraps the long-lived buffers.
         // The classifier just resets the buffers on construction so the previous
-        // batch's data is invalidated.
+        // batch's data is invalidated. V3.1: also propagates the executor-level
+        // listStateNames registry into the classifier so APPEND_MERGE routing
+        // survives the per-batch classifier reset.
         VectorizedClassifier classifier =
                 new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
         classifier.reset();
+        for (String name : listStateNames) {
+            classifier.registerListState(name);
+        }
+        // Lazy-init the APPEND_MERGE / ITER buffers using the executor's Arena so the
+        // classifier doesn't have to allocate them per-batch.
+        classifier.initNewKindBuffers(arena);
         return classifier;
+    }
+
+    /**
+     * V3.1 (V20 sub-spec §5): register a ListState name so the per-batch classifier's
+     * APPEND_MERGE routing recognizes LIST_ADD requests on this state. Idempotent.
+     */
+    public void registerListState(String stateName) {
+        listStateNames.add(stateName);
     }
 
     @Override
@@ -162,6 +185,15 @@ public class VectorizedExecutor implements StateExecutor {
             AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
             if (amBuf != null && !amBuf.isEmpty()) {
                 dispatchAppendMerge(amBuf);
+                // V3.1: complete the parallel StateRequest futures so Flink's
+                // async-state runtime sees the LIST_ADD as done. dispatchAppendMerge
+                // already completed amReq.future() above; here we propagate to the
+                // underlying StateRequest's runtime future.
+                StateRequest<?, ?, ?, ?>[] amReqs = classifier.appendMergeRequests();
+                int amCount = classifier.appendMergeCount();
+                for (int i = 0; i < amCount; i++) {
+                    completePut(amReqs[i]);
+                }
             }
             // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is
             // non-null/non-empty.

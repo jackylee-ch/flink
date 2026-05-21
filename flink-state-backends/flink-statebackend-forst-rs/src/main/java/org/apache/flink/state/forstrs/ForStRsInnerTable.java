@@ -50,6 +50,15 @@ public interface ForStRsInnerTable<K, N, V> {
 
     Object deserializeValue(byte[] raw);
 
+    /**
+     * Returns the state name. Used by the classifier's APPEND_MERGE routing (V3.1) to look up
+     * the state in the {@code listStateNames} registry. Default impl returns {@code null} so
+     * non-ListState implementations don't have to override.
+     */
+    default String getStateName() {
+        return null;
+    }
+
     ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request);
 
     ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request);
