@@ -359,9 +359,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // the per-thread scratch MemorySegment owned by this backend. The state instance
         // survives setCurrentKey because the encoder reads the current key on each call.
         ForStRsKeyGroupedSerializer<K> kgSer = new ForStRsKeyGroupedSerializer<>(keySerializer);
-        ArrowBinaryBuffer buf = new ArrowBinaryBuffer(ArrowBinaryBuffer.MIN_CAPACITY);
         ArrowBinaryBufferAutoTuner tuner =
                 new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+        // ValueState uses the global MAX_CAPACITY (1 048 576 — lifted in size-aware AutoTune
+        // design 2026-05-21) so Q5's HOP working set (~150K) fits. Q11-style small-WS workloads
+        // stay at MIN_CAPACITY because the tuner's occupancy gate refuses to grow a buffer
+        // whose fill rate stays below 70%.
+        ArrowBinaryBuffer buf =
+                new ArrowBinaryBuffer(
+                        ArrowBinaryBuffer.MIN_CAPACITY, ArrowBinaryBuffer.MAX_CAPACITY, tuner);
         ownedBuffers.add(buf);
         ForStRsValueState<T> created =
                 new ForStRsValueState<>(
@@ -419,14 +425,16 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         ForStRsKeyGroupedSerializer<K> kgSer = new ForStRsKeyGroupedSerializer<>(keySerializer);
         // MapState gets a larger per-instance cap (matches legacy MAP_WRITE_BUFFER_THRESHOLD)
         // to avoid Q19-style high-cardinality top-N RMW thrashing the FFI boundary at the
-        // ValueState default of 65536. Tuner relies on insert()'s own maxCapacity guard —
-        // it may suggest grows past the cap, but insert silently keeps capacity at maxCapacity.
+        // ValueState default. The size-aware tuner is wired so small-WS MapState workloads
+        // (Q15 / Q19 patterns with bounded distinct user-keys) stay near MIN_CAPACITY rather
+        // than paying repeated resize churn.
+        ArrowBinaryBufferAutoTuner tuner =
+                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
         ArrowBinaryBuffer buf =
                 new ArrowBinaryBuffer(
                         ArrowBinaryBuffer.MIN_CAPACITY,
-                        ArrowBinaryBuffer.MAX_CAPACITY_MAP_STATE);
-        ArrowBinaryBufferAutoTuner tuner =
-                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+                        ArrowBinaryBuffer.MAX_CAPACITY_MAP_STATE,
+                        tuner);
         ownedBuffers.add(buf);
         ForStRsMapState<UK, UV> created =
                 new ForStRsMapState<>(

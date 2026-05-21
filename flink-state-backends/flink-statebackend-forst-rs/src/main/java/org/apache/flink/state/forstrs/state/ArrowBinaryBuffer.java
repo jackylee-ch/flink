@@ -40,9 +40,15 @@ import java.lang.foreign.ValueLayout;
 @Internal
 public final class ArrowBinaryBuffer implements AutoCloseable {
 
-    public static final int MAX_CAPACITY = 65536;
+    public static final int MAX_CAPACITY = 1_048_576;
     public static final int MAX_CAPACITY_MAP_STATE = 524288; // matches legacy MAP_WRITE_BUFFER_THRESHOLD
     public static final int MIN_CAPACITY = 1024;
+
+    /**
+     * Signal returned by {@link #insert} when the buffer is at its current capacity AND the
+     * AutoTuner refused to grow it. Callers MUST flush + clear before retrying the insert.
+     */
+    public static final int INSERT_NEEDS_FLUSH = -2;
 
     private static final int EMPTY_SLOT = -1;
     private static final int TOMBSTONE = -2;
@@ -70,14 +76,27 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     private long keyDataCapacity;
     private long valueDataCapacity;
 
+    /**
+     * Optional dual-gate AutoTuner; when non-null, {@link #insert} consults it before growing
+     * the buffer on a full-buffer event. If the tuner refuses to grow (size-gate not met),
+     * {@link #insert} returns {@link #INSERT_NEEDS_FLUSH} and the caller must flush + retry.
+     */
+    private ArrowBinaryBufferAutoTuner tuner;
+
     public ArrowBinaryBuffer(int initialCapacity) {
-        this(initialCapacity, MAX_CAPACITY);
+        this(initialCapacity, MAX_CAPACITY, null);
     }
 
     public ArrowBinaryBuffer(int initialCapacity, int maxCapacity) {
+        this(initialCapacity, maxCapacity, null);
+    }
+
+    public ArrowBinaryBuffer(
+            int initialCapacity, int maxCapacity, ArrowBinaryBufferAutoTuner tuner) {
         this.capacity = Math.max(initialCapacity, 8);
         this.maxCapacity = maxCapacity;
         this.arena = Arena.ofShared();
+        this.tuner = tuner;
         allocate(this.capacity, 64 /* avg key bytes */, 64 /* avg value bytes */);
     }
 
@@ -166,14 +185,29 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
             return existing;
         }
         if (size >= capacity) {
-            if (capacity < maxCapacity) {
-                resize(Math.min(capacity * 2, maxCapacity));
+            // Dual-gate path: if a tuner is wired, ask it whether to grow. The tuner's
+            // size-gate refuses growth when occupancy stays low (small-WS workloads like Q11);
+            // in that case we return INSERT_NEEDS_FLUSH and the caller must flush + retry.
+            //
+            // Without a tuner, fall back to the legacy "always grow up to maxCapacity" path
+            // so existing direct ArrowBinaryBuffer users (e.g. unit tests, legacy mode) keep
+            // their auto-grow semantics.
+            int suggested;
+            if (tuner != null) {
+                suggested = tuner.shouldResizeTo(capacity);
+            } else {
+                suggested = capacity < maxCapacity ? Math.min(capacity * 2, maxCapacity) : capacity;
             }
-            // If we're at maxCapacity OR still full after resize, the CALLER must flush
-            // before inserting more. needsFlush() exposes this state for callers to check
-            // BEFORE calling insert. We throw here only as a safety net; the well-behaved
-            // path is caller-side: if (buf.needsFlush()) buf.flushTo(...); buf.insert(...).
+            if (suggested > capacity) {
+                resize(suggested);
+            }
             if (size >= capacity) {
+                // Either at maxCapacity or the gate refused growth. Caller must flush.
+                if (tuner != null) {
+                    return INSERT_NEEDS_FLUSH;
+                }
+                // Legacy path (no tuner): keep historical IllegalStateException behavior so
+                // direct callers learn they need to call flushTo before the next insert.
                 throw new IllegalStateException(
                         "ArrowBinaryBuffer at maxCapacity="
                                 + maxCapacity

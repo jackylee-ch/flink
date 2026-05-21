@@ -281,7 +281,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int row = statebuf.find(scratch, keyOff, keyLen);
-            tuner.observeRead(row >= 0);
+            tuner.observeRead(row >= 0, statebuf.size(), statebuf.capacity());
             if (row >= 0) {
                 offheapInputView.rewind(
                         statebuf.valueDataSegment(),
@@ -351,7 +351,12 @@ public class ForStRsValueState<T> implements ValueState<T> {
             if (statebuf.needsFlush() || statebuf.shouldAutoFlush()) {
                 statebuf.flushTo(linker, db, cf);
             }
-            statebuf.insert(scratch, keyOff, keyLen, scratch, valStart, valLen);
+            int row = statebuf.insert(scratch, keyOff, keyLen, scratch, valStart, valLen);
+            if (row == ArrowBinaryBuffer.INSERT_NEEDS_FLUSH) {
+                // AutoTuner refused to grow (small-WS workload). Drain to engine + retry.
+                statebuf.flushTo(linker, db, cf);
+                statebuf.insert(scratch, keyOff, keyLen, scratch, valStart, valLen);
+            }
             return;
         }
         outputBuffer.clear();
