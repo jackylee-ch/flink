@@ -117,8 +117,8 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
 
     private static TimerServiceFactory pickTimerFactory() {
         String prop =
-                System.getProperty("forst.rs.timer-service.factory", "HEAP").trim().toUpperCase();
-        return "FORSTRS".equals(prop) ? TimerServiceFactory.FORSTRS : TimerServiceFactory.HEAP;
+                System.getProperty("forst.rs.timer-service.factory", "FORSTRS").trim().toUpperCase();
+        return "HEAP".equals(prop) ? TimerServiceFactory.HEAP : TimerServiceFactory.FORSTRS;
     }
 
     /** A delegate L5 backend (existing simple Closeable) that owns the actual FFM handles. */
@@ -137,6 +137,14 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * once snapshot wiring is connected.
      */
     private ForStRsSstRegistry sstRegistry;
+
+    /**
+     * Registry of engine-backed priority queues created via {@link #createInternalPriorityQueue}.
+     * Used by {@link #snapshot} to flush each queue's pending buffer to the engine BEFORE the
+     * snapshot is captured (spec invariant #4 from the batched-timer design).
+     */
+    private final java.util.List<ForStRsKeyGroupedInternalPriorityQueue<?>>
+            engineTimerQueues = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     /**
      * Per-key futures chain shared by all {@code getAsync*State} factories on this backend (spec
@@ -359,6 +367,11 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // the engine snapshot must include all state mutations up to this barrier.
         delegate.flushWriteBuffer();
         delegate.flushAllMapStates();
+        // Spec invariant #4 — every engine-backed priority queue's pending buffer must be
+        // drained to the engine BEFORE the snapshot is captured.
+        for (ForStRsKeyGroupedInternalPriorityQueue<?> q : engineTimerQueues) {
+            q.flushPendingToEngine();
+        }
         // Drive the snapshot through Flink's canonical SnapshotStrategyRunner so the returned
         // RunnableFuture is wrapped in an AsyncSnapshotCallable that:
         //   * registers cancellation hooks on cancelStreamRegistry (for checkpoint abort),
@@ -529,16 +542,19 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             ForStRsKeyGroupedInternalPriorityQueue<T> createInternalPriorityQueue(
                     String stateName, TypeSerializer<T> elementSerializer) {
         java.util.function.ToLongFunction<T> tsExtractor = reflectiveTimestampExtractor();
-        return new ForStRsKeyGroupedInternalPriorityQueue<>(
-                delegate.getLinker(),
-                delegate.getDb(),
-                delegate.getDefaultCf(),
-                delegate.getArena(),
-                stateName,
-                elementSerializer,
-                tsExtractor,
-                this::getCurrentKeyGroupIndex,
-                getKeyGroupRange());
+        ForStRsKeyGroupedInternalPriorityQueue<T> q =
+                new ForStRsKeyGroupedInternalPriorityQueue<>(
+                        delegate.getLinker(),
+                        delegate.getDb(),
+                        delegate.getDefaultCf(),
+                        delegate.getArena(),
+                        stateName,
+                        elementSerializer,
+                        tsExtractor,
+                        this::getCurrentKeyGroupIndex,
+                        getKeyGroupRange());
+        engineTimerQueues.add(q);
+        return q;
     }
 
     /**
@@ -714,6 +730,15 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         try {
             super.close();
         } finally {
+            // Flush + close each engine-backed priority queue's pending buffer before tearing
+            // down the delegate (engine handles).
+            for (ForStRsKeyGroupedInternalPriorityQueue<?> q : engineTimerQueues) {
+                try {
+                    q.close();
+                } catch (Exception ignored) {
+                }
+            }
+            engineTimerQueues.clear();
             // Best-effort shutdown of the async executor — long-running async ops are interrupted.
             if (asyncExecutor != null) {
                 asyncExecutor.shutdownNow();

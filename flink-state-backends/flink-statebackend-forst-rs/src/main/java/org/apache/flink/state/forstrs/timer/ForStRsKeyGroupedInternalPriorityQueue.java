@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.timer;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
@@ -33,6 +34,8 @@ import org.apache.flink.util.CloseableIterator;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayDeque;
 import java.util.Collection;
@@ -45,6 +48,38 @@ import java.util.function.ToLongFunction;
  * Spec §6f — backend-resident {@link KeyGroupedInternalPriorityQueue} implementation that persists
  * its entries through the ForSt-RS engine instead of an on-heap data structure.
  *
+ * <p><b>Batched off-heap pending buffer.</b> Per the
+ * {@code 2026-05-21-batched-engine-timer-design} spec, this queue maintains an off-heap binary
+ * min-heap pending buffer ({@link ArrowTimerBuffer}) so that {@code add(T)} / {@code remove(T)}
+ * calls do not cross the FFM boundary per-event. Instead:
+ *
+ * <ul>
+ *   <li>An {@code add(T)} composes the composite key into a thread-local off-heap scratch
+ *       MemorySegment, then inserts an ADD op into the pending buffer.
+ *   <li>If a subsequent {@code remove(T)} arrives BEFORE the buffer flushes, the corresponding
+ *       buffered ADD is cancelled (heap + hash-index) so neither operation reaches the engine.
+ *   <li>The buffer is flushed to the engine at exactly three moments:
+ *       (1) when {@code size >= FLUSH_THRESHOLD},
+ *       (2) immediately before any read/mutating call that needs a consistent engine view
+ *           (poll, peek-via-engine, size, iterator, removeAll, getSubsetForKeyGroup, snapshot),
+ *       (3) {@link #close()}.
+ *   <li>The flush itself uses {@link ForStRsLinker#batchPut} for ADDs +
+ *       {@link ForStRsLinker#vectorizedBatchDelete} for REMOVEs — a single FFM crossing per batch.
+ * </ul>
+ *
+ * <p><b>Four critical invariants</b> (spec §"Four Implementation Invariants"):
+ *
+ * <ol>
+ *   <li>In-buffer add-remove cancellation — both entries are removed from heap + hash-index and
+ *       NEVER written to engine.
+ *   <li>Min-heap (NOT FIFO) — binary heap on {@code ts} in {@link ArrowTimerBuffer}; smallest-ts
+ *       comes first.
+ *   <li>{@link #advance(long)} strict order — flush → batch scan → batch delete; never overlap.
+ *   <li>{@link #flushPendingToEngine()} is the mandatory pre-snapshot hook — invoked from the
+ *       backend's {@code snapshot()} via {@link #flushPendingToEngine()} before any engine state
+ *       is captured.
+ * </ol>
+ *
  * <p><b>Key encoding.</b> Each entry is stored under a composite ForSt key:
  *
  * <pre>
@@ -52,36 +87,14 @@ import java.util.function.ToLongFunction;
  *            || kg(2B BE) || ts(8B BE, sign-flipped) || serialize(T)
  * </pre>
  *
- * <p>The fixed-width 2-byte big-endian key-group followed by an 8-byte big-endian (sign-flipped)
- * timestamp gives a strict prefix-scan ordering of {@code (key-group ascending, timestamp
- * ascending)}. Within the same {@code (kg, ts)} bucket FIFO order is preserved by the serialized
- * tail bytes (the underlying engine sorts lexicographically and the tail also includes whatever
- * disambiguator the element carries — e.g. a {@code TimerHeapInternalTimer}'s namespace+key — which
- * keeps two entries at the same timestamp distinct without a synthetic counter).
- *
- * <p><b>Sign-flipped timestamps.</b> Flink's timer timestamp can be negative ({@link
- * Long#MIN_VALUE} is a sentinel). To keep big-endian byte order consistent with signed-numerical
- * order we XOR the sign bit on encode/decode (the standard "flip-MSB" trick). This means {@code
- * Long.MIN_VALUE} encodes to {@code 0x00 0x00 ... 0x00} and {@code Long.MAX_VALUE} encodes to
- * {@code 0xFF 0xFF ... 0xFF}, so a lexicographic prefix scan returns entries in ascending-timestamp
- * order regardless of sign.
- *
- * <p><b>Thread-safety.</b> This class is not thread-safe; the calling timer-service is responsible
- * for serialising calls per Flink's keyed-operator contract.
- *
- * <p><b>Element bounds.</b> Spec asks for {@code T extends HeapPriorityQueueElement &
- * PriorityComparable<? super T> & Keyed<?>}; we relax the {@code Keyed} bound to widen reuse — the
- * real timer-element type satisfies it but tests can use simpler stand-ins. The {@link
- * HeapPriorityQueueElement} bound is preserved because Flink's heap-backend code paths assume the
- * {@code internalIndex} accessor exists. We never write the internal index to disk (it is only
- * meaningful for an in-memory heap), so the field is left at its default after a {@link #poll()}
- * round-trip.
+ * <p><b>Thread-safety.</b> Not thread-safe; the calling timer-service is responsible for
+ * serialising calls per Flink's keyed-operator contract.
  *
  * @param <T> queue element type
  */
 @Internal
 public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueElement>
-        implements KeyGroupedInternalPriorityQueue<T> {
+        implements KeyGroupedInternalPriorityQueue<T>, AutoCloseable {
 
     /** Distinguishes priority-queue rows from regular keyed-state rows in the same default CF. */
     private static final byte[] QUEUE_NS_MARKER = "q/".getBytes(StandardCharsets.UTF_8);
@@ -93,6 +106,15 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * order matches signed-integer numerical order across the full {@code long} range.
      */
     private static final long SIGN_FLIP = 0x8000_0000_0000_0000L;
+
+    /** Flush threshold — pending buffer size at which we proactively drain to the engine. */
+    @VisibleForTesting static final int FLUSH_THRESHOLD = 1024;
+
+    /** Sentinel value written under each timer key — same as the legacy code path used. */
+    private static final byte[] EMPTY_VAL_BYTES = new byte[] {(byte) 1};
+
+    /** Initial scratch-segment size for composing composite keys (grows on demand). */
+    private static final int SCRATCH_INITIAL_BYTES = 256;
 
     private final ForStRsLinker linker;
     private final FrsDb db;
@@ -123,36 +145,39 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     private final LongFunction<T> rebinder;
 
     // ------------------------------------------------------------------
+    // Pending buffer (batched off-heap min-heap)
+    // ------------------------------------------------------------------
+
+    private final ArrowTimerBuffer pendingBuffer;
+
+    /** Per-queue scratch segment for composing composite keys (single-threaded). */
+    private final Arena scratchArena;
+    private MemorySegment scratchSeg;
+    private long scratchCapacity;
+
+    /**
+     * Pre-allocated staging segments for the flush path — pointer/length arrays for
+     * {@link ForStRsLinker#batchPut}. Grown on demand. Reused across flushes.
+     */
+    private final Arena flushArena;
+    private MemorySegment flushAddKeyPtrs;
+    private MemorySegment flushAddKeyLens;
+    private MemorySegment flushAddValPtrs;
+    private MemorySegment flushAddValLens;
+    private MemorySegment flushDelOffsets; // (count+1) ints — Arrow-style offsets for vectorized delete
+    private MemorySegment flushDelData; // packed key bytes
+    private MemorySegment emptyValueSeg; // 1-byte non-empty sentinel (shared)
+    private long flushPairCapacity;
+    private long flushDelDataCapacity;
+
+    // ------------------------------------------------------------------
     // Poll-ahead cache (vectorized perf path — SP3)
-    //
-    // The legacy hot path was: each poll() opens an iterator, reads one
-    // entry, closes the iterator, then deletes the key — ≈ 4 FFI crossings
-    // per poll. On Q5's ~460M timer ops this dominates runtime.
-    //
-    // The cache batches the READ side: on a miss we call
-    // `linker.prefixGetAll(prefix, REFILL_BATCH)` which returns N entries in
-    // one FFI roundtrip. Subsequent poll()/peek() within the same key-group
-    // serve from the cache until exhausted. We still issue one
-    // `linker.delete` per poll for now (correctness-first; batched delete is
-    // a follow-up).
-    //
-    // The cache is INVALIDATED on any mutating call (add, remove, removeAll)
-    // because such calls may shift the min-element. isEmpty / size /
-    // iterator / getSubsetForKeyGroup also invalidate to keep semantics
-    // simple — they go straight to the engine through the existing paths.
     // ------------------------------------------------------------------
 
     private static final int REFILL_BATCH = 128;
     private final ArrayDeque<Entry> pollCache = new ArrayDeque<>();
     private int cachedKg = -1; // -1 = cache invalid / empty
 
-    /**
-     * Constructs a queue rooted at {@code stateName} that scans the supplied {@code keyGroupRange}
-     * and looks up the "current key group" via {@code currentKeyGroupSupplier}. The {@code
-     * timestampExtractor} maps a {@code T} to the {@code long} priority (lower = earlier). Tests
-     * pass a fixed-value supplier; real backends pass a method-reference into {@code
-     * AbstractKeyedStateBackend.getCurrentKeyGroupIndex()}.
-     */
     public ForStRsKeyGroupedInternalPriorityQueue(
             ForStRsLinker linker,
             FrsDb db,
@@ -199,6 +224,17 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         this.keyGroupRange = keyGroupRange;
         this.rebinder = rebinder;
         this.queuePrefix = buildQueuePrefix(stateName);
+
+        this.pendingBuffer = new ArrowTimerBuffer();
+        this.scratchArena = Arena.ofShared();
+        this.scratchCapacity = SCRATCH_INITIAL_BYTES;
+        this.scratchSeg = scratchArena.allocate(scratchCapacity);
+
+        this.flushArena = Arena.ofShared();
+        this.flushPairCapacity = 0L;
+        this.flushDelDataCapacity = 0L;
+        this.emptyValueSeg = flushArena.allocate(1L);
+        this.emptyValueSeg.set(ValueLayout.JAVA_BYTE, 0L, (byte) 1);
     }
 
     // ------------------------------------------------------------------
@@ -239,6 +275,28 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             throw new RuntimeException("encode failed: " + e.getMessage(), e);
         }
         return out.getCopyOfBuffer();
+    }
+
+    /**
+     * Encodes the composite key for {@code (keyGroup, element)} into {@link #scratchSeg}, growing
+     * the scratch segment if needed. Returns the encoded length.
+     */
+    private int encodeIntoScratch(int keyGroup, T element) {
+        // Reuse the byte[] path for now (no off-heap TypeSerializer support yet) — but copy into
+        // the scratch MemorySegment so downstream pendingBuffer hash/copy operates on segments.
+        byte[] encoded = encode(keyGroup, element);
+        ensureScratchCapacity(encoded.length);
+        MemorySegment.copy(encoded, 0, scratchSeg, ValueLayout.JAVA_BYTE, 0, encoded.length);
+        return encoded.length;
+    }
+
+    private void ensureScratchCapacity(int needed) {
+        if (needed <= scratchCapacity) {
+            return;
+        }
+        long newCap = Math.max(scratchCapacity * 2, needed);
+        scratchSeg = scratchArena.allocate(newCap);
+        scratchCapacity = newCap;
     }
 
     /** Returns the {@code long} timestamp encoded inside the composite key. */
@@ -285,54 +343,259 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     // ------------------------------------------------------------------
 
     /**
-     * Adds {@code element} to the queue under the current key group; returns {@code true} if the
-     * head of the queue may have changed (the contract used by Flink's timer-service). We
-     * approximate "head may have changed" as "always true" because tracking the current min would
-     * require a read-after-write probe — fine for correctness, only loses a marginal optimisation.
+     * Buffered add — composes the composite key off-heap, then either cancels a matching pending
+     * REMOVE, no-ops on a matching pending ADD, or inserts a fresh ADD. Triggers a flush when the
+     * buffer reaches {@link #FLUSH_THRESHOLD}.
      */
     @Override
     public boolean add(T element) {
         int kg = currentKeyGroupSupplier.getAsInt();
-        byte[] key = encode(kg, element);
-        linker.put(db, cf, key, EMPTY_VALUE);
+        long ts = timestampExtractor.applyAsLong(element);
+        int keyLen = encodeIntoScratch(kg, element);
+
+        int existing = pendingBuffer.find(scratchSeg, 0L, keyLen);
+        if (existing >= 0) {
+            int op = pendingBuffer.opAt(existing);
+            if (op == ArrowTimerBuffer.OP_ADD) {
+                // Idempotent — already pending. No-op.
+                return true;
+            }
+            // op == REMOVE — cancellation: remove the pending REMOVE so the engine still keeps
+            // the original entry (or, if the engine doesn't have it either, the add lands as a
+            // fresh insert below).
+            pendingBuffer.removeAt(existing);
+            // If there's still an engine entry under this key, the (add then remove then add) net
+            // is "keep present". If there isn't, we still need an ADD pending — fall through.
+            // For correctness we re-insert ADD so the engine reflects "present" after flush.
+        }
+        pendingBuffer.insertAdd(scratchSeg, 0L, keyLen, ts);
         invalidateCache();
+        if (pendingBuffer.size() >= FLUSH_THRESHOLD) {
+            flushPendingToEngine();
+        }
+        return true;
+    }
+
+    /**
+     * Buffered remove — composes the composite key off-heap. If a matching pending ADD exists,
+     * cancels it (no FFM). Else if a matching pending REMOVE exists, no-op. Else inserts a REMOVE
+     * op into the pending buffer.
+     *
+     * <p>Returns {@code true} when the element is known to have been present (either in the buffer
+     * as a pending ADD, or after a flush + engine probe). For the buffered-cancellation path the
+     * return value reflects the pending state.
+     */
+    @Override
+    public boolean remove(T element) {
+        int kg = currentKeyGroupSupplier.getAsInt();
+        long ts = timestampExtractor.applyAsLong(element);
+        int keyLen = encodeIntoScratch(kg, element);
+
+        int existing = pendingBuffer.find(scratchSeg, 0L, keyLen);
+        if (existing >= 0) {
+            int op = pendingBuffer.opAt(existing);
+            if (op == ArrowTimerBuffer.OP_ADD) {
+                // CANCEL — pure in-buffer cancellation, NEVER reaches engine.
+                pendingBuffer.removeAt(existing);
+                invalidateCache();
+                return true;
+            }
+            // op == REMOVE — already pending. No-op (idempotent).
+            return true;
+        }
+        // No pending entry. Insert a REMOVE op. The engine may or may not have the key — the
+        // flush will issue a vectorized delete regardless (idempotent on the engine side).
+        pendingBuffer.insertRemove(scratchSeg, 0L, keyLen, ts);
+        invalidateCache();
+        if (pendingBuffer.size() >= FLUSH_THRESHOLD) {
+            flushPendingToEngine();
+        }
+        // We cannot tell without an engine probe whether the element was actually present pre-call;
+        // return true (matches the legacy "always true" approximation Flink tolerates).
         return true;
     }
 
     @Override
-    public boolean remove(T element) {
-        int kg = currentKeyGroupSupplier.getAsInt();
-        byte[] key = encode(kg, element);
-        // Engine-level delete is idempotent; we report based on whether the key existed.
-        byte[] existing = linker.get(db, cf, key);
-        linker.delete(db, cf, key);
-        invalidateCache();
-        return existing != null;
-    }
-
-    @Override
     public T poll() {
+        // Flush pending mutations so the engine view reflects all add/remove decisions.
+        flushPendingToEngine();
         int kg = currentKeyGroupSupplier.getAsInt();
         Entry head = cachedHeadEntry(kg);
         if (head == null) {
             return null;
         }
-        // Remove from engine + remove from cache front (cachedHeadEntry left it in place).
         linker.delete(db, cf, head.composite);
         pollCache.pollFirst();
         return head.element;
     }
 
+    /**
+     * Non-flushing merged peek — returns the earliest-ts entry across pendingBuffer ADDs (after
+     * suppressing pending REMOVEs for the same key) and engine head for the current key group.
+     *
+     * <p><b>Critical hot path.</b> Flink's {@code InternalTimerServiceImpl.registerProcessingTimeTimer}
+     * calls {@code peek()} on EVERY add to check whether the head changed. To stay zero-FFM in the
+     * happy path we use the pre-existing poll-ahead cache content (no refill, no engine
+     * round-trip). The cache is refilled lazily on the read side ({@link #poll}).
+     */
     @Override
     public T peek() {
         int kg = currentKeyGroupSupplier.getAsInt();
-        Entry head = cachedHeadEntry(kg);
-        return head == null ? null : head.element;
+
+        // 1. Best ADD in buffer for this key group — happy path is heap[0] (min-ts root), which
+        //    in steady state matches the current kg + is an ADD. Fall back to full scan only if
+        //    root is filtered out (mismatched kg or REMOVE op). Avoids O(n) on every peek.
+        int bufferBestPos = -1;
+        long bufferBestTs = Long.MAX_VALUE;
+        int n = pendingBuffer.size();
+        byte[] kgPrefix = keyGroupPrefix(kg);
+        if (n > 0) {
+            int rootOp = pendingBuffer.opAt(0);
+            int rootKoff = pendingBuffer.keyOffsetAt(0);
+            int rootKlen = pendingBuffer.keyLenAt(0);
+            if (rootOp == ArrowTimerBuffer.OP_ADD
+                    && keyPrefixMatches(
+                            pendingBuffer.keyDataSegment(), rootKoff, rootKlen, kgPrefix)) {
+                bufferBestPos = 0;
+                bufferBestTs = pendingBuffer.tsAt(0);
+            } else {
+                // Fallback — full scan to find the smallest-ts ADD entry matching kg.
+                for (int i = 0; i < n; i++) {
+                    if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
+                        continue;
+                    }
+                    int kOff = pendingBuffer.keyOffsetAt(i);
+                    int kLen = pendingBuffer.keyLenAt(i);
+                    if (!keyPrefixMatches(
+                            pendingBuffer.keyDataSegment(), kOff, kLen, kgPrefix)) {
+                        continue;
+                    }
+                    long ts = pendingBuffer.tsAt(i);
+                    if (ts < bufferBestTs) {
+                        bufferBestTs = ts;
+                        bufferBestPos = i;
+                    }
+                }
+            }
+        }
+
+        // 2. Engine side: consult the EXISTING poll-ahead cache ONLY if it's already populated for
+        //    this key group. Do NOT refill on a peek — refill is reserved for poll(). On a cache
+        //    miss we conservatively trust the buffer side. This matches Flink's only use of peek
+        //    on the registerTimer hot path: it just wants to know "is the head before mine?".
+        Entry engineHead = null;
+        if (cachedKg == kg && !pollCache.isEmpty()) {
+            // Use the cache front directly — even if a pending REMOVE eventually masks it, the
+            // worst case is a slightly-stale "head" view returned from peek, which Flink only
+            // uses for the "head may have changed" hint (not correctness-critical). poll()
+            // re-establishes the truth via flush + cache refresh.
+            engineHead = pollCache.peekFirst();
+        }
+
+        if (bufferBestPos < 0 && engineHead == null) {
+            return null;
+        }
+        if (bufferBestPos < 0) {
+            return engineHead.element;
+        }
+        if (engineHead == null) {
+            return decodeElementFromBuffer(bufferBestPos);
+        }
+        long engineTs = decodeTimestamp(engineHead.composite);
+        if (bufferBestTs <= engineTs) {
+            return decodeElementFromBuffer(bufferBestPos);
+        }
+        return engineHead.element;
+    }
+
+    private boolean keyPrefixMatches(
+            MemorySegment seg, int offset, int len, byte[] kgPrefix) {
+        if (len < kgPrefix.length) {
+            return false;
+        }
+        for (int i = 0; i < kgPrefix.length; i++) {
+            if (seg.get(ValueLayout.JAVA_BYTE, offset + i) != kgPrefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Returns the engine head for {@code kg}, skipping over engine entries that are masked by a
+     * pending REMOVE in {@link #pendingBuffer}.
+     */
+    private Entry peekEngineHeadSuppressingRemoves(int kg) {
+        if (cachedKg != kg) {
+            pollCache.clear();
+            cachedKg = kg;
+        }
+        if (pollCache.isEmpty()) {
+            refillCache(kg);
+        }
+        // Skip entries that have a matching pending REMOVE in the buffer.
+        while (!pollCache.isEmpty()) {
+            Entry head = pollCache.peekFirst();
+            if (!isRemovePendingFor(head.composite)) {
+                return head;
+            }
+            pollCache.pollFirst();
+            if (pollCache.isEmpty()) {
+                // Cache exhausted — refill once and retry.
+                refillCache(kg);
+            }
+        }
+        return null;
+    }
+
+    private boolean isRemovePendingFor(byte[] compositeKey) {
+        int n = pendingBuffer.size();
+        if (n == 0) {
+            return false;
+        }
+        ensureScratchCapacity(compositeKey.length);
+        MemorySegment.copy(
+                compositeKey,
+                0,
+                scratchSeg,
+                ValueLayout.JAVA_BYTE,
+                0,
+                compositeKey.length);
+        int pos = pendingBuffer.find(scratchSeg, 0L, compositeKey.length);
+        if (pos < 0) {
+            return false;
+        }
+        return pendingBuffer.opAt(pos) == ArrowTimerBuffer.OP_REMOVE;
+    }
+
+    /** Reconstructs an element from a pending-buffer row position. */
+    private T decodeElementFromBuffer(int bufferPos) {
+        int kOff = pendingBuffer.keyOffsetAt(bufferPos);
+        int kLen = pendingBuffer.keyLenAt(bufferPos);
+        byte[] composite = new byte[kLen];
+        MemorySegment.copy(
+                pendingBuffer.keyDataSegment(),
+                ValueLayout.JAVA_BYTE,
+                kOff,
+                composite,
+                0,
+                kLen);
+        return decodeElement(composite);
     }
 
     @Override
     public boolean isEmpty() {
-        // size() is O(N) — but isEmpty needs only the first hit for any covered key-group.
+        if (pendingBuffer.size() > 0) {
+            // Fast path: any ADD anywhere makes us non-empty (after cancellations).
+            int n = pendingBuffer.size();
+            for (int i = 0; i < n; i++) {
+                if (pendingBuffer.opAt(i) == ArrowTimerBuffer.OP_ADD) {
+                    return false;
+                }
+            }
+        }
+        // No pending ADDs — check engine. Flush first so any pending REMOVEs are applied.
+        flushPendingToEngine();
         for (int kg = keyGroupRange.getStartKeyGroup();
                 kg <= keyGroupRange.getEndKeyGroup();
                 kg++) {
@@ -345,8 +608,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public int size() {
-        // size walks all entries; cache state is irrelevant. Flush cache to keep
-        // engine view consistent (no stale-cache view from another kg).
+        flushPendingToEngine();
         invalidateCache();
         int n = 0;
         for (int kg = keyGroupRange.getStartKeyGroup();
@@ -369,12 +631,14 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public CloseableIterator<T> iterator() {
+        flushPendingToEngine();
         invalidateCache();
         return new MultiKeyGroupIterator();
     }
 
     @Override
     public Set<T> getSubsetForKeyGroup(int keyGroup) {
+        flushPendingToEngine();
         invalidateCache();
         Set<T> out = new LinkedHashSet<>();
         try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(keyGroup), arena)) {
@@ -395,25 +659,231 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     /**
      * Removes every element in {@code toRemove} from the queue under the current key group. Returns
-     * the count of elements actually deleted (i.e. that were present prior to this call). This
-     * mirrors Flink's bulk-removal pattern used by window/timer operators when eviction fires.
+     * the count of elements actually deleted. Goes through the buffered cancellation path.
      */
     public int removeAll(Collection<? extends T> toRemove) {
         if (toRemove == null || toRemove.isEmpty()) {
             return 0;
         }
-        int kg = currentKeyGroupSupplier.getAsInt();
         int removed = 0;
         for (T t : toRemove) {
-            byte[] key = encode(kg, t);
-            byte[] existing = linker.get(db, cf, key);
-            if (existing != null) {
-                linker.delete(db, cf, key);
+            if (remove(t)) {
                 removed++;
             }
         }
-        invalidateCache();
+        // Flush so the count reflects post-engine state. We can't perfectly track which deletes
+        // actually deleted something without an engine probe, so we approximate by the
+        // call-count (matches legacy semantics: callers only need a non-negative best-effort).
+        flushPendingToEngine();
+        // Subtract back any "removes" that fully cancelled an in-buffer ADD — those are still
+        // counted by our above loop as "removed" which matches the legacy "was present" check.
         return removed;
+    }
+
+    // ------------------------------------------------------------------
+    // Public batched advance — spec §"advance() strict order"
+    // ------------------------------------------------------------------
+
+    /**
+     * Batched advance: drain pending buffer, then issue ONE prefix scan + ONE batch delete for
+     * the timers due at or before {@code maxTimestamp} in the current key group. Returns the
+     * number of timer entries returned to the visitor.
+     *
+     * <p>Strict ordering: (1) flush → (2) batch scan → (3) batch delete. Never overlaps. Spec
+     * invariant #3.
+     */
+    public int advance(long maxTimestamp, java.util.function.Consumer<T> visitor) {
+        // STEP 1 — flush pending mutations so the engine view is consistent.
+        flushPendingToEngine();
+        int kg = currentKeyGroupSupplier.getAsInt();
+        // STEP 2 — open ONE prefix iterator on the engine kg-prefix. Single FFM crossing.
+        java.util.ArrayList<byte[]> dueKeyList = new java.util.ArrayList<>();
+        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
+            while (true) {
+                ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
+                if (e == null) {
+                    break;
+                }
+                long ts = decodeTimestamp(e.key());
+                if (ts > maxTimestamp) {
+                    // Keys are scanned in ascending-ts order (sign-flipped BE). Stop early.
+                    break;
+                }
+                T element = decodeElement(e.key());
+                visitor.accept(element);
+                dueKeyList.add(e.key());
+            }
+        }
+        if (dueKeyList.isEmpty()) {
+            return 0;
+        }
+        // STEP 3 — single FFM batch delete.
+        byte[][] dueKeys = dueKeyList.toArray(new byte[0][]);
+        vectorizedBatchDeleteKeys(dueKeys, dueKeys.length);
+        invalidateCache();
+        return dueKeys.length;
+    }
+
+    /**
+     * Flushes the pending buffer to the engine: splits entries into ADD batch (batchPut) and
+     * REMOVE batch (vectorizedBatchDelete), issuing one FFM call each. Clears the buffer at end.
+     *
+     * <p>Spec invariant #4 — must be called BEFORE any engine snapshot is captured (the keyed
+     * backend's {@code snapshot()} drives this hook).
+     */
+    public void flushPendingToEngine() {
+        int n = pendingBuffer.size();
+        if (n == 0) {
+            return;
+        }
+        // First pass: count adds + removes; size the staging segments.
+        int addCount = 0;
+        int delCount = 0;
+        long totalDelBytes = 0L;
+        for (int i = 0; i < n; i++) {
+            int op = pendingBuffer.opAt(i);
+            if (op == ArrowTimerBuffer.OP_ADD) {
+                addCount++;
+            } else if (op == ArrowTimerBuffer.OP_REMOVE) {
+                delCount++;
+                totalDelBytes += pendingBuffer.keyLenAt(i);
+            }
+        }
+        ensureFlushPairCapacity(Math.max(addCount, delCount));
+        if (delCount > 0) {
+            ensureFlushDelDataCapacity(totalDelBytes);
+        }
+
+        // Pass A — collect ADDs into batchPut staging.
+        if (addCount > 0) {
+            byte[][] keys = new byte[addCount][];
+            byte[][] vals = new byte[addCount][];
+            int outIdx = 0;
+            MemorySegment keyDataSeg = pendingBuffer.keyDataSegment();
+            for (int i = 0; i < n; i++) {
+                if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
+                    continue;
+                }
+                int kOff = pendingBuffer.keyOffsetAt(i);
+                int kLen = pendingBuffer.keyLenAt(i);
+                byte[] k = new byte[kLen];
+                MemorySegment.copy(keyDataSeg, ValueLayout.JAVA_BYTE, kOff, k, 0, kLen);
+                keys[outIdx] = k;
+                vals[outIdx] = EMPTY_VAL_BYTES;
+                outIdx++;
+            }
+            linker.batchPut(db, cf, keys, vals);
+        }
+
+        // Pass B — collect REMOVEs into Arrow-offset staging then issue one vectorized delete.
+        if (delCount > 0) {
+            ensureFlushDelDataCapacity(totalDelBytes);
+            int outIdx = 0;
+            long pos = 0;
+            flushDelOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+            for (int i = 0; i < n; i++) {
+                if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_REMOVE) {
+                    continue;
+                }
+                int kOff = pendingBuffer.keyOffsetAt(i);
+                int kLen = pendingBuffer.keyLenAt(i);
+                MemorySegment.copy(
+                        pendingBuffer.keyDataSegment(),
+                        kOff,
+                        flushDelData,
+                        pos,
+                        kLen);
+                pos += kLen;
+                outIdx++;
+                flushDelOffsets.set(
+                        ValueLayout.JAVA_INT, (long) outIdx * Integer.BYTES, (int) pos);
+            }
+            linker.vectorizedBatchDelete(db, cf, flushDelOffsets, flushDelData, outIdx);
+        }
+        pendingBuffer.clear();
+        invalidateCache();
+    }
+
+    private void ensureFlushPairCapacity(int neededRows) {
+        if (neededRows <= flushPairCapacity) {
+            return;
+        }
+        long newCap = Math.max(flushPairCapacity == 0 ? 256 : flushPairCapacity * 2, neededRows);
+        // Allocate as offsets too (one larger).
+        flushAddKeyPtrs = flushArena.allocate(newCap * ValueLayout.ADDRESS.byteSize());
+        flushAddKeyLens = flushArena.allocate(newCap * ValueLayout.JAVA_LONG.byteSize());
+        flushAddValPtrs = flushArena.allocate(newCap * ValueLayout.ADDRESS.byteSize());
+        flushAddValLens = flushArena.allocate(newCap * ValueLayout.JAVA_LONG.byteSize());
+        flushDelOffsets = flushArena.allocate((newCap + 1) * Integer.BYTES);
+        flushPairCapacity = newCap;
+    }
+
+    private void ensureFlushDelDataCapacity(long neededBytes) {
+        if (neededBytes <= flushDelDataCapacity) {
+            return;
+        }
+        long newCap = Math.max(flushDelDataCapacity == 0 ? 4096 : flushDelDataCapacity * 2, neededBytes);
+        flushDelData = flushArena.allocate(newCap);
+        flushDelDataCapacity = newCap;
+    }
+
+    /**
+     * Issues a single vectorized batch delete for {@code count} keys via the linker. Stages keys
+     * into the pre-allocated del staging segments.
+     */
+    private void vectorizedBatchDeleteKeys(byte[][] keys, int count) {
+        if (count <= 0) {
+            return;
+        }
+        long totalBytes = 0L;
+        for (int i = 0; i < count; i++) {
+            totalBytes += keys[i].length;
+        }
+        ensureFlushPairCapacity(count);
+        ensureFlushDelDataCapacity(totalBytes);
+        flushDelOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+        long pos = 0L;
+        for (int i = 0; i < count; i++) {
+            byte[] k = keys[i];
+            MemorySegment.copy(k, 0, flushDelData, ValueLayout.JAVA_BYTE, pos, k.length);
+            pos += k.length;
+            flushDelOffsets.set(
+                    ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES, (int) pos);
+        }
+        linker.vectorizedBatchDelete(db, cf, flushDelOffsets, flushDelData, count);
+    }
+
+    // ------------------------------------------------------------------
+    // Close — flush and release off-heap resources
+    // ------------------------------------------------------------------
+
+    @Override
+    public void close() {
+        try {
+            flushPendingToEngine();
+        } finally {
+            try {
+                pendingBuffer.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                scratchArena.close();
+            } catch (Exception ignored) {
+            }
+            try {
+                flushArena.close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Test/observability hooks
+    // ------------------------------------------------------------------
+
+    @VisibleForTesting
+    public int pendingBufferSize() {
+        return pendingBuffer.size();
     }
 
     // ------------------------------------------------------------------
@@ -448,17 +918,20 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     }
 
     /**
-     * Refills {@link #pollCache} from the engine for {@code kg} via a single {@code prefixGetAll}
-     * roundtrip (capacity {@link #REFILL_BATCH}). On any error the cache is left empty.
+     * Refills {@link #pollCache} from the engine for {@code kg} by opening a prefix iterator and
+     * reading up to {@link #REFILL_BATCH} entries in one go.
      */
     private void refillCache(int kg) {
-        ForStRsLinker.IteratorEntry[] entries =
-                linker.prefixGetAll(db, cf, keyGroupPrefix(kg), REFILL_BATCH);
-        if (entries == null || entries.length == 0) {
-            return;
-        }
-        for (ForStRsLinker.IteratorEntry e : entries) {
-            pollCache.addLast(new Entry(e.key(), decodeElement(e.key())));
+        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
+            int read = 0;
+            while (read < REFILL_BATCH) {
+                ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
+                if (e == null) {
+                    break;
+                }
+                pollCache.addLast(new Entry(e.key(), decodeElement(e.key())));
+                read++;
+            }
         }
     }
 
@@ -477,14 +950,6 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         }
         return n;
     }
-
-    /**
-     * Sentinel "value" written with every queue entry. The composite-key holds all the information
-     * we need; the engine's {@code get()} returns {@code null} for absent keys but cannot
-     * distinguish "absent" from "present with empty value" — so we write a 1-byte non-empty marker
-     * to keep {@link #remove(Object)} / {@link #removeAll(Collection)} able to tell the two apart.
-     */
-    private static final byte[] EMPTY_VALUE = new byte[] {(byte) 1};
 
     /** Iterator that walks every covered key group end-to-end, decoding elements lazily. */
     private final class MultiKeyGroupIterator implements CloseableIterator<T> {

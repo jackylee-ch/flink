@@ -105,8 +105,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     private static TimerServiceFactory pickTimerFactory() {
         String prop =
-                System.getProperty("forst.rs.timer-service.factory", "HEAP").trim().toUpperCase();
-        return "FORSTRS".equals(prop) ? TimerServiceFactory.FORSTRS : TimerServiceFactory.HEAP;
+                System.getProperty("forst.rs.timer-service.factory", "FORSTRS").trim().toUpperCase();
+        return "HEAP".equals(prop) ? TimerServiceFactory.HEAP : TimerServiceFactory.FORSTRS;
     }
 
     private StateRequestHandler stateRequestHandler;
