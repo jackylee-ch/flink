@@ -440,6 +440,130 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     /**
+     * Phase A.1 (audit-design §3 V4) — batched APPEND_MERGE dispatch.
+     *
+     * <p>Single FFI crossing for {@code count} rows. Each row's operand is the
+     * caller-pre-encoded payload bytes (typically {@code [count=u32 LE][elem_bytes*]}
+     * for ListState semantics — see {@link
+     * org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2#asyncAdd}).
+     *
+     * <p>Per-row layout in {@code buffer}: each {@link AppendMergeBatchBuffer#valueSliceLists()}
+     * entry must contain exactly ONE {@link MemorySegment} (the pre-encoded operand). The
+     * batched FFI expects one operand per row — for multi-element {@code asyncAddAll}, the
+     * caller should pre-concatenate elements into a single operand with {@code count=N}.
+     *
+     * <p>NOT YET WIRED to any call site in Phase A.1 — {@link #dispatchAppendMerge} is still
+     * the only caller of the engine FFI. Phase A.2 switches the call site by replacing the
+     * per-row {@code dispatchAppendMerge} loop with this batched form.
+     *
+     * @param buffer the APPEND_MERGE batch buffer populated by the classifier
+     * @return native error code (0 = OK)
+     */
+    public int dispatchAppendMergeBatch(AppendMergeBatchBuffer buffer) {
+        int count = buffer.count();
+        if (count == 0) {
+            return 0;
+        }
+        long t0 = System.nanoTime();
+        long bytesIn = 0;
+
+        ColumnarBatchBuffer keyBuf = buffer.keyBuffer();
+        List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
+        List<CompletableFuture<Void>> futures = buffer.futures();
+
+        // Build packed ops_off / ops_data in a single scratch Arena (one alloc total,
+        // not one-per-row like the legacy per-row dispatchAppendMerge).
+        Arena scratch = Arena.ofConfined();
+        try {
+            // Compute total ops byte size and per-row offset.
+            int[] opsOffsets = new int[count + 1];
+            int opsTotal = 0;
+            for (int row = 0; row < count; row++) {
+                MemorySegment[] vs = valueSliceLists.get(row);
+                // Phase A.1 contract: exactly 1 pre-encoded operand per row.
+                if (vs.length != 1) {
+                    throw new IllegalArgumentException(
+                            "dispatchAppendMergeBatch: row "
+                                    + row
+                                    + " must carry exactly 1 pre-encoded operand (got "
+                                    + vs.length
+                                    + "). Multi-element asyncAddAll callers must pre-concat.");
+                }
+                opsOffsets[row] = opsTotal;
+                opsTotal += (int) vs[0].byteSize();
+            }
+            opsOffsets[count] = opsTotal;
+
+            MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
+            MemorySegment opsDataSeg = scratch.allocate(opsTotal);
+            int writeOff = 0;
+            for (int row = 0; row < count; row++) {
+                opsOffSeg.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
+                MemorySegment op = valueSliceLists.get(row)[0];
+                long opLen = op.byteSize();
+                MemorySegment.copy(op, 0L, opsDataSeg, writeOff, opLen);
+                writeOff += (int) opLen;
+                bytesIn += opLen;
+            }
+            opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
+
+            // Keys are already in the columnar layout of keyBuf — no copy.
+            MemorySegment keysOffSeg = keyBuf.offsetsSegment();
+            MemorySegment keysDataSeg = keyBuf.dataSegment();
+            for (int row = 0; row < count; row++) {
+                int kStart = keysOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                int kEnd = keysOffSeg.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                bytesIn += kEnd - kStart;
+            }
+
+            int rc =
+                    linker.frsVecMergeAppendBatch(
+                            db.handle(),
+                            cf.handle(),
+                            keysOffSeg,
+                            keysDataSeg,
+                            opsOffSeg,
+                            opsDataSeg,
+                            count);
+            FrsErrorCode code = FrsErrorCode.fromU32(rc);
+
+            if (code == FrsErrorCode.OK) {
+                for (CompletableFuture<Void> f : futures) {
+                    f.complete(null);
+                }
+            } else {
+                Throwable err =
+                        code.isFailProcess()
+                                ? new FrsEnginePanicError(code, "kind=APPEND_MERGE_BATCH")
+                                : new FrsException(code, -1, new byte[0]);
+                if (code.isFailProcess() && fatalHandler != null) {
+                    fatalHandler.onFatalError((FrsEnginePanicError) err);
+                }
+                if (metrics != null) {
+                    metrics.recordFfiError(
+                            VectorizedStateRequest.Kind.APPEND_MERGE, "_batched", code);
+                }
+                for (CompletableFuture<Void> f : futures) {
+                    f.completeExceptionally(err);
+                }
+            }
+
+            if (metrics != null) {
+                metrics.recordDispatch(
+                        VectorizedStateRequest.Kind.APPEND_MERGE,
+                        MIXED_STATE,
+                        count,
+                        bytesIn,
+                        System.nanoTime() - t0);
+            }
+
+            return rc;
+        } finally {
+            scratch.close();
+        }
+    }
+
+    /**
      * Dispatches an ITER_PREFIX batch via {@code frs_vec_iter_prefix_open} FFI (P5).
      *
      * <p>For each request in the buffer, opens a native prefix-bounded iterator, wraps it in an

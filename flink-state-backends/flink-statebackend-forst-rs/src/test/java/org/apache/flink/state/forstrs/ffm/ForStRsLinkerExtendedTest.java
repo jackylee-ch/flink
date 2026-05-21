@@ -71,6 +71,142 @@ class ForStRsLinkerExtendedTest {
         }
     }
 
+    /**
+     * Phase A.1 (audit-design §3 V4): batched merge-append — 3 distinct keys with 1 operand each
+     * in a single FFI call.
+     */
+    @Test
+    void frsVecMergeAppendBatch_threeDistinctKeys() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                // 3 keys: "k1", "k2", "k3"; 3 operands: "A", "B", "C"
+                byte[] keys = "k1k2k3".getBytes(StandardCharsets.UTF_8);
+                int[] keysOff = {0, 2, 4, 6};
+                byte[] ops = "ABC".getBytes(StandardCharsets.UTF_8);
+                int[] opsOff = {0, 1, 2, 3};
+
+                java.lang.foreign.MemorySegment keysOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, keysOff.length);
+                for (int i = 0; i < keysOff.length; i++) {
+                    keysOffSeg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_INT, i, keysOff[i]);
+                }
+                java.lang.foreign.MemorySegment keysDataSeg = arena.allocate(keys.length);
+                java.lang.foreign.MemorySegment.copy(
+                        keys, 0, keysDataSeg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0,
+                        keys.length);
+                java.lang.foreign.MemorySegment opsOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, opsOff.length);
+                for (int i = 0; i < opsOff.length; i++) {
+                    opsOffSeg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_INT, i, opsOff[i]);
+                }
+                java.lang.foreign.MemorySegment opsDataSeg = arena.allocate(ops.length);
+                java.lang.foreign.MemorySegment.copy(
+                        ops, 0, opsDataSeg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0,
+                        ops.length);
+
+                int rc =
+                        linker.frsVecMergeAppendBatch(
+                                db.handle(),
+                                cf.handle(),
+                                keysOffSeg,
+                                keysDataSeg,
+                                opsOffSeg,
+                                opsDataSeg,
+                                3);
+                assertEquals(0, rc, "frsVecMergeAppendBatch returned rc=" + rc);
+
+                assertArrayEquals(utf8("A"), linker.lookupKv(db, cf, utf8("k1")));
+                assertArrayEquals(utf8("B"), linker.lookupKv(db, cf, utf8("k2")));
+                assertArrayEquals(utf8("C"), linker.lookupKv(db, cf, utf8("k3")));
+            }
+        }
+    }
+
+    /**
+     * Phase A.1: batched merge-append — same key repeated; operands concatenate into a single
+     * stored value (engine's read-combine-write per distinct key).
+     */
+    @Test
+    void frsVecMergeAppendBatch_sameKeyConcatenates() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[] keys = "k1k1k1".getBytes(StandardCharsets.UTF_8);
+                int[] keysOff = {0, 2, 4, 6};
+                byte[] ops = "XYZ".getBytes(StandardCharsets.UTF_8);
+                int[] opsOff = {0, 1, 2, 3};
+
+                java.lang.foreign.MemorySegment keysOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, keysOff.length);
+                for (int i = 0; i < keysOff.length; i++) {
+                    keysOffSeg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_INT, i, keysOff[i]);
+                }
+                java.lang.foreign.MemorySegment keysDataSeg = arena.allocate(keys.length);
+                java.lang.foreign.MemorySegment.copy(
+                        keys, 0, keysDataSeg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0,
+                        keys.length);
+                java.lang.foreign.MemorySegment opsOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, opsOff.length);
+                for (int i = 0; i < opsOff.length; i++) {
+                    opsOffSeg.setAtIndex(java.lang.foreign.ValueLayout.JAVA_INT, i, opsOff[i]);
+                }
+                java.lang.foreign.MemorySegment opsDataSeg = arena.allocate(ops.length);
+                java.lang.foreign.MemorySegment.copy(
+                        ops, 0, opsDataSeg, java.lang.foreign.ValueLayout.JAVA_BYTE, 0,
+                        ops.length);
+
+                int rc =
+                        linker.frsVecMergeAppendBatch(
+                                db.handle(),
+                                cf.handle(),
+                                keysOffSeg,
+                                keysDataSeg,
+                                opsOffSeg,
+                                opsDataSeg,
+                                3);
+                assertEquals(0, rc);
+
+                // All 3 ops concatenated into one stored value.
+                assertArrayEquals(utf8("XYZ"), linker.lookupKv(db, cf, utf8("k1")));
+            }
+        }
+    }
+
+    /** Phase A.1: n=0 is a no-op (no crash, returns OK). */
+    @Test
+    void frsVecMergeAppendBatch_zeroRowsIsNoop() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                // Valid empty buffers (callee must not deref when n=0).
+                java.lang.foreign.MemorySegment keysOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, 1);
+                java.lang.foreign.MemorySegment keysDataSeg = arena.allocate(1);
+                java.lang.foreign.MemorySegment opsOffSeg =
+                        arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT, 1);
+                java.lang.foreign.MemorySegment opsDataSeg = arena.allocate(1);
+
+                int rc =
+                        linker.frsVecMergeAppendBatch(
+                                db.handle(),
+                                cf.handle(),
+                                keysOffSeg,
+                                keysDataSeg,
+                                opsOffSeg,
+                                opsDataSeg,
+                                0);
+                assertEquals(0, rc);
+            }
+        }
+    }
+
     @Test
     void iteratorReturnsAllRowsInSortedOrder() {
         try (Arena arena = Arena.ofShared()) {

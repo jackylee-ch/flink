@@ -211,6 +211,7 @@ public final class ForStRsLinker {
     private final MethodHandle frsVecIterPrefixClose;
     private final MethodHandle frsVecIterPrefixAbort;
     private final MethodHandle frsVecMergeAppend;
+    private final MethodHandle frsVecMergeAppendBatch; // Phase A.1 (audit-design §3 V4)
 
     // 13. Range iterator (P9, §2-D): mirrors prefix handles with extra hi-bound argument.
     private final MethodHandle frsVecIterRangeOpen;
@@ -902,6 +903,19 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS,
                                 ValueLayout.ADDRESS,
                                 ValueLayout.JAVA_INT)); // P6-B
+        // Phase A.1 (audit-design §3 V4): batched merge-append, N rows in 1 FFI call.
+        this.frsVecMergeAppendBatch =
+                bind(
+                        "frs_vec_merge_append_batch",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT, // return rc
+                                ValueLayout.ADDRESS,   // db
+                                ValueLayout.ADDRESS,   // cf
+                                ValueLayout.ADDRESS,   // keys_off (u32*)
+                                ValueLayout.ADDRESS,   // keys_data (u8*)
+                                ValueLayout.ADDRESS,   // ops_off (u32*)
+                                ValueLayout.ADDRESS,   // ops_data (u8*)
+                                ValueLayout.JAVA_INT));// n
 
         // 13. Vectorized chunked range iterator (P9, spec §2 component D)
         this.frsVecIterRangeOpen =
@@ -3250,6 +3264,37 @@ public final class ForStRsLinker {
                             db, cf, keyPtr, keyLen, operandPtrs, operandLens, numOperands);
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_merge_append failed", t);
+        }
+    }
+
+    /**
+     * Phase A.1 (audit-design §3 V4) — batched merge-append.
+     *
+     * <p>Consumes {@code n} (key, operand) rows in a single FFI call. Each row's operand is the
+     * caller-encoded payload bytes (e.g. {@code [count][elem_bytes*]} for ListState semantics).
+     * The engine groups rows by key internally and performs one read-combine-write per distinct
+     * key, eliminating both the per-row FFM crossing and the per-row {@code Arena.ofConfined()}
+     * allocation pattern of {@link #frsVecMergeAppend}.
+     *
+     * <p>Layout: {@code keys_off[i+1] - keys_off[i] = keys[i].length}; same for {@code ops_off}.
+     *
+     * @return native error code (0 = OK; see {@link
+     *     org.apache.flink.state.forstrs.FrsErrorCode}).
+     */
+    public int frsVecMergeAppendBatch(
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment keysOff,
+            MemorySegment keysData,
+            MemorySegment opsOff,
+            MemorySegment opsData,
+            int n) {
+        try {
+            return (int)
+                    frsVecMergeAppendBatch.invokeExact(
+                            db, cf, keysOff, keysData, opsOff, opsData, n);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_merge_append_batch failed", t);
         }
     }
 
