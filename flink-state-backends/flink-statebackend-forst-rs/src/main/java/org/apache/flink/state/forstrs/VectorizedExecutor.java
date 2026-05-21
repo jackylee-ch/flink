@@ -342,18 +342,44 @@ public class VectorizedExecutor implements StateExecutor {
     /**
      * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI (P6-B).
      *
-     * <p>Per-request dispatch: for each request in the buffer, allocates a small scratch {@link
-     * Arena} to hold the {@code operand_ptrs} and {@code operand_lens} arrays, then calls {@code
-     * frs_vec_merge_append} with the key and N operand slices. V1 uses one FFI call per request;
-     * true multi-request batching is V1.x.
+     * <p><b>Phase A.1 update (audit-design §3 V4):</b> when each request carries exactly 1 operand
+     * slice, this method delegates to {@link #dispatchAppendMergeBatch} for a single batched FFM
+     * crossing. Multi-operand-per-row requests still go through the legacy per-row path below
+     * (the batched FFI's wire layout is 1 operand per row).
      *
-     * <p>Each request carries N value slices (one per list element). For {@link
+     * <p>Legacy per-request dispatch: for each request in the buffer, allocates a small scratch
+     * {@link Arena} to hold the {@code operand_ptrs} and {@code operand_lens} arrays, then calls
+     * {@code frs_vec_merge_append} with the key and N operand slices. Each request carries N
+     * value slices (one per list element). For {@link
      * org.apache.flink.state.forstrs.state.ForStRsListStateV2#addAll(java.util.List)}, N &gt; 1 so
      * the call is effectively batched at the element level even in this per-request form.
      *
      * @param buffer the APPEND_MERGE batch buffer populated by the classifier
      */
     public void dispatchAppendMerge(AppendMergeBatchBuffer buffer) {
+        // Phase A.1 fast path: if every row has exactly 1 operand, use the batched FFI.
+        // This is the common case for ListState.asyncAdd (one element per call).
+        int count = buffer.count();
+        if (count == 0) {
+            return;
+        }
+        boolean allSingleOperand = true;
+        for (int row = 0; row < count; row++) {
+            if (buffer.valueSliceLists().get(row).length != 1) {
+                allSingleOperand = false;
+                break;
+            }
+        }
+        if (allSingleOperand) {
+            dispatchAppendMergeBatch(buffer);
+            return;
+        }
+        // Fall through to the legacy per-row path for multi-operand-per-row requests.
+        dispatchAppendMergePerRow(buffer);
+    }
+
+    /** Legacy per-row dispatch path. Kept for multi-operand-per-row requests until V20 closes. */
+    private void dispatchAppendMergePerRow(AppendMergeBatchBuffer buffer) {
         int count = buffer.count();
         if (count == 0) {
             return;
