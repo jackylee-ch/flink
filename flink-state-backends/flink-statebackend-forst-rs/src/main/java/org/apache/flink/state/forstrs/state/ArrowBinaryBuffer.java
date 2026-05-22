@@ -480,13 +480,11 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         if (kEnd - kStart != len) {
             return false;
         }
-        for (int i = 0; i < len; i++) {
-            if (keyData.get(ValueLayout.JAVA_BYTE, kStart + i)
-                    != seg.get(ValueLayout.JAVA_BYTE, offset + i)) {
-                return false;
-            }
-        }
-        return true;
+        // Round-3 fix V2-9 / J4-5: JDK 22+ MemorySegment.mismatch() is JIT-intrinsified
+        // (vector-compare instructions on AVX2/NEON). Replaces a scalar byte-by-byte loop
+        // that was on the V1-sync hot path (92M ops on Q11).
+        // Returns -1 when slices are equal, or the first mismatch index otherwise.
+        return keyData.asSlice(kStart, len).mismatch(seg.asSlice(offset, len)) < 0;
     }
 
     private int appendKey(MemorySegment seg, long off, int len) {

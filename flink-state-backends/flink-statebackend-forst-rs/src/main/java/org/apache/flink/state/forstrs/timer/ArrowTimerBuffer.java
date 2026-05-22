@@ -82,7 +82,7 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     private long keyDataUsed;
     private long keyDataCapacity;
 
-    /** Visitor for {@link #drainTo(FlushVisitor)} — receives entries in heap-array index order. */
+    /** Visitor for {@link #drainUnordered(FlushVisitor)} / {@link #drainTo(FlushVisitor)}. */
     public interface FlushVisitor {
         void visit(int op, MemorySegment keyData, int keyOff, int keyLen, long ts);
     }
@@ -212,10 +212,14 @@ public final class ArrowTimerBuffer implements AutoCloseable {
 
     /**
      * Iterates ALL entries (in heap-array index order) and passes each to the visitor. Used by
-     * the priority queue's flush path. Caller is responsible for calling {@link #clear()} after
-     * draining if buffer reuse is desired.
+     * the priority queue's flush path — engine-side re-sorts on insert. Caller is responsible
+     * for calling {@link #clear()} after draining if buffer reuse is desired.
+     *
+     * <p><b>Round-3 fix S1-7:</b> renamed from {@code drainTo} to make ordering explicit. The
+     * old name implied min-heap timestamp order which it never delivered. Any future
+     * savepoint/migration caller that needs ordered drain must use {@link #drainOrdered}.
      */
-    public void drainTo(FlushVisitor v) {
+    public void drainUnordered(FlushVisitor v) {
         for (int i = 0; i < size; i++) {
             int op = opAt(i);
             int kOff = keyOffsetAt(i);
@@ -223,6 +227,19 @@ public final class ArrowTimerBuffer implements AutoCloseable {
             long ts = tsAt(i);
             v.visit(op, keyData, kOff, kLen, ts);
         }
+    }
+
+    /**
+     * Backward-compat shim for the old {@code drainTo} name. Delegates to {@link
+     * #drainUnordered}. New callers should pick {@code drainUnordered} or {@code drainOrdered}
+     * explicitly.
+     *
+     * @deprecated use {@link #drainUnordered} (heap-index order) or a future {@code
+     *     drainOrdered} (strict timestamp order).
+     */
+    @Deprecated
+    public void drainTo(FlushVisitor v) {
+        drainUnordered(v);
     }
 
     /** Clears all entries; reuses capacity for next call. */
