@@ -58,6 +58,27 @@ public final class ForStRsKeyGroupedSerializer<K> {
     private static final ThreadLocal<DataOutputSerializer> POOL =
             ThreadLocal.withInitial(() -> new DataOutputSerializer(256));
 
+    /**
+     * Per-thread cache of state-name UTF-8 byte arrays. State names are very few (one per
+     * registered state) and never reclaimed during the operator's lifetime, so a small bounded
+     * map keyed by interned String identity beats {@code String.getBytes(UTF_8)} per call by
+     * ~3-5 µs of allocation+encoding (PR-B3). Callers that already know the bytes should use the
+     * overload that takes {@code byte[] stateNameBytes} directly.
+     */
+    private static final ThreadLocal<java.util.HashMap<String, byte[]>> STATE_NAME_BYTES_CACHE =
+            ThreadLocal.withInitial(() -> new java.util.HashMap<>(8));
+
+    private static byte[] stateNameBytes(String stateName) {
+        java.util.HashMap<String, byte[]> cache = STATE_NAME_BYTES_CACHE.get();
+        byte[] cached = cache.get(stateName);
+        if (cached != null) {
+            return cached;
+        }
+        byte[] encoded = stateName.getBytes(StandardCharsets.UTF_8);
+        cache.put(stateName, encoded);
+        return encoded;
+    }
+
     private final TypeSerializer<K> keySerializer;
 
     public ForStRsKeyGroupedSerializer(TypeSerializer<K> keySerializer) {
@@ -69,6 +90,19 @@ public final class ForStRsKeyGroupedSerializer<K> {
     }
 
     public byte[] encodeForState(int keyGroup, K userKey, String stateName) {
+        // PR-B3: route through the byte[]-taking overload; the per-thread cache
+        // eliminates the per-call String.getBytes(UTF_8) allocation on the heap-path
+        // V1-sync hot path.
+        return encodeForState(keyGroup, userKey, stateNameBytes(stateName));
+    }
+
+    /**
+     * Byte[]-cached variant of {@link #encodeForState}. Callers that hold the pre-encoded UTF-8
+     * bytes of the state name (e.g. state-class constructors that cache the bytes once) should
+     * prefer this overload — it skips both the per-thread cache lookup and the
+     * {@code String.getBytes(UTF_8)} fallback.
+     */
+    public byte[] encodeForState(int keyGroup, K userKey, byte[] stateNameBytes) {
         validateKeyGroup(keyGroup);
         DataOutputSerializer out = POOL.get();
         out.clear();
@@ -76,8 +110,7 @@ public final class ForStRsKeyGroupedSerializer<K> {
             out.writeShort(keyGroup); // 2 bytes BE per Flink convention
             keySerializer.serialize(userKey, out);
             out.write(SEP);
-            byte[] sn = stateName.getBytes(StandardCharsets.UTF_8);
-            out.write(sn);
+            out.write(stateNameBytes);
             out.write(SEP);
         } catch (IOException e) {
             throw new RuntimeException("encodeForState failed: " + e.getMessage(), e);
@@ -232,6 +265,21 @@ public final class ForStRsKeyGroupedSerializer<K> {
             String stateName,
             TypeSerializer<UK> userKeySerializer,
             UK userMapKey) {
+        // PR-B3: route through the byte[]-taking overload via the per-thread cache.
+        return encodeForMap(
+                keyGroup, userKey, stateNameBytes(stateName), userKeySerializer, userMapKey);
+    }
+
+    /**
+     * Byte[]-cached variant of {@link #encodeForMap}. See {@link #encodeForState(int, Object,
+     * byte[])} for rationale.
+     */
+    public <UK> byte[] encodeForMap(
+            int keyGroup,
+            K userKey,
+            byte[] stateNameBytes,
+            TypeSerializer<UK> userKeySerializer,
+            UK userMapKey) {
         validateKeyGroup(keyGroup);
         DataOutputSerializer out = POOL.get();
         out.clear();
@@ -239,8 +287,7 @@ public final class ForStRsKeyGroupedSerializer<K> {
             out.writeShort(keyGroup);
             keySerializer.serialize(userKey, out);
             out.write(SEP);
-            byte[] sn = stateName.getBytes(StandardCharsets.UTF_8);
-            out.write(sn);
+            out.write(stateNameBytes);
             out.write(SEP);
             userKeySerializer.serialize(userMapKey, out);
         } catch (IOException e) {

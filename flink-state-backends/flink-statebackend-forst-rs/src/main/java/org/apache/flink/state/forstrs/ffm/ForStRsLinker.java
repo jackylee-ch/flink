@@ -1351,8 +1351,42 @@ public final class ForStRsLinker {
      * the duration of the native call instead of staging them through a per-call native arena.
      */
     public void put(FrsDb db, FrsCfHandle cf, byte[] key, byte[] value) {
+        put(db, cf, key, value, 0, value.length);
+    }
+
+    /**
+     * Writes a key/value pair using a sub-range of the supplied {@code value} byte[]. Allows
+     * callers (e.g. V1-sync state classes) to pass the shared internal buffer of a
+     * {@link org.apache.flink.core.memory.DataOutputSerializer} without first calling
+     * {@code getCopyOfBuffer()} — eliminates one per-event byte[] allocation on the value-state
+     * update hot path (PR-B3).
+     *
+     * @param value the value-bearing buffer (only bytes {@code [valueOffset, valueOffset +
+     *     valueLength)} are read by the engine)
+     * @param valueOffset offset into {@code value} where the payload starts (must be {@code >= 0})
+     * @param valueLength number of payload bytes (must be {@code >= 0} and {@code valueOffset +
+     *     valueLength <= value.length})
+     */
+    public void put(
+            FrsDb db,
+            FrsCfHandle cf,
+            byte[] key,
+            byte[] value,
+            int valueOffset,
+            int valueLength) {
+        if (valueOffset < 0
+                || valueLength < 0
+                || (long) valueOffset + (long) valueLength > value.length) {
+            throw new IllegalArgumentException(
+                    "value range out of bounds: offset="
+                            + valueOffset
+                            + " length="
+                            + valueLength
+                            + " value.length="
+                            + value.length);
+        }
         MemorySegment keySeg = MemorySegment.ofArray(key);
-        MemorySegment valSeg = MemorySegment.ofArray(value);
+        MemorySegment valSeg = MemorySegment.ofArray(value).asSlice(valueOffset, valueLength);
         int rc;
         try {
             rc =
@@ -1363,7 +1397,7 @@ public final class ForStRsLinker {
                                     keySeg,
                                     (long) key.length,
                                     valSeg,
-                                    (long) value.length);
+                                    (long) valueLength);
         } catch (Throwable t) {
             throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
         }
@@ -1505,8 +1539,36 @@ public final class ForStRsLinker {
      * ValueState read-modify-write pattern.
      */
     public byte[] getAndPut(FrsDb db, FrsCfHandle cf, byte[] key, byte[] newValue) {
+        return getAndPut(db, cf, key, newValue, 0, newValue.length);
+    }
+
+    /**
+     * Sub-range variant of {@link #getAndPut(FrsDb, FrsCfHandle, byte[], byte[])}. Lets V1-sync
+     * state classes pass the shared internal buffer of a
+     * {@link org.apache.flink.core.memory.DataOutputSerializer} directly, avoiding the per-event
+     * {@code getCopyOfBuffer()} allocation on the read-modify-write hot path (PR-B3).
+     */
+    public byte[] getAndPut(
+            FrsDb db,
+            FrsCfHandle cf,
+            byte[] key,
+            byte[] newValue,
+            int newValueOffset,
+            int newValueLength) {
+        if (newValueOffset < 0
+                || newValueLength < 0
+                || (long) newValueOffset + (long) newValueLength > newValue.length) {
+            throw new IllegalArgumentException(
+                    "newValue range out of bounds: offset="
+                            + newValueOffset
+                            + " length="
+                            + newValueLength
+                            + " newValue.length="
+                            + newValue.length);
+        }
         MemorySegment keySeg = MemorySegment.ofArray(key);
-        MemorySegment valSeg = MemorySegment.ofArray(newValue);
+        MemorySegment valSeg =
+                MemorySegment.ofArray(newValue).asSlice(newValueOffset, newValueLength);
         byte[] outBytesArr = FRS_BYTES_BUF.get();
         MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
         int rc;
@@ -1519,7 +1581,7 @@ public final class ForStRsLinker {
                                     keySeg,
                                     (long) key.length,
                                     valSeg,
-                                    (long) newValue.length,
+                                    (long) newValueLength,
                                     outBytes);
         } catch (Throwable t) {
             throw new FrsBackendException(

@@ -361,14 +361,24 @@ public class ForStRsValueState<T> implements ValueState<T> {
         }
         outputBuffer.clear();
         serializer.serialize(value, outputBuffer);
-        byte[] payload = outputBuffer.getCopyOfBuffer();
         // Reuse the key from the preceding value() call if available
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
-        // Buffer the write instead of calling native immediately
         if (writeBufferPut != null) {
+            // Buffered path: the buffer MUST own the value (it stays referenced until the
+            // shared write buffer is drained). Keep the defensive copy.
+            byte[] payload = outputBuffer.getCopyOfBuffer();
             writeBufferPut.accept(key, payload);
         } else {
-            linker.put(db, cf, key, payload);
+            // Immediate path: the engine consumes the value bytes synchronously inside the
+            // critical-mode FFM call, so we can reuse the serializer's internal buffer
+            // without copying (PR-B3 — eliminates ~64-byte alloc per update).
+            linker.put(
+                    db,
+                    cf,
+                    key,
+                    outputBuffer.getSharedBuffer(),
+                    0,
+                    outputBuffer.length());
         }
         lastValueKey = null; // consumed
     }
@@ -420,8 +430,17 @@ public class ForStRsValueState<T> implements ValueState<T> {
     public T getAndUpdate(T newValue) throws IOException {
         outputBuffer.clear();
         serializer.serialize(newValue, outputBuffer);
-        byte[] payload = outputBuffer.getCopyOfBuffer();
-        byte[] oldRaw = linker.getAndPut(db, cf, computeKey(), payload);
+        // PR-B3: reuse the serializer's internal buffer; the engine consumes the value
+        // bytes synchronously inside the critical-mode FFM call, so no defensive copy is
+        // required. Eliminates one byte[] allocation per read-modify-write event.
+        byte[] oldRaw =
+                linker.getAndPut(
+                        db,
+                        cf,
+                        computeKey(),
+                        outputBuffer.getSharedBuffer(),
+                        0,
+                        outputBuffer.length());
         if (oldRaw == null) {
             return null;
         }
