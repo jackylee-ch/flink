@@ -225,8 +225,23 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * ValueState entry point (encoder writes from offset 0). 64 KB is plenty for Q5 (max composite
      * key ~100 B + value ~16 B; reused across the 5 panes within one event).
      */
+    /**
+     * PR-M1 (D-R2-5 fix): the previous {@code ThreadLocal<MemorySegment>} initializer was
+     * {@code () -> Arena.ofShared().allocate(65536)} — the {@code Arena} reference was dropped,
+     * so it never closed (bounded 64 KB leak per task thread). Now stores both Arena + segment
+     * and tracks all per-thread Arenas in {@link #threadLocalArenas} so {@link #close()} can
+     * dispose them.
+     */
+    private final java.util.List<Arena> threadLocalArenas =
+            java.util.Collections.synchronizedList(new java.util.ArrayList<>());
+
     private final ThreadLocal<MemorySegment> scratchArenaTL =
-            ThreadLocal.withInitial(() -> Arena.ofShared().allocate(65536));
+            ThreadLocal.withInitial(
+                    () -> {
+                        Arena a = Arena.ofShared();
+                        threadLocalArenas.add(a);
+                        return a.allocate(65536);
+                    });
 
     /**
      * Suppliers passed to off-heap ForStRsValueState. NOTE: returns 0 unconditionally because
@@ -926,6 +941,18 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             }
         }
         ownedBuffers.clear();
+        // PR-M1 (D-R2-5): close all per-thread scratch Arenas so their 64 KB allocations
+        // are reclaimed instead of leaking until JVM shutdown.
+        synchronized (threadLocalArenas) {
+            for (Arena a : threadLocalArenas) {
+                try {
+                    a.close();
+                } catch (Throwable ignore) {
+                    // best-effort
+                }
+            }
+            threadLocalArenas.clear();
+        }
         // Flush any buffered writes before releasing resources.
         flushWriteBuffer();
         stateCache.clear();

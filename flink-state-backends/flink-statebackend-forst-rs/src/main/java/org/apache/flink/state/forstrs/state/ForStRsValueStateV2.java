@@ -70,11 +70,24 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
     // -- ForStRsInnerTable implementation --
 
     @Override
+    @SuppressWarnings("unchecked")
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
-        byte[] cached = (byte[]) ctx.getExtra();
-        if (cached != null) {
-            return cached;
+        // PR-A5 (S1-10 / A1-H6 fix): RecordContext.extra is shared across ValueStates within
+        // the same operator. Previously stored a single byte[] composite key, which meant a
+        // second ValueState would read the FIRST state's composite (wrong stateName encoded)
+        // — silent cross-state corruption. Now keyed by stateName via a Map<String, byte[]>.
+        Object extra = ctx.getExtra();
+        java.util.Map<String, byte[]> slot;
+        if (extra instanceof java.util.Map<?, ?>) {
+            slot = (java.util.Map<String, byte[]>) extra;
+            byte[] cached = slot.get(stateName);
+            if (cached != null) {
+                return cached;
+            }
+        } else {
+            slot = new java.util.HashMap<>(4);
+            ctx.setExtra(slot);
         }
         try {
             keyOut.clear();
@@ -97,7 +110,7 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
             System.arraycopy(stateNameBytes, 0, composite, off, stateNameBytes.length);
             off += stateNameBytes.length;
             System.arraycopy(SLASH, 0, composite, off, SLASH.length);
-            ctx.setExtra(composite);
+            slot.put(stateName, composite);
             return composite;
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize key", e);
