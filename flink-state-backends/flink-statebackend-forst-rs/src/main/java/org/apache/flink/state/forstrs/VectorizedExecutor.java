@@ -169,10 +169,79 @@ public class VectorizedExecutor implements StateExecutor {
         listStateNames.add(stateName);
     }
 
+    /**
+     * Execute a classified batch end-to-end and return a container future that reflects the
+     * outcome.
+     *
+     * <p><b>PR-E2 / F5-3 design rationale (in-flight parallelism).</b> The spec asked whether we
+     * could pipeline dispatch by:
+     *
+     * <ol>
+     *   <li>Submitting the FFM batch synchronously on the mailbox thread,
+     *   <li>Returning an INCOMPLETE container future immediately, and
+     *   <li>Completing per-row futures from a worker thread on the next mailbox tick.
+     * </ol>
+     *
+     * <p>The framework <em>does</em> permit this contract — the {@link
+     * org.apache.flink.runtime.asyncprocessing.AsyncExecutionController#triggerIfNeeded} caller
+     * ignores the container future entirely; per-row {@link
+     * org.apache.flink.core.asyncprocessing.InternalAsyncFuture#complete} already queues user
+     * callbacks back onto the mailbox via {@link
+     * org.apache.flink.runtime.asyncprocessing.CallbackRunnerWrapper}. The community ForSt
+     * {@code ForStStateExecutor} exploits this by offloading the engine call to a dedicated
+     * {@code coordinatorThread} and returning early.
+     *
+     * <p><b>Why forst-rs cannot adopt that pattern in PR-E2's 2.5-day scope:</b>
+     *
+     * <ol>
+     *   <li><b>FFI is synchronous (V1 contract).</b> {@code frs_vectorized_batch_get/put/delete}
+     *       block until the engine has applied the batch op. So the only thread-side parallelism
+     *       to win is interleaving Java-side decode + future-completion with the NEXT batch's
+     *       classifier offer-phase.
+     *   <li><b>Shared executor buffers prevent offload.</b> The Arrow {@link
+     *       ColumnarBatchBuffer}s ({@code getKeys}, {@code putKeys}, {@code putValues}, {@code
+     *       deleteKeys}) and the GET out-segments ({@code outOffsets}, {@code outValidity},
+     *       {@code outData}) are <em>long-lived, executor-owned</em>. {@link
+     *       #createRequestContainer()} hands the same buffer instances to every per-batch
+     *       classifier and calls {@code reset()} on them. If we offloaded batch N to a worker
+     *       and let the mailbox thread call {@code createRequestContainer()} for batch N+1, the
+     *       reset would clobber buffer state that batch N's worker is still reading/writing →
+     *       data race.
+     *   <li><b>No MailboxExecutor injection.</b> The "defer per-row completion to next mailbox
+     *       tick" alternative requires plumbing a {@link
+     *       org.apache.flink.api.common.operators.MailboxExecutor} reference into this class.
+     *       That plumbing reaches up through {@code ForStRsAsyncKeyedStateBackend.create(...)}
+     *       and the keyed-state-backend factory and is non-trivially out of PR-E2's scope.
+     *   <li><b>{@link #fullyLoaded()} always returns {@code false}.</b> Without a real in-flight
+     *       accounting (counting outstanding batches in flight on a worker), the runtime would
+     *       trigger an unbounded number of pipelined batches and overflow the shared buffers
+     *       within milliseconds.
+     * </ol>
+     *
+     * <p>The proper fix is structural: per-batch buffer ownership (refactor of the C1 design),
+     * MailboxExecutor injection, a coordinator-thread mirror of community ForSt, and real
+     * {@code fullyLoaded()} accounting. That is multiple PRs of work and was explicitly flagged
+     * by the spec as "deferred to a Flink-runtime change" when the buffer model blocks the
+     * surgical fix.
+     *
+     * <p><b>Pragmatic fallback chosen here.</b> We instrument the synchronous path with {@link
+     * DispatchMetrics#recordBatchStart()} / {@link DispatchMetrics#recordBatchEnd()} so the
+     * in-flight depth is observable. In the current contract the depth histogram is a dirac at
+     * 1; the test {@code AsyncDispatchInFlightParallelismTest} asserts this invariant. When the
+     * proper structural fix lands, the same histogram will show depths &gt; 1, and the test
+     * becomes a regression gate for the buffer-ownership refactor.
+     *
+     * <p>This is NOT a forst-rs bug — the V1 FFI is sync by design, and the framework's caller
+     * doesn't gate on the container future. The depth-=-1 invariant is a buffer-ownership
+     * constraint enforced by the current shared-buffer design.
+     */
     @Override
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
         VectorizedClassifier classifier = (VectorizedClassifier) container;
+        if (metrics != null) {
+            metrics.recordBatchStart();
+        }
         try {
             // Spec §Correctness Invariant 2: any deferred / cached writes must be
             // flushed BEFORE iterator ops. Within a single batch the natural
@@ -251,6 +320,12 @@ public class VectorizedExecutor implements StateExecutor {
             // previously escape the outer catch and the container future would never be
             // returned (operator hangs forever on the unresolved CompletableFuture).
             return CompletableFuture.failedFuture(t);
+        } finally {
+            // PR-E2: end-of-batch hook for in-flight depth tracking. Runs even on the
+            // failure path so the depth gauge accurately reflects batch lifecycle.
+            if (metrics != null) {
+                metrics.recordBatchEnd();
+            }
         }
     }
 

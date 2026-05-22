@@ -60,6 +60,16 @@ public final class DispatchMetrics {
     private final Histogram snapshotHeldMs;
     private final AtomicLong iterHandlesOpen = new AtomicLong(0);
 
+    // PR-E2: per-batch in-flight depth tracking. Records how many batches are currently being
+    // dispatched (i.e., have entered {@code executeBatchRequests} but not yet returned). With the
+    // current synchronous-on-mailbox-thread contract, the histogram is expected to be a dirac at
+    // 1 — the value of this metric is to LET OBSERVABILITY PROVE THAT INVARIANT in production
+    // and to give a falsifiable signal when (and only when) the framework's contract relaxes to
+    // permit pipelined dispatch.
+    private final AtomicLong inFlightBatches = new AtomicLong(0);
+    private final Histogram inFlightBatchDepth;
+    private final Counter totalBatches;
+
     public DispatchMetrics(MetricGroup root) {
         MetricGroup forstrs = root.addGroup("forstrs");
         this.dispatchGroup = forstrs.addGroup("dispatch");
@@ -71,6 +81,39 @@ public final class DispatchMetrics {
         this.snapshotHeldMs =
                 iterGroup.histogram("snapshot_held_ms", new DescriptiveStatisticsHistogram(500));
         iterGroup.gauge("handles_open", iterHandlesOpen::get);
+        // PR-E2 in-flight depth observability.
+        this.totalBatches = dispatchGroup.counter("batches_total");
+        this.inFlightBatchDepth =
+                dispatchGroup.histogram(
+                        "in_flight_batch_depth", new DescriptiveStatisticsHistogram(500));
+        dispatchGroup.gauge("in_flight_batches", inFlightBatches::get);
+    }
+
+    // ---------- PR-E2: per-batch in-flight depth tracking ----------
+
+    /**
+     * Record the start of a batch dispatch. Increments the in-flight counter and pushes the
+     * post-increment depth into the depth histogram. Pair with {@link #recordBatchEnd()}.
+     */
+    public void recordBatchStart() {
+        long depth = inFlightBatches.incrementAndGet();
+        inFlightBatchDepth.update(depth);
+        totalBatches.inc();
+    }
+
+    /** Record batch completion. Decrements the in-flight counter. */
+    public void recordBatchEnd() {
+        inFlightBatches.decrementAndGet();
+    }
+
+    /** Current in-flight batch count. Used by PR-E2 contract assertions. */
+    public long inFlightBatchCount() {
+        return inFlightBatches.get();
+    }
+
+    /** Total batches dispatched since startup (counter). */
+    public long totalBatchCount() {
+        return totalBatches.getCount();
     }
 
     // ---------- Per-kind, per-state recording ----------

@@ -139,12 +139,16 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
     // ---------------------------------------------------------------
 
     /**
-     * Builds the cache key bytes from the current record context. Mirrors {@link
-     * #serializeKey(StateRequest)} but reads the (K, N) from the AEC's current {@link
-     * RecordContext} instead of a StateRequest.
+     * Cleanup-C3 (zero-alloc cache key): writes the composite cache key bytes into the
+     * per-instance reusable {@link #keyOut} and returns the length. Callers probe the cache via a
+     * slice view over {@code keyOut.getSharedBuffer()} — no {@code getCopyOfBuffer()} allocation.
+     * The miss-resolve branch snapshots the slice once before deferring to {@code asyncGetInternal}.
+     *
+     * <p>Mirrors {@link #serializeKey(StateRequest)} but reads the (K, N) from the AEC's current
+     * {@link RecordContext} instead of a StateRequest.
      */
     @SuppressWarnings("unchecked")
-    private byte[] buildCacheKeyFromContext() {
+    private int writeCacheKeyToKeyOut() {
         AsyncExecutionController<K, ?> aec =
                 (AsyncExecutionController<K, ?>) stateRequestHandler;
         RecordContext<K> ctx = aec.getCurrentContext();
@@ -161,7 +165,7 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
                     && !(namespace instanceof VoidNamespace)) {
                 namespaceSerializer.serialize(namespace, keyOut);
             }
-            return keyOut.getCopyOfBuffer();
+            return keyOut.length();
         } catch (IOException e) {
             throw new RuntimeException(
                     "ForStRsAsyncAggregatingStateV2: failed to serialize cache key", e);
@@ -175,18 +179,27 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      * value, and stores the result in the cache (marked dirty).
      *
      * <p>Null inputs are ignored to match base-class semantics.
+     *
+     * <p>Cleanup-C3: cache-hit path is alloc-free; the key bytes are probed as a slice view of
+     * the per-instance {@code keyOut} shared buffer. Only the miss-resolve branch snapshots the
+     * bytes (one allocation on the cold path).
      */
     @Override
     public StateFuture<Void> asyncAdd(IN value) {
         if (value == null) {
             return StateFutureUtils.completedVoidFuture();
         }
-        byte[] cacheKey = buildCacheKeyFromContext();
-        Optional<ACC> hit = cache.tryFold(cacheKey, value);
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        Optional<ACC> hit = cache.tryFold(keyBuf, 0, keyLen, value);
         if (hit.isPresent()) {
             return StateFutureUtils.completedVoidFuture();
         }
-        // Cache miss — fetch existing accumulator from the engine, fold, populate cache.
+        // Cache miss — snapshot the key bytes (the only allocation on the miss path) so that
+        // subsequent serialize calls don't clobber the shared keyOut buffer before the cache
+        // put completes.
+        final byte[] keySnapshot = new byte[keyLen];
+        System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
         return asyncGetInternal()
                 .thenApply(
                         oldAcc -> {
@@ -196,7 +209,7 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
                                                 ? aggregateFn.createAccumulator()
                                                 : oldAcc;
                                 ACC newAcc = aggregateFn.add(value, seed);
-                                cache.put(cacheKey, newAcc);
+                                cache.put(keySnapshot, newAcc);
                                 return null;
                             } catch (Exception e) {
                                 throw new RuntimeException(
@@ -210,12 +223,15 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      * Cache-aware {@code asyncGet}. If the entry is in the cache (even dirty), returns the cached
      * value (after {@link AggregateFunction#getResult(Object)}) without an engine round trip.
      * Otherwise falls through to the base implementation.
+     *
+     * <p>Cleanup-C3: probes via the shared-buffer slice view; no byte[] allocation on hit.
      */
     @Override
     public StateFuture<OUT> asyncGet() {
-        byte[] cacheKey = buildCacheKeyFromContext();
-        if (cache.contains(cacheKey)) {
-            ACC cached = cache.peek(cacheKey);
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        if (cache.contains(keyBuf, 0, keyLen)) {
+            ACC cached = cache.peek(keyBuf, 0, keyLen);
             OUT out = cached == null ? null : aggregateFn.getResult(cached);
             return StateFutureUtils.completedFuture(out);
         }

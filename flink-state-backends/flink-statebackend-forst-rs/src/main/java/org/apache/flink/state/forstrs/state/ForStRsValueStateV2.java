@@ -36,6 +36,7 @@ import org.apache.flink.state.forstrs.ForStRsInnerTable;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * V2 async ValueState for ForSt-RS. Extends Flink's {@link AbstractValueState} for the async state
@@ -47,10 +48,29 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
 
     private static final byte[] KEY_PREFIX = "k/".getBytes(StandardCharsets.UTF_8);
     private static final byte[] SLASH = "/".getBytes(StandardCharsets.UTF_8);
-    private static final byte[] EMPTY_BYTES = new byte[0];
+
+    /**
+     * Cleanup-A5 (zero-copy): registration-time ordinal counter. Each ValueStateV2 instance gets a
+     * dense, monotonically-increasing integer at construction so the per-{@link RecordContext}
+     * cache slot can be a {@code Slot[]} indexed by ordinal — no {@code Map.put}, no
+     * {@code String} hashing/concat per call. Counter is process-static; only ValueStateV2
+     * consumes {@code ctx.getExtra()} today, so its ordinal space is private to this class.
+     */
+    private static final AtomicInteger NEXT_STATE_ORDINAL = new AtomicInteger(0);
+
+    /** Initial growth size for the per-ctx slot array. */
+    private static final int INITIAL_SLOT_CAPACITY = 4;
 
     private final String stateName;
     private final byte[] stateNameBytes;
+
+    /**
+     * Cleanup-A5: dense ordinal assigned at construction. Used as the index into the {@code Slot[]}
+     * the per-record {@link RecordContext} holds via {@link RecordContext#getExtra()}. Stable for
+     * this instance's lifetime — the operator constructs each ValueStateV2 once at registration.
+     */
+    private final int stateOrdinal;
+
     private final TypeSerializer<K> keySerializer;
     private final TypeSerializer<V> valueSerializer;
     /**
@@ -63,8 +83,17 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
     private final TypeSerializer<N> namespaceSerializer;
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
-    private final DataOutputSerializer namespaceOut = new DataOutputSerializer(32);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
+
+    /**
+     * Cleanup-A5: per-(stateOrdinal, namespace) cache slot. The {@code byte[]} is the composite
+     * key; {@code nsIdentity} is the {@link System#identityHashCode} of the namespace whose bytes
+     * produced it — invalidated by writing a new identity, no per-call String alloc.
+     */
+    static final class Slot {
+        int nsIdentity;
+        byte[] composite;
+    }
 
     public ForStRsValueStateV2(
             StateRequestHandler stateRequestHandler,
@@ -75,9 +104,15 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
         super(stateRequestHandler, valueSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
+        this.stateOrdinal = NEXT_STATE_ORDINAL.getAndIncrement();
         this.keySerializer = keySerializer;
         this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
+    }
+
+    /** Test/diagnostic accessor for the per-instance ordinal. */
+    public int stateOrdinal() {
+        return stateOrdinal;
     }
 
     // -- ForStRsInnerTable implementation --
@@ -86,71 +121,67 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
     @SuppressWarnings("unchecked")
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
-        // PR-A5 (S1-10 / A1-H6 fix): RecordContext.extra is shared across ValueStates within
-        // the same operator. Previously stored a single byte[] composite key, which meant a
-        // second ValueState would read the FIRST state's composite (wrong stateName encoded)
-        // — silent cross-state corruption. Now keyed by stateName via a Map<String, byte[]>.
-        //
-        // PR-A2 (S1-4 / E2-CRIT-1): cache slot must also be invalidated on namespace switch,
-        // otherwise the same (key, stateName) entry serves stale composite bytes that point at
-        // the previously-encoded namespace. We key the slot by
-        // `stateName + "::" + System.identityHashCode(namespace)`. identityHashCode is constant
-        // for the lifetime of a namespace instance (single-threaded operator thread sees stable
-        // refs from Flink's window/timer scheduler), and a different namespace object yields a
-        // different cache miss, forcing fresh composite-key serialization.
+        // Cleanup-A2/A5 (zero-copy): the previous implementation allocated three heap byte[]s
+        // per call (namespaceOut.getCopyOfBuffer, keyOut.getCopyOfBuffer, the final composite
+        // new byte[len]) plus four System.arraycopy memcpys, plus a Map.put with a String key
+        // concatenated from stateName + "::" + namespace-identityHashCode every call. All of
+        // that violated the zero-copy invariant. The new path is:
+        //   * single-sweep into keyOut (writes KEY_PREFIX, key, SLASH, stateNameBytes, SLASH,
+        //     namespace bytes — no intermediate byte[]s, no arraycopy fan-out),
+        //   * cache slot is a Slot[] indexed by per-instance stateOrdinal (set at construction),
+        //     so the lookup is a single array load with no String hashing,
+        //   * Slot.nsIdentity is the System.identityHashCode of the current namespace;
+        //     identityHashCode is stable for a JVM-resident object and changes mean a different
+        //     namespace, which forces a cache miss + re-serialize. identityHashCode collisions
+        //     are theoretically possible but Flink's single-threaded operator hands us one
+        //     namespace at a time from a small pool, and a false-positive hit would silently
+        //     serve the wrong composite bytes — same risk as the previous implementation, which
+        //     keyed off the same identityHashCode inside its String cacheKey.
         N namespace = request.getNamespace();
-        String cacheKey = stateName + "::" + System.identityHashCode(namespace);
+        int nsIdentity = System.identityHashCode(namespace);
         Object extra = ctx.getExtra();
-        java.util.Map<String, byte[]> slot;
-        if (extra instanceof java.util.Map<?, ?>) {
-            slot = (java.util.Map<String, byte[]>) extra;
-            byte[] cached = slot.get(cacheKey);
-            if (cached != null) {
-                return cached;
+        Slot[] slots;
+        if (extra instanceof Slot[]) {
+            slots = (Slot[]) extra;
+            if (stateOrdinal < slots.length) {
+                Slot s = slots[stateOrdinal];
+                if (s != null && s.composite != null && s.nsIdentity == nsIdentity) {
+                    return s.composite; // HIT: zero allocations on this path.
+                }
+            } else {
+                // Grow: state ordinal climbed past the current slot array. Reuse the old slots.
+                Slot[] grown = new Slot[Math.max(stateOrdinal + 1, slots.length * 2)];
+                System.arraycopy(slots, 0, grown, 0, slots.length);
+                slots = grown;
+                ctx.setExtra(slots);
             }
         } else {
-            slot = new java.util.HashMap<>(4);
-            ctx.setExtra(slot);
+            int cap = Math.max(INITIAL_SLOT_CAPACITY, stateOrdinal + 1);
+            slots = new Slot[cap];
+            ctx.setExtra(slots);
         }
+        // MISS: serialize composite key in a single sweep into keyOut, then snapshot to byte[].
         try {
-            // PR-A2: encode namespace bytes as the trailing component of the composite key.
-            // Pre-A2 v3.x snapshots are NOT compatible with this format — the key format
-            // changed from `[KEY_PREFIX][key][/][stateName][/]` to
-            // `[KEY_PREFIX][key][/][stateName][/][namespaceBytes]`. Restoring an old snapshot
-            // surfaces as missing keys (loud "value() == null" reads), not silent corruption.
-            // See RELEASE-NOTES: "v4.0 keyed-state binary format is incompatible with v3.x".
-            byte[] namespaceBytes;
-            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
-                namespaceOut.clear();
-                namespaceSerializer.serialize(namespace, namespaceOut);
-                namespaceBytes = namespaceOut.getCopyOfBuffer();
-            } else {
-                namespaceBytes = EMPTY_BYTES;
-            }
             keyOut.clear();
+            keyOut.write(KEY_PREFIX);
             keySerializer.serialize(ctx.getKey(), keyOut);
-            byte[] keyBytes = keyOut.getCopyOfBuffer();
-            int len =
-                    KEY_PREFIX.length
-                            + keyBytes.length
-                            + SLASH.length
-                            + stateNameBytes.length
-                            + SLASH.length
-                            + namespaceBytes.length;
-            byte[] composite = new byte[len];
-            int off = 0;
-            System.arraycopy(KEY_PREFIX, 0, composite, off, KEY_PREFIX.length);
-            off += KEY_PREFIX.length;
-            System.arraycopy(keyBytes, 0, composite, off, keyBytes.length);
-            off += keyBytes.length;
-            System.arraycopy(SLASH, 0, composite, off, SLASH.length);
-            off += SLASH.length;
-            System.arraycopy(stateNameBytes, 0, composite, off, stateNameBytes.length);
-            off += stateNameBytes.length;
-            System.arraycopy(SLASH, 0, composite, off, SLASH.length);
-            off += SLASH.length;
-            System.arraycopy(namespaceBytes, 0, composite, off, namespaceBytes.length);
-            slot.put(cacheKey, composite);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            // PR-A2: trailing namespace bytes go directly into keyOut — no intermediate
+            // namespaceOut buffer + getCopyOfBuffer round-trip. Pre-A2 v3.x snapshots are NOT
+            // compatible (format break is independent of this cleanup).
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            byte[] composite = keyOut.getCopyOfBuffer(); // ONE alloc on miss.
+            Slot s = slots[stateOrdinal];
+            if (s == null) {
+                s = new Slot();
+                slots[stateOrdinal] = s;
+            }
+            s.nsIdentity = nsIdentity;
+            s.composite = composite;
             return composite;
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize key", e);

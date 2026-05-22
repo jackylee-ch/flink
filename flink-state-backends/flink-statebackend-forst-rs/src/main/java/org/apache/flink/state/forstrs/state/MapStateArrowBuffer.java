@@ -26,9 +26,6 @@ import org.apache.flink.state.forstrs.ffm.FrsDb;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
 
 /**
  * Per-state-instance off-heap staging buffer for V2 async MapState (PR-C1).
@@ -47,10 +44,22 @@ import java.util.Set;
  *   <li>a heap byte[] → off-heap MemorySegment staging arena, so callers can hand in the byte[]
  *       keys/values produced by the V2 framework's serializeKey/serializeValue without writing
  *       their own MemorySegment encoder;
- *   <li>an in-buffer {@code tombstoneKeys} set for {@code asyncRemove} so reads after a remove
- *       short-circuit to {@code null} without an engine round-trip;
+ *   <li>tombstone short-circuiting on {@code asyncRemove} so reads after a remove return {@code
+ *       null} without an engine round-trip — implemented zero-alloc via the underlying buffer's
+ *       per-row tombstone bitmap (Cleanup-C1; no HashSet wrapper allocation per call);
  *   <li>a {@code drainOnFlush=true} flag wiring the auto-flush gates to the V2 snapshot hook.
  * </ul>
+ *
+ * <h3>Cleanup-C1: zero-alloc tombstone path</h3>
+ *
+ * <p>The previous incarnation tracked tombstones in a {@code HashSet<BytesKey>}, allocating a
+ * {@code BytesKey} wrapper object (and its internal {@code Arrays.hashCode} byte[] read) on
+ * every {@code asyncRemove}. The new path delegates tombstone tracking to
+ * {@link ArrowBinaryBuffer#tombstone} / {@link ArrowBinaryBuffer#findOrTombstone}, which use a
+ * per-row off-heap bitmap. {@code asyncRemove} no longer allocates on the heap; {@code asyncGet}
+ * after a remove resolves the tombstone via the off-heap bitmap probe and short-circuits to
+ * {@code null} without an engine round-trip — identical observable behaviour, zero heap allocation
+ * on the hot path.
  *
  * <h3>NOT cross-state-shared</h3>
  *
@@ -82,13 +91,6 @@ public final class MapStateArrowBuffer implements AutoCloseable {
 
     private MemorySegment staging;
     private int stagingCap;
-
-    /**
-     * Tombstone tracker for {@link #remove}. A simple HashSet of composite keys is sufficient — the
-     * V1-sync analogue uses the same approach. On {@link #flushTo} we issue native deletes for any
-     * pending tombstones, then clear the set.
-     */
-    private final Set<BytesKey> tombstones = new HashSet<>();
 
     private boolean closed;
 
@@ -130,8 +132,6 @@ public final class MapStateArrowBuffer implements AutoCloseable {
      */
     public void put(byte[] compositeKey, byte[] value, ForStRsLinker linker, FrsDb db, FrsCfHandle cf) {
         ensureClosed();
-        // PUT supersedes any pending tombstone for the same composite key.
-        tombstones.remove(new BytesKey(compositeKey));
         int needed = compositeKey.length + (value == null ? 0 : value.length);
         ensureStagingCapacity(needed);
         MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
@@ -144,6 +144,8 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         if (buf.needsFlush() || buf.shouldAutoFlush()) {
             flushTo(linker, db, cf);
         }
+        // PUT supersedes any pending tombstone on the row (ArrowBinaryBuffer.insert clears the
+        // tombstone bit on overwrite — Cleanup-C1).
         int row =
                 buf.insert(staging, 0, compositeKey.length, staging, compositeKey.length, valLen);
         if (row == ArrowBinaryBuffer.INSERT_NEEDS_FLUSH) {
@@ -163,13 +165,20 @@ public final class MapStateArrowBuffer implements AutoCloseable {
      *       {@link #valueBytesOf} of the row.
      *   <li>{@code cached=false} → miss; fall through to engine.
      * </ul>
+     *
+     * <p>Cleanup-C1: the tombstone branch is decided by the underlying buffer's off-heap
+     * tombstone bitmap (no HashSet probe, no per-call BytesKey allocation).
      */
     public Lookup lookup(byte[] compositeKey) {
         ensureClosed();
-        if (tombstones.contains(new BytesKey(compositeKey))) {
+        ensureStagingCapacity(compositeKey.length);
+        MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
+        int row = buf.findOrTombstone(staging, 0, compositeKey.length);
+        if (row == ArrowBinaryBuffer.TOMBSTONE_FOUND) {
+            // Match the pre-C1 observeRead semantics: tombstones short-circuit before the live-hit
+            // path, so they did not feed the AutoTuner's hit-rate signal. Preserve that.
             return Lookup.TOMBSTONE;
         }
-        int row = bufferFind(compositeKey);
         tuner.observeRead(row >= 0, buf.size(), buf.capacity());
         if (row >= 0) {
             return new Lookup(true, false, row);
@@ -197,21 +206,25 @@ public final class MapStateArrowBuffer implements AutoCloseable {
 
     /**
      * Marks {@code compositeKey} as removed. Subsequent {@link #lookup} returns a tombstone hit
-     * without an engine probe. On {@link #flushTo} the tombstoned keys are issued as native
+     * without an engine probe. On {@link #flushTo} the tombstoned rows are issued as native
      * deletes alongside the buffered PUTs.
+     *
+     * <p>Cleanup-C1: tombstone tracking is delegated to the underlying buffer's per-row
+     * bitmap. No HashSet, no BytesKey allocation.
      */
     public void remove(byte[] compositeKey, ForStRsLinker linker, FrsDb db, FrsCfHandle cf) {
         ensureClosed();
         ensureStagingCapacity(compositeKey.length);
         MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
-        buf.remove(staging, 0, compositeKey.length);
-        // Mark a tombstone so subsequent lookups short-circuit; the engine delete fires on flush.
-        tombstones.add(new BytesKey(compositeKey));
+        if (buf.needsFlush() || buf.shouldAutoFlush()) {
+            flushTo(linker, db, cf);
+        }
+        buf.tombstone(staging, 0, compositeKey.length);
     }
 
     /**
      * Drains all buffered rows to the engine via {@code linker.batchPut} and issues a delete
-     * for every pending tombstone. Clears the buffer + tombstone set on return.
+     * for every tombstoned row. Clears the buffer on return.
      *
      * <p>Called by:
      *
@@ -226,20 +239,27 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         if (closed) {
             return;
         }
+        // Issue per-row deletes for tombstoned rows BEFORE flushTo clears the buffer. The
+        // tombstoned rows' key bytes still live in the off-heap keyData region, but flushTo's
+        // clear() wipes them, so we have to extract them first.
+        int[] tombstones = buf.tombstonedRows();
+        for (int row : tombstones) {
+            byte[] keyBytes = buf.copyKey(row);
+            linker.delete(db, cf, keyBytes);
+        }
         if (buf.size() > 0) {
             buf.flushTo(linker, db, cf);
         }
-        if (!tombstones.isEmpty()) {
-            for (BytesKey k : tombstones) {
-                linker.delete(db, cf, k.bytes);
-            }
-            tombstones.clear();
-        }
     }
 
-    /** Returns the number of tombstoned keys awaiting flush. Visible for tests. */
+    /**
+     * Returns the number of tombstoned rows awaiting flush. Visible for tests.
+     *
+     * <p>Cleanup-C1: implemented via the underlying buffer's tombstone-bit scan; no HashSet to
+     * size.
+     */
     public int tombstoneCount() {
-        return tombstones.size();
+        return buf.tombstonedRows().length;
     }
 
     /**
@@ -263,10 +283,8 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         ensureClosed();
         // Drain any staged PUTs + pending tombstones to the engine first so we don't lose them.
         flushTo(linker, db, cf);
-        // Then drop every buffered row and any residual tombstones (defensive — flushTo clears
-        // tombstones on return, but a future change in flushTo's contract should not break us).
+        // Then drop every buffered row (clear() also resets all tombstone bits).
         buf.clear();
-        tombstones.clear();
     }
 
     @Override
@@ -277,7 +295,6 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         closed = true;
         buf.close();
         stagingArena.close();
-        tombstones.clear();
     }
 
     // -----------------------------------------------------------------
@@ -301,12 +318,6 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         stagingCap = newCap;
     }
 
-    private int bufferFind(byte[] compositeKey) {
-        ensureStagingCapacity(compositeKey.length);
-        MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
-        return buf.find(staging, 0, compositeKey.length);
-    }
-
     /** Result of {@link #lookup}. {@code row} is meaningful only when {@code cached && !tombstone}. */
     public static final class Lookup {
         public static final Lookup MISS = new Lookup(false, false, -1);
@@ -320,27 +331,6 @@ public final class MapStateArrowBuffer implements AutoCloseable {
             this.cached = cached;
             this.tombstone = tombstone;
             this.row = row;
-        }
-    }
-
-    /** Content-equality wrapper for byte[] composite keys in the tombstone set. */
-    private static final class BytesKey {
-        final byte[] bytes;
-        private final int hash;
-
-        BytesKey(byte[] bytes) {
-            this.bytes = bytes;
-            this.hash = Arrays.hashCode(bytes);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            return o instanceof BytesKey bk && Arrays.equals(bytes, bk.bytes);
         }
     }
 }

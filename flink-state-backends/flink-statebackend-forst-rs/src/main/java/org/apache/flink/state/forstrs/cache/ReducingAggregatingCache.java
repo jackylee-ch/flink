@@ -70,6 +70,19 @@ public final class ReducingAggregatingCache<IN, ACC> {
     private final BiConsumer<byte[], ACC> flushCallback;
     private final LinkedHashMap<BytesKey, Entry<ACC>> entries;
 
+    /**
+     * Cleanup-C3: per-cache reusable view of an externally-owned byte buffer slice. Used by the
+     * zero-alloc lookup overloads ({@link #tryFold(byte[], int, int, Object)}, {@link
+     * #contains(byte[], int, int)}, {@link #peek(byte[], int, int)}). The state class can pass the
+     * shared key buffer (from {@code DataOutputSerializer.getSharedBuffer()}) without producing a
+     * fresh {@code byte[]} per add() — eliminating the {@code keyOut.getCopyOfBuffer()} alloc on
+     * the cache-hit path described in the audit (B3-H1 / B3-H2).
+     *
+     * <p>Single-threaded by the cache's contract (per-RecordContext serialization); the field is
+     * mutated in place during each lookup and consumed before the call returns.
+     */
+    private final BytesKey scratch = new BytesKey();
+
     // -----------------------------------------------------------------
     // Entry
     // -----------------------------------------------------------------
@@ -140,7 +153,12 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * @param compositeKey raw composite key bytes
      */
     public boolean contains(byte[] compositeKey) {
-        return entries.containsKey(new BytesKey(compositeKey));
+        return contains(compositeKey, 0, compositeKey.length);
+    }
+
+    /** Cleanup-C3: zero-alloc slice-view variant of {@link #contains(byte[])}. */
+    public boolean contains(byte[] buf, int off, int len) {
+        return entries.containsKey(scratch.view(buf, off, len));
     }
 
     /**
@@ -149,7 +167,12 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * @param compositeKey raw composite key bytes
      */
     public ACC peek(byte[] compositeKey) {
-        Entry<ACC> e = entries.get(new BytesKey(compositeKey));
+        return peek(compositeKey, 0, compositeKey.length);
+    }
+
+    /** Cleanup-C3: zero-alloc slice-view variant of {@link #peek(byte[])}. */
+    public ACC peek(byte[] buf, int off, int len) {
+        Entry<ACC> e = entries.get(scratch.view(buf, off, len));
         return e == null ? null : e.acc;
     }
 
@@ -160,7 +183,7 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * @param compositeKey raw composite key bytes
      */
     public boolean isDirty(byte[] compositeKey) {
-        Entry<ACC> e = entries.get(new BytesKey(compositeKey));
+        Entry<ACC> e = entries.get(scratch.view(compositeKey, 0, compositeKey.length));
         return e != null && e.dirty;
     }
 
@@ -174,7 +197,22 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * @return the new accumulator on hit, or empty on miss
      */
     public Optional<ACC> tryFold(byte[] compositeKey, IN input) {
-        Entry<ACC> e = entries.get(new BytesKey(compositeKey));
+        return tryFold(compositeKey, 0, compositeKey.length, input);
+    }
+
+    /**
+     * Cleanup-C3: zero-alloc lookup overload. Probes the cache using a slice {@code (buf, off,
+     * len)} of an externally-owned byte buffer (typically {@code keyOut.getSharedBuffer()} from a
+     * {@code DataOutputSerializer}). On hit, folds in place — no allocation. On miss, returns
+     * empty; the caller must subsequently snapshot the slice via {@link #put(byte[], Object)}
+     * (passing {@code keyOut.getCopyOfBuffer()} — the only allocation on the miss path) to seed
+     * the cache.
+     *
+     * <p>The scratch slice view is reused across calls; the single-threaded contract of this
+     * cache (per-RecordContext lock) guarantees no interleaved probe can clobber it.
+     */
+    public Optional<ACC> tryFold(byte[] buf, int off, int len, IN input) {
+        Entry<ACC> e = entries.get(scratch.view(buf, off, len));
         if (e == null) {
             return Optional.empty();
         }
@@ -194,6 +232,17 @@ public final class ReducingAggregatingCache<IN, ACC> {
      */
     public void put(byte[] compositeKey, ACC acc) {
         entries.put(new BytesKey(compositeKey), new Entry<>(acc, true));
+    }
+
+    /**
+     * Cleanup-C3: slice-view put variant for the miss-resolve path. Snapshots {@code (buf, off,
+     * len)} into a freshly-owned {@code byte[]} for stable storage in the LRU. This is the ONLY
+     * allocation on the asyncAdd miss path; the hit path remains alloc-free.
+     */
+    public void put(byte[] buf, int off, int len, ACC acc) {
+        byte[] owned = new byte[len];
+        System.arraycopy(buf, off, owned, 0, len);
+        entries.put(new BytesKey(owned), new Entry<>(acc, true));
     }
 
     /**
@@ -232,21 +281,70 @@ public final class ReducingAggregatingCache<IN, ACC> {
     // Content-equality key wrapper for byte[] in LinkedHashMap
     // -----------------------------------------------------------------
 
-    private static final class BytesKey {
-        final byte[] bytes;
+    /**
+     * Dual-mode byte-slice key. Owns a {@code byte[]} when used as a stored map key (after
+     * {@link #put}); reused as a slice view {@code (buf, off, len)} when used as a probe key
+     * (zero-alloc lookup paths). Hash and equality are computed over the active range so both
+     * modes compare consistently against each other in the HashMap.
+     */
+    static final class BytesKey {
+        byte[] bytes;
+        int off;
+        int len;
+
+        /** Constructs an empty scratch view; {@link #view(byte[], int, int)} sets the range. */
+        BytesKey() {}
 
         BytesKey(byte[] bytes) {
             this.bytes = bytes;
+            this.off = 0;
+            this.len = bytes.length;
+        }
+
+        /** Reuses this key to view a slice. Returns {@code this} to chain into a lookup call. */
+        BytesKey view(byte[] buf, int off, int len) {
+            this.bytes = buf;
+            this.off = off;
+            this.len = len;
+            return this;
+        }
+
+        /**
+         * Snapshots the current slice as an owned {@code byte[]} suitable for a stored map key.
+         * The returned BytesKey does not share storage with any external buffer, so it is safe
+         * to keep across mutations of the probe scratch.
+         */
+        BytesKey snapshot() {
+            byte[] copy = new byte[len];
+            System.arraycopy(bytes, off, copy, 0, len);
+            return new BytesKey(copy);
         }
 
         @Override
         public boolean equals(Object o) {
-            return o instanceof BytesKey bk && java.util.Arrays.equals(bytes, bk.bytes);
+            if (!(o instanceof BytesKey)) {
+                return false;
+            }
+            BytesKey bk = (BytesKey) o;
+            if (len != bk.len) {
+                return false;
+            }
+            // Range-aware byte comparison. java.util.Arrays.equals(byte[], int, int, byte[], int,
+            // int) is JIT-intrinsified on JDK 22+ (AVX2/NEON vector compare), so this is no
+            // slower than the legacy full-array compare for typical 8-64-byte composite keys.
+            return java.util.Arrays.equals(bytes, off, off + len, bk.bytes, bk.off, bk.off + bk.len);
         }
 
         @Override
         public int hashCode() {
-            return java.util.Arrays.hashCode(bytes);
+            // Range-aware hashCode: same algorithm as Arrays.hashCode(byte[]) but over the slice.
+            // Keeps hashes consistent between view-mode and owned-mode for the same byte content.
+            int h = 1;
+            int end = off + len;
+            for (int i = off; i < end; i++) {
+                h = 31 * h + bytes[i];
+            }
+            return h;
         }
     }
 }

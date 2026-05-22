@@ -50,6 +50,13 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
      */
     public static final int INSERT_NEEDS_FLUSH = -2;
 
+    /**
+     * Cleanup-C1 (zero-copy tombstone): returned by {@link #findOrTombstone} when the probed key
+     * was previously marked via {@link #tombstone}. Distinct from {@code -1} (never inserted) so
+     * callers can short-circuit a {@code null} result without consulting the engine.
+     */
+    public static final int TOMBSTONE_FOUND = -3;
+
     private static final int EMPTY_SLOT = -1;
     private static final int TOMBSTONE = -2;
 
@@ -60,6 +67,11 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     private MemorySegment valueLengths; // (capacity) int4 — length of row i's value (overwrite-safe sidecar)
     private MemorySegment valueData; // raw bytes
     private MemorySegment hashIndex; // 2 × capacity int4 entries (hash, row#) — open addressing
+    // Cleanup-C1: per-row tombstone bitmap (1 byte/row). 0 = live, 1 = tombstoned. Allocated
+    // alongside the row-indexed arrays in {@link #allocate} so a tombstone marker survives
+    // overwrites/reads without a heap HashSet. {@link #flushTo} routes tombstoned rows to
+    // {@code linker.delete} instead of {@code linker.batchPut}.
+    private MemorySegment tombstoneBits;
     // Pre-allocated staging segments for batched flush — written per-row in flushTo, reused
     // across flushes so we don't pay per-flush Arena allocation cost. Sized to capacity slots.
     private MemorySegment flushKeyPtrs;
@@ -110,6 +122,8 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         this.valueData = arena.allocate(valueDataCapacity == 0 ? 1 : valueDataCapacity);
         // hashIndex layout: 2 × capacity slots, each slot is (hash:int, rowOrSentinel:int)
         this.hashIndex = arena.allocate((long) cap * 2 * 2 * Integer.BYTES);
+        // Cleanup-C1: per-row tombstone bitmap (1 byte/row, zero-initialized by Arena).
+        this.tombstoneBits = arena.allocate(cap);
         // Flush staging arrays — pointer/length pairs sized to capacity rows (max live rows).
         this.flushKeyPtrs = arena.allocate((long) cap * ValueLayout.ADDRESS.byteSize());
         this.flushKeyLens = arena.allocate((long) cap * ValueLayout.JAVA_LONG.byteSize());
@@ -182,6 +196,8 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
                     ValueLayout.JAVA_INT, (long) existing * Integer.BYTES, newValOffset);
             valueLengths.set(
                     ValueLayout.JAVA_INT, (long) existing * Integer.BYTES, valueLen);
+            // Cleanup-C1: a PUT supersedes any pending tombstone for this row.
+            tombstoneBits.set(ValueLayout.JAVA_BYTE, existing, (byte) 0);
             return existing;
         }
         if (size >= capacity) {
@@ -227,6 +243,112 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         return row;
     }
 
+    /**
+     * Cleanup-C1: marks the row identified by {@code (keySeg, keyOffset, keyLen)} as tombstoned
+     * WITHOUT dropping the row data. Subsequent {@link #findOrTombstone} probes for the same
+     * key return {@link #TOMBSTONE_FOUND}, so callers can short-circuit a {@code null} result
+     * without an engine round-trip and without the per-call heap allocation of a wrapper key
+     * object.
+     *
+     * <p>If the key is not already in the buffer, this method inserts an empty-value row first so
+     * the tombstone is recorded in the row table. A future PUT for the same key will lift the
+     * tombstone (see {@link #insert} — the overwrite branch clears the bit).
+     *
+     * <p>On {@link #flushTo} tombstoned rows are routed to {@code linker.delete} per row instead
+     * of being included in the {@code linker.batchPut} batch.
+     */
+    public void tombstone(MemorySegment keySeg, long keyOffset, int keyLen) {
+        // insert() handles both the new-row and existing-row cases. For a fresh key it adds a
+        // row with empty value; for an existing key it overwrites the value with empty AND
+        // clears the tombstone bit (PUT-supersedes-tombstone branch). Either way, the bit flip
+        // below stamps the tombstone — and on flush the row is routed to linker.delete instead
+        // of being staged into the batchPut.
+        int row = insert(keySeg, keyOffset, keyLen, keySeg, keyOffset, 0);
+        if (row == INSERT_NEEDS_FLUSH) {
+            // Buffer is at maxCapacity and the tuner refused growth. The caller must flush
+            // before retrying — surface this as an exception since tombstone() doesn't have a
+            // flush handle available. The V2 wrapper (MapStateArrowBuffer) calls flushTo
+            // opportunistically before tombstone() so this shouldn't fire in production.
+            throw new IllegalStateException(
+                    "ArrowBinaryBuffer.tombstone called on full buffer — flushTo required");
+        }
+        tombstoneBits.set(ValueLayout.JAVA_BYTE, row, (byte) 1);
+    }
+
+    /**
+     * Cleanup-C1: probe variant of {@link #find} that distinguishes a live hit from a tombstone
+     * hit from a complete miss. Returns:
+     *
+     * <ul>
+     *   <li>row id ({@code >= 0}) — the key is present and live (not tombstoned);
+     *   <li>{@link #TOMBSTONE_FOUND} — the key was previously {@link #tombstone}d;
+     *   <li>{@code -1} — the key has never been inserted (or has been {@link #clear}ed).
+     * </ul>
+     *
+     * <p>This is the alloc-free replacement for the HashSet-tombstone path. Callers (e.g.
+     * {@code MapStateArrowBuffer.lookup}) use the tri-state result to short-circuit GET/CONTAINS
+     * without instantiating a heap wrapper for the composite key.
+     */
+    public int findOrTombstone(MemorySegment keySeg, long keyOffset, int keyLen) {
+        int row = find(keySeg, keyOffset, keyLen);
+        if (row < 0) {
+            return -1;
+        }
+        if (tombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0) {
+            return TOMBSTONE_FOUND;
+        }
+        return row;
+    }
+
+    /** Returns true if the given row is currently flagged as tombstoned. Visible for tests. */
+    public boolean isTombstoned(int row) {
+        if (row < 0 || row >= size) {
+            return false;
+        }
+        return tombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0;
+    }
+
+    /**
+     * Iterates all tombstoned rows and returns their row ids in insertion order. Used by
+     * {@link MapStateArrowBuffer#flushTo} to issue per-tombstone {@code linker.delete} calls.
+     * O(size) scan; allocation = one int[] sized to live tombstone count.
+     */
+    public int[] tombstonedRows() {
+        int n = 0;
+        for (int row = 0; row < size; row++) {
+            if (tombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0) {
+                n++;
+            }
+        }
+        if (n == 0) {
+            return EMPTY_INT_ARRAY;
+        }
+        int[] out = new int[n];
+        int o = 0;
+        for (int row = 0; row < size; row++) {
+            if (tombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0) {
+                out[o++] = row;
+            }
+        }
+        return out;
+    }
+
+    private static final int[] EMPTY_INT_ARRAY = new int[0];
+
+    /**
+     * Copies the key bytes for the given row into a fresh byte[]. Used by the per-row delete path
+     * in {@code MapStateArrowBuffer.flushTo} to hand a heap byte[] to {@code linker.delete}. The
+     * alloc here is on the cold flush path (one per tombstoned row, not per remove() call), so
+     * it does NOT violate the C1 zero-copy contract that applies to the hot path.
+     */
+    public byte[] copyKey(int row) {
+        int kStart = keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+        int kEnd = keyOffsets.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+        byte[] out = new byte[kEnd - kStart];
+        MemorySegment.copy(keyData, ValueLayout.JAVA_BYTE, kStart, out, 0, out.length);
+        return out;
+    }
+
     public void remove(MemorySegment keySeg, long keyOffset, int keyLen) {
         int h = hash(keySeg, keyOffset, keyLen);
         int mask = (capacity * 2) - 1;
@@ -265,6 +387,8 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
                     (long) i * 2 * Integer.BYTES + Integer.BYTES,
                     EMPTY_SLOT);
         }
+        // Cleanup-C1: drop all tombstone bits when the buffer resets to empty state.
+        tombstoneBits.fill((byte) 0);
     }
 
     /**
@@ -318,6 +442,11 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
                             ValueLayout.JAVA_INT,
                             (long) i * 2 * Integer.BYTES + Integer.BYTES);
             if (row == EMPTY_SLOT || row == TOMBSTONE) {
+                continue;
+            }
+            // Cleanup-C1: tombstoned rows are excluded from the batchPut; the wrapper buffer
+            // (MapStateArrowBuffer) handles them via its own per-row linker.delete loop.
+            if (tombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0) {
                 continue;
             }
             int kStart =
@@ -575,6 +704,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         MemorySegment oldValueOffsets = valueOffsets;
         MemorySegment oldValueLengths = valueLengths;
         MemorySegment oldValueData = valueData;
+        MemorySegment oldTombstoneBits = tombstoneBits;
         int oldSize = size;
         long oldKeyDataCap = keyDataCapacity;
         long oldValueDataCap = valueDataCapacity;
@@ -598,7 +728,11 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
                     oldValueOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
             int vLen =
                     oldValueLengths.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-            insert(oldKeyData, kStart, kEnd - kStart, oldValueData, vStart, vLen);
+            int newRow = insert(oldKeyData, kStart, kEnd - kStart, oldValueData, vStart, vLen);
+            // Cleanup-C1: preserve the tombstone bit across resize.
+            if (newRow >= 0 && oldTombstoneBits.get(ValueLayout.JAVA_BYTE, row) != 0) {
+                tombstoneBits.set(ValueLayout.JAVA_BYTE, newRow, (byte) 1);
+            }
         }
         oldArena.close();
     }

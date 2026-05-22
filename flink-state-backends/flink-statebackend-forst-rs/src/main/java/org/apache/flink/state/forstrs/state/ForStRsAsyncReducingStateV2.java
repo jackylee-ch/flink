@@ -149,13 +149,20 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     // ---------------------------------------------------------------
 
     /**
-     * Builds the cache key bytes from the current record context. Mirrors {@link
-     * #serializeKey(StateRequest)} but reads the (K, N) from the AEC's current {@link
-     * RecordContext} instead of a StateRequest — used by the {@link #asyncAdd(Object)} override
-     * which runs before any state request is built.
+     * Cleanup-C3 (zero-alloc cache key): writes the composite cache key bytes into the
+     * per-instance reusable {@link #keyOut} and returns the length of the written prefix. The
+     * caller obtains the byte slice via {@code keyOut.getSharedBuffer()} + the returned length —
+     * no {@code getCopyOfBuffer()} allocation. The shared buffer is reused across calls but the
+     * single-threaded RecordContext-lock contract guarantees the bytes remain valid until the
+     * lookup call returns. On miss-resolve the caller snapshots the slice via {@code
+     * cache.put(buf, off, len, acc)} which performs the one unavoidable allocation.
+     *
+     * <p>Mirrors {@link #serializeKey(StateRequest)} but reads (K, N) from the AEC's current
+     * {@link RecordContext} instead of a StateRequest — used by the {@link #asyncAdd(Object)}
+     * override which runs before any state request is built.
      */
     @SuppressWarnings("unchecked")
-    private byte[] buildCacheKeyFromContext() {
+    private int writeCacheKeyToKeyOut() {
         AsyncExecutionController<K, ?> aec =
                 (AsyncExecutionController<K, ?>) stateRequestHandler;
         RecordContext<K> ctx = aec.getCurrentContext();
@@ -172,7 +179,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
                     && !(namespace instanceof VoidNamespace)) {
                 namespaceSerializer.serialize(namespace, keyOut);
             }
-            return keyOut.getCopyOfBuffer();
+            return keyOut.length();
         } catch (IOException e) {
             throw new RuntimeException(
                     "ForStRsAsyncReducingStateV2: failed to serialize cache key", e);
@@ -186,18 +193,28 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * the cache until {@link #flushOnBarrier()} drains it.
      *
      * <p>Null inputs are ignored to match ReduceFunction semantics in the base class.
+     *
+     * <p>Cleanup-C3: the cache-hit path is now alloc-free. The cache key bytes are written into a
+     * shared {@code DataOutputSerializer} buffer (the {@code keyOut} field already reused for
+     * {@link #serializeKey}); the cache probes via a slice view of that buffer. Only the
+     * miss-resolve branch snapshots the bytes via {@code cache.put(buf, off, len, ...)}.
      */
     @Override
     public StateFuture<Void> asyncAdd(V value) {
         if (value == null) {
             return StateFutureUtils.completedVoidFuture();
         }
-        byte[] cacheKey = buildCacheKeyFromContext();
-        Optional<V> hit = cache.tryFold(cacheKey, value);
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        Optional<V> hit = cache.tryFold(keyBuf, 0, keyLen, value);
         if (hit.isPresent()) {
             return StateFutureUtils.completedVoidFuture();
         }
-        // Cache miss — fetch existing accumulator from the engine, fold, populate cache.
+        // Cache miss — fetch existing accumulator from the engine, fold, populate cache. We
+        // snapshot the cache key slice here (one alloc on the cold path) because the keyOut
+        // shared buffer will be overwritten by subsequent calls.
+        final byte[] keySnapshot = new byte[keyLen];
+        System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
         return asyncGetInternal()
                 .thenApply(
                         oldValue -> {
@@ -206,7 +223,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
                                         oldValue == null
                                                 ? value
                                                 : reduceFunction.reduce(oldValue, value);
-                                cache.put(cacheKey, newAcc);
+                                cache.put(keySnapshot, newAcc);
                                 return null;
                             } catch (Exception e) {
                                 throw new RuntimeException(
@@ -221,12 +238,15 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * value without an engine round trip. Otherwise falls through to {@code asyncGetInternal} and
      * does NOT populate the cache (only writes / folds populate the cache; pure reads stay
      * uncached to bound memory).
+     *
+     * <p>Cleanup-C3: probes via the shared-buffer slice view; no byte[] allocation on hit.
      */
     @Override
     public StateFuture<V> asyncGet() {
-        byte[] cacheKey = buildCacheKeyFromContext();
-        if (cache.contains(cacheKey)) {
-            return StateFutureUtils.completedFuture(cache.peek(cacheKey));
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        if (cache.contains(keyBuf, 0, keyLen)) {
+            return StateFutureUtils.completedFuture(cache.peek(keyBuf, 0, keyLen));
         }
         return asyncGetInternal();
     }
