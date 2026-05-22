@@ -54,8 +54,19 @@ public final class FrsIterHandle implements AutoCloseable {
     /**
      * Per-iterator Arena for scratch out-parameter segments (outRc, outBu). Closed on handle close
      * so the scratch memory is reclaimed promptly rather than waiting for the slot Arena.
+     *
+     * <p>When {@link #ownsArena} is {@code false} this handle was constructed from a batched-open
+     * (PR-E3) that supplies a shared, long-lived executor-level Arena — in that case {@link #close()}
+     * MUST NOT close the Arena (it is owned by the executor, not by this handle).
      */
     private final Arena perIterArena;
+
+    /**
+     * {@code true} if this handle owns {@link #perIterArena} and is responsible for closing it on
+     * {@link #close()}. {@code false} when the Arena is borrowed from a long-lived owner (executor
+     * level arena, PR-E3 batched-open path).
+     */
+    private final boolean ownsArena;
 
     private final SlotArenaScope slotScope;
 
@@ -80,10 +91,27 @@ public final class FrsIterHandle implements AutoCloseable {
             ForStRsLinker linker,
             Arena perIterArena,
             SlotArenaScope slotScope) {
+        this(handleId, nativeHandleId, linker, perIterArena, slotScope, /* ownsArena= */ true);
+    }
+
+    /**
+     * PR-E3 constructor: explicit ownership flag. Used by the batched-open path in
+     * {@link org.apache.flink.state.forstrs.VectorizedExecutor#dispatchIterPrefix} so the
+     * executor's long-lived Arena can be shared across all handles in the batch without per-row
+     * {@code Arena.ofShared()} allocations.
+     */
+    public FrsIterHandle(
+            long handleId,
+            long nativeHandleId,
+            ForStRsLinker linker,
+            Arena perIterArena,
+            SlotArenaScope slotScope,
+            boolean ownsArena) {
         this.handleId = handleId;
         this.nativeHandleId = nativeHandleId;
         this.linker = linker;
         this.perIterArena = perIterArena;
+        this.ownsArena = ownsArena;
         this.slotScope = slotScope;
         this.lastNextNs = new AtomicLong(System.nanoTime());
         this.openedAtMs = System.currentTimeMillis();
@@ -178,12 +206,16 @@ public final class FrsIterHandle implements AutoCloseable {
         try {
             linker.frsVecIterPrefixClose(nativeHandleId);
         } finally {
-            try {
-                perIterArena.close();
-            } catch (Throwable ignored) {
-                // Best-effort; perIterArena is a confined Arena so close should
-                // always succeed on the owning thread. Swallow to protect callers.
+            if (ownsArena) {
+                try {
+                    perIterArena.close();
+                } catch (Throwable ignored) {
+                    // Best-effort; perIterArena is a confined Arena so close should
+                    // always succeed on the owning thread. Swallow to protect callers.
+                }
             }
+            // ownsArena == false: borrowed long-lived Arena (PR-E3); do not close —
+            // the executor closes it at its own lifecycle boundary.
             slotScope.unregisterIter(handleId);
         }
     }

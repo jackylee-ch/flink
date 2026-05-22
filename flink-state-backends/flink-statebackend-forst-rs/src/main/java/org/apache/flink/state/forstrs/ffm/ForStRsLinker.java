@@ -122,6 +122,37 @@ public final class ForStRsLinker {
             FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("release"));
 
     /**
+     * {@code FrsChunk} struct layout (PR-E3 / E-HIGH-5 / F5-4). Mirrors the {@code #[repr(C)]} struct
+     * in {@code crates/forst-rs-ffi/src/lib.rs §12.b}.
+     *
+     * <p>Layout (24 bytes on 64-bit, u64-aligned):
+     *
+     * <pre>
+     * +0   ADDRESS   (8B)  buf_ptr     — caller-owned chunk buffer (input)
+     * +8   JAVA_INT  (4B)  buf_cap     — buffer capacity in bytes (input)
+     * +12  JAVA_INT  (4B)  row_count   — rows written by engine (output)
+     * +16  JAVA_INT  (4B)  bytes_used  — bytes written by engine (output)
+     * +20  JAVA_INT  (4B)  _reserved   — explicit padding for u64 alignment
+     * </pre>
+     */
+    public static final StructLayout FRS_CHUNK_LAYOUT =
+            MemoryLayout.structLayout(
+                    ValueLayout.ADDRESS.withName("buf_ptr"),
+                    ValueLayout.JAVA_INT.withName("buf_cap"),
+                    ValueLayout.JAVA_INT.withName("row_count"),
+                    ValueLayout.JAVA_INT.withName("bytes_used"),
+                    ValueLayout.JAVA_INT.withName("_reserved"));
+
+    private static final VarHandle FRS_CHUNK_BUF_PTR =
+            FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("buf_ptr"));
+    private static final VarHandle FRS_CHUNK_BUF_CAP =
+            FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("buf_cap"));
+    private static final VarHandle FRS_CHUNK_ROW_COUNT =
+            FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("row_count"));
+    private static final VarHandle FRS_CHUNK_BYTES_USED =
+            FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("bytes_used"));
+
+    /**
      * {@code FrsEngineOptions} struct layout (B-Prod-P7, spec §6d). Mirrors the {@code #[repr(C)]}
      * struct in {@code crates/forst-rs-ffi/src/lib.rs}.
      *
@@ -269,6 +300,13 @@ public final class ForStRsLinker {
     private final MethodHandle frsVecIterPrefixNext;
     private final MethodHandle frsVecIterPrefixClose;
     private final MethodHandle frsVecIterPrefixAbort;
+    /**
+     * PR-E3 / E-HIGH-5 / F5-4: batched prefix-iter open — single FFI crossing
+     * for N prefix opens (SoA prefixes_off + prefixes_data, AoS FrsChunk
+     * output array).  Replaces the per-request loop that crossed FFI N times.
+     */
+    private final MethodHandle frsVecIterPrefixOpenBatch;
+
     private final MethodHandle frsVecMergeAppend;
     private final MethodHandle frsVecMergeAppendBatch; // Phase A.1 (audit-design §3 V4)
 
@@ -962,6 +1000,25 @@ public final class ForStRsLinker {
                 bind(
                         "frs_vec_iter_prefix_abort",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
+        // PR-E3 / E-HIGH-5 / F5-4: batched prefix-iter open.  Critical mode is
+        // safe here because the Rust impl performs N synchronous engine
+        // prefix_scan + fill_chunk operations inside one FFI call; no thread
+        // park, no async wait.  Batch length is bounded by the executor's
+        // batch flush threshold (same bound that PR-D3/PR-D4 rely on), so the
+        // safepoint window stays acceptable.
+        this.frsVecIterPrefixOpenBatch =
+                bindCritical(
+                        "frs_vec_iter_prefix_open_batch",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT, // return rc
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // prefixes_off (u32*)
+                                ValueLayout.ADDRESS, // prefixes_data (u8*)
+                                ValueLayout.JAVA_INT, // n (u32)
+                                ValueLayout.ADDRESS, // out_handles (u64*)
+                                ValueLayout.ADDRESS, // out_first_chunks (FrsChunk*)
+                                ValueLayout.JAVA_INT)); // chunk_cap (u32)
         this.frsVecMergeAppend =
                 bind(
                         "frs_vec_merge_append",
@@ -3487,6 +3544,76 @@ public final class ForStRsLinker {
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_iter_prefix_abort failed", t);
         }
+    }
+
+    /**
+     * PR-E3 / E-HIGH-5 / F5-4: opens N prefix iterators in a single FFI crossing.
+     *
+     * <p>Replaces N separate {@link #frsVecIterPrefixOpen} calls (each previously requiring its own
+     * {@code Arena.ofShared()} for out-params) with one batched call. The caller pre-packs all N
+     * prefixes into an SoA layout (offsets array + flat data buffer) and supplies one output array
+     * for handles and one for per-iter chunk descriptors. The chunk capacity is uniform across all
+     * iters in the batch (validated against each {@link #FRS_CHUNK_LAYOUT} {@code buf_cap} field).
+     *
+     * @param db engine handle
+     * @param cf column-family handle
+     * @param prefixesOff packed offsets, length n+1 (the n-th entry is the total prefix bytes)
+     * @param prefixesData flat concatenated prefix bytes
+     * @param n number of iters to open
+     * @param outHandles array of {@code n} u64 handle slots (engine writes 0 on per-row failure)
+     * @param outFirstChunks array of {@code n} {@link #FRS_CHUNK_LAYOUT} structs; caller fills {@code
+     *     buf_ptr} + {@code buf_cap}, engine fills {@code row_count} + {@code bytes_used}
+     * @param chunkCap uniform per-iter capacity (each chunk's {@code buf_cap} MUST match)
+     * @return native error code (0 = all opens succeeded; non-zero = first per-row error)
+     */
+    public int frsVecIterPrefixOpenBatch(
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment prefixesOff,
+            MemorySegment prefixesData,
+            int n,
+            MemorySegment outHandles,
+            MemorySegment outFirstChunks,
+            int chunkCap) {
+        try {
+            return (int)
+                    frsVecIterPrefixOpenBatch.invokeExact(
+                            db,
+                            cf,
+                            prefixesOff,
+                            prefixesData,
+                            n,
+                            outHandles,
+                            outFirstChunks,
+                            chunkCap);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_open_batch failed", t);
+        }
+    }
+
+    /** Per-iter FrsChunk struct byte size — used by callers to allocate AoS output arrays. */
+    public static long frsChunkLayoutByteSize() {
+        return FRS_CHUNK_LAYOUT.byteSize();
+    }
+
+    /** Per-iter FrsChunk write: set the caller-owned chunk buffer pointer for row {@code i}. */
+    public static void setFrsChunkBufPtr(MemorySegment chunks, int i, MemorySegment bufPtr) {
+        FRS_CHUNK_BUF_PTR.set(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize(), bufPtr);
+    }
+
+    /** Per-iter FrsChunk write: set the per-row chunk capacity. */
+    public static void setFrsChunkBufCap(MemorySegment chunks, int i, int cap) {
+        FRS_CHUNK_BUF_CAP.set(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize(), cap);
+    }
+
+    /** Per-iter FrsChunk read: row_count written by the engine. */
+    public static int getFrsChunkRowCount(MemorySegment chunks, int i) {
+        return (int) FRS_CHUNK_ROW_COUNT.get(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize());
+    }
+
+    /** Per-iter FrsChunk read: bytes_used written by the engine. */
+    public static int getFrsChunkBytesUsed(MemorySegment chunks, int i) {
+        return (int) FRS_CHUNK_BYTES_USED.get(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize());
     }
 
     /** Appends N merge operands for key (P6-B §1 §a). Returns native error code. */

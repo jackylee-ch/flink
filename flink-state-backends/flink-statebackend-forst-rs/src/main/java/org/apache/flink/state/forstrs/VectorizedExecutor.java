@@ -898,50 +898,117 @@ public class VectorizedExecutor implements StateExecutor {
         List<MemorySegment> prefixSlices = buffer.prefixSlices();
         List<MemorySegment> chunkBufSlices = buffer.chunkBufSlices();
         List<CompletableFuture<IterPrefixRequest.IterFirstChunk>> futures = buffer.futures();
+        int n = buffer.count();
+        if (n == 0) {
+            return;
+        }
 
-        for (int row = 0; row < buffer.count(); row++) {
-            MemorySegment prefix = prefixSlices.get(row);
-            MemorySegment chunkBuf = chunkBufSlices.get(row);
+        // PR-E3 (E-HIGH-5 / F5-4): replace the per-request Arena.ofShared() + per-request
+        // frsVecIterPrefixOpen call with a SINGLE batched FFI crossing.
+        //
+        // Buffer plan (all allocated from the executor's long-lived `arena` — NO per-request
+        // Arena.ofShared() — that was D-H4, cited in PR-E3 spec):
+        //   1. prefixesOff: u32[n+1] packed offsets
+        //   2. prefixesData: u8[total_prefix_bytes] flat key data
+        //   3. outHandles:   u64[n] handle output array
+        //   4. outChunks:    FrsChunk[n] AoS struct array (caller fills buf_ptr+buf_cap;
+        //                    engine fills row_count+bytes_used)
+        //
+        // All four allocations come from `arena` (the executor-level Arena passed to the
+        // constructor) — a cheap bump allocation, no shared-Arena cost.
+        //
+        // Chunk capacity policy: chunkBufSlices already come from a uniform 64KiB pool
+        // (ForStRsDBIterRequest.CHUNK_BUF_CAP). We pick the first row's chunk size as the
+        // uniform `chunkCap` parameter; the Rust side validates that every per-row
+        // buf_cap matches and rejects malformed rows individually without aborting the
+        // whole batch.
+        int chunkCap = (int) chunkBufSlices.get(0).byteSize();
+
+        // 1+2: pack the prefixes into SoA layout in the executor arena.
+        int totalPrefixBytes = 0;
+        for (int i = 0; i < n; i++) {
+            totalPrefixBytes += (int) prefixSlices.get(i).byteSize();
+        }
+        MemorySegment prefixesOff = arena.allocate(ValueLayout.JAVA_INT, (long) n + 1);
+        MemorySegment prefixesData =
+                totalPrefixBytes == 0
+                        ? MemorySegment.NULL
+                        : arena.allocate(totalPrefixBytes);
+        int off = 0;
+        prefixesOff.set(ValueLayout.JAVA_INT, 0L, 0);
+        for (int i = 0; i < n; i++) {
+            MemorySegment p = prefixSlices.get(i);
+            int len = (int) p.byteSize();
+            if (len > 0) {
+                MemorySegment.copy(p, 0L, prefixesData, off, len);
+            }
+            off += len;
+            prefixesOff.set(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES, off);
+        }
+
+        // 3: handles output array (n × u64).
+        MemorySegment outHandles = arena.allocate(ValueLayout.JAVA_LONG, n);
+
+        // 4: FrsChunk AoS array — pre-fill buf_ptr + buf_cap from per-row chunk buffers.
+        long chunkStride = ForStRsLinker.frsChunkLayoutByteSize();
+        MemorySegment outChunks = arena.allocate(chunkStride * n);
+        for (int i = 0; i < n; i++) {
+            MemorySegment chunkBuf = chunkBufSlices.get(i);
+            ForStRsLinker.setFrsChunkBufPtr(outChunks, i, chunkBuf);
+            ForStRsLinker.setFrsChunkBufCap(outChunks, i, (int) chunkBuf.byteSize());
+        }
+
+        // Single FFI crossing for N opens.  Critical mode: see linker bind comment.
+        int rcBatch =
+                linker.frsVecIterPrefixOpenBatch(
+                        db.handle(),
+                        cf.handle(),
+                        prefixesOff,
+                        prefixesData,
+                        n,
+                        outHandles,
+                        outChunks,
+                        chunkCap);
+
+        FrsErrorCode batchCode = FrsErrorCode.fromU32(rcBatch);
+        // Even on batch-level non-Ok, per-row handles may be populated for the rows that
+        // did succeed — Rust impl writes 0 to outHandles[i] for failed rows. We must
+        // process each row independently.
+
+        for (int row = 0; row < n; row++) {
             CompletableFuture<IterPrefixRequest.IterFirstChunk> future = futures.get(row);
+            long nativeHandle = outHandles.get(ValueLayout.JAVA_LONG, (long) row * Long.BYTES);
+            int firstChunkRows = ForStRsLinker.getFrsChunkRowCount(outChunks, row);
+            int firstChunkBytes = ForStRsLinker.getFrsChunkBytesUsed(outChunks, row);
 
-            // Allocate out-params in a per-iterator Arena; the Arena is closed when the
-            // handle is closed (via FrsIterHandle.close() → perIterArena.close()).
-            Arena perIterArena = Arena.ofShared();
-            MemorySegment outHandle = perIterArena.allocate(ValueLayout.JAVA_LONG);
-            MemorySegment outRowCount = perIterArena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outBytesUsed = perIterArena.allocate(ValueLayout.JAVA_INT);
-
-            int rc =
-                    linker.frsVecIterPrefixOpen(
-                            db.handle(),
-                            cf.handle(),
-                            prefix,
-                            (int) prefix.byteSize(),
-                            chunkBuf,
-                            (int) chunkBuf.byteSize(),
-                            outHandle,
-                            outRowCount,
-                            outBytesUsed);
-
-            FrsErrorCode code = FrsErrorCode.fromU32(rc);
-            if (code != FrsErrorCode.OK) {
-                perIterArena.close();
-                future.completeExceptionally(new FrsException(code, row, new byte[0]));
+            if (nativeHandle == 0L) {
+                // Per-row failure — propagate the batch-level code (best-effort
+                // attribution; the Rust impl returns the FIRST per-row error code).
+                FrsErrorCode rowCode = batchCode != FrsErrorCode.OK ? batchCode : FrsErrorCode.UNKNOWN;
+                future.completeExceptionally(new FrsException(rowCode, row, new byte[0]));
                 if (metrics != null) {
-                    metrics.recordFfiError(VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", code);
+                    metrics.recordFfiError(
+                            VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", rowCode);
                 }
                 continue;
             }
 
-            long nativeHandle = outHandle.get(ValueLayout.JAVA_LONG, 0);
-            int firstChunkRows = outRowCount.get(ValueLayout.JAVA_INT, 0);
-            int firstChunkBytes = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
             rowsTotal += firstChunkRows;
             bytesIn += firstChunkBytes;
 
             long jHandleId = nextIterHandleId.incrementAndGet();
+            // PR-E3 zero-memory-copy gate: the FrsIterHandle borrows the executor's
+            // long-lived arena (ownsArena=false) so close() does NOT close it.  The
+            // next() scratch (outRc, outBu — 8 bytes per next call) is allocated from
+            // the same executor arena via the borrowed reference.
             FrsIterHandle fh =
-                    new FrsIterHandle(jHandleId, nativeHandle, linker, perIterArena, slotScope);
+                    new FrsIterHandle(
+                            jHandleId,
+                            nativeHandle,
+                            linker,
+                            arena,
+                            slotScope,
+                            /* ownsArena= */ false);
             slotScope.registerIter(fh);
             if (metrics != null) {
                 metrics.recordIterHandlesOpened();
