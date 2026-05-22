@@ -177,8 +177,16 @@ public class ForStRsListState<T> implements ListState<T> {
         for (T v : values) {
             serializer.serialize(v, outputBuffer);
         }
-        byte[] payload = outputBuffer.getCopyOfBuffer();
-        linker.put(db, cf, computeKey(), payload);
+        // PR-E4: reuse the serializer's internal buffer; the engine consumes the value
+        // bytes synchronously inside the critical-mode FFM call, so no defensive copy is
+        // required. Eliminates one byte[] allocation per writeList.
+        linker.put(
+                db,
+                cf,
+                computeKey(),
+                outputBuffer.getSharedBuffer(),
+                0,
+                outputBuffer.length());
     }
 
     private byte[] computeKey() {

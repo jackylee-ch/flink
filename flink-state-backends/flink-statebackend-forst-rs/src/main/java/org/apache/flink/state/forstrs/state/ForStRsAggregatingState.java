@@ -135,8 +135,16 @@ public class ForStRsAggregatingState<IN, ACC, OUT> implements AggregatingState<I
     private void writeAccumulator(ACC acc) throws IOException {
         outputBuffer.clear();
         accSerializer.serialize(acc, outputBuffer);
-        byte[] payload = outputBuffer.getCopyOfBuffer();
-        linker.put(db, cf, computeKey(), payload);
+        // PR-E4: reuse the serializer's internal buffer; the engine consumes the value
+        // bytes synchronously inside the critical-mode FFM call, so no defensive copy is
+        // required. Eliminates one byte[] allocation per add().
+        linker.put(
+                db,
+                cf,
+                computeKey(),
+                outputBuffer.getSharedBuffer(),
+                0,
+                outputBuffer.length());
     }
 
     private byte[] computeKey() {

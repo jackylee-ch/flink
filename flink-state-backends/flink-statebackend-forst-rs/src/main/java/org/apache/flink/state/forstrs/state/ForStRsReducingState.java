@@ -125,8 +125,16 @@ public class ForStRsReducingState<T> implements ReducingState<T> {
     private void writeValue(T value) throws IOException {
         outputBuffer.clear();
         serializer.serialize(value, outputBuffer);
-        byte[] payload = outputBuffer.getCopyOfBuffer();
-        linker.put(db, cf, computeKey(), payload);
+        // PR-E4: reuse the serializer's internal buffer; the engine consumes the value
+        // bytes synchronously inside the critical-mode FFM call, so no defensive copy is
+        // required. Eliminates one byte[] allocation per add().
+        linker.put(
+                db,
+                cf,
+                computeKey(),
+                outputBuffer.getSharedBuffer(),
+                0,
+                outputBuffer.length());
     }
 
     private byte[] computeKey() {

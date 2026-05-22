@@ -758,10 +758,13 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize MapState user key", e);
         }
-        byte[] keyBytes = keyOutBuffer.getCopyOfBuffer();
-        byte[] full = new byte[keyPrefix.length + keyBytes.length];
+        // PR-E4: copy straight from the serializer's shared buffer into the composite key
+        // — saves the intermediate byte[] that getCopyOfBuffer() would allocate. The final
+        // {@code full} array still needs to be owned (it's stashed in the writeCache).
+        int keyLen = keyOutBuffer.length();
+        byte[] full = new byte[keyPrefix.length + keyLen];
         System.arraycopy(keyPrefix, 0, full, 0, keyPrefix.length);
-        System.arraycopy(keyBytes, 0, full, keyPrefix.length, keyBytes.length);
+        System.arraycopy(keyOutBuffer.getSharedBuffer(), 0, full, keyPrefix.length, keyLen);
         return full;
     }
 

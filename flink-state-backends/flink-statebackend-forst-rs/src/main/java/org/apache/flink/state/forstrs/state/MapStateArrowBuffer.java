@@ -131,14 +131,40 @@ public final class MapStateArrowBuffer implements AutoCloseable {
      * the {@code linker/db/cf} bound at construction time.
      */
     public void put(byte[] compositeKey, byte[] value, ForStRsLinker linker, FrsDb db, FrsCfHandle cf) {
-        ensureClosed();
-        int needed = compositeKey.length + (value == null ? 0 : value.length);
-        ensureStagingCapacity(needed);
-        MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
         int valLen = value == null ? 0 : value.length;
-        if (valLen > 0) {
+        putShared(compositeKey, 0, compositeKey.length, value, 0, valLen, linker, db, cf);
+    }
+
+    /**
+     * PR-M3 hot-path overload: stage a (key, value) pair using caller-owned byte[] slices, so the
+     * caller can pass {@code DataOutputSerializer.getSharedBuffer()} + {@code length()} without
+     * paying for a {@code getCopyOfBuffer()} allocation on every {@code asyncPut}.
+     *
+     * <p>The bytes are copied into this buffer's off-heap staging segment immediately (same as the
+     * {@link #put(byte[], byte[], ForStRsLinker, FrsDb, FrsCfHandle)} entry point), so the
+     * caller's byte[] is consumed synchronously and may be reused after this method returns.
+     *
+     * <p>Pass {@code valueSrc == null} or {@code valueLen == 0} to stage a zero-length value
+     * (treated as a delete sentinel by {@code ArrowBinaryBuffer.insert}).
+     */
+    public void putShared(
+            byte[] keySrc,
+            int keyOff,
+            int keyLen,
+            byte[] valueSrc,
+            int valueOff,
+            int valueLen,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf) {
+        ensureClosed();
+        int safeValLen = (valueSrc == null) ? 0 : valueLen;
+        int needed = keyLen + safeValLen;
+        ensureStagingCapacity(needed);
+        MemorySegment.copy(keySrc, keyOff, staging, ValueLayout.JAVA_BYTE, 0, keyLen);
+        if (safeValLen > 0) {
             MemorySegment.copy(
-                    value, 0, staging, ValueLayout.JAVA_BYTE, compositeKey.length, valLen);
+                    valueSrc, valueOff, staging, ValueLayout.JAVA_BYTE, keyLen, safeValLen);
         }
         // Opportunistic + forced flush gates, same pattern as V1-sync ForStRsMapState.put.
         if (buf.needsFlush() || buf.shouldAutoFlush()) {
@@ -146,11 +172,10 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         }
         // PUT supersedes any pending tombstone on the row (ArrowBinaryBuffer.insert clears the
         // tombstone bit on overwrite — Cleanup-C1).
-        int row =
-                buf.insert(staging, 0, compositeKey.length, staging, compositeKey.length, valLen);
+        int row = buf.insert(staging, 0, keyLen, staging, keyLen, safeValLen);
         if (row == ArrowBinaryBuffer.INSERT_NEEDS_FLUSH) {
             flushTo(linker, db, cf);
-            buf.insert(staging, 0, compositeKey.length, staging, compositeKey.length, valLen);
+            buf.insert(staging, 0, keyLen, staging, keyLen, safeValLen);
         }
     }
 

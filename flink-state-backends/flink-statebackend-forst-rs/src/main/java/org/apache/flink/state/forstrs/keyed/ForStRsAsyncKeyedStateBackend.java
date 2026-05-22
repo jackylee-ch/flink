@@ -128,6 +128,29 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         return "HEAP".equals(prop) ? TimerServiceFactory.HEAP : TimerServiceFactory.FORSTRS;
     }
 
+    // ---------------------------------------------------------------------
+    // PR-M2: single-writer-thread invariant for keyed-state registries.
+    //
+    // All registry fields below ({@link #stateCache}, {@link #managedExecutors}, and every
+    // {@code registered*StatesV2}/{@code registered*States} list) are mutated and iterated
+    // exclusively from the operator's mailbox thread. Flink's async-V2 contract guarantees:
+    //   • {@code setup(...)} / {@code getOrCreateKeyedState} / {@code createStateExecutor}
+    //     are invoked from {@code AbstractStreamOperator.initializeState} (mailbox).
+    //   • {@code snapshot(id, ts, factory, options)} is invoked from {@code
+    //     prepareSnapshotPreBarrier} / checkpoint barrier alignment (mailbox).
+    //   • Subsequent record-driven {@code getOrCreateKeyedState} calls (lazy state creation
+    //     on first use) run from {@code processElement}, also on the mailbox thread.
+    //
+    // The async snapshot strategy's worker thread (PHASE 3 in {@link #snapshot}) does NOT
+    // touch these registries — it operates on the engine handle (FFI) and the SST registry.
+    // Therefore plain {@code ArrayList}/{@code HashMap}/{@code HashSet} is correct here; no
+    // {@code CopyOnWriteArrayList} or {@code ConcurrentHashMap} is required.
+    //
+    // EXCEPTION: {@link #registeredTimerQueues} uses {@code CopyOnWriteArrayList} because
+    // the engine-backed timer queue's {@code create(...)} entry point (which adds to the
+    // registry) is callable from non-mailbox threads in the engine-FORSTRS timer-factory
+    // mode (which is opt-in, not default).
+    // ---------------------------------------------------------------------
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();

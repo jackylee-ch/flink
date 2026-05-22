@@ -239,8 +239,32 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // PR-C1: stage the PUT off-heap. Bypasses the V2 columnar dispatch until the buffer's
         // auto-flush watermark or the snapshot pre-hook drains it via linker.batchPut.
         if (offHeapBuf != null) {
-            byte[] valBytes = serializeUserValue(value);
-            offHeapBuf.put(keyBytes, valBytes, linker, db, cf);
+            // PR-M3: avoid getCopyOfBuffer() — MapStateArrowBuffer copies the value bytes into
+            // its own off-heap staging segment, so we can pass valueOut's shared buffer + length
+            // and let it consume them synchronously. Eliminates one byte[] alloc per asyncPut.
+            if (value == null) {
+                offHeapBuf.putShared(keyBytes, 0, keyBytes.length, null, 0, 0, linker, db, cf);
+            } else {
+                try {
+                    valueOut.clear();
+                    @SuppressWarnings("unchecked")
+                    UV uv = (UV) value;
+                    userValueSerializer.serialize(uv, valueOut);
+                    offHeapBuf.putShared(
+                            keyBytes,
+                            0,
+                            keyBytes.length,
+                            valueOut.getSharedBuffer(),
+                            0,
+                            valueOut.length(),
+                            linker,
+                            db,
+                            cf);
+                } catch (java.io.IOException e) {
+                    throw new RuntimeException(
+                            "Failed to serialize map value for off-heap staging", e);
+                }
+            }
             return StateFutureUtils.completedFuture(null);
         }
         return super.asyncPut(userKey, value);
