@@ -239,4 +239,100 @@ public final class StateSerializerRegistry {
     public StateSerializerMetadata get(String stateName) {
         return live.get(stateName);
     }
+
+    // ------------------------------------------------------------------
+    // E5-HIGH-2 (PR-A11-emit) — registry wire codec for snapshot/restore.
+    // ------------------------------------------------------------------
+
+    /**
+     * Magic header for the serialized registry blob — guards against accidentally feeding an
+     * unrelated private-state byte stream to the parser on restore.
+     */
+    public static final int REGISTRY_BLOB_MAGIC = 0x46524552; // "FRER" — ForstRs Registry
+
+    /** Registry-blob envelope format version. v1 = the layout documented on {@link #serialize}. */
+    public static final int REGISTRY_BLOB_FORMAT_V1 = 1;
+
+    /**
+     * Serialize the supplied metadata map into a single contiguous byte[] suitable for storage as
+     * a private-state entry in the checkpoint blob. PR-A1's snapshot path drains this into the
+     * checkpoint upload; {@link #deserialize(byte[])} reads the inverse.
+     *
+     * <p><b>Wire format (v1)</b>:
+     *
+     * <pre>
+     *   |  4 bytes  | magic = {@link #REGISTRY_BLOB_MAGIC} (big-endian)                |
+     *   |  4 bytes  | envelope format-version = {@link #REGISTRY_BLOB_FORMAT_V1}        |
+     *   |  4 bytes  | entry count                                                      |
+     *   | per entry:                                                                   |
+     *   |    UTF8   | state name (via DataOutputSerializer.writeUTF — 2-byte length)   |
+     *   |  4 bytes  | per-entry format version (see {@link StateSerializerMetadata})   |
+     *   |  4 bytes  | stateKindOrdinal                                                 |
+     *   |  4 bytes  | serializerSnapshot byte length                                   |
+     *   |  N bytes  | serializerSnapshot bytes                                         |
+     * </pre>
+     *
+     * <p>The blob is self-describing — the magic + format-version pair makes corruption / wrong
+     * blob detection trivial on restore.
+     */
+    public static byte[] serialize(Map<String, StateSerializerMetadata> entries) throws IOException {
+        DataOutputSerializer out = new DataOutputSerializer(128 + entries.size() * 64);
+        out.writeInt(REGISTRY_BLOB_MAGIC);
+        out.writeInt(REGISTRY_BLOB_FORMAT_V1);
+        out.writeInt(entries.size());
+        for (Map.Entry<String, StateSerializerMetadata> e : entries.entrySet()) {
+            StateSerializerMetadata md = e.getValue();
+            out.writeUTF(e.getKey());
+            out.writeInt(md.formatVersion());
+            out.writeInt(md.stateKindOrdinal());
+            byte[] bytes = md.serializerSnapshotBytes();
+            out.writeInt(bytes.length);
+            out.write(bytes);
+        }
+        return out.getCopyOfBuffer();
+    }
+
+    /** Convenience: serialize {@link #metadataBuffer()} of {@code this} registry. */
+    public byte[] serialize() throws IOException {
+        return serialize(metadataBuffer());
+    }
+
+    /**
+     * Inverse of {@link #serialize(Map)}. Validates the magic + version; throws {@link
+     * IOException} on mismatch so a malformed private-state blob fails the restore loudly rather
+     * than silently returning an empty map (which would re-enable the schema-drift gap E5-HIGH-2
+     * was meant to close).
+     */
+    public static Map<String, StateSerializerMetadata> deserialize(byte[] blob) throws IOException {
+        DataInputDeserializer in = new DataInputDeserializer(blob);
+        int magic = in.readInt();
+        if (magic != REGISTRY_BLOB_MAGIC) {
+            throw new IOException(
+                    "StateSerializerRegistry blob magic mismatch: expected 0x"
+                            + Integer.toHexString(REGISTRY_BLOB_MAGIC)
+                            + ", got 0x"
+                            + Integer.toHexString(magic));
+        }
+        int envelopeVer = in.readInt();
+        if (envelopeVer != REGISTRY_BLOB_FORMAT_V1) {
+            throw new IOException(
+                    "Unsupported StateSerializerRegistry envelope version: "
+                            + envelopeVer
+                            + " (this build understands v"
+                            + REGISTRY_BLOB_FORMAT_V1
+                            + ")");
+        }
+        int count = in.readInt();
+        Map<String, StateSerializerMetadata> out = new LinkedHashMap<>(count * 2);
+        for (int i = 0; i < count; i++) {
+            String name = in.readUTF();
+            int fmtVer = in.readInt();
+            int kindOrd = in.readInt();
+            int bytesLen = in.readInt();
+            byte[] bytes = new byte[bytesLen];
+            in.readFully(bytes);
+            out.put(name, new StateSerializerMetadata(name, kindOrd, fmtVer, bytes));
+        }
+        return out;
+    }
 }

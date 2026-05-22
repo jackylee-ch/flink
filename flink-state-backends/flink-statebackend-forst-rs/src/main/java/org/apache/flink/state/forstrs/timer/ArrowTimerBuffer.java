@@ -83,6 +83,15 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     private long keyDataUsed;
     private long keyDataCapacity;
 
+    /**
+     * B5-HIGH-6: reusable scratch buffer for {@link #swapHeap(int, int)} row copies. Q12-style
+     * timer-heavy workloads issue O(log N) heap sifts per add/remove and millions of timer ops, so
+     * allocating a fresh {@code byte[24]} per swap was a material hot-path allocation. The buffer
+     * is single-threaded by {@link ArrowTimerBuffer}'s "one instance per Flink slot" contract,
+     * matching the rest of this class's mutable state.
+     */
+    private final byte[] heapSwapScratch = new byte[HEAP_ROW_BYTES];
+
     /** Visitor for {@link #drainUnordered(FlushVisitor)} / {@link #drainTo(FlushVisitor)}. */
     public interface FlushVisitor {
         void visit(int op, MemorySegment keyData, int keyOff, int keyLen, long ts);
@@ -334,13 +343,25 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         int hi = heapArray.get(ValueLayout.JAVA_INT, (long) i * HEAP_ROW_BYTES + HASH_OFF);
         int hj = heapArray.get(ValueLayout.JAVA_INT, (long) j * HEAP_ROW_BYTES + HASH_OFF);
 
-        // Swap row bytes using a scratch buffer (24 bytes is small).
-        byte[] tmp = new byte[HEAP_ROW_BYTES];
+        // B5-HIGH-6: swap row bytes using the per-instance scratch buffer. Allocating a fresh
+        // byte[24] per swap was a hot-path allocation under Q12-style timer workloads
+        // (O(log N) sifts × millions of ops). The scratch field is safe to reuse because
+        // ArrowTimerBuffer is single-threaded per Flink slot.
         MemorySegment.copy(
-                heapArray, ValueLayout.JAVA_BYTE, (long) i * HEAP_ROW_BYTES, tmp, 0, HEAP_ROW_BYTES);
+                heapArray,
+                ValueLayout.JAVA_BYTE,
+                (long) i * HEAP_ROW_BYTES,
+                heapSwapScratch,
+                0,
+                HEAP_ROW_BYTES);
         copyRow(j, i);
         MemorySegment.copy(
-                tmp, 0, heapArray, ValueLayout.JAVA_BYTE, (long) j * HEAP_ROW_BYTES, HEAP_ROW_BYTES);
+                heapSwapScratch,
+                0,
+                heapArray,
+                ValueLayout.JAVA_BYTE,
+                (long) j * HEAP_ROW_BYTES,
+                HEAP_ROW_BYTES);
 
         // Update hash-index slots referencing i / j to point at their new rows.
         updateHashSlotPos(hi, i, j);

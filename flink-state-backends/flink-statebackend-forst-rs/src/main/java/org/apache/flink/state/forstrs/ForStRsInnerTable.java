@@ -99,6 +99,36 @@ public interface ForStRsInnerTable<K, N, V> {
         return false;
     }
 
+    /**
+     * A5-H1 / A5-H2: pre-DELETE hook fired on the vectorized DELETE path
+     * ({@link org.apache.flink.state.forstrs.VectorizedClassifier#recordDelete}) BEFORE the
+     * DELETE row is enqueued into the executor's columnar batch buffer. State classes use this
+     * to drain per-instance write buffers and invalidate per-instance caches so that pending
+     * writes / cached accumulators do NOT survive the engine-side DELETE.
+     *
+     * <p>Concrete overrides:
+     *
+     * <ul>
+     *   <li>{@code ForStRsAsyncListStateV2.onClear} drains the per-state {@code
+     *       ListStateArrowBuffer} (A5-H1 — without this, queued APPEND_MERGE rows would flush
+     *       AFTER the DELETE and resurrect the cleared entry).
+     *   <li>{@code ForStRsAsyncReducingStateV2.onClear} /
+     *       {@code ForStRsAsyncAggregatingStateV2.onClear} invalidate the per-state
+     *       {@code ReducingAggregatingCache} slot for the current record-context key (A5-H2 —
+     *       without this, the dirty cached accumulator survives the DELETE and the next
+     *       {@code flushOnBarrier()} would write it back, overwriting the DELETE).
+     * </ul>
+     *
+     * <p>Default impl is a no-op; only state classes with per-instance buffers / caches need to
+     * override.
+     *
+     * @param request the CLEAR / DELETE request being dispatched; carries the RecordContext used
+     *     to compute the cache / buffer key
+     */
+    default void onClear(StateRequest<K, N, ?, ?> request) {
+        // no-op default
+    }
+
     ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request);
 
     ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request);

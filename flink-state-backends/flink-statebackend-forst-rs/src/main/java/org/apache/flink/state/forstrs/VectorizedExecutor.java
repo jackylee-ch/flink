@@ -107,6 +107,17 @@ public class VectorizedExecutor implements StateExecutor {
     private int outSlotsCap;
     private final MemorySegment outDataLenSeg; // *mut usize scratch
 
+    // B5-H7: scratch int[] for per-row ops offsets in dispatchAppendMergeBatch. Grown on
+    // demand with the same exponential pattern as outSlotsCap; reused across batches.
+    // Sized to count+1 entries.
+    private int[] scratchOpsOffsets = new int[0];
+
+    // B5-H7: scratch flat array for heap-path APPEND_MERGE futures so the per-row drain in
+    // executeBatchRequests / executeRequestSyncInner avoids the per-row List.get() interface
+    // dispatch. Grown on demand; only the first `count` entries are valid per dispatch.
+    @SuppressWarnings("unchecked")
+    private CompletableFuture<Void>[] scratchHeapFutures = (CompletableFuture<Void>[]) new CompletableFuture<?>[0];
+
     public VectorizedExecutor(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         this.linker = linker;
         this.db = db;
@@ -286,14 +297,22 @@ public class VectorizedExecutor implements StateExecutor {
                 CompletableFuture<Void>[] offFutures = classifier.offHeapAppendMergeFutures();
                 List<CompletableFuture<Void>> heapFutures =
                         amBuf != null ? amBuf.futures() : null;
-                // Track per-path indices: heap rows index into heapFutures in heap-append order.
+                // B5-H7: flatten the heap-path futures into a primitive array so the per-row
+                // dispatch below avoids the per-row List.get() interface call.
+                CompletableFuture<Void>[] heapFuturesArr = null;
+                int heapFuturesSize = 0;
+                if (heapFutures != null && !heapFutures.isEmpty()) {
+                    heapFuturesArr = flattenHeapFutures(heapFutures);
+                    heapFuturesSize = heapFutures.size();
+                }
+                // Track per-path indices: heap rows index into heapFuturesArr in heap-append order.
                 int heapIdx = 0;
                 for (int i = 0; i < amCount; i++) {
                     CompletableFuture<Void> amFut =
                             offFutures[i] != null
                                     ? offFutures[i]
-                                    : (heapFutures != null && heapIdx < heapFutures.size()
-                                            ? heapFutures.get(heapIdx++)
+                                    : (heapFuturesArr != null && heapIdx < heapFuturesSize
+                                            ? heapFuturesArr[heapIdx++]
                                             : null);
                     if (amFut != null && amFut.isCompletedExceptionally()) {
                         Throwable cause;
@@ -380,13 +399,20 @@ public class VectorizedExecutor implements StateExecutor {
             CompletableFuture<Void>[] offFutures = single.offHeapAppendMergeFutures();
             List<CompletableFuture<Void>> heapFutures =
                     amBuf != null ? amBuf.futures() : null;
+            // B5-H7: flatten heap-path futures to avoid per-row List.get() interface dispatch.
+            CompletableFuture<Void>[] heapFuturesArr = null;
+            int heapFuturesSize = 0;
+            if (heapFutures != null && !heapFutures.isEmpty()) {
+                heapFuturesArr = flattenHeapFutures(heapFutures);
+                heapFuturesSize = heapFutures.size();
+            }
             int heapIdx = 0;
             for (int i = 0; i < amCount; i++) {
                 CompletableFuture<Void> amFut =
                         offFutures[i] != null
                                 ? offFutures[i]
-                                : (heapFutures != null && heapIdx < heapFutures.size()
-                                        ? heapFutures.get(heapIdx++)
+                                : (heapFuturesArr != null && heapIdx < heapFuturesSize
+                                        ? heapFuturesArr[heapIdx++]
                                         : null);
                 if (amFut != null && amFut.isCompletedExceptionally()) {
                     Throwable cause;
@@ -705,81 +731,82 @@ public class VectorizedExecutor implements StateExecutor {
                 bytesIn += v.byteSize();
             }
 
-            // Build operand_ptrs and operand_lens arrays in a per-row scratch Arena.
-            // Value slices may be heap segments; copy each into native memory so
-            // the operand_ptrs array holds stable native addresses for the FFI call.
-            // Bounded allocation: typically a handful of operands per call.
-            Arena scratch = Arena.ofConfined();
+            // B5-H4: build operand_ptrs and operand_lens arrays in the executor's long-lived
+            // arena instead of a per-row Arena.ofConfined() (formerly D-H4 — the per-row
+            // confined Arena was a benchmark-cited cost). Mirrors the PR-E3 pattern already
+            // applied to dispatchIterPrefix. Per-row growth is bounded by the per-batch row
+            // count and reclaimed at executor close.
+            //
+            // A5-H3: the scratch allocations themselves can throw (OOM, IllegalStateException
+            // if the arena is closed). The OUTER try/catch wraps BOTH allocation AND the FFI
+            // dispatch so a throw at any point drains every pending future in
+            // futures[row..count-1] (not just the tail past a successful alloc). Without this
+            // an OOM in `arena.allocate(vLen)` would escape before completing any future,
+            // wedging the operator on `futures[row..count-1]`.
             try {
-                MemorySegment ptrs = scratch.allocate(ValueLayout.ADDRESS, vs.length);
-                MemorySegment lens = scratch.allocate(ValueLayout.JAVA_INT, vs.length);
+                MemorySegment ptrs = arena.allocate(ValueLayout.ADDRESS, vs.length);
+                MemorySegment lens = arena.allocate(ValueLayout.JAVA_INT, vs.length);
                 for (int i = 0; i < vs.length; i++) {
                     long vLen = vs[i].byteSize();
-                    MemorySegment nativeV = scratch.allocate(vLen);
+                    MemorySegment nativeV = arena.allocate(vLen);
                     MemorySegment.copy(vs[i], 0L, nativeV, 0L, vLen);
                     ptrs.setAtIndex(ValueLayout.ADDRESS, i, nativeV);
                     lens.setAtIndex(ValueLayout.JAVA_INT, i, (int) vLen);
                 }
-                // S1-9 (Agent-A correctness): wrap the per-row FFI call in try/catch so a mid-loop
-                // throw (uncaught native panic upcall, RuntimeException from {@code linker}, OOM
-                // inside the scratch Arena allocations above this point, etc.) does NOT leave the
-                // remaining {@code futures[row+1..count-1]} dangling — they would otherwise be
-                // completed by no-one and the AEC's record-context lock would never release,
-                // wedging the operator thread. Complete this row's future + all subsequent rows
-                // exceptionally with the same throwable, then re-throw so the executor sees the
-                // failure (existing snapshot/close paths handle it via fatalHandler).
-                try {
-                    int rc =
-                            linker.frsVecMergeAppend(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keyPtr,
-                                    keyLen,
-                                    ptrs,
-                                    lens,
-                                    vs.length);
-                    FrsErrorCode code = FrsErrorCode.fromU32(rc);
-                    if (code == FrsErrorCode.OK) {
-                        future.complete(null);
-                        rowsProcessed += vs.length;
-                    } else if (code.isFailProcess()) {
-                        if (metrics != null) {
-                            metrics.recordFfiError(
-                                    VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
-                        }
-                        FrsEnginePanicError panicErr =
-                                new FrsEnginePanicError(code, "kind=APPEND_MERGE row=" + row);
-                        if (fatalHandler != null) {
-                            fatalHandler.onFatalError(panicErr);
-                        }
-                        future.completeExceptionally(panicErr);
-                    } else {
-                        if (metrics != null) {
-                            metrics.recordFfiError(
-                                    VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
-                        }
-                        future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                int rc =
+                        linker.frsVecMergeAppend(
+                                db.handle(),
+                                cf.handle(),
+                                keyPtr,
+                                keyLen,
+                                ptrs,
+                                lens,
+                                vs.length);
+                FrsErrorCode code = FrsErrorCode.fromU32(rc);
+                if (code == FrsErrorCode.OK) {
+                    future.complete(null);
+                    rowsProcessed += vs.length;
+                } else if (code.isFailProcess()) {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
                     }
-                } catch (Throwable t) {
-                    // Drain ALL pending futures (this row + the unprocessed tail) so no caller
-                    // is left waiting. Order matters: complete `future` first (matches the
-                    // request that actually triggered the throw), then the tail.
-                    future.completeExceptionally(t);
-                    for (int r = row + 1; r < count; r++) {
-                        CompletableFuture<Void> tail = futures.get(r);
-                        if (!tail.isDone()) {
-                            tail.completeExceptionally(
-                                    new RuntimeException(
-                                            "dispatchAppendMergePerRow aborted at row=" + row, t));
-                        }
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(code, "kind=APPEND_MERGE row=" + row);
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
                     }
-                    // Re-throw so the executor surfaces the fatal condition through the same
-                    // path as a non-batched FFI failure (mirrors how `frsVecMergeAppend`
-                    // non-OK return codes propagate to the upstream snapshot/close handler).
-                    throw t;
+                    future.completeExceptionally(panicErr);
+                } else {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
+                    }
+                    future.completeExceptionally(new FrsException(code, row, new byte[0]));
                 }
-            } finally {
-                scratch.close();
+            } catch (Throwable t) {
+                // S1-9 + A5-H3: drain ALL pending futures (this row + the unprocessed tail)
+                // so no caller is left waiting. Order matters: complete `future` first (matches
+                // the request that actually triggered the throw), then the tail. Covers BOTH
+                // allocation failures (OOM, arena closed) AND FFI dispatch failures (panic
+                // upcall, linker RuntimeException) — the previous structure only covered the
+                // latter because the per-row Arena.ofConfined() open + scratch.allocate() sat
+                // outside the inner try.
+                if (!future.isDone()) {
+                    future.completeExceptionally(t);
+                }
+                for (int r = row + 1; r < count; r++) {
+                    CompletableFuture<Void> tail = futures.get(r);
+                    if (!tail.isDone()) {
+                        tail.completeExceptionally(
+                                new RuntimeException(
+                                        "dispatchAppendMergePerRow aborted at row=" + row, t));
+                    }
+                }
+                // Re-throw so the executor surfaces the fatal condition through the same
+                // path as a non-batched FFI failure (mirrors how `frsVecMergeAppend`
+                // non-OK return codes propagate to the upstream snapshot/close handler).
+                throw t;
             }
         }
 
@@ -825,96 +852,96 @@ public class VectorizedExecutor implements StateExecutor {
         List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
         List<CompletableFuture<Void>> futures = buffer.futures();
 
-        // Build packed ops_off / ops_data in a single scratch Arena (one alloc total,
-        // not one-per-row like the legacy per-row dispatchAppendMerge).
-        Arena scratch = Arena.ofConfined();
-        try {
-            // Compute total ops byte size and per-row offset.
-            int[] opsOffsets = new int[count + 1];
-            int opsTotal = 0;
-            for (int row = 0; row < count; row++) {
-                MemorySegment[] vs = valueSliceLists.get(row);
-                // Phase A.1 contract: exactly 1 pre-encoded operand per row.
-                if (vs.length != 1) {
-                    throw new IllegalArgumentException(
-                            "dispatchAppendMergeBatch: row "
-                                    + row
-                                    + " must carry exactly 1 pre-encoded operand (got "
-                                    + vs.length
-                                    + "). Multi-element asyncAddAll callers must pre-concat.");
-                }
-                opsOffsets[row] = opsTotal;
-                opsTotal += (int) vs[0].byteSize();
+        // B5-H4: build packed ops_off / ops_data in the executor's long-lived arena instead of
+        // a per-batch Arena.ofConfined(). Memory grows per dispatch but is reclaimed at
+        // executor close; PR-E3 already established this trade-off in dispatchIterPrefix.
+        // B5-H7: opsOffsets uses the reusable scratchOpsOffsets field (grows on demand) so
+        // we don't `new int[count+1]` per dispatch.
+        // Compute total ops byte size and per-row offset.
+        int[] opsOffsets = ensureScratchOpsOffsets(count + 1);
+        int opsTotal = 0;
+        for (int row = 0; row < count; row++) {
+            MemorySegment[] vs = valueSliceLists.get(row);
+            // Phase A.1 contract: exactly 1 pre-encoded operand per row.
+            if (vs.length != 1) {
+                throw new IllegalArgumentException(
+                        "dispatchAppendMergeBatch: row "
+                                + row
+                                + " must carry exactly 1 pre-encoded operand (got "
+                                + vs.length
+                                + "). Multi-element asyncAddAll callers must pre-concat.");
             }
-            opsOffsets[count] = opsTotal;
-
-            MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
-            MemorySegment opsDataSeg = scratch.allocate(opsTotal);
-            int writeOff = 0;
-            for (int row = 0; row < count; row++) {
-                opsOffSeg.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
-                MemorySegment op = valueSliceLists.get(row)[0];
-                long opLen = op.byteSize();
-                MemorySegment.copy(op, 0L, opsDataSeg, writeOff, opLen);
-                writeOff += (int) opLen;
-                bytesIn += opLen;
-            }
-            opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
-
-            // Keys are already in the columnar layout of keyBuf — no copy.
-            MemorySegment keysOffSeg = keyBuf.offsetsSegment();
-            MemorySegment keysDataSeg = keyBuf.dataSegment();
-            for (int row = 0; row < count; row++) {
-                int kStart = keysOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-                int kEnd = keysOffSeg.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                bytesIn += kEnd - kStart;
-            }
-
-            int rc =
-                    linker.frsVecMergeAppendBatch(
-                            db.handle(),
-                            cf.handle(),
-                            keysOffSeg,
-                            keysDataSeg,
-                            opsOffSeg,
-                            opsDataSeg,
-                            count);
-            FrsErrorCode code = FrsErrorCode.fromU32(rc);
-
-            if (code == FrsErrorCode.OK) {
-                for (CompletableFuture<Void> f : futures) {
-                    f.complete(null);
-                }
-            } else {
-                Throwable err =
-                        code.isFailProcess()
-                                ? new FrsEnginePanicError(code, "kind=APPEND_MERGE_BATCH")
-                                : new FrsException(code, -1, new byte[0]);
-                if (code.isFailProcess() && fatalHandler != null) {
-                    fatalHandler.onFatalError((FrsEnginePanicError) err);
-                }
-                if (metrics != null) {
-                    metrics.recordFfiError(
-                            VectorizedStateRequest.Kind.APPEND_MERGE, "_batched", code);
-                }
-                for (CompletableFuture<Void> f : futures) {
-                    f.completeExceptionally(err);
-                }
-            }
-
-            if (metrics != null) {
-                metrics.recordDispatch(
-                        VectorizedStateRequest.Kind.APPEND_MERGE,
-                        MIXED_STATE,
-                        count,
-                        bytesIn,
-                        System.nanoTime() - t0);
-            }
-
-            return rc;
-        } finally {
-            scratch.close();
+            opsOffsets[row] = opsTotal;
+            opsTotal += (int) vs[0].byteSize();
         }
+        opsOffsets[count] = opsTotal;
+
+        MemorySegment opsOffSeg = arena.allocate(ValueLayout.JAVA_INT, count + 1L);
+        MemorySegment opsDataSeg = opsTotal == 0 ? MemorySegment.NULL : arena.allocate(opsTotal);
+        int writeOff = 0;
+        for (int row = 0; row < count; row++) {
+            opsOffSeg.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
+            MemorySegment op = valueSliceLists.get(row)[0];
+            long opLen = op.byteSize();
+            if (opLen > 0) {
+                MemorySegment.copy(op, 0L, opsDataSeg, writeOff, opLen);
+            }
+            writeOff += (int) opLen;
+            bytesIn += opLen;
+        }
+        opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
+
+        // Keys are already in the columnar layout of keyBuf — no copy.
+        MemorySegment keysOffSeg = keyBuf.offsetsSegment();
+        MemorySegment keysDataSeg = keyBuf.dataSegment();
+        for (int row = 0; row < count; row++) {
+            int kStart = keysOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+            int kEnd = keysOffSeg.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+            bytesIn += kEnd - kStart;
+        }
+
+        int rc =
+                linker.frsVecMergeAppendBatch(
+                        db.handle(),
+                        cf.handle(),
+                        keysOffSeg,
+                        keysDataSeg,
+                        opsOffSeg,
+                        opsDataSeg,
+                        count);
+        FrsErrorCode code = FrsErrorCode.fromU32(rc);
+
+        if (code == FrsErrorCode.OK) {
+            for (CompletableFuture<Void> f : futures) {
+                f.complete(null);
+            }
+        } else {
+            Throwable err =
+                    code.isFailProcess()
+                            ? new FrsEnginePanicError(code, "kind=APPEND_MERGE_BATCH")
+                            : new FrsException(code, -1, new byte[0]);
+            if (code.isFailProcess() && fatalHandler != null) {
+                fatalHandler.onFatalError((FrsEnginePanicError) err);
+            }
+            if (metrics != null) {
+                metrics.recordFfiError(
+                        VectorizedStateRequest.Kind.APPEND_MERGE, "_batched", code);
+            }
+            for (CompletableFuture<Void> f : futures) {
+                f.completeExceptionally(err);
+            }
+        }
+
+        if (metrics != null) {
+            metrics.recordDispatch(
+                    VectorizedStateRequest.Kind.APPEND_MERGE,
+                    MIXED_STATE,
+                    count,
+                    bytesIn,
+                    System.nanoTime() - t0);
+        }
+
+        return rc;
     }
 
     /**
@@ -1105,11 +1132,17 @@ public class VectorizedExecutor implements StateExecutor {
             MemorySegment chunkBuf = chunkBufSlices.get(row);
             CompletableFuture<IterRangeRequest.IterFirstChunk> future = futures.get(row);
 
-            // Allocate out-params in a per-iterator Arena; closed when FrsIterHandle.close() fires.
-            Arena perIterArena = Arena.ofShared();
-            MemorySegment outHandle = perIterArena.allocate(ValueLayout.JAVA_LONG);
-            MemorySegment outRowCount = perIterArena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outBytesUsed = perIterArena.allocate(ValueLayout.JAVA_INT);
+            // D5-H3 + B5-H4: allocate out-params from the executor's long-lived arena instead
+            // of a per-iterator Arena.ofShared(). The previous structure opened the per-iter
+            // Arena OUTSIDE any try block — only the explicit `code != OK` branch closed it,
+            // so an allocation failure or an FFI throw would leak the Arena. The FrsIterHandle
+            // is constructed with ownsArena=false (mirrors the PR-E3 dispatchIterPrefix path)
+            // so handle.close() does NOT touch the executor arena. The 3 scratch segments
+            // (24 bytes each handle) live until the executor closes — bounded growth, same
+            // trade-off PR-E3 accepted for iter-prefix scratch.
+            MemorySegment outHandle = arena.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment outRowCount = arena.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
 
             int rc =
                     linker.frsVecIterRangeOpen(
@@ -1127,7 +1160,6 @@ public class VectorizedExecutor implements StateExecutor {
 
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
             if (code != FrsErrorCode.OK) {
-                perIterArena.close();
                 future.completeExceptionally(new FrsException(code, row, new byte[0]));
                 if (metrics != null) {
                     metrics.recordFfiError(
@@ -1143,8 +1175,16 @@ public class VectorizedExecutor implements StateExecutor {
             bytesIn += firstChunkBytes;
 
             long jHandleId = nextIterHandleId.incrementAndGet();
+            // ownsArena=false: arena is the executor-owned long-lived arena and must NOT
+            // be closed when this handle closes (mirrors PR-E3 dispatchIterPrefix).
             FrsIterHandle fh =
-                    new FrsIterHandle(jHandleId, nativeHandle, linker, perIterArena, slotScope);
+                    new FrsIterHandle(
+                            jHandleId,
+                            nativeHandle,
+                            linker,
+                            arena,
+                            slotScope,
+                            /* ownsArena= */ false);
             slotScope.registerIter(fh);
             if (metrics != null) {
                 metrics.recordIterHandlesOpened();
@@ -1315,6 +1355,54 @@ public class VectorizedExecutor implements StateExecutor {
             msg = "ForSt-RS DELETE dispatch failed: " + cause.getClass().getSimpleName();
         }
         ((InternalAsyncFuture<Object>) request.getFuture()).completeExceptionally(msg, cause);
+    }
+
+    // -----------------------------------------------------------------
+    // Scratch-array sizing (B5-H7)
+    // -----------------------------------------------------------------
+
+    /**
+     * B5-H7: flatten the heap-path APPEND_MERGE futures into a primitive array, sized at least
+     * {@code count}. Reuses {@link #scratchHeapFutures} across batches via an exponential
+     * grow-on-demand pattern. The caller indexes the returned array directly to avoid the
+     * per-row {@code List.get()} interface dispatch.
+     *
+     * <p>Returns the (possibly grown) scratch array. Callers must only read indices
+     * {@code [0, count)}; trailing entries are stale from prior dispatches.
+     */
+    private CompletableFuture<Void>[] flattenHeapFutures(
+            List<CompletableFuture<Void>> heapFutures) {
+        int n = heapFutures.size();
+        if (scratchHeapFutures.length < n) {
+            int newCap = Math.max(16, scratchHeapFutures.length);
+            while (newCap < n) {
+                newCap <<= 1;
+            }
+            @SuppressWarnings("unchecked")
+            CompletableFuture<Void>[] grown =
+                    (CompletableFuture<Void>[]) new CompletableFuture<?>[newCap];
+            scratchHeapFutures = grown;
+        }
+        for (int i = 0; i < n; i++) {
+            scratchHeapFutures[i] = heapFutures.get(i);
+        }
+        return scratchHeapFutures;
+    }
+
+    /**
+     * B5-H7: ensure {@link #scratchOpsOffsets} holds at least {@code needed} ints. Grown with
+     * the same exponential strategy as {@link #ensureOutCapacity}.
+     */
+    private int[] ensureScratchOpsOffsets(int needed) {
+        if (scratchOpsOffsets.length >= needed) {
+            return scratchOpsOffsets;
+        }
+        int newCap = Math.max(16, scratchOpsOffsets.length);
+        while (newCap < needed) {
+            newCap <<= 1;
+        }
+        scratchOpsOffsets = new int[newCap];
+        return scratchOpsOffsets;
     }
 
     // -----------------------------------------------------------------

@@ -31,7 +31,10 @@ import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 import org.apache.flink.state.forstrs.keyed.sst.SstRetryStrategy;
+import org.apache.flink.state.forstrs.state.StateSerializerMetadata;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.foreign.Arena;
@@ -41,6 +44,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -127,16 +131,19 @@ public class ForStRsRestoreOperation {
         private final FrsCfHandle defaultCf;
         private final Map<String, Long> cfMap;
         private final long restoredCheckpointId;
+        private final Map<String, StateSerializerMetadata> restoredSerializerMetadata;
 
         RestoreResult(
                 FrsDb db,
                 FrsCfHandle defaultCf,
                 Map<String, Long> cfMap,
-                long restoredCheckpointId) {
+                long restoredCheckpointId,
+                Map<String, StateSerializerMetadata> restoredSerializerMetadata) {
             this.db = db;
             this.defaultCf = defaultCf;
             this.cfMap = cfMap;
             this.restoredCheckpointId = restoredCheckpointId;
+            this.restoredSerializerMetadata = restoredSerializerMetadata;
         }
 
         public FrsDb getDb() {
@@ -153,6 +160,16 @@ public class ForStRsRestoreOperation {
 
         public long getRestoredCheckpointId() {
             return restoredCheckpointId;
+        }
+
+        /**
+         * E5-HIGH-2: per-state serializer metadata parsed from the
+         * {@link ForStRsSnapshotStrategy#SERIALIZER_REGISTRY_LOCAL_PATH} private-state entry, if
+         * the restored handle carried one. Returns an empty map for pre-E5 snapshots that did not
+         * include the registry blob. Never {@code null}.
+         */
+        public Map<String, StateSerializerMetadata> getRestoredSerializerMetadata() {
+            return restoredSerializerMetadata;
         }
     }
 
@@ -214,11 +231,36 @@ public class ForStRsRestoreOperation {
         //    because the engine's manifest indexes SSTs by local path and the LSM-reconstruction
         //    step downstream consumes the list as a set, but we keep stable order to make
         //    debugging deterministic.
+        // E5-HIGH-2: separate the well-known serializer-registry private-state entry from the
+        // engine SST list so it is not handed to {@code dbOpenFromIncremental} (which would treat
+        // it as an SST and fail). The entry is downloaded inline (small blob — typically tens of
+        // bytes per state), parsed via {@link StateSerializerRegistry#deserialize}, and surfaced
+        // through {@link RestoreResult#getRestoredSerializerMetadata}. Pre-E5 snapshots produce
+        // an empty privateState list, so {@code restoredSerializerMetadata} stays empty and the
+        // restore-side {@code seedFromRestore(empty)} is a no-op.
+        HandleAndLocalPath registryEntry = null;
+        List<HandleAndLocalPath> sstPrivateState =
+                new ArrayList<>(handle.getPrivateState().size());
+        for (HandleAndLocalPath hlp : handle.getPrivateState()) {
+            if (ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH.equals(hlp.getLocalPath())) {
+                registryEntry = hlp;
+            } else {
+                sstPrivateState.add(hlp);
+            }
+        }
+
         List<HandleAndLocalPath> allHlps =
-                new ArrayList<>(handle.getSharedState().size() + handle.getPrivateState().size());
+                new ArrayList<>(handle.getSharedState().size() + sstPrivateState.size());
         allHlps.addAll(handle.getSharedState());
-        allHlps.addAll(handle.getPrivateState());
+        allHlps.addAll(sstPrivateState);
         List<String> sstLocalPaths = parallelDownloadSsts(allHlps, downloadDir, handle);
+
+        // E5-HIGH-2: download + parse the registry blob (if present) before engine open so a
+        // corrupt blob fails the restore loudly rather than after the engine is up.
+        Map<String, StateSerializerMetadata> restoredSerializerMetadata =
+                registryEntry == null
+                        ? Collections.emptyMap()
+                        : downloadAndParseRegistryBlob(registryEntry, handle);
 
         // 3. Hand the materialized files to the engine, which links/copies them under targetDir
         //    and reconstructs the LSM from the manifest.
@@ -255,7 +297,73 @@ public class ForStRsRestoreOperation {
         }
 
         return new RestoreResult(
-                db, defaultCf, new LinkedHashMap<>(handle.getCfMap()), handle.getCheckpointId());
+                db,
+                defaultCf,
+                new LinkedHashMap<>(handle.getCfMap()),
+                handle.getCheckpointId(),
+                restoredSerializerMetadata);
+    }
+
+    /**
+     * E5-HIGH-2: download the {@link ForStRsSnapshotStrategy#SERIALIZER_REGISTRY_LOCAL_PATH} blob
+     * into memory and parse it via {@link StateSerializerRegistry#deserialize}. The blob is small
+     * (typically tens of bytes per registered state) so we keep it fully in-memory rather than
+     * spilling to disk like SST handles. Failures are surfaced as
+     * {@link ForStRsCheckpointRestoreException} carrying the offending checkpoint id so the
+     * runtime routes them through {@code CheckpointFailureManager} consistently with other
+     * restore failure paths.
+     */
+    private Map<String, StateSerializerMetadata> downloadAndParseRegistryBlob(
+            HandleAndLocalPath entry, ForStRsIncrementalKeyedStateHandle owner)
+            throws ForStRsCheckpointRestoreException {
+        StreamStateHandle h = entry.getHandle();
+        if (h == null) {
+            throw new ForStRsCheckpointRestoreException(
+                    entry.getLocalPath(),
+                    owner.getCheckpointId(),
+                    "Strict restore: serializer-registry handle for '"
+                            + entry.getLocalPath()
+                            + "' is null");
+        }
+        byte[] blob;
+        try (FSDataInputStream in = h.openInputStream();
+                ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+            byte[] buf = new byte[4 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            blob = out.toByteArray();
+        } catch (IOException ioe) {
+            throw new ForStRsCheckpointRestoreException(
+                    entry.getLocalPath(),
+                    owner.getCheckpointId(),
+                    "Strict restore: failed reading serializer-registry blob '"
+                            + entry.getLocalPath()
+                            + "': "
+                            + ioe.getMessage(),
+                    ioe);
+        }
+        if (blob.length == 0) {
+            throw new ForStRsCheckpointRestoreException(
+                    entry.getLocalPath(),
+                    owner.getCheckpointId(),
+                    "Strict restore: serializer-registry blob '"
+                            + entry.getLocalPath()
+                            + "' resolved to 0 bytes");
+        }
+        try {
+            return StateSerializerRegistry.deserialize(blob);
+        } catch (IOException ioe) {
+            throw new ForStRsCheckpointRestoreException(
+                    entry.getLocalPath(),
+                    owner.getCheckpointId(),
+                    "Strict restore: serializer-registry blob '"
+                            + entry.getLocalPath()
+                            + "' is malformed: "
+                            + ioe.getMessage(),
+                    ioe);
+        }
     }
 
     /**
@@ -468,7 +576,18 @@ public class ForStRsRestoreOperation {
                         re);
             }
 
-            return new RestoreResult(targetDb, targetCf, mergedCfMap, maxRestoredCkpt);
+            // E5-HIGH-2: rescaling path does not yet propagate per-source serializer metadata.
+            // A future PR can union the registry blobs across all source handles (de-duped by
+            // state name — well-formed job graphs always carry identical serializer snapshots for
+            // the same state name across subtasks). For now, fall back to an empty map; the
+            // backend treats this as "no schema seed", matching pre-E5 behavior on the rescaling
+            // path only.
+            return new RestoreResult(
+                    targetDb,
+                    targetCf,
+                    mergedCfMap,
+                    maxRestoredCkpt,
+                    Collections.emptyMap());
         } finally {
             // Always close the source DBs/CFs, success or failure.
             for (OpenSourceDb src : sources) {
@@ -681,7 +800,7 @@ public class ForStRsRestoreOperation {
                     "Empty-restore: default CF unreachable on fresh engine: " + re.getMessage(),
                     re);
         }
-        return new RestoreResult(db, cf, new LinkedHashMap<>(), 0L);
+        return new RestoreResult(db, cf, new LinkedHashMap<>(), 0L, Collections.emptyMap());
     }
 
     private void ensureTargetDirEmpty() throws IOException {

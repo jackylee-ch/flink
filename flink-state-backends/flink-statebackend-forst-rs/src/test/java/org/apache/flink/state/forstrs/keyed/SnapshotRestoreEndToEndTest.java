@@ -18,7 +18,10 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.api.common.typeutils.base.StringSerializer;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.checkpoint.CheckpointType;
 import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
@@ -29,6 +32,8 @@ import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.state.StateSerializerMetadata;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -36,6 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.RunnableFuture;
 
@@ -167,6 +173,132 @@ class SnapshotRestoreEndToEndTest {
         } finally {
             // restored.close() already closed restoreArena via ownsResources=true. Only attempt a
             // safety-net close if restored.close() never ran (e.g. exception before its finally).
+            if (!restoredClosedOk) {
+                try {
+                    restoreArena.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+    }
+
+    /**
+     * E5-HIGH-2: register two states with different serializer snapshots, snapshot the registry
+     * via the snapshot strategy's private-state emit, restore, and verify {@link
+     * StateSerializerRegistry#verifyOrRegister} succeeds for both (i.e. the parsed restore-side
+     * registry sees both prior snapshots and routes them through the COMPATIBLE_AS_IS branch).
+     *
+     * <p>Why this test, not just a codec round-trip: pre-fix the schema-drift detection was
+     * structurally broken because {@code seedFromRestore(new LinkedHashMap<>())} always seeded an
+     * empty map and the snapshot path never wrote the registry blob. This test pins BOTH halves:
+     * write (snapshot strategy emit) and read (restore op parse + seedFromRestore).
+     */
+    @Test
+    void serializerRegistrySurvivesSnapshotAndRestore(@TempDir Path tmp) throws Exception {
+        // Step 1: open a source backend.
+        Arena srcArena = Arena.ofShared();
+        ForStRsLinker srcLinker = new ForStRsLinker(srcArena);
+        Path srcDbPath = tmp.resolve("src-db");
+        java.nio.file.Files.createDirectories(srcDbPath);
+        FrsDb srcDb = srcLinker.dbOpen(srcArena, srcDbPath.toString());
+        FrsCfHandle srcCf = srcLinker.dbDefaultCf(srcDb, srcArena);
+        ForStRsAsyncKeyedStateBackend<Integer> srcBackend =
+                new ForStRsAsyncKeyedStateBackend<>(
+                        srcArena,
+                        srcLinker,
+                        srcDb,
+                        srcCf,
+                        IntSerializer.INSTANCE,
+                        new KeyGroupRange(0, 0),
+                        /* totalKeyGroups= */ 1,
+                        /* ownsResources= */ true);
+
+        // Step 2: seed two state-name → serializer registrations with DIFFERENT snapshot kinds.
+        // "counter" uses LongSerializer; "name" uses StringSerializer. The registry buffer must
+        // carry both entries' opaque {@code TypeSerializerSnapshot} bytes.
+        StateSerializerRegistry srcRegistry = srcBackend.stateSerializerRegistry();
+        srcRegistry.register("counter", /* VALUE */ 0, LongSerializer.INSTANCE);
+        srcRegistry.register("name", /* VALUE */ 0, StringSerializer.INSTANCE);
+        assertEquals(
+                2,
+                srcRegistry.metadataBuffer().size(),
+                "source registry holds both registrations before snapshot");
+
+        // Step 3: seed engine data so the snapshot path materialises a real SST + manifest.
+        for (int i = 0; i < 128; i++) {
+            srcLinker.put(srcDb, srcCf, key(i), value(i));
+        }
+
+        // Step 4: snapshot. The strategy's setRegistryBlobProvider hook (wired by
+        // ensureSnapshotStrategy) drains the registry into a private-state entry under
+        // {@link ForStRsSnapshotStrategy#SERIALIZER_REGISTRY_LOCAL_PATH}.
+        MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+        CheckpointOptions opts =
+                CheckpointOptions.alignedNoTimeout(
+                        CheckpointType.CHECKPOINT,
+                        CheckpointStorageLocationReference.getDefault());
+        RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                srcBackend.snapshot(7L, 0L, factory, opts);
+        if (!fut.isDone()) {
+            fut.run();
+        }
+        ForStRsIncrementalKeyedStateHandle handle =
+                (ForStRsIncrementalKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
+        assertNotNull(handle);
+        // Sanity: the privateState list now carries the registry blob entry.
+        assertTrue(
+                handle.getPrivateState().stream()
+                        .anyMatch(
+                                hlp ->
+                                        ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH
+                                                .equals(hlp.getLocalPath())),
+                "E5-HIGH-2: snapshot emits the registry blob as a private-state entry");
+        srcBackend.close();
+
+        // Step 5: restore into a fresh backend.
+        Arena restoreArena = Arena.ofShared();
+        boolean restoredClosedOk = false;
+        try {
+            ForStRsLinker restoreLinker = new ForStRsLinker(restoreArena);
+            Path restoreDbPath = tmp.resolve("restored-db");
+            ForStRsAsyncKeyedStateBackend<Integer> restored =
+                    ForStRsAsyncKeyedStateBackend.restoreFromHandles(
+                            restoreArena,
+                            restoreLinker,
+                            IntSerializer.INSTANCE,
+                            new KeyGroupRange(0, 0),
+                            /* totalKeyGroups= */ 1,
+                            restoreDbPath,
+                            List.<KeyedStateHandle>of(handle));
+            try {
+                // Step 6: verify the restore-side registry has BOTH entries and
+                // verifyOrRegister against the original serializers succeeds for both.
+                StateSerializerRegistry restoredRegistry = restored.stateSerializerRegistry();
+                assertTrue(
+                        restoredRegistry.activatedForRestore(),
+                        "restoreFromHandles must seed the registry");
+                TypeSerializer<Long> counterEffective =
+                        restoredRegistry.verifyOrRegister(
+                                "counter", /* VALUE */ 0, LongSerializer.INSTANCE);
+                TypeSerializer<String> nameEffective =
+                        restoredRegistry.verifyOrRegister(
+                                "name", /* VALUE */ 0, StringSerializer.INSTANCE);
+                assertNotNull(counterEffective, "counter verifyOrRegister returned a serializer");
+                assertNotNull(nameEffective, "name verifyOrRegister returned a serializer");
+
+                // The restore-side registry must hold both names in {@code live} after promotion.
+                Map<String, StateSerializerMetadata> postBuffer = restoredRegistry.metadataBuffer();
+                assertTrue(
+                        postBuffer.containsKey("counter"),
+                        "restored+verified registry holds 'counter'");
+                assertTrue(
+                        postBuffer.containsKey("name"),
+                        "restored+verified registry holds 'name'");
+            } finally {
+                restored.close();
+                restoredClosedOk = true;
+            }
+        } finally {
             if (!restoredClosedOk) {
                 try {
                     restoreArena.close();

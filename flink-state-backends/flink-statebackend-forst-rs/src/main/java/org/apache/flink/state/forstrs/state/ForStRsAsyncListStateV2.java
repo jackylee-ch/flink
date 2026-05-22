@@ -282,6 +282,22 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         return true;
     }
 
+    /**
+     * A5-H1: pre-DELETE hook fired by {@link
+     * org.apache.flink.state.forstrs.VectorizedClassifier#recordDelete}. Drains the off-heap
+     * {@link ListStateArrowBuffer} BEFORE the DELETE row enters the executor's columnar batch
+     * buffer. Without this, the V2 vectorized dispatch order (PUT → DELETE → ... → off-heap
+     * drain) would let pending APPEND_MERGE bytes flush AFTER the engine-side DELETE, resurrecting
+     * the cleared entry on the next read (state leak past asyncClear()).
+     *
+     * <p>The buffer is not prefix-indexed, so we drain it unconditionally on any clear — same
+     * semantics as the legacy {@link #buildDBPutRequest} CLEAR branch.
+     */
+    @Override
+    public void onClear(StateRequest<K, N, ?, ?> request) {
+        flushIfDirty();
+    }
+
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();

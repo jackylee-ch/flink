@@ -358,6 +358,24 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         return offHeapBuf;
     }
 
+    /**
+     * D5-H2: releases the per-state {@link MapStateCache} arena. Invoked by the async backend
+     * during {@code dispose()} so every {@code Arena.ofShared()} allocated by the cache (5
+     * off-heap segments: keyOffsets, keyLengths, keyData, hashIndex, accessTime) is reclaimed
+     * promptly instead of surviving to JVM exit.
+     *
+     * <p>Idempotent — safe to call multiple times. Mirrors the cache's idempotent {@code close}
+     * contract.
+     */
+    public void close() {
+        cache.close();
+    }
+
+    /** Visible for tests: exposes the internal cache so tests can assert lifecycle behaviour. */
+    public MapStateCache<UV> cacheForTests() {
+        return cache;
+    }
+
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();

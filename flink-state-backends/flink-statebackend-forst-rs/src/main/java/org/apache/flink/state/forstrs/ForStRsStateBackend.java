@@ -122,17 +122,49 @@ public class ForStRsStateBackend implements StateBackend {
             }
         }
 
-        FrsDb db = linker.dbOpen(arena, localDbPath.toString());
-        FrsCfHandle cf = linker.dbDefaultCf(db, arena);
-        return new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
-                arena,
-                linker,
-                db,
-                cf,
-                parameters.getKeySerializer(),
-                parameters.getKeyGroupRange(),
-                parameters.getNumberOfKeyGroups(),
-                true);
+        // D5-H1: mirror the restore-path try/catch tear-down (lines 100-122). Before this fix a
+        // throw from {@code dbOpen}, {@code dbDefaultCf}, or the backend constructor leaked both
+        // the arena and any partially-opened db/cf — the only catch was inside the restore
+        // branch. Close in CF→DB→Arena order: cf must be released before db (the engine pins
+        // its CF handles to the open db), and arena last because it owns the linker that issued
+        // the close calls themselves.
+        FrsDb db = null;
+        FrsCfHandle cf = null;
+        try {
+            db = linker.dbOpen(arena, localDbPath.toString());
+            cf = linker.dbDefaultCf(db, arena);
+            return new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
+                    arena,
+                    linker,
+                    db,
+                    cf,
+                    parameters.getKeySerializer(),
+                    parameters.getKeyGroupRange(),
+                    parameters.getNumberOfKeyGroups(),
+                    true);
+        } catch (Throwable t) {
+            if (cf != null) {
+                try {
+                    cf.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (db != null) {
+                try {
+                    db.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            try {
+                arena.close();
+            } catch (Throwable ignored) {
+            }
+            if (t instanceof Exception ex) {
+                throw ex;
+            }
+            throw new Exception(
+                    "ForStRsStateBackend.createAsyncKeyedStateBackend open failed", t);
+        }
     }
 
     @Override

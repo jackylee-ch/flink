@@ -265,6 +265,51 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     }
 
     /**
+     * A5-H2: pre-DELETE hook fired by {@link
+     * org.apache.flink.state.forstrs.VectorizedClassifier#recordDelete}. Invalidates the cache
+     * slot for the current (record-context key, namespace) BEFORE the DELETE row is enqueued.
+     * Without this, a dirty cached accumulator survives the engine-side DELETE and the next
+     * {@link #flushOnBarrier()} writes it back via {@link #flushHandler} ({@code linker.put}),
+     * OVERWRITING the DELETE — silent data corruption past {@code asyncClear()}.
+     *
+     * <p>The cache key bytes are computed off the StateRequest's own {@link RecordContext} (NOT
+     * the AEC's current context) so this hook is correct under both batched (vectorized) and
+     * single-request synchronous dispatch — both code paths pass the originating request through
+     * the classifier.
+     */
+    @Override
+    public void onClear(StateRequest<K, N, ?, ?> request) {
+        int keyLen = writeRequestKeyToKeyOut(request);
+        cache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
+    }
+
+    /**
+     * A5-H2 helper: same composite-key layout as {@link #serializeKey(StateRequest)} but writes
+     * into {@link #keyOut} without snapshotting (no {@code getCopyOfBuffer} allocation). Returns
+     * the length of the written prefix; caller uses the shared buffer for a single zero-alloc
+     * cache probe and must consume the bytes before any other writer touches {@code keyOut}.
+     */
+    private int writeRequestKeyToKeyOut(StateRequest<K, N, ?, ?> request) {
+        RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            return keyOut.length();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncReducingStateV2: failed to write cache invalidation key", e);
+        }
+    }
+
+    /**
      * Replaces the flush handler. Used by the backend to wire the production PUT path and by tests
      * to capture flushed bytes. The handler receives composite-key bytes and serialized
      * accumulator bytes (null acc — cleared entry — passes null bytes).

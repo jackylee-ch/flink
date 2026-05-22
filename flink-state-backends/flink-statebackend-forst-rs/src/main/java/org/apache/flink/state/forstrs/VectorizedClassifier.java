@@ -532,6 +532,19 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     private <K, N, V> void recordDelete(
             ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
+        // A5-H1 / A5-H2: fire the pre-DELETE hook BEFORE the DELETE row is enqueued. State
+        // classes use this to drain per-instance write buffers (ListStateArrowBuffer) and
+        // invalidate per-instance caches (ReducingAggregatingCache) so that pending APPEND_MERGE
+        // rows / dirty cached accumulators do NOT survive the engine-side DELETE.
+        //
+        // Why here and not in {@link VectorizedExecutor#executeDeletes}: the dispatch order in
+        // {@code executeBatchRequests} is PUT → DELETE → GET → ITER → APPEND_MERGE → off-heap
+        // drain. If we drained inside the executor we'd have to reorder the loop — but the
+        // off-heap APPEND_MERGE drain is bundled with the dispatch step at the END. Calling
+        // {@code onClear} at classifier time means the per-state {@code flushIfDirty()} runs
+        // SYNCHRONOUSLY (in-mailbox-turn) before {@code executeDeletes} ever sees this row, so
+        // pending APPEND_MERGE bytes hit the engine BEFORE the DELETE.
+        table.onClear(request);
         ensureDeleteCapacity();
         table.serializeKeyInto(request, deleteKeys);
         deleteRequests[deleteCount] = request;

@@ -21,6 +21,7 @@ package org.apache.flink.state.forstrs.keyed;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
@@ -35,7 +36,9 @@ import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsSnapshot;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
 
+import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -81,6 +84,13 @@ public class ForStRsSnapshotStrategy
     /** Layout: data ptr (8) + len (8) + reserved (8) for FrsBytes; here for path/list pointers. */
     private static final long PTR = ValueLayout.ADDRESS.byteSize();
 
+    /**
+     * E5-HIGH-2: well-known local-path name for the serialized {@link StateSerializerRegistry}
+     * blob, stored under {@code privateState}. The restore path scans for this exact path to
+     * separate the registry blob from any future per-checkpoint private artefacts.
+     */
+    public static final String SERIALIZER_REGISTRY_LOCAL_PATH = "_serializer_metadata.bin";
+
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final UUID backendIdentifier;
@@ -89,6 +99,35 @@ public class ForStRsSnapshotStrategy
     private final ForStRsSstUploader uploader;
     private final Arena nativeArena;
     private final Map<String, Long> cfMap;
+
+    /**
+     * E5-HIGH-2: hook that returns the current registry blob bytes at snapshot time. The blob is
+     * uploaded as a private-state {@link HandleAndLocalPath} entry under {@link
+     * #SERIALIZER_REGISTRY_LOCAL_PATH}; restore parses it and re-seeds the next session's
+     * registry so {@code verifyOrRegister} can detect schema drift. Defaults to "no registry
+     * wired" (null) — emitted privateState stays empty and behavior matches pre-fix snapshots.
+     * Tests can leave this null to keep existing checkpoint snapshots intact.
+     */
+    private volatile RegistryBlobProvider registryBlobProvider = null;
+
+    /** Supplier callback used by {@link #setRegistryBlobProvider}. */
+    @FunctionalInterface
+    public interface RegistryBlobProvider {
+        /**
+         * Returns the current registry blob bytes to embed in the snapshot, or {@code null} if no
+         * states are registered (in which case no private-state entry is emitted).
+         */
+        byte[] currentBlob() throws IOException;
+    }
+
+    /**
+     * Wire a supplier that returns the registry blob at snapshot time. Called once by the keyed
+     * backend immediately after the strategy is constructed; subsequent calls overwrite. Setting
+     * to {@code null} disables emit (used by tests that don't have a backend registry).
+     */
+    public void setRegistryBlobProvider(RegistryBlobProvider provider) {
+        this.registryBlobProvider = provider;
+    }
 
     /**
      * The previous successfully-completed checkpoint id. Updated by {@link
@@ -273,10 +312,29 @@ public class ForStRsSnapshotStrategy
         pendingRegistrations.put(resources.getCheckpointId(), thisCheckpointRegistrations);
         // Manifest is private — kept off the shared list. (Carried as the metaStateHandle below.)
 
+        // ---- E5-HIGH-2: emit the StateSerializerRegistry blob as a private-state entry. ----
+        // The blob is a small in-memory byte[] produced by {@link StateSerializerRegistry#serialize}.
+        // We write it directly into a fresh {@link CheckpointStateOutputStream} (EXCLUSIVE scope —
+        // schema registry is checkpoint-local, never shared) and bundle the resulting
+        // StreamStateHandle into privateState under the well-known local path. If no provider is
+        // wired (test-only construction) or the registry is empty the entry is skipped — older
+        // checkpoints that don't carry the blob remain readable by the restore-side guard, which
+        // treats absence as "no metadata seeded" (matches pre-fix behavior).
+        List<HandleAndLocalPath> privateStateEntries = List.of();
+        RegistryBlobProvider provider = registryBlobProvider;
+        if (provider != null) {
+            byte[] registryBlob = provider.currentBlob();
+            if (registryBlob != null && registryBlob.length > 0) {
+                StreamStateHandle registryHandle = uploadRegistryBlob(registryBlob, streamFactory);
+                privateStateEntries =
+                        List.of(HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
+            }
+        }
+
         // ---- Build the keyed state handle. ----
-        // Private state for v1 is empty (manifest is the dedicated metaStateHandle slot per
-        // Flink's incremental contract; the engine writes only one file per checkpoint that we
-        // treat as private). We keep the privateState list reserved for future per-ckpt artefacts.
+        // The manifest is the dedicated metaStateHandle slot per Flink's incremental contract; the
+        // engine writes a single manifest file per checkpoint, distinct from the serializer
+        // registry blob now carried under privateState (E5-HIGH-2).
         ForStRsIncrementalKeyedStateHandle handle =
                 new ForStRsIncrementalKeyedStateHandle(
                         backendIdentifier,
@@ -284,10 +342,25 @@ public class ForStRsSnapshotStrategy
                         resources.getCheckpointId(),
                         resources.getBaseCheckpointId(),
                         /* sharedState= */ sharedHandles,
-                        /* privateState= */ List.of(),
+                        /* privateState= */ privateStateEntries,
                         metaHandle,
                         cfMap);
         return SnapshotResult.of(handle);
+    }
+
+    /**
+     * E5-HIGH-2: write a small in-memory byte[] (the serialized {@link StateSerializerRegistry}
+     * blob) into a fresh {@link CheckpointStateOutputStream} and return the resulting
+     * {@link StreamStateHandle}. EXCLUSIVE scope because the registry blob is checkpoint-local —
+     * SharedStateRegistry sharing is for SSTs that span checkpoints, not per-ckpt metadata.
+     */
+    private StreamStateHandle uploadRegistryBlob(byte[] blob, CheckpointStreamFactory streamFactory)
+            throws IOException {
+        try (CheckpointStateOutputStream out =
+                streamFactory.createCheckpointStateOutputStream(CheckpointedStateScope.EXCLUSIVE)) {
+            out.write(blob, 0, blob.length);
+            return out.closeAndGetHandle();
+        }
     }
 
     // ------------------------------------------------------------------

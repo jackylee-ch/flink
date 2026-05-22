@@ -268,6 +268,23 @@ public final class ReducingAggregatingCache<IN, ACC> {
         entries.clear();
     }
 
+    /**
+     * A5-H2: removes the entry for the given composite key without invoking the flush callback.
+     * Called from the state class's {@code onClear()} hook when {@code asyncClear()} is dispatched
+     * via the {@link org.apache.flink.state.forstrs.VectorizedClassifier} DELETE path. Without this,
+     * a dirty cached accumulator survives the engine-side DELETE and {@link #flushAllDirty()} on
+     * the next barrier would write it back, overwriting the DELETE. Returns {@code true} if an
+     * entry was removed.
+     */
+    public boolean invalidate(byte[] compositeKey) {
+        return invalidate(compositeKey, 0, compositeKey.length);
+    }
+
+    /** Zero-alloc slice-view variant of {@link #invalidate(byte[])}. */
+    public boolean invalidate(byte[] buf, int off, int len) {
+        return entries.remove(scratch.view(buf, off, len)) != null;
+    }
+
     // -----------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------

@@ -34,6 +34,7 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.checkpoint.SavepointType;
 import org.apache.flink.runtime.checkpoint.SnapshotType;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
@@ -433,38 +434,82 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         ForStRsRestoreOperation restoreOp =
                 new ForStRsRestoreOperation(
                         linker, arena, localDbPath, keyGroupRange, restoredSstRegistry);
-        ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
+        // A5-M1: accumulate db + cf references separately from {@code restored} so the catch
+        // path can close them BEFORE the caller (createAsyncKeyedStateBackend) closes the
+        // arena. Pre-fix, a throw inside the backend constructor or any of the post-restore
+        // wiring leaked the engine-side FrsDb + default CF; the caller's catch path only
+        // closed the arena, which dropped the FFI shared-segment ownership but did NOT issue
+        // {@code dbClose}/{@code cfClose} on the open engine handle.
+        FrsDb db = null;
+        FrsCfHandle cf = null;
+        try {
+            ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
+            db = restored.getDb();
+            cf = restored.getDefaultCf();
 
-        ForStRsAsyncKeyedStateBackend<K> backend =
-                new ForStRsAsyncKeyedStateBackend<>(
-                        arena,
-                        linker,
-                        restored.getDb(),
-                        restored.getDefaultCf(),
-                        keySerializer,
-                        keyGroupRange,
-                        totalKeyGroups,
-                        /* ownsResources= */ true);
+            ForStRsAsyncKeyedStateBackend<K> backend =
+                    new ForStRsAsyncKeyedStateBackend<>(
+                            arena,
+                            linker,
+                            db,
+                            cf,
+                            keySerializer,
+                            keyGroupRange,
+                            totalKeyGroups,
+                            /* ownsResources= */ true);
 
-        // Preserve the source backend identifier when restoring from a single non-rescaled
-        // handle so SharedStateRegistry resolves the prior session's shared SSTs. On rescaling
-        // (multiple source handles or differing source range) we leave backendIdentifier null and
-        // let ensureSnapshotStrategy mint a fresh UUID — the restored LSM is a new lineage.
-        UUID inherited = inheritBackendIdentifier(restoredHandles, keyGroupRange);
-        if (inherited != null) {
-            backend.backendIdentifier = inherited;
+            // Preserve the source backend identifier when restoring from a single non-rescaled
+            // handle so SharedStateRegistry resolves the prior session's shared SSTs. On
+            // rescaling (multiple source handles or differing source range) we leave
+            // backendIdentifier null and let ensureSnapshotStrategy mint a fresh UUID — the
+            // restored LSM is a new lineage.
+            UUID inherited = inheritBackendIdentifier(restoredHandles, keyGroupRange);
+            if (inherited != null) {
+                backend.backendIdentifier = inherited;
+            }
+
+            // Repopulate the SST registry from the restored handles so post-restore
+            // incremental snapshots reuse SSTs already on S3 without re-uploading.
+            backend.adoptSstRegistry(restoredSstRegistry);
+
+            // E5-HIGH-2: seed the serializer registry from the restored handle's
+            // {@code _serializer_metadata.bin} private-state entry. ForStRsRestoreOperation has
+            // already parsed the blob (via StateSerializerRegistry.deserialize) so we just hand
+            // the decoded map straight to the registry. Pre-E5 snapshots carry no blob and
+            // restoreOp returns an empty map — seedFromRestore stays a no-op in that case, which
+            // matches the documented "fresh state in this session" branch of verifyOrRegister.
+            backend.stateSerializerRegistry.seedFromRestore(
+                    new LinkedHashMap<>(restored.getRestoredSerializerMetadata()));
+
+            return backend;
+        } catch (Throwable t) {
+            // Best-effort tear-down on restore failure. Order matters: CF closes BEFORE DB
+            // because the engine pins CF handles to the open db. Arena ownership is the
+            // caller's; we leave it for createAsyncKeyedStateBackend's catch to close so we
+            // don't double-close on the propagated exception path.
+            if (cf != null) {
+                try {
+                    cf.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (db != null) {
+                try {
+                    db.close();
+                } catch (Throwable ignored) {
+                }
+            }
+            if (t instanceof IOException io) {
+                throw io;
+            }
+            if (t instanceof RuntimeException re) {
+                throw re;
+            }
+            if (t instanceof Error err) {
+                throw err;
+            }
+            throw new IOException("ForStRsAsyncKeyedStateBackend.restoreFromHandles failed", t);
         }
-
-        // Repopulate the SST registry from the restored handles so post-restore incremental
-        // snapshots reuse SSTs already on S3 without re-uploading.
-        backend.adoptSstRegistry(restoredSstRegistry);
-
-        // Seed the serializer registry. The snapshot() write-path TODO leaves this empty until
-        // PR-A11-emit lands; the seed is therefore a no-op for V1 snapshots but the hook is in
-        // place so a metadata-bearing snapshot is consumed automatically when it ships.
-        backend.stateSerializerRegistry.seedFromRestore(new LinkedHashMap<>());
-
-        return backend;
     }
 
     /**
@@ -914,20 +959,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         boolean isSavepoint = ctype.isSavepoint();
         boolean isSync = isSavepoint && ((SavepointType) ctype).isSynchronous();
 
-        // E4-HIGH-1: PR-A8/A9 emit a {@link ForStRsIncrementalKeyedStateHandle} ("incremental
-        // ForSt-RS") for both checkpoints and savepoints; the canonical Flink savepoint format
-        // (loadable by community ForSt / RocksDB) is a follow-on PR. Surface the deferred
-        // canonical-format gap loudly when a savepoint is requested so operators don't get
-        // caught by "savepoint completed" log lines that mask a non-portable handle. The
-        // operation itself succeeds — only the emitted handle's format is non-canonical.
+        // E5-HIGH-1: Canonical savepoint format ({@link SavepointFormatType#CANONICAL}, the
+        // {@link SavepointFormatType#DEFAULT}) requires emitting a backend-portable handle that
+        // community ForSt / RocksDB can load. ForSt-RS only emits its incremental native format
+        // today, so silently accepting a canonical savepoint request would produce a non-portable
+        // handle that operators discover only at restore time. Fail fast at the request site
+        // with a clear remediation: the operator must explicitly opt into NATIVE format (either
+        // via the CLI {@code --type native} flag or by passing {@link SavepointFormatType#NATIVE}
+        // programmatically) until the canonical-emit PR lands.
+        //
+        // E4-HIGH-1: For NATIVE savepoints we still emit a {@link ForStRsIncrementalKeyedStateHandle}
+        // — the format is backend-native by definition, so this is correct. We retain the WARN so
+        // operators can see savepoint events in the log; only the canonical-handle gap throws.
         if (isSavepoint) {
+            SavepointFormatType formatType = ((SavepointType) ctype).getFormatType();
+            if (formatType == SavepointFormatType.CANONICAL) {
+                throw new UnsupportedOperationException(
+                        "Canonical savepoint format not yet supported by ForSt-RS backend;"
+                                + " use --type native or set SavepointFormatType.NATIVE");
+            }
             LOG.warn(
-                    "ForStRsAsyncKeyedStateBackend: savepoint requested for checkpoint id={} "
-                            + "(synchronous={}), but the emitted KeyedStateHandle is the "
-                            + "incremental ForSt-RS format — canonical Flink savepoint format "
-                            + "(loadable by community ForSt / RocksDB) is a follow-on PR. The "
-                            + "snapshot is durable and restorable by ForSt-RS itself, but cannot "
-                            + "yet be loaded by other backends.",
+                    "ForStRsAsyncKeyedStateBackend: NATIVE savepoint requested for checkpoint"
+                            + " id={} (synchronous={}). The emitted KeyedStateHandle is the"
+                            + " incremental ForSt-RS native format — durable and restorable by"
+                            + " ForSt-RS itself, but not loadable by other backends. For"
+                            + " cross-backend portability, the canonical-emit PR is still TODO.",
                     id,
                     isSync);
         }
@@ -1016,7 +1072,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // failures, manifest write failures, FFI errors surfaced as IOException — MUST
             // propagate so the checkpoint coordinator's failedCheckpoints counter increments
             // and `tolerable-failed-checkpoints` accounting fires (A4-H3 fix).
-            if (e.getMessage() != null && e.getMessage().contains("registry is already closed")) {
+            //
+            // E5-HIGH-3: precondition the empty-result fallback on
+            // {@code cancelStreamRegistry.isClosed()} rather than substring-matching the
+            // exception message. The previous match on {@code "registry is already closed"}
+            // was brittle: a downstream change to {@link CloseableRegistry}'s rejection
+            // message (or a translated locale) would have silently flipped real failures into
+            // {@code SnapshotResult.empty()} and bypassed checkpoint-failure accounting.
+            // {@link AbstractAutoCloseableRegistry#isClosed()} is the structural precondition
+            // and is stable across Flink versions.
+            if (cancelStreamRegistry.isClosed()) {
                 return DoneFuture.of(SnapshotResult.empty());
             }
             throw e;
@@ -1070,6 +1135,11 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                             uploader,
                             arena,
                             cfMap);
+            // E5-HIGH-2: wire the serializer-registry blob provider so each snapshot's
+            // privateState carries the current schema metadata. Restore reads it back via
+            // ForStRsRestoreOperation + seedFromRestore so the next session can detect schema
+            // drift across the snapshot/restore boundary.
+            s.setRegistryBlobProvider(stateSerializerRegistry::serialize);
             this.sstRegistry = reg;
             this.snapshotStrategy = s;
             return s;
@@ -1207,6 +1277,18 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
         managedExecutors.forEach(VectorizedExecutor::shutdown);
         managedExecutors.clear();
+        // D5-H2: release each MapStateV2's MapStateCache arena BEFORE clearing the state cache
+        // and dropping registry references. Pre-fix, the cache's Arena.ofShared() (and its 5
+        // off-heap segments) survived to JVM exit — one perma-leak per V2 MapState instance.
+        for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
+            try {
+                ms.close();
+            } catch (Throwable ignored) {
+                // Per-state close is best-effort on dispose; a failure here must not block
+                // subsequent state tear-down (engine close, arena close).
+            }
+        }
+        registeredMapStatesV2.clear();
         stateCache.clear();
         if (iterWatchdog != null) {
             iterWatchdog.stop();

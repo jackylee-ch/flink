@@ -44,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -218,13 +219,19 @@ class AsyncBackendSnapshotPathTest {
         // PR-A8: when the runtime issues stop --savepoint (SavepointType.terminate, isSynchronous
         // == true), the returned future must be pre-run before snapshot() returns. The mailbox
         // thread is expected to block until the snapshot is durable on storage.
+        //
+        // E5-HIGH-1: ForSt-RS only emits its native incremental format today, so the savepoint
+        // request must explicitly opt into {@link SavepointFormatType#NATIVE}. CANONICAL is
+        // rejected with UnsupportedOperationException (see {@link
+        // ForStRsAsyncKeyedStateBackend#snapshot}); the dedicated test
+        // {@link #canonicalSavepointThrowsUnsupportedOperation} exercises that path.
         ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db"));
         try {
             seed(backend, 0, 4);
             MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
             // Use terminate (post-checkpoint action TERMINATE) which is synchronous per
             // SavepointType.isSynchronous().
-            SavepointType savepointType = SavepointType.terminate(SavepointFormatType.CANONICAL);
+            SavepointType savepointType = SavepointType.terminate(SavepointFormatType.NATIVE);
             assertTrue(
                     savepointType.isSynchronous(),
                     "sanity: SavepointType.terminate(...) is synchronous");
@@ -246,6 +253,40 @@ class AsyncBackendSnapshotPathTest {
             assertNotNull(
                     result.getJobManagerOwnedSnapshot(),
                     "PR-A8/A9: savepoint emits a handle (V1 incremental, V2 canonical TODO)");
+        } finally {
+            backend.close();
+        }
+    }
+
+    @Test
+    void canonicalSavepointThrowsUnsupportedOperation(@TempDir Path tmp) throws Exception {
+        // E5-HIGH-1: a CANONICAL savepoint (the {@link SavepointFormatType#DEFAULT} when an
+        // operator runs `stop --savepoint` without an explicit `--type native` flag) must throw
+        // UnsupportedOperationException at the request site. Pre-fix the backend logged a WARN
+        // and proceeded to emit a non-portable incremental handle that operators would only
+        // discover as broken at restore time. This test pins the new contract.
+        ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db"));
+        try {
+            seed(backend, 0, 4);
+            MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+            SavepointType canonical = SavepointType.terminate(SavepointFormatType.CANONICAL);
+            CheckpointOptions opts =
+                    CheckpointOptions.alignedNoTimeout(
+                            canonical, CheckpointStorageLocationReference.getDefault());
+
+            UnsupportedOperationException uoe =
+                    assertThrows(
+                            UnsupportedOperationException.class,
+                            () -> backend.snapshot(99L, 0L, factory, opts),
+                            "E5-HIGH-1: CANONICAL savepoint must be rejected at the request"
+                                    + " site rather than silently producing a non-portable handle");
+            assertTrue(
+                    uoe.getMessage().contains("Canonical savepoint format"),
+                    "exception message should name the unsupported format: " + uoe.getMessage());
+            assertTrue(
+                    uoe.getMessage().contains("NATIVE"),
+                    "exception message should suggest NATIVE as the supported alternative: "
+                            + uoe.getMessage());
         } finally {
             backend.close();
         }

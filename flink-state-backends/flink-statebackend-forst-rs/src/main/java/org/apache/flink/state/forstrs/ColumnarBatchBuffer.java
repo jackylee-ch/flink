@@ -106,6 +106,27 @@ public final class ColumnarBatchBuffer {
     }
 
     /**
+     * B5-H5 zero-copy variant: appends {@code len} bytes from a {@link MemorySegment} source
+     * starting at {@code srcOff}. Flows the bytes directly into the off-heap {@code data}
+     * segment without an intermediate heap {@code byte[]} hop. Mirrors the
+     * {@link org.apache.flink.state.forstrs.state.ArrowBinaryBuffer#appendKey(MemorySegment, long,
+     * int)} pattern used elsewhere in this backend.
+     *
+     * <p>Returns the index of the appended entry.
+     */
+    public int append(MemorySegment src, long srcOff, int len) {
+        ensureCapacity(1);
+        ensureData(len);
+        if (len > 0) {
+            MemorySegment.copy(src, srcOff, data, dataPos, len);
+        }
+        dataPos += len;
+        int idx = count++;
+        offsets.set(ValueLayout.JAVA_INT, (long) (idx + 1) * Integer.BYTES, dataPos);
+        return idx;
+    }
+
+    /**
      * Appends the contents of a {@link DataOutputSerializer}'s shared backing buffer. Avoids the
      * intermediate {@code getCopyOfBuffer()} byte[] allocation that the legacy {@code serializeKey}
      * → {@code byte[]} path incurs.

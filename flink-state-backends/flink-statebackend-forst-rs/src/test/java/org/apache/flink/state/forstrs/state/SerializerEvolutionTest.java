@@ -26,9 +26,11 @@ import org.apache.flink.util.StateMigrationException;
 
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -185,5 +187,65 @@ class SerializerEvolutionTest {
         assertTrue(
                 md.serializerSnapshotBytes().length > 0,
                 "Serialized snapshot must be non-empty for IntSerializer");
+    }
+
+    // ----------------------------------------------------------------
+    // E5-HIGH-2: registry serialize ↔ deserialize codec round-trip.
+    // ----------------------------------------------------------------
+
+    @Test
+    void registryBlobRoundTripsAcrossSessions() throws Exception {
+        // Source session registers two states with distinct snapshots.
+        StateSerializerRegistry src = new StateSerializerRegistry();
+        src.register("counter", VALUE_KIND, LongSerializer.INSTANCE);
+        src.register("name", VALUE_KIND, StringSerializer.INSTANCE);
+        assertEquals(2, src.metadataBuffer().size());
+
+        // Drain → blob → re-parse.
+        byte[] blob = src.serialize();
+        assertNotNull(blob);
+        assertTrue(blob.length > 0, "blob is non-empty for two registered states");
+
+        Map<String, StateSerializerMetadata> parsed = StateSerializerRegistry.deserialize(blob);
+        assertEquals(2, parsed.size(), "round-tripped map preserves entry count");
+
+        // Per-entry byte-identity: the deserialized metadata must reconstruct the same
+        // {@code stateKindOrdinal}, {@code formatVersion}, and snapshot bytes.
+        for (Map.Entry<String, StateSerializerMetadata> e : src.metadataBuffer().entrySet()) {
+            StateSerializerMetadata expected = e.getValue();
+            StateSerializerMetadata actual = parsed.get(e.getKey());
+            assertNotNull(actual, "parsed map contains key " + e.getKey());
+            assertEquals(expected.stateKindOrdinal(), actual.stateKindOrdinal());
+            assertEquals(expected.formatVersion(), actual.formatVersion());
+            assertArrayEquals(
+                    expected.serializerSnapshotBytes(),
+                    actual.serializerSnapshotBytes(),
+                    "snapshot bytes are byte-identical after round-trip for " + e.getKey());
+        }
+
+        // Restore-side: seedFromRestore + verifyOrRegister for both states with the original
+        // serializers — must succeed (COMPATIBLE_AS_IS).
+        StateSerializerRegistry restored = new StateSerializerRegistry();
+        restored.seedFromRestore(parsed);
+        assertTrue(restored.activatedForRestore());
+        assertSame(
+                LongSerializer.INSTANCE,
+                restored.verifyOrRegister("counter", VALUE_KIND, LongSerializer.INSTANCE));
+        assertSame(
+                StringSerializer.INSTANCE,
+                restored.verifyOrRegister("name", VALUE_KIND, StringSerializer.INSTANCE));
+    }
+
+    @Test
+    void deserializeRejectsBlobWithWrongMagic() {
+        // E5-HIGH-2: corrupted private-state blob (e.g. an SST file accidentally routed through
+        // the registry parser) must fail loudly rather than silently returning an empty map.
+        byte[] bogus = new byte[] {0, 0, 0, 0, 0, 0, 0, 0};
+        IOException ioe =
+                assertThrows(
+                        IOException.class, () -> StateSerializerRegistry.deserialize(bogus));
+        assertTrue(
+                ioe.getMessage().contains("magic mismatch"),
+                "magic mismatch message: " + ioe.getMessage());
     }
 }

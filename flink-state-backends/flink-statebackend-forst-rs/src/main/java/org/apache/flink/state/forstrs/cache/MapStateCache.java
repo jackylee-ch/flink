@@ -88,7 +88,7 @@ import java.lang.foreign.ValueLayout;
  * @param <V> the user value type
  */
 @Internal
-public final class MapStateCache<V> {
+public final class MapStateCache<V> implements AutoCloseable {
 
     /**
      * Default max entries; PR-F3 bumped from 256K to 1M to absorb Q16 working sets without LRU
@@ -291,6 +291,34 @@ public final class MapStateCache<V> {
 
     public int size() {
         return size;
+    }
+
+    /**
+     * D5-H2: releases the off-heap arena that backs {@link #keyOffsets}, {@link #keyLengths},
+     * {@link #keyData}, {@link #hashIndex}, and {@link #accessTime}. Idempotent — safe to call
+     * multiple times; subsequent calls after the arena has been closed are observed as a no-op
+     * via {@link Arena#close} throwing {@code IllegalStateException}, which we swallow.
+     *
+     * <p>Owning class invariant: every {@link MapStateCache} instance is owned by exactly one
+     * {@code ForStRsMapStateV2} (see {@code state/ForStRsMapStateV2.java:91}). The owner state
+     * is in turn registered with the backend ({@code registeredMapStatesV2}) and disposed when
+     * the backend disposes; that disposal chain MUST invoke this method so the shared arena
+     * is released. Without it, every V2 MapState created during the lifetime of the JVM kept
+     * its 5 off-heap segments live until process exit (perma-leak).
+     */
+    @Override
+    public void close() {
+        try {
+            arena.close();
+        } catch (IllegalStateException alreadyClosedOrInUse) {
+            // Arena.close throws IllegalStateException if a thread still holds a confined
+            // resource or if the arena was already closed. The cache is single-threaded by
+            // contract; an already-closed arena is the only realistic case here and is
+            // benign (idempotent close).
+        }
+        // Drop references on the on-heap value array so GC can reclaim user values promptly.
+        java.util.Arrays.fill(values, null);
+        size = 0;
     }
 
     // -------------------------------------------------------------------

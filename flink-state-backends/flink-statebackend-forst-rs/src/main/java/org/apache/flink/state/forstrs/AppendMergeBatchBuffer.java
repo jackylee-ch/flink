@@ -51,7 +51,13 @@ public final class AppendMergeBatchBuffer {
         this.keyBuffer = new ColumnarBatchBuffer(arena);
     }
 
-    /** Appends an {@link AppendMergeRequest} into this buffer. */
+    /**
+     * Appends an {@link AppendMergeRequest} into this buffer.
+     *
+     * <p>B5-H5: routes the key slice directly into the off-heap {@code ColumnarBatchBuffer.data}
+     * via the {@link ColumnarBatchBuffer#append(MemorySegment, long, int)} overload — no heap
+     * {@code byte[]} hop per APPEND_MERGE row.
+     */
     public void append(AppendMergeRequest req) {
         MemorySegment keySlice = req.keySlice();
         if (keySlice == null || keySlice == MemorySegment.NULL) {
@@ -61,9 +67,7 @@ public final class AppendMergeBatchBuffer {
             if (byteSize == 0) {
                 keyBuffer.appendEmpty();
             } else {
-                byte[] keyBytes = new byte[(int) byteSize];
-                MemorySegment.copy(keySlice, 0L, MemorySegment.ofArray(keyBytes), 0L, byteSize);
-                keyBuffer.append(keyBytes);
+                keyBuffer.append(keySlice, 0L, (int) byteSize);
             }
         }
         valueSliceLists.add(req.valueSlices());
