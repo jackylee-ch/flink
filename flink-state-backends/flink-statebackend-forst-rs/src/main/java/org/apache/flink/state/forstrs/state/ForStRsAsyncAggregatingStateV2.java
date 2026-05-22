@@ -19,11 +19,15 @@
 package org.apache.flink.state.forstrs.state;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.state.v2.AggregatingState;
+import org.apache.flink.api.common.state.v2.StateFuture;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.asyncprocessing.AsyncExecutionController;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
@@ -34,9 +38,12 @@ import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * Async-V2 AggregatingState for ForSt-RS. Extends {@link AbstractAggregatingState} (which
@@ -46,7 +53,21 @@ import java.nio.charset.StandardCharsets;
  *
  * <p>Storage: the accumulator {@code ACC} is stored as a single serialized value.
  * AGGREGATING_GET maps to GET (returns raw ACC bytes → deserialized ACC).
- * AGGREGATING_ADD maps to PUT (payload is the new ACC, computed by AbstractAggregatingState).
+ * AGGREGATING_ADD maps to PUT (payload is the new ACC).
+ *
+ * <h3>PR-C3 RMW cache (V12, B3-H2)</h3>
+ *
+ * <p>This class wraps the inherited {@link AbstractAggregatingState#asyncAdd} with a per-instance
+ * {@link ReducingAggregatingCache}. On cache hit, {@link AggregateFunction#add(Object, Object)} is
+ * applied in-memory on the operator thread (zero engine I/O) and the result is marked dirty. On
+ * cache miss, the inherited {@code asyncGetInternal()} fetches the existing accumulator from the
+ * engine (or seeds a new one via {@link AggregateFunction#createAccumulator()}), folds in the new
+ * input, and stores the result in the cache (dirty). The accumulator stays in cache until
+ * {@link #flushOnBarrier()} drains it via the configured flush handler.
+ *
+ * <p>The cache key is the same composite-key bytes that {@link #serializeKey(StateRequest)}
+ * produces — built off-thread by reading the current {@link RecordContext} via the AEC. This
+ * mirrors the {@code ForStRsMapStateV2#serializeMapEntryKey} pattern (PR-C1).
  *
  * @param <K> backend key type
  * @param <N> namespace type
@@ -71,10 +92,26 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      */
     private final TypeSerializer<N> namespaceSerializer;
     private final TypeSerializer<ACC> accSerializer;
+    private final AggregateFunction<IN, ACC, OUT> aggregateFn;
 
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
+
+    /**
+     * Per-instance RMW cache (PR-C3 / B3-H2). Combiner invokes {@link
+     * AggregateFunction#add(Object, Object)} on the operator thread. flushCallback materializes
+     * the dirty accumulator and routes it to {@link #flushHandler}.
+     */
+    private final ReducingAggregatingCache<IN, ACC> cache;
+
+    /**
+     * Pluggable flush handler invoked once per dirty entry on {@link #flushOnBarrier()} (and on
+     * LRU eviction). Receives the composite-key bytes and the serialized accumulator bytes. The
+     * default is a no-op — production wiring to the engine PUT path is gated on PR-A1 / V1.1
+     * (matches the V1 placeholder pattern in {@code ForStRsAggregatingStateV2}).
+     */
+    private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
 
     public ForStRsAsyncAggregatingStateV2(
             StateRequestHandler stateRequestHandler,
@@ -89,6 +126,140 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
         this.keySerializer = keySerializer;
         this.namespaceSerializer = namespaceSerializer;
         this.accSerializer = accSerializer;
+        this.aggregateFn = aggregateFunction;
+        this.cache =
+                new ReducingAggregatingCache<>(
+                        // AggregateFunction.add signature is add(IN, ACC) → ACC, so reorder.
+                        (acc, in) -> aggregateFunction.add(in, acc),
+                        this::flushEntry);
+    }
+
+    // ---------------------------------------------------------------
+    // PR-C3 RMW cache — async overrides
+    // ---------------------------------------------------------------
+
+    /**
+     * Builds the cache key bytes from the current record context. Mirrors {@link
+     * #serializeKey(StateRequest)} but reads the (K, N) from the AEC's current {@link
+     * RecordContext} instead of a StateRequest.
+     */
+    @SuppressWarnings("unchecked")
+    private byte[] buildCacheKeyFromContext() {
+        AsyncExecutionController<K, ?> aec =
+                (AsyncExecutionController<K, ?>) stateRequestHandler;
+        RecordContext<K> ctx = aec.getCurrentContext();
+        N namespace = ctx.getNamespace(this);
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (namespaceSerializer != null
+                    && namespace != null
+                    && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            return keyOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncAggregatingStateV2: failed to serialize cache key", e);
+        }
+    }
+
+    /**
+     * Cache-mediated {@code asyncAdd}. PR-C3 (V12 / B3-H2): folds in-memory on cache hit, returning
+     * a completed future; on cache miss, fetches the existing accumulator from the engine (or
+     * seeds a fresh one via {@link AggregateFunction#createAccumulator()}), folds in the new
+     * value, and stores the result in the cache (marked dirty).
+     *
+     * <p>Null inputs are ignored to match base-class semantics.
+     */
+    @Override
+    public StateFuture<Void> asyncAdd(IN value) {
+        if (value == null) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        byte[] cacheKey = buildCacheKeyFromContext();
+        Optional<ACC> hit = cache.tryFold(cacheKey, value);
+        if (hit.isPresent()) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        // Cache miss — fetch existing accumulator from the engine, fold, populate cache.
+        return asyncGetInternal()
+                .thenApply(
+                        oldAcc -> {
+                            try {
+                                ACC seed =
+                                        (oldAcc == null)
+                                                ? aggregateFn.createAccumulator()
+                                                : oldAcc;
+                                ACC newAcc = aggregateFn.add(value, seed);
+                                cache.put(cacheKey, newAcc);
+                                return null;
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "ForStRsAsyncAggregatingStateV2: AggregateFunction threw on miss",
+                                        e);
+                            }
+                        });
+    }
+
+    /**
+     * Cache-aware {@code asyncGet}. If the entry is in the cache (even dirty), returns the cached
+     * value (after {@link AggregateFunction#getResult(Object)}) without an engine round trip.
+     * Otherwise falls through to the base implementation.
+     */
+    @Override
+    public StateFuture<OUT> asyncGet() {
+        byte[] cacheKey = buildCacheKeyFromContext();
+        if (cache.contains(cacheKey)) {
+            ACC cached = cache.peek(cacheKey);
+            OUT out = cached == null ? null : aggregateFn.getResult(cached);
+            return StateFutureUtils.completedFuture(out);
+        }
+        return super.asyncGet();
+    }
+
+    /**
+     * Drains all dirty cache entries via the configured {@link #flushHandler}. Called by the
+     * backend's snapshot pre-flush (Trace E).
+     */
+    public void flushOnBarrier() {
+        cache.flushAllDirty();
+    }
+
+    /**
+     * Replaces the flush handler. Used by the backend to wire the production PUT path and by tests
+     * to capture flushed bytes. The handler receives composite-key bytes and serialized
+     * accumulator bytes (null acc → null bytes).
+     */
+    @VisibleForTesting
+    public void setFlushHandler(BiConsumer<byte[], byte[]> handler) {
+        this.flushHandler = handler;
+    }
+
+    /** Returns the number of cache entries. Exposed for tests / diagnostics. */
+    @VisibleForTesting
+    public int cacheSize() {
+        return cache.size();
+    }
+
+    private void flushEntry(byte[] keyBytes, ACC acc) {
+        byte[] valBytes = acc == null ? null : serializeAccBytes(acc);
+        flushHandler.accept(keyBytes, valBytes);
+    }
+
+    private byte[] serializeAccBytes(ACC acc) {
+        try {
+            valueOut.clear();
+            accSerializer.serialize(acc, valueOut);
+            return valueOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncAggregatingStateV2: failed to serialize accumulator", e);
+        }
     }
 
     // ---------------------------------------------------------------

@@ -182,18 +182,39 @@ public class VectorizedExecutor implements StateExecutor {
             executeGets(classifier);
             executeIters(classifier);
             // Dispatch vectorized APPEND_MERGE requests (P6-B, ListState path).
+            //
+            // PR-C2 split: each row went via either the heap path (appendMergeBuffer) or the
+            // off-heap path (per-state ListStateArrowBuffer). The classifier's parallel arrays
+            // {@code offHeapAppendMergeFutures} / {@code offHeapAppendMergeStates} mark which
+            // path each row took.
+            //   - Heap path: dispatchAppendMerge(amBuf) drives futures via amBuf.futures();
+            //   - Off-heap path: drain unique state buffers via flushOffHeapListBuffersIfDirty()
+            //     and the per-row off-heap futures resolve when their state's buffer flushes.
             AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
             Throwable firstRowFailure = null;
-            if (amBuf != null && !amBuf.isEmpty()) {
-                dispatchAppendMerge(amBuf);
-                // Round-1 fix A1-H5 + Round-2 fix A2-H3: propagate per-row futures
-                // AND track if any row failed so the container future reflects it.
+            int amCount = classifier.appendMergeCount();
+            if (amCount > 0) {
+                // 1) Heap path: dispatch and propagate any heap-row futures.
+                if (amBuf != null && !amBuf.isEmpty()) {
+                    dispatchAppendMerge(amBuf);
+                }
+                // 2) Off-heap path: drain unique state-instance buffers exactly once.
+                classifier.flushOffHeapListBuffersIfDirty();
+                // 3) Plumb completion to the StateRequest's runtime future on a per-row basis.
                 StateRequest<?, ?, ?, ?>[] amReqs = classifier.appendMergeRequests();
-                int amCount = classifier.appendMergeCount();
-                List<CompletableFuture<Void>> amReqFutures = amBuf.futures();
+                CompletableFuture<Void>[] offFutures = classifier.offHeapAppendMergeFutures();
+                List<CompletableFuture<Void>> heapFutures =
+                        amBuf != null ? amBuf.futures() : null;
+                // Track per-path indices: heap rows index into heapFutures in heap-append order.
+                int heapIdx = 0;
                 for (int i = 0; i < amCount; i++) {
-                    CompletableFuture<Void> amFut = amReqFutures.get(i);
-                    if (amFut.isCompletedExceptionally()) {
+                    CompletableFuture<Void> amFut =
+                            offFutures[i] != null
+                                    ? offFutures[i]
+                                    : (heapFutures != null && heapIdx < heapFutures.size()
+                                            ? heapFutures.get(heapIdx++)
+                                            : null);
+                    if (amFut != null && amFut.isCompletedExceptionally()) {
                         Throwable cause;
                         try {
                             amFut.getNow(null);
@@ -259,17 +280,28 @@ public class VectorizedExecutor implements StateExecutor {
         executeGets(single);
         executeIters(single);
         AppendMergeBatchBuffer amBuf = single.appendMergeBuffer();
-        if (amBuf != null && !amBuf.isEmpty()) {
-            dispatchAppendMerge(amBuf);
-            // Round-2 fix A2-H1: propagate AppendMergeRequest future outcomes to the
-            // parallel StateRequest's runtime future — same anti-pattern A1-H5 fixed
-            // in executeBatchRequests, the sync sibling was missed.
+        int amCount = single.appendMergeCount();
+        if (amCount > 0) {
+            // PR-C2: mirror the executeBatchRequests split — drive both heap (amBuf) and
+            // off-heap (per-state ListStateArrowBuffer) paths and complete per-row futures
+            // in row order.
+            if (amBuf != null && !amBuf.isEmpty()) {
+                dispatchAppendMerge(amBuf);
+            }
+            single.flushOffHeapListBuffersIfDirty();
             StateRequest<?, ?, ?, ?>[] amReqs = single.appendMergeRequests();
-            int amCount = single.appendMergeCount();
-            List<CompletableFuture<Void>> amReqFutures = amBuf.futures();
+            CompletableFuture<Void>[] offFutures = single.offHeapAppendMergeFutures();
+            List<CompletableFuture<Void>> heapFutures =
+                    amBuf != null ? amBuf.futures() : null;
+            int heapIdx = 0;
             for (int i = 0; i < amCount; i++) {
-                CompletableFuture<Void> amFut = amReqFutures.get(i);
-                if (amFut.isCompletedExceptionally()) {
+                CompletableFuture<Void> amFut =
+                        offFutures[i] != null
+                                ? offFutures[i]
+                                : (heapFutures != null && heapIdx < heapFutures.size()
+                                        ? heapFutures.get(heapIdx++)
+                                        : null);
+                if (amFut != null && amFut.isCompletedExceptionally()) {
                     Throwable cause;
                     try {
                         amFut.getNow(null);

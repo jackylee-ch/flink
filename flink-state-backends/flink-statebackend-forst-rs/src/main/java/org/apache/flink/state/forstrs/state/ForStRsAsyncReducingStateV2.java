@@ -19,11 +19,15 @@
 package org.apache.flink.state.forstrs.state;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.state.v2.ReducingState;
+import org.apache.flink.api.common.state.v2.StateFuture;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.asyncprocessing.AsyncExecutionController;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
@@ -34,9 +38,12 @@ import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Optional;
+import java.util.function.BiConsumer;
 
 /**
  * Async-V2 ReducingState for ForSt-RS. Extends {@link AbstractReducingState} (which implements
@@ -44,9 +51,30 @@ import java.nio.charset.StandardCharsets;
  * chain) and implements {@link ForStRsInnerTable} for the vectorized batch-dispatch path.
  *
  * <p>Storage: the current reduced value is stored as a single serialized {@code V}. REDUCING_GET
- * maps to GET; REDUCING_ADD maps to PUT (the payload is already the new accumulated value, computed
- * by {@link AbstractReducingState#asyncAdd} which issues REDUCING_GET, then folds, then calls
- * asyncUpdateInternal which issues REDUCING_ADD with the new value).
+ * maps to GET; REDUCING_ADD maps to PUT.
+ *
+ * <h3>PR-C3 RMW cache (V12, B3-H1)</h3>
+ *
+ * <p>This class wraps the inherited {@link AbstractReducingState#asyncAdd} with a per-instance
+ * {@link ReducingAggregatingCache}. On cache hit, the input is folded in-memory on the operator
+ * thread (zero engine I/O) and the result is marked dirty. On cache miss, the inherited
+ * {@code asyncGetInternal()} fetches the existing accumulator from the engine, folds the new input,
+ * and stores the result in the cache (dirty). The accumulator stays in cache until
+ * {@link #flushOnBarrier()} drains it via the configured flush handler.
+ *
+ * <p>The cache key is the same composite-key bytes that
+ * {@link #serializeKey(StateRequest)} produces — built off-thread by reading the current
+ * {@link RecordContext} via the AEC. This mirrors the
+ * {@code ForStRsMapStateV2#serializeMapEntryKey} pattern (PR-C1).
+ *
+ * <h3>flushOnBarrier()</h3>
+ *
+ * <p>The backend's {@code snapshot()} invokes {@link #flushOnBarrier()} on every registered
+ * instance before the engine snapshot runs (Trace E barrier drain). Dirty accumulators are
+ * serialized and delivered to the flush handler — a callback set by the backend or a test. The
+ * default handler is a no-op (V1 behaviour, matches the production gating on full classifier
+ * integration), but a hook is exposed via {@link #setFlushHandler(BiConsumer)} for tests and
+ * future P11 wiring.
  *
  * @param <K> backend key type
  * @param <N> namespace type
@@ -68,10 +96,26 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      */
     private final TypeSerializer<N> namespaceSerializer;
     private final TypeSerializer<V> valueSerializer;
+    private final ReduceFunction<V> reduceFunction;
 
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
+
+    /**
+     * Per-instance RMW cache (PR-C3 / B3-H1). Combiner invokes {@link
+     * ReduceFunction#reduce(Object, Object)} on the operator thread. flushCallback materializes
+     * the dirty accumulator and routes it to {@link #flushHandler}.
+     */
+    private final ReducingAggregatingCache<V, V> cache;
+
+    /**
+     * Pluggable flush handler invoked once per dirty entry on {@link #flushOnBarrier()} (and on
+     * LRU eviction). Receives the composite-key bytes and the serialized accumulator bytes. The
+     * default is a no-op — production wiring to the engine PUT path is gated on PR-A1 / V1.1
+     * (matches the V1 placeholder pattern in {@code ForStRsReducingStateV2}).
+     */
+    private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
 
     public ForStRsAsyncReducingStateV2(
             StateRequestHandler stateRequestHandler,
@@ -86,6 +130,146 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         this.keySerializer = keySerializer;
         this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
+        this.reduceFunction = reduceFunction;
+        this.cache =
+                new ReducingAggregatingCache<>(
+                        (acc, in) -> {
+                            try {
+                                return reduceFunction.reduce(acc, in);
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
+                            }
+                        },
+                        this::flushEntry);
+    }
+
+    // ---------------------------------------------------------------
+    // PR-C3 RMW cache — async overrides
+    // ---------------------------------------------------------------
+
+    /**
+     * Builds the cache key bytes from the current record context. Mirrors {@link
+     * #serializeKey(StateRequest)} but reads the (K, N) from the AEC's current {@link
+     * RecordContext} instead of a StateRequest — used by the {@link #asyncAdd(Object)} override
+     * which runs before any state request is built.
+     */
+    @SuppressWarnings("unchecked")
+    private byte[] buildCacheKeyFromContext() {
+        AsyncExecutionController<K, ?> aec =
+                (AsyncExecutionController<K, ?>) stateRequestHandler;
+        RecordContext<K> ctx = aec.getCurrentContext();
+        N namespace = ctx.getNamespace(this);
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (namespaceSerializer != null
+                    && namespace != null
+                    && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            return keyOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncReducingStateV2: failed to serialize cache key", e);
+        }
+    }
+
+    /**
+     * Cache-mediated {@code asyncAdd}. PR-C3 (V12 / B3-H1): folds in-memory on cache hit, returning
+     * a completed future; on cache miss, fetches the existing accumulator from the engine, folds in
+     * the new value, and stores the result in the cache (marked dirty). The accumulator remains in
+     * the cache until {@link #flushOnBarrier()} drains it.
+     *
+     * <p>Null inputs are ignored to match ReduceFunction semantics in the base class.
+     */
+    @Override
+    public StateFuture<Void> asyncAdd(V value) {
+        if (value == null) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        byte[] cacheKey = buildCacheKeyFromContext();
+        Optional<V> hit = cache.tryFold(cacheKey, value);
+        if (hit.isPresent()) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        // Cache miss — fetch existing accumulator from the engine, fold, populate cache.
+        return asyncGetInternal()
+                .thenApply(
+                        oldValue -> {
+                            try {
+                                V newAcc =
+                                        oldValue == null
+                                                ? value
+                                                : reduceFunction.reduce(oldValue, value);
+                                cache.put(cacheKey, newAcc);
+                                return null;
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "ForStRsAsyncReducingStateV2: ReduceFunction threw on miss",
+                                        e);
+                            }
+                        });
+    }
+
+    /**
+     * Cache-aware {@code asyncGet}. If the entry is in the cache (even dirty), returns the cached
+     * value without an engine round trip. Otherwise falls through to {@code asyncGetInternal} and
+     * does NOT populate the cache (only writes / folds populate the cache; pure reads stay
+     * uncached to bound memory).
+     */
+    @Override
+    public StateFuture<V> asyncGet() {
+        byte[] cacheKey = buildCacheKeyFromContext();
+        if (cache.contains(cacheKey)) {
+            return StateFutureUtils.completedFuture(cache.peek(cacheKey));
+        }
+        return asyncGetInternal();
+    }
+
+    /**
+     * Drains all dirty cache entries via the configured {@link #flushHandler}. Called by the
+     * backend's snapshot pre-flush (Trace E). Entries are serialized once per call and the handler
+     * decides how to route them (production: engine PUT; tests: capture).
+     */
+    public void flushOnBarrier() {
+        cache.flushAllDirty();
+    }
+
+    /**
+     * Replaces the flush handler. Used by the backend to wire the production PUT path and by tests
+     * to capture flushed bytes. The handler receives composite-key bytes and serialized
+     * accumulator bytes (null acc — cleared entry — passes null bytes).
+     */
+    @VisibleForTesting
+    public void setFlushHandler(BiConsumer<byte[], byte[]> handler) {
+        this.flushHandler = handler;
+    }
+
+    /** Returns the number of cache entries. Exposed for tests / diagnostics. */
+    @VisibleForTesting
+    public int cacheSize() {
+        return cache.size();
+    }
+
+    private void flushEntry(byte[] keyBytes, V acc) {
+        byte[] valBytes = acc == null ? null : serializeValueBytes(acc);
+        flushHandler.accept(keyBytes, valBytes);
+    }
+
+    private byte[] serializeValueBytes(V acc) {
+        try {
+            valueOut.clear();
+            valueSerializer.serialize(acc, valueOut);
+            return valueOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncReducingStateV2: failed to serialize accumulator", e);
+        }
     }
 
     // ---------------------------------------------------------------

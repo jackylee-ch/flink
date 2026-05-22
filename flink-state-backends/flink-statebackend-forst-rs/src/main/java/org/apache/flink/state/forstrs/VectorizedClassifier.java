@@ -104,6 +104,16 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private StateRequest<?, ?, ?, ?>[] appendMergeRequests;
     private int appendMergeCount;
 
+    // PR-C2: parallel arrays for the off-heap APPEND_MERGE fast path. For each row {@code i}, if
+    // {@code offHeapAppendMergeFutures[i] != null} the row went through the per-state
+    // {@link org.apache.flink.state.forstrs.state.ListStateArrowBuffer}; otherwise it's a heap-path
+    // row sharing {@link #appendMergeBuffer}. The executor uses these to (a) complete the row's
+    // {@code AppendMergeRequest}-equivalent future on the off-heap-path, and (b) drain unique
+    // state-instance buffers exactly once after dispatch.
+    private java.util.concurrent.CompletableFuture<Void>[] offHeapAppendMergeFutures;
+    private org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?>[]
+            offHeapAppendMergeStates;
+
     private final List<ForStRsDBIterRequest<?, ?, ?, ?>> iterRequests = new ArrayList<>();
 
     public VectorizedClassifier(
@@ -120,6 +130,13 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         this.putRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.deleteRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.appendMergeRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        java.util.concurrent.CompletableFuture<Void>[] futs =
+                (java.util.concurrent.CompletableFuture<Void>[])
+                        new java.util.concurrent.CompletableFuture[INIT_SLOTS];
+        this.offHeapAppendMergeFutures = futs;
+        this.offHeapAppendMergeStates =
+                new org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?>[INIT_SLOTS];
         // appendMergeBuffer / iterPrefixBuffer / iterRangeBuffer are lazy-initialized by
         // initNewKindBuffers(Arena) to avoid requiring an Arena here.
     }
@@ -149,6 +166,14 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         getCount = 0;
         putCount = 0;
         deleteCount = 0;
+        // PR-C2: clear parallel off-heap arrays up to the prior appendMergeCount so stale state
+        // refs don't keep ListStateArrowBuffers alive across batch boundaries.
+        if (offHeapAppendMergeFutures != null) {
+            for (int i = 0; i < appendMergeCount; i++) {
+                offHeapAppendMergeFutures[i] = null;
+                offHeapAppendMergeStates[i] = null;
+            }
+        }
         appendMergeCount = 0;
         iterRequests.clear();
         if (appendMergeBuffer != null) {
@@ -513,10 +538,47 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
      * destructive PUT path. Constructs an {@link AppendMergeRequest} whose key + operand are
      * heap-backed {@link MemorySegment}s; {@link VectorizedExecutor#dispatchAppendMergeBatch}
      * copies them into off-heap buffers before the FFI call.
+     *
+     * <p><b>PR-C2 fast path:</b> when {@code table} is a {@link
+     * org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2} with an off-heap accumulator
+     * configured, route the chunk bytes directly into the per-state-instance buffer (one off-heap
+     * copy) and skip both the heap {@link AppendMergeBatchBuffer} step and the per-row scratch
+     * {@link Arena} that the legacy dispatch path allocates. The buffer drains via a single
+     * {@code frs_vec_merge_append_batch} call on auto-flush, pre-snapshot, or
+     * {@link #flushOffHeapListBuffersIfDirty}.
+     *
+     * <p>The off-heap path's future (returned by {@code recordAppendMergeOffHeap}) is captured
+     * into {@link #offHeapAppendMergeFutures} parallel to {@link #appendMergeRequests} so the
+     * executor can plumb completion back to the Flink-runtime async future.
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <K, N, V> void recordAppendMerge(
             ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
+        // PR-C2: off-heap fast path when the state has a configured ListStateArrowBuffer.
+        if (table instanceof org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2) {
+            org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 list =
+                    (org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2) table;
+            if (list.buffer() != null) {
+                java.util.concurrent.CompletableFuture<Void> fut =
+                        list.recordAppendMergeOffHeap((StateRequest) request);
+                if (fut != null) {
+                    ensureAppendMergeCapacity();
+                    appendMergeRequests[appendMergeCount] = request;
+                    ensureOffHeapAppendMergeCapacity();
+                    offHeapAppendMergeFutures[appendMergeCount] = fut;
+                    offHeapAppendMergeStates[appendMergeCount] = list;
+                    appendMergeCount++;
+                    return;
+                }
+                // null return means defensive fall-through to recordDelete (null payload) —
+                // handle that here so we don't double-count.
+                if (request.getPayload() == null) {
+                    recordDelete(table, request);
+                    return;
+                }
+                // Otherwise fall through to the heap path below.
+            }
+        }
         ensureAppendMergeBuffer();
         ensureAppendMergeCapacity();
         byte[] keyBytes = table.serializeKey(request);
@@ -536,7 +598,38 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                         new java.lang.foreign.MemorySegment[] {valSlice});
         appendMergeBuffer.append(amReq);
         appendMergeRequests[appendMergeCount] = request;
+        ensureOffHeapAppendMergeCapacity();
+        // Mark slot as heap-path (null off-heap future + null off-heap state).
+        offHeapAppendMergeFutures[appendMergeCount] = null;
+        offHeapAppendMergeStates[appendMergeCount] = null;
         appendMergeCount++;
+    }
+
+    /**
+     * PR-C2: drain any non-empty off-heap ListStateArrowBuffers referenced by this batch's
+     * APPEND_MERGE rows. Called by the executor after the per-row {@link
+     * AppendMergeBatchBuffer} dispatch so the off-heap-path's per-row futures resolve in the
+     * same batch boundary. Idempotent (no-op when nothing was buffered or buffer empty).
+     *
+     * <p>De-duplicates by state-instance identity — multiple LIST_ADD rows for the same state
+     * share one buffer, so a single drain handles all of them.
+     */
+    public void flushOffHeapListBuffersIfDirty() {
+        if (offHeapAppendMergeStates == null) {
+            return;
+        }
+        // Walk the parallel array and flush each unique state instance's buffer once.
+        java.util.IdentityHashMap<
+                        org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2,
+                        Boolean>
+                seen = new java.util.IdentityHashMap<>();
+        for (int i = 0; i < appendMergeCount; i++) {
+            org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
+                    offHeapAppendMergeStates[i];
+            if (s != null && seen.put(s, Boolean.TRUE) == null) {
+                s.flushIfDirty();
+            }
+        }
     }
 
     private void ensureAppendMergeCapacity() {
@@ -547,6 +640,42 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         StateRequest<?, ?, ?, ?>[] r = new StateRequest<?, ?, ?, ?>[newCap];
         System.arraycopy(appendMergeRequests, 0, r, 0, appendMergeRequests.length);
         appendMergeRequests = r;
+    }
+
+    /** PR-C2: keep off-heap parallel arrays in lockstep with {@link #appendMergeRequests}. */
+    private void ensureOffHeapAppendMergeCapacity() {
+        if (appendMergeCount < offHeapAppendMergeFutures.length) {
+            return;
+        }
+        int newCap = offHeapAppendMergeFutures.length << 1;
+        @SuppressWarnings({"unchecked", "rawtypes"})
+        java.util.concurrent.CompletableFuture<Void>[] futs =
+                (java.util.concurrent.CompletableFuture<Void>[])
+                        new java.util.concurrent.CompletableFuture[newCap];
+        System.arraycopy(offHeapAppendMergeFutures, 0, futs, 0, offHeapAppendMergeFutures.length);
+        offHeapAppendMergeFutures = futs;
+        org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?>[] sts =
+                new org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?>[newCap];
+        System.arraycopy(offHeapAppendMergeStates, 0, sts, 0, offHeapAppendMergeStates.length);
+        offHeapAppendMergeStates = sts;
+    }
+
+    /**
+     * PR-C2 accessor: per-row off-heap future. Index {@code i} parallels
+     * {@link #appendMergeRequests}; {@code null} means the row used the heap fast path
+     * ({@link #appendMergeBuffer}).
+     */
+    public java.util.concurrent.CompletableFuture<Void>[] offHeapAppendMergeFutures() {
+        return offHeapAppendMergeFutures;
+    }
+
+    /**
+     * PR-C2 accessor: per-row state instance for off-heap path. Index {@code i} parallels
+     * {@link #appendMergeRequests}; {@code null} for heap-path rows.
+     */
+    public org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?>[]
+            offHeapAppendMergeStates() {
+        return offHeapAppendMergeStates;
     }
 
     /** V3.1 accessor — parallel to {@link #putRequests()} / {@link #deleteRequests()}. */

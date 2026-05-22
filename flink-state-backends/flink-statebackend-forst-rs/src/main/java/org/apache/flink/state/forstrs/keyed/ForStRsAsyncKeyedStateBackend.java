@@ -134,6 +134,38 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final List<ForStRsAggregatingStateV2<?, ?, ?>> registeredAggregatingStates =
             new ArrayList<>();
 
+    /**
+     * PR-C3 (V12 / B3-H1): registry of live async-V2 ReducingState instances. Each instance is
+     * registered when the backend creates it so that {@link #snapshot} can call {@code
+     * flushOnBarrier()} to drain the RMW accumulator cache before the engine snapshot runs.
+     */
+    private final List<ForStRsAsyncReducingStateV2<?, ?, ?>> registeredAsyncReducingStates =
+            new ArrayList<>();
+
+    /**
+     * PR-C3 (V12 / B3-H2): registry of live async-V2 AggregatingState instances. Each instance is
+     * registered when the backend creates it so that {@link #snapshot} can call {@code
+     * flushOnBarrier()} to drain the RMW accumulator cache before the engine snapshot runs.
+     */
+    private final List<ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?>>
+            registeredAsyncAggregatingStates = new ArrayList<>();
+
+    /**
+     * PR-C1 (V2-8 / Z3-6 / C-H5): registry of live MapStateV2 instances so that {@link #snapshot}
+     * drains every state's off-heap staging buffer to the engine BEFORE the snapshot reads from
+     * the engine. Trace E barrier-drain semantics; mirrors the V1-sync {@code statebuf} flush hook
+     * in {@code ForStRsKeyedStateBackend.flushValueStateBuffers} (commit b3b9d7f2a6c).
+     */
+    private final List<ForStRsMapStateV2<?, ?, ?, ?>> registeredMapStatesV2 = new ArrayList<>();
+
+    /**
+     * PR-C2: registry of {@link ForStRsAsyncListStateV2} instances configured with an off-heap
+     * {@link org.apache.flink.state.forstrs.state.ListStateArrowBuffer}. Snapshot pre-hook drains
+     * each instance's buffer via {@code frs_vec_merge_append_batch} BEFORE the engine snapshot is
+     * read, so accumulated single-element {@code asyncAdd} chunks are durable.
+     */
+    private final List<ForStRsAsyncListStateV2<?, ?, ?>> registeredListStatesV2 = new ArrayList<>();
+
     private SlotArenaScope slotArenaScope;
     private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
@@ -329,14 +361,22 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 desc.getSerializer());
             case MAP:
                 var mapDesc = (MapStateDescriptor<?, ?>) desc;
-                return (S)
+                // PR-C1: hand linker/db/cf to the MapStateV2 so it can stage writes in its
+                // off-heap MapStateArrowBuffer and drain via linker.batchPut on flush. Register
+                // the instance so the snapshot pre-hook drains every live MapState V2.
+                ForStRsMapStateV2<K, N, ?, ?> mapStateV2 =
                         new ForStRsMapStateV2<>(
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
                                 nsSer,
                                 mapDesc.getUserKeySerializer(),
-                                mapDesc.getSerializer());
+                                mapDesc.getSerializer(),
+                                linker,
+                                db,
+                                defaultCf);
+                registeredMapStatesV2.add(mapStateV2);
+                return (S) mapStateV2;
             case LIST:
                 var listDesc = (ListStateDescriptor<?>) desc;
                 // V3.2 (V20 sub-spec §5): register the ListState name with every managed
@@ -344,13 +384,25 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 for (VectorizedExecutor exec : managedExecutors) {
                     exec.registerListState(name);
                 }
-                return (S)
+                // PR-C2: hand linker/db/cf + a fresh per-state ListStateArrowBuffer to the
+                // AsyncListStateV2 so the classifier's APPEND_MERGE routing goes through the
+                // off-heap fast path (skips the heap-byte[] AppendMergeBatchBuffer). Register
+                // the instance so the snapshot pre-hook drains its accumulator.
+                org.apache.flink.state.forstrs.state.ListStateArrowBuffer listBuf =
+                        new org.apache.flink.state.forstrs.state.ListStateArrowBuffer();
+                ForStRsAsyncListStateV2<K, N, ?> listStateV2 =
                         new ForStRsAsyncListStateV2<>(
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
                                 nsSer,
-                                listDesc.getSerializer());
+                                listDesc.getSerializer(),
+                                listBuf,
+                                linker,
+                                db,
+                                defaultCf);
+                registeredListStatesV2.add(listStateV2);
+                return (S) listStateV2;
             case REDUCING:
                 return (S) createReducingState(name, nsSer, desc);
             case AGGREGATING:
@@ -364,26 +416,34 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private <N> ForStRsAsyncReducingStateV2<K, N, ?> createReducingState(
             String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
         ReducingStateDescriptor reducingDesc = (ReducingStateDescriptor) desc;
-        return new ForStRsAsyncReducingStateV2<>(
-                stateRequestHandler,
-                name,
-                keySerializer,
-                nsSer,
-                reducingDesc.getSerializer(),
-                reducingDesc.getReduceFunction());
+        ForStRsAsyncReducingStateV2<K, N, ?> state =
+                new ForStRsAsyncReducingStateV2<>(
+                        stateRequestHandler,
+                        name,
+                        keySerializer,
+                        nsSer,
+                        reducingDesc.getSerializer(),
+                        reducingDesc.getReduceFunction());
+        // PR-C3 (V12 / B3-H1): register so snapshot's Trace E drain flushes the RMW cache.
+        registeredAsyncReducingStates.add(state);
+        return state;
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <N> ForStRsAsyncAggregatingStateV2<K, N, ?, ?, ?> createAggregatingState(
             String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
         AggregatingStateDescriptor aggDesc = (AggregatingStateDescriptor) desc;
-        return new ForStRsAsyncAggregatingStateV2<>(
-                stateRequestHandler,
-                name,
-                keySerializer,
-                nsSer,
-                aggDesc.getSerializer(),
-                aggDesc.getAggregateFunction());
+        ForStRsAsyncAggregatingStateV2<K, N, ?, ?, ?> state =
+                new ForStRsAsyncAggregatingStateV2<>(
+                        stateRequestHandler,
+                        name,
+                        keySerializer,
+                        nsSer,
+                        aggDesc.getSerializer(),
+                        aggDesc.getAggregateFunction());
+        // PR-C3 (V12 / B3-H2): register so snapshot's Trace E drain flushes the RMW cache.
+        registeredAsyncAggregatingStates.add(state);
+        return state;
     }
 
     @Nonnull
@@ -460,6 +520,22 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // before we begin draining the RMW caches.
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
 
+        // PR-C1: drain each MapStateV2's off-heap staging buffer to the engine via batchPut +
+        // tombstone deletes BEFORE reading the engine for the snapshot. Mirrors the V1-sync
+        // statebuf flush hook (commit b3b9d7f2a6c). MUST run before phase-2 flushDirty so the
+        // batchPut requests have a chance to land in the engine memtable.
+        for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
+            ms.flushOffHeapBuffer();
+        }
+        // PR-C2: same pattern for the ListStateV2 off-heap accumulator — drain every registered
+        // instance's {@link org.apache.flink.state.forstrs.state.ListStateArrowBuffer} via a
+        // single {@code frs_vec_merge_append_batch} FFI before the engine snapshot reads. Without
+        // this hook, accumulated single-element {@code asyncAdd} chunks would still be in the
+        // off-heap arena at snapshot time and lost on restore.
+        for (ForStRsAsyncListStateV2<?, ?, ?> ls : registeredListStatesV2) {
+            ls.flushPreSnapshot();
+        }
+
         // flushRmwCacheDirty: for every registered RMW state, flush dirty cache entries.
         // This serializes any accumulated (but not yet submitted) RMW results and enqueues
         // PUT requests to the classifier (deferred to P11 for real submission wiring).
@@ -467,6 +543,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             s.flushOnBarrier();
         }
         for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
+            s.flushOnBarrier();
+        }
+        // PR-C3: drain the async-V2 RMW caches (Reducing/Aggregating). Before this PR these
+        // classes had no cache and asyncAdd was a fresh GET→reduce→PUT round trip per record;
+        // see V12 + B3-H1/H2 in the architectural audit.
+        for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
+            s.flushOnBarrier();
+        }
+        for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAsyncAggregatingStates) {
             s.flushOnBarrier();
         }
 

@@ -41,6 +41,11 @@ import org.apache.flink.state.forstrs.ForStRsInnerTable;
 import org.apache.flink.state.forstrs.ForStRsIterableState;
 import org.apache.flink.state.forstrs.IteratorEntryView;
 import org.apache.flink.state.forstrs.cache.MapStateCache;
+import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
+import org.apache.flink.state.forstrs.ffm.FrsDb;
+
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.lang.foreign.MemorySegment;
@@ -85,6 +90,22 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      */
     private final MapStateCache<UV> cache = new MapStateCache<>();
 
+    /**
+     * PR-C1 (V2-8 / Z3-6 / C-H5): per-state off-heap staging buffer mirroring the V1-sync
+     * {@code statebuf} path. Non-null only when the backend constructed this state with the
+     * off-heap-aware constructor (i.e. when {@code linker/db/cf} are available — which is always
+     * true in production; the legacy constructor stays as null-buffer for unit tests that don't
+     * have a live engine handle).
+     *
+     * <p>Writes stage here and skip the V2 columnar dispatch entirely until {@link #flushOffHeapBuffer}
+     * is called by the backend snapshot pre-hook or the buffer hits its auto-flush watermark.
+     */
+    @Nullable private final MapStateArrowBuffer offHeapBuf;
+
+    @Nullable private final ForStRsLinker linker;
+    @Nullable private final FrsDb db;
+    @Nullable private final FrsCfHandle cf;
+
     @SuppressWarnings("unchecked")
     public ForStRsMapStateV2(
             StateRequestHandler stateRequestHandler,
@@ -93,6 +114,35 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             TypeSerializer<N> namespaceSerializer,
             TypeSerializer<UK> userKeySerializer,
             TypeSerializer<UV> userValueSerializer) {
+        this(
+                stateRequestHandler,
+                stateName,
+                keySerializer,
+                namespaceSerializer,
+                userKeySerializer,
+                userValueSerializer,
+                /* linker */ null,
+                /* db */ null,
+                /* cf */ null);
+    }
+
+    /**
+     * PR-C1 off-heap-aware constructor. When {@code linker/db/cf} are non-null this state will
+     * stage writes into an off-heap {@link MapStateArrowBuffer} that drains via
+     * {@code linker.batchPut} on threshold or snapshot. When any of the three is null we fall
+     * back to the V2 columnar-dispatch path (legacy behaviour, used by unit tests).
+     */
+    @SuppressWarnings("unchecked")
+    public ForStRsMapStateV2(
+            StateRequestHandler stateRequestHandler,
+            String stateName,
+            TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
+            TypeSerializer<UK> userKeySerializer,
+            TypeSerializer<UV> userValueSerializer,
+            @Nullable ForStRsLinker linker,
+            @Nullable FrsDb db,
+            @Nullable FrsCfHandle cf) {
         super(stateRequestHandler, (TypeSerializer<UV>) userValueSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
@@ -100,6 +150,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         this.namespaceSerializer = namespaceSerializer;
         this.userKeySerializer = userKeySerializer;
         this.userValueSerializer = userValueSerializer;
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+        this.offHeapBuf = (linker != null && db != null && cf != null) ? new MapStateArrowBuffer() : null;
     }
 
     // -----------------------------------------------------------------
@@ -160,6 +214,16 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             // Cache hit (or known-missing tombstone) — return completed future immediately.
             return StateFutureUtils.completedFuture(hit.value());
         }
+        // PR-C1: probe the off-heap buffer before falling through to the engine. A buffer hit
+        // resolves locally; a buffer tombstone short-circuits to null without an engine probe.
+        if (offHeapBuf != null) {
+            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBytes);
+            if (bufHit.cached) {
+                UV resolved = bufHit.tombstone ? null : deserializeFromBuffer(bufHit.row);
+                cache.put(keyBytes, resolved);
+                return StateFutureUtils.completedFuture(resolved);
+            }
+        }
         // Miss — fall through, then populate cache on result.
         return super.asyncGet(userKey)
                 .thenApply(
@@ -173,6 +237,13 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     public StateFuture<Void> asyncPut(UK userKey, UV value) {
         byte[] keyBytes = serializeMapEntryKey(userKey);
         cache.put(keyBytes, value);
+        // PR-C1: stage the PUT off-heap. Bypasses the V2 columnar dispatch until the buffer's
+        // auto-flush watermark or the snapshot pre-hook drains it via linker.batchPut.
+        if (offHeapBuf != null) {
+            byte[] valBytes = serializeUserValue(value);
+            offHeapBuf.put(keyBytes, valBytes, linker, db, cf);
+            return StateFutureUtils.completedFuture(null);
+        }
         return super.asyncPut(userKey, value);
     }
 
@@ -180,6 +251,12 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     public StateFuture<Void> asyncRemove(UK userKey) {
         byte[] keyBytes = serializeMapEntryKey(userKey);
         cache.remove(keyBytes);
+        if (offHeapBuf != null) {
+            // Stage a buffer tombstone + drop any prior buffered PUT for this key. The engine
+            // delete fires when the buffer is drained.
+            offHeapBuf.remove(keyBytes, linker, db, cf);
+            return StateFutureUtils.completedFuture(null);
+        }
         return super.asyncRemove(userKey);
     }
 
@@ -190,7 +267,72 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         if (hit != null && hit.cached()) {
             return StateFutureUtils.completedFuture(hit.value() != null);
         }
+        if (offHeapBuf != null) {
+            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBytes);
+            if (bufHit.cached) {
+                return StateFutureUtils.completedFuture(!bufHit.tombstone);
+            }
+        }
         return super.asyncContains(userKey);
+    }
+
+    /**
+     * Serializes a user value to a heap byte[] for off-heap staging. Reuses the per-instance
+     * {@code valueOut} buffer the V2 framework already uses for {@link #serializeValue}, so this
+     * adds no per-call allocation beyond the unavoidable {@code getCopyOfBuffer} (which the
+     * MapStateArrowBuffer needs to memcpy into its off-heap data region).
+     */
+    @SuppressWarnings("unchecked")
+    private byte[] serializeUserValue(UV value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            valueOut.clear();
+            userValueSerializer.serialize(value, valueOut);
+            return valueOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to serialize map value for off-heap staging", e);
+        }
+    }
+
+    /**
+     * Deserializes a user value out of the off-heap buffer's value-data segment for the given
+     * row. Uses the zero-copy {@code MemorySegmentDataInputView} path (PR-B1).
+     */
+    private UV deserializeFromBuffer(int row) {
+        MemorySegment vd = offHeapBuf.valueDataSegment();
+        int vOff = offHeapBuf.valueOffsetOf(row);
+        int vLen = offHeapBuf.valueLengthOf(row);
+        if (vLen == 0) {
+            return null;
+        }
+        try {
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
+                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            view.rewind(vd, vOff, vLen);
+            return userValueSerializer.deserialize(view);
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "Failed to deserialize map value from off-heap buffer", e);
+        }
+    }
+
+    /**
+     * PR-C1 pre-snapshot flush hook. Called by the backend's {@code snapshot()} Trace E barrier
+     * drain to push all staged writes + tombstones to the engine BEFORE the snapshot reads from
+     * the engine. No-op when {@link #offHeapBuf} is null (legacy/test path).
+     */
+    public void flushOffHeapBuffer() {
+        if (offHeapBuf != null) {
+            offHeapBuf.flushTo(linker, db, cf);
+        }
+    }
+
+    /** Visible for tests: returns the underlying buffer, or null if running in legacy mode. */
+    @Nullable
+    public MapStateArrowBuffer offHeapBufferForTests() {
+        return offHeapBuf;
     }
 
     @Override

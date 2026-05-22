@@ -35,12 +35,16 @@ import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
+import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Async-V2 ListState for ForSt-RS. Extends {@link AbstractListState} (which wires asyncGet /
@@ -80,19 +84,183 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
     private final DataOutputSerializer valueOut = new DataOutputSerializer(128);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
+    /**
+     * PR-C2: separate serializer used by the off-heap accumulator chunk-encode path so it doesn't
+     * trample {@link #valueOut} (which is shared by the heap-byte[] {@link #serializeValueInto}
+     * fallback). Encodes {@code [count][elem*]} chunks for LIST_ADD / LIST_ADD_ALL.
+     */
+    private final DataOutputSerializer chunkOut = new DataOutputSerializer(64);
 
+    // PR-C2: per-state-instance off-heap accumulator + engine handles. When non-null, the
+    // VectorizedClassifier's recordAppendMerge routes LIST_ADD / LIST_ADD_ALL chunks into
+    // {@code buffer} via {@link #recordAppendMergeOffHeap}, bypassing the heap-AppendMergeBatchBuffer
+    // path. Drained on auto-flush, on the backend's pre-snapshot hook, or before any
+    // read-or-overwrite op (handled by the classifier ordering: GET / PUT / DELETE precede
+    // APPEND_MERGE in {@code executeBatchRequests}, but only the AppendMerge buffer holds writes
+    // that must be visible to subsequent batches' reads — read-after-write across batches is
+    // covered by the buffer being drained before the next GET-issuing batch enters).
+    private final ListStateArrowBuffer buffer;
+    private final ForStRsLinker linker;
+    private final FrsDb db;
+    private final FrsCfHandle cf;
+
+    /**
+     * Legacy 5-arg constructor — off-heap buffer disabled. Used by all pre-PR-C2 call sites and by
+     * tests that don't exercise the off-heap fast path.
+     */
     public ForStRsAsyncListStateV2(
             StateRequestHandler stateRequestHandler,
             String stateName,
             TypeSerializer<K> keySerializer,
             TypeSerializer<N> namespaceSerializer,
             TypeSerializer<V> elementSerializer) {
+        this(
+                stateRequestHandler,
+                stateName,
+                keySerializer,
+                namespaceSerializer,
+                elementSerializer,
+                null,
+                null,
+                null,
+                null);
+    }
+
+    /**
+     * PR-C2 constructor — off-heap accumulator enabled. The four trailing args are non-null
+     * together (or all null, equivalent to the legacy constructor). When the buffer is configured,
+     * {@code VectorizedClassifier.recordAppendMerge} routes LIST_ADD chunks here via
+     * {@link #recordAppendMergeOffHeap}, and the backend calls {@link #flushPreSnapshot} before
+     * checkpoint barrier drain.
+     */
+    public ForStRsAsyncListStateV2(
+            StateRequestHandler stateRequestHandler,
+            String stateName,
+            TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
+            TypeSerializer<V> elementSerializer,
+            ListStateArrowBuffer buffer,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf) {
         super(stateRequestHandler, elementSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         this.keySerializer = keySerializer;
         this.namespaceSerializer = namespaceSerializer;
         this.elementSerializer = elementSerializer;
+        this.buffer = buffer;
+        this.linker = linker;
+        this.db = db;
+        this.cf = cf;
+    }
+
+    /** Test/backend accessor — may be null when the legacy constructor was used. */
+    public ListStateArrowBuffer buffer() {
+        return buffer;
+    }
+
+    /**
+     * PR-C2: pre-snapshot drain hook. Called by {@code ForStRsAsyncKeyedStateBackend.snapshot()}
+     * BEFORE the executor flush so accumulated single-element {@code asyncAdd} chunks become
+     * durable on the engine side before Flink records the checkpoint barrier. No-op when the
+     * buffer is not configured.
+     */
+    public void flushPreSnapshot() {
+        if (buffer != null && !buffer.isEmpty() && linker != null && db != null && cf != null) {
+            buffer.flushTo(linker, db, cf);
+        }
+    }
+
+    /**
+     * PR-C2: routes a LIST_ADD / LIST_ADD_ALL request into the per-state off-heap accumulator.
+     * Called by {@code VectorizedClassifier.recordAppendMerge} when the state instance has a
+     * configured buffer.
+     *
+     * <p><b>Wins vs the heap path:</b> the legacy
+     * {@code recordAppendMerge → AppendMergeBatchBuffer} path materialises (a) a heap
+     * {@code byte[]} for the composite key, (b) a heap {@code byte[]} for the value chunk, (c)
+     * another heap-{@code byte[]} copy of the key inside {@link
+     * org.apache.flink.state.forstrs.AppendMergeBatchBuffer#append} into the column buffer, and
+     * (d) a per-row scratch {@link java.lang.foreign.Arena} for the per-call FFI. This routine
+     * eliminates (c) and (d): chunk bytes are written into the per-state-instance off-heap arena
+     * once via {@link ListStateArrowBuffer#append}, and the {@link #flushPreSnapshot} drain — or
+     * an auto-flush threshold — issues a single {@code frs_vec_merge_append_batch} FFI for all
+     * accumulated rows.
+     *
+     * <p><b>Ordering invariant:</b> append order = flush order. Since the classifier offers
+     * requests in FIFO submit order and {@link ListStateArrowBuffer#append} is FIFO, the engine
+     * receives operands in the exact in-call order asyncAdd was invoked. The engine's merge
+     * operator concatenates operand bytes verbatim, so a subsequent asyncGet's
+     * {@link #deserializeValue} sees the Format-B chunks in submit order — matching V20 §7.4.
+     *
+     * @return {@code null} when no buffer is configured (caller falls back to heap-path); else the
+     *     per-row future that will be completed on the next buffer flush.
+     */
+    public CompletableFuture<Void> recordAppendMergeOffHeap(StateRequest<K, N, ?, ?> request) {
+        if (buffer == null) {
+            return null;
+        }
+        Object payload = request.getPayload();
+        if (payload == null) {
+            // Defensive — null payload routes to recordDelete in the classifier's outer switch
+            // before reaching here. Returning null tells the caller to fall back to heap path.
+            return null;
+        }
+        // Build composite key on heap (existing serializeKey API). The key bytes are copied into
+        // the off-heap arena by the buffer's {@code append}; the heap byte[] is then garbage —
+        // PR-C2 doesn't claim to eliminate the composite-key heap byte[], only the per-row
+        // AppendMergeBatchBuffer key copy and the per-row scratch Arena.
+        byte[] keyBytes = serializeKey(request);
+        try {
+            chunkOut.clear();
+            StateRequestType type = request.getRequestType();
+            if (type == StateRequestType.LIST_ADD) {
+                @SuppressWarnings("unchecked")
+                V elem = (V) payload;
+                chunkOut.writeInt(1);
+                elementSerializer.serialize(elem, chunkOut);
+            } else if (type == StateRequestType.LIST_ADD_ALL) {
+                @SuppressWarnings("unchecked")
+                List<V> list = (List<V>) payload;
+                chunkOut.writeInt(list.size());
+                for (V e : list) {
+                    elementSerializer.serialize(e, chunkOut);
+                }
+            } else {
+                // Defensive — only LIST_ADD / LIST_ADD_ALL should ever reach this hook.
+                return null;
+            }
+            // Pass MemorySegment views over the heap byte[] / shared buffer — buffer.append
+            // copies into the off-heap arena and stores no reference to the source heap region.
+            return buffer.append(
+                    java.lang.foreign.MemorySegment.ofArray(keyBytes),
+                    0L,
+                    keyBytes.length,
+                    java.lang.foreign.MemorySegment.ofArray(chunkOut.getSharedBuffer()),
+                    0L,
+                    chunkOut.length());
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncListStateV2.recordAppendMergeOffHeap: serialization failed", e);
+        }
+    }
+
+    /**
+     * PR-C2: post-append auto-flush check. Called by the classifier after
+     * {@link #recordAppendMergeOffHeap}; if the buffer is at threshold the classifier flushes it
+     * mid-batch via {@link #flushIfDirty} — same engine-side effect as a pre-snapshot drain but
+     * bounded by buffer occupancy rather than checkpoint cadence.
+     */
+    public boolean shouldAutoFlush() {
+        return buffer != null && buffer.shouldAutoFlush();
+    }
+
+    /** Drains the buffer if non-empty and the engine handles are configured. */
+    public void flushIfDirty() {
+        if (buffer != null && !buffer.isEmpty() && linker != null && db != null && cf != null) {
+            buffer.flushTo(linker, db, cf);
+        }
     }
 
     // ---------------------------------------------------------------
