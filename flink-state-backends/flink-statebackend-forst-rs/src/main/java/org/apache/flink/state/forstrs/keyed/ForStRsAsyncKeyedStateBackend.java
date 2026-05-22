@@ -278,7 +278,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      */
     @Nullable private volatile K currentKey;
 
-    private int currentKeyGroup = -1;
+    /**
+     * E6-M1 / E7-M1: volatile for the same publication guarantees as {@link #currentKey}. The
+     * {@code currentKeyGroup} is mutated on the mailbox thread (via {@code switchContext}) but
+     * read from the snapshot pre-flush lambda — when that lambda runs off-mailbox (e.g.
+     * async-snapshot prepare), a non-volatile int could observe a stale group via the JMM (no
+     * happens-before edge between the mailbox writer and the snapshot reader without the
+     * volatile). A stale group routes the timer queue's peek/poll into the wrong key-group
+     * slice — the E2-CRIT-2 family of bugs in latent form.
+     */
+    private volatile int currentKeyGroup = -1;
 
     /**
      * View of this backend's per-record key/key-group state as an {@link InternalKeyContext}.

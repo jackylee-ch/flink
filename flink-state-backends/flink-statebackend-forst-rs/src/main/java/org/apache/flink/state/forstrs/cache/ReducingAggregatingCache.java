@@ -69,6 +69,7 @@ public final class ReducingAggregatingCache<IN, ACC> {
     private final BiFunction<ACC, IN, ACC> combiner;
     private final BiConsumer<byte[], ACC> flushCallback;
     private final LinkedHashMap<BytesKey, Entry<ACC>> entries;
+    private final int maxEntries;
 
     /**
      * A6-H1: per-key generation counter. Bumped on every {@link #invalidate} so a concurrently
@@ -77,14 +78,22 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * generation entry stays) so the resolve lambda sees the bumped value even after the slot
      * has been wiped. Pruned lazily on the next successful {@link #putIfGen}.
      *
-     * <p>Single-mutator contract: mutations happen only on the mailbox thread; the async resolve
-     * lambda reads via {@link #currentGen} but never mutates. The map is therefore only ever
-     * concurrently READ (by the resolve lambda) while WRITES (mailbox thread mutations) are
-     * serialised — but we still keep this on a {@link java.util.concurrent.ConcurrentHashMap} so
-     * the concurrent read is publishable across threads without explicit volatiles.
+     * <p>A7-M1: bounded at {@link #maxEntries}. Mutations happen only on the mailbox thread; the
+     * async resolve lambda reads via {@link #currentGen} but never mutates. We use an
+     * insertion-ordered {@link LinkedHashMap} guarded by {@link #generationsLock} so concurrent
+     * reads from the resolve callback see a consistent map state. When the size exceeds
+     * {@link #maxEntries} we evict oldest-by-insertion-order generation entries that are NOT
+     * currently in the {@link #entries} map — these are stale tombstones from long-ago
+     * invalidations whose original resolve callback has either already raced and lost, or will
+     * never arrive (the worst-case correctness regression is that an absurdly-long-stalled
+     * resolve lambda for an evicted gen sees gen=0 and proceeds to put — same outcome as a
+     * normal miss-resolve, so no data-loss). Generation entries whose key is still cached are
+     * preserved to keep the race-detection signal live for any in-flight resolves.
      */
-    private final java.util.concurrent.ConcurrentHashMap<BytesKey, Long> generations =
-            new java.util.concurrent.ConcurrentHashMap<>();
+    private final LinkedHashMap<BytesKey, Long> generations = new LinkedHashMap<>();
+
+    /** Monitor guarding {@link #generations} for cross-thread reads from miss-resolve callbacks. */
+    private final Object generationsLock = new Object();
 
     /**
      * Cleanup-C3: per-cache reusable view of an externally-owned byte buffer slice. Used by the
@@ -142,6 +151,7 @@ public final class ReducingAggregatingCache<IN, ACC> {
             int maxEntries) {
         this.combiner = combiner;
         this.flushCallback = flushCallback;
+        this.maxEntries = maxEntries;
         // access-order LRU LinkedHashMap; removeEldestEntry flushes dirty entries on eviction
         this.entries =
                 new LinkedHashMap<>(Math.min(maxEntries, 1024), 0.75f, true) {
@@ -278,8 +288,18 @@ public final class ReducingAggregatingCache<IN, ACC> {
 
     /** Zero-alloc slice-view variant of {@link #currentGen(byte[])}. */
     public long currentGen(byte[] buf, int off, int len) {
-        Long g = generations.get(scratch.view(buf, off, len));
-        return g == null ? 0L : g;
+        // A7-M1: synchronize on generationsLock because reads come from the async
+        // miss-resolve callback while writes (invalidate / putIfGen) run on the mailbox
+        // thread. We must NOT use the shared {@link #scratch} here — that field is reserved
+        // for the mailbox-only zero-alloc lookup paths and would race with concurrent
+        // tryFold/peek/contains calls. Allocate a fresh BytesKey view for the cross-thread
+        // lookup; this is the only allocation on the gen-check path and is bounded to the
+        // miss-resolve callback (cold path).
+        synchronized (generationsLock) {
+            BytesKey probe = new BytesKey().view(buf, off, len);
+            Long g = generations.get(probe);
+            return g == null ? 0L : g;
+        }
     }
 
     /**
@@ -294,20 +314,29 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * to be A6-H1 correct.
      */
     public boolean putIfGen(byte[] compositeKey, ACC acc, long expectedGen) {
-        long current = currentGen(compositeKey);
-        if (current != expectedGen) {
-            return false;
+        // A7-M1: hold generationsLock across the gen-check + put so that a concurrent
+        // mailbox-thread invalidate cannot slip a generation bump in between. Without this,
+        // the gen-check could see expectedGen, invalidate could bump and remove the entry,
+        // then we'd resurrect the stale acc into entries despite the bump.
+        synchronized (generationsLock) {
+            BytesKey probe = new BytesKey().view(compositeKey, 0, compositeKey.length);
+            Long g = generations.get(probe);
+            long current = g == null ? 0L : g;
+            if (current != expectedGen) {
+                return false;
+            }
+            entries.put(new BytesKey(compositeKey), new Entry<>(acc, true));
+            // Lazy GC: if a generation slot existed but matched (i.e. the key was invalidated
+            // and then re-resolved at the same gen — only possible at gen=0), drop the entry
+            // so the map doesn't grow unboundedly across stable steady-state. We only prune
+            // when the generation is at the "no invalidation" baseline; non-zero gens stay to
+            // preserve the race-detection signal for any other in-flight resolves on the same
+            // key.
+            if (expectedGen == 0L) {
+                generations.remove(probe);
+            }
+            return true;
         }
-        entries.put(new BytesKey(compositeKey), new Entry<>(acc, true));
-        // Lazy GC: if a generation slot existed but matched (i.e. the key was invalidated and
-        // then re-resolved at the same gen — only possible at gen=0), drop the entry so the
-        // map doesn't grow unboundedly across stable steady-state. We only prune when the
-        // generation is at the "no invalidation" baseline; non-zero gens stay to preserve the
-        // race-detection signal for any other in-flight resolves on the same key.
-        if (expectedGen == 0L) {
-            generations.remove(new BytesKey(compositeKey));
-        }
-        return true;
     }
 
     /**
@@ -354,7 +383,27 @@ public final class ReducingAggregatingCache<IN, ACC> {
         // survives the entry's removal — the resolve lambda may run after the entries map has
         // been wiped of this slot.
         BytesKey owned = scratch.view(buf, off, len).snapshot();
-        generations.merge(owned, 1L, Long::sum);
+        synchronized (generationsLock) {
+            generations.merge(owned, 1L, Long::sum);
+            // A7-M1: bound generations growth. When the map exceeds maxEntries, evict
+            // oldest-by-insertion-order tombstones whose key is no longer present in
+            // entries — those have no live cache slot to protect; the worst case for an
+            // absurdly-stalled resolve lambda whose tombstone got evicted is that
+            // currentGen returns 0L and putIfGen proceeds as a normal cache seed (same
+            // shape as a clean cache miss — no data loss).
+            if (generations.size() > maxEntries) {
+                java.util.Iterator<Map.Entry<BytesKey, Long>> it =
+                        generations.entrySet().iterator();
+                int overflow = generations.size() - maxEntries;
+                while (it.hasNext() && overflow > 0) {
+                    Map.Entry<BytesKey, Long> me = it.next();
+                    if (!entries.containsKey(me.getKey())) {
+                        it.remove();
+                        overflow--;
+                    }
+                }
+            }
+        }
         return entries.remove(scratch.view(buf, off, len)) != null;
     }
 

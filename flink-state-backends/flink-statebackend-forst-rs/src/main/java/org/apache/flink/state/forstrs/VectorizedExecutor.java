@@ -960,55 +960,86 @@ public class VectorizedExecutor implements StateExecutor {
         int rc;
         FrsErrorCode code;
         try (Arena scratch = Arena.ofConfined()) {
-            MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
-            MemorySegment opsDataSeg =
-                    opsTotal == 0 ? MemorySegment.NULL : scratch.allocate(opsTotal);
-            int writeOff = 0;
-            MemorySegment valDataSeg = valBuf.dataSegment();
-            for (int row = 0; row < count; row++) {
-                opsOffSeg.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
-                MemorySegment vs = scratchSlices[row];
-                long opLen;
-                if (vs == null) {
-                    // B6-H1: copy from the heap-path value column buffer.
-                    int vStart = valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-                    int vEnd =
-                            valOffSeg.get(
-                                    ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                    opLen = vEnd - vStart;
-                    if (opLen > 0) {
-                        MemorySegment.copy(valDataSeg, vStart, opsDataSeg, writeOff, opLen);
+            try {
+                MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
+                MemorySegment opsDataSeg =
+                        opsTotal == 0 ? MemorySegment.NULL : scratch.allocate(opsTotal);
+                int writeOff = 0;
+                MemorySegment valDataSeg = valBuf.dataSegment();
+                for (int row = 0; row < count; row++) {
+                    opsOffSeg.set(
+                            ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
+                    MemorySegment vs = scratchSlices[row];
+                    long opLen;
+                    if (vs == null) {
+                        // B6-H1: copy from the heap-path value column buffer.
+                        int vStart =
+                                valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                        int vEnd =
+                                valOffSeg.get(
+                                        ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                        opLen = vEnd - vStart;
+                        if (opLen > 0) {
+                            MemorySegment.copy(valDataSeg, vStart, opsDataSeg, writeOff, opLen);
+                        }
+                    } else {
+                        opLen = vs.byteSize();
+                        if (opLen > 0) {
+                            MemorySegment.copy(vs, 0L, opsDataSeg, writeOff, opLen);
+                        }
                     }
-                } else {
-                    opLen = vs.byteSize();
-                    if (opLen > 0) {
-                        MemorySegment.copy(vs, 0L, opsDataSeg, writeOff, opLen);
+                    writeOff += (int) opLen;
+                    bytesIn += opLen;
+                }
+                opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
+
+                // Keys are already in the columnar layout of keyBuf — no copy.
+                MemorySegment keysOffSeg = keyBuf.offsetsSegment();
+                MemorySegment keysDataSeg = keyBuf.dataSegment();
+                for (int row = 0; row < count; row++) {
+                    int kStart =
+                            keysOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                    int kEnd =
+                            keysOffSeg.get(
+                                    ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                    bytesIn += kEnd - kStart;
+                }
+
+                rc =
+                        linker.frsVecMergeAppendBatch(
+                                db.handle(),
+                                cf.handle(),
+                                keysOffSeg,
+                                keysDataSeg,
+                                opsOffSeg,
+                                opsDataSeg,
+                                count);
+                code = FrsErrorCode.fromU32(rc);
+            } catch (Throwable t) {
+                // A7-H1: B12-C consolidation introduced this per-batch Arena.ofConfined
+                // block but lost the per-row try/catch that the legacy
+                // dispatchAppendMergePerRow keeps (lines 856-878). If the FFI call
+                // (linker.frsVecMergeAppendBatch) or any of the preceding scratch
+                // allocations / MemorySegment.copy ops throw (RuntimeException, Error,
+                // scratch OOM, panic upcall), the futures in futuresArr[*] would
+                // NEVER be completed and callers would hang forever. Drain ALL
+                // pending futures exceptionally before re-raising, mirroring the
+                // per-row path's pattern. The outer try-with-resources closes
+                // `scratch` in its finally before the throw escapes.
+                for (int r = 0; r < count; r++) {
+                    CompletableFuture<Void> f = futuresArr[r];
+                    if (f != null && !f.isDone()) {
+                        f.completeExceptionally(t);
                     }
                 }
-                writeOff += (int) opLen;
-                bytesIn += opLen;
+                if (metrics != null) {
+                    metrics.recordFfiError(
+                            VectorizedStateRequest.Kind.APPEND_MERGE,
+                            "_batched",
+                            FrsErrorCode.PANIC_CAUGHT);
+                }
+                throw t;
             }
-            opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
-
-            // Keys are already in the columnar layout of keyBuf — no copy.
-            MemorySegment keysOffSeg = keyBuf.offsetsSegment();
-            MemorySegment keysDataSeg = keyBuf.dataSegment();
-            for (int row = 0; row < count; row++) {
-                int kStart = keysOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-                int kEnd = keysOffSeg.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                bytesIn += kEnd - kStart;
-            }
-
-            rc =
-                    linker.frsVecMergeAppendBatch(
-                            db.handle(),
-                            cf.handle(),
-                            keysOffSeg,
-                            keysDataSeg,
-                            opsOffSeg,
-                            opsDataSeg,
-                            count);
-            code = FrsErrorCode.fromU32(rc);
         }
 
         if (code == FrsErrorCode.OK) {

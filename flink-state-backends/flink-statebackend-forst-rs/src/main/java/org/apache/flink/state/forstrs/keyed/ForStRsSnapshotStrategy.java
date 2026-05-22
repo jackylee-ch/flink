@@ -140,6 +140,16 @@ public class ForStRsSnapshotStrategy
      * Per-checkpoint list of {@link HandleAndLocalPath} entries registered by the async phase.
      * Consumed by the backend's {@code notifyCheckpointAborted} to roll back ref-counts of the
      * aborted checkpoint without touching ref-counts contributed by other (completed) checkpoints.
+     *
+     * <p>E7-H1: Flink may retry an async snapshot for the same {@code checkpointId} after a partial
+     * failure. The first attempt may already have bumped registry ref-counts for some SSTs before
+     * throwing. An unconditional {@code put} on the second attempt would REPLACE the first
+     * attempt's list — only the second list would be rolled back on abort, leaking the first
+     * attempt's ref-bumps. The writer at the end of {@link #doAsyncSnapshot} therefore uses {@link
+     * java.util.concurrent.ConcurrentHashMap#merge(Object, Object, java.util.function.BiFunction)}
+     * to APPEND any pre-existing list for the same id rather than overwrite it. Retries thus
+     * contribute additional rollback entries; a single {@code notifyCheckpointAborted} sweeps
+     * every ref-bump from every attempt for that checkpoint.
      */
     private final java.util.concurrent.ConcurrentHashMap<Long, List<HandleAndLocalPath>>
             pendingRegistrations = new java.util.concurrent.ConcurrentHashMap<>();
@@ -183,29 +193,46 @@ public class ForStRsSnapshotStrategy
         // Step 1: capture an engine snapshot (pinning the seq). This is O(1) and non-blocking.
         FrsSnapshot snapshot = linker.dbSnapshot(db, nativeArena);
 
-        // Step 2: record the base checkpoint id for the async phase. The actual
-        // createIncrementalCheckpointAt call (which flushes memtables and computes
-        // new/shared SST lists) is deferred to the async phase so it does NOT block
-        // the task thread during checkpoint barriers. The snapshot pins all versions
-        // at the captured seq — concurrent writes do not affect correctness.
-        long baseCheckpointId = lastCompletedCheckpointId.get();
+        // A7-H3: from here through the ForStRsSnapshotResources construction we MUST
+        // close the engine snapshot on any throw — otherwise no SnapshotResources is
+        // constructed → release() is never called → the snapshot pins the source seq
+        // until process exit, which blocks compaction. provider.currentBlob() in
+        // particular can race with concurrent register() writes and surface a
+        // ConcurrentModificationException; without this guard, that escape leaks the
+        // native snapshot handle.
+        try {
+            // Step 2: record the base checkpoint id for the async phase. The actual
+            // createIncrementalCheckpointAt call (which flushes memtables and computes
+            // new/shared SST lists) is deferred to the async phase so it does NOT block
+            // the task thread during checkpoint barriers. The snapshot pins all versions
+            // at the captured seq — concurrent writes do not affect correctness.
+            long baseCheckpointId = lastCompletedCheckpointId.get();
 
-        // E6-H3: capture the serializer-registry blob on the mailbox thread (the sync phase
-        // runs in-mailbox-turn during checkpoint barrier alignment). The async-snapshot
-        // worker would otherwise call {@code provider.currentBlob()} on the worker thread —
-        // which iterates the live {@link
-        // org.apache.flink.state.forstrs.state.StateSerializerRegistry} LinkedHashMap,
-        // racing with concurrent {@code register()} writes also on the mailbox thread (via
-        // {@code verifyOrRegister}). Pulling the bytes here, while the mailbox holds the
-        // turn, makes the snapshot immutable / thread-safe by the time the worker reads it.
-        byte[] capturedRegistryBlob = null;
-        RegistryBlobProvider provider = registryBlobProvider;
-        if (provider != null) {
-            capturedRegistryBlob = provider.currentBlob();
+            // E6-H3: capture the serializer-registry blob on the mailbox thread (the sync
+            // phase runs in-mailbox-turn during checkpoint barrier alignment). The
+            // async-snapshot worker would otherwise call {@code provider.currentBlob()} on
+            // the worker thread — which iterates the live {@link
+            // org.apache.flink.state.forstrs.state.StateSerializerRegistry} LinkedHashMap,
+            // racing with concurrent {@code register()} writes also on the mailbox thread
+            // (via {@code verifyOrRegister}). Pulling the bytes here, while the mailbox
+            // holds the turn, makes the snapshot immutable / thread-safe by the time the
+            // worker reads it.
+            byte[] capturedRegistryBlob = null;
+            RegistryBlobProvider provider = registryBlobProvider;
+            if (provider != null) {
+                capturedRegistryBlob = provider.currentBlob();
+            }
+
+            return new ForStRsSnapshotResources(
+                    linker, db, snapshot, checkpointId, baseCheckpointId, capturedRegistryBlob);
+        } catch (Throwable t) {
+            try {
+                snapshot.close();
+            } catch (Throwable closeErr) {
+                t.addSuppressed(closeErr);
+            }
+            throw t;
         }
-
-        return new ForStRsSnapshotResources(
-                linker, db, snapshot, checkpointId, baseCheckpointId, capturedRegistryBlob);
     }
 
     @Override
@@ -234,6 +261,19 @@ public class ForStRsSnapshotStrategy
      */
     public List<HandleAndLocalPath> takePendingRegistrations(long checkpointId) {
         return pendingRegistrations.remove(checkpointId);
+    }
+
+    /**
+     * Test-only helper for the E7-H1 retry-semantics regression: re-install a previously-taken
+     * list back under the same id so a subsequent async-snapshot call exercises the {@code merge}
+     * path against a non-empty existing entry. Real Flink does not call this — the merge fires
+     * naturally because the first attempt never reached {@code takePendingRegistrations} before
+     * the retry kicked off.
+     */
+    @org.apache.flink.annotation.VisibleForTesting
+    public void takePendingRegistrationsForTestsReinstall(
+            long checkpointId, List<HandleAndLocalPath> list) {
+        pendingRegistrations.put(checkpointId, new ArrayList<>(list));
     }
 
     private SnapshotResult<KeyedStateHandle> doAsyncSnapshot(
@@ -306,25 +346,54 @@ public class ForStRsSnapshotStrategy
         // Track the per-checkpoint registrations so notifyCheckpointAborted can roll back
         // exactly this checkpoint's ref-count contribution without disturbing baseline shared
         // state from previously-completed checkpoints.
+        //
+        // E7-M3: dedupe the rollback list by StateHandleID. If the engine ever reports the
+        // same localPath in BOTH newSstFiles and sharedSstFiles (or duplicates within one
+        // list), the registration loops above would each fire — bumping the refcount twice
+        // — but if the rollback list also recorded both, notifyCheckpointAborted would
+        // unregister() the same id twice, while a follow-up notifyCheckpointComplete on a
+        // sibling checkpoint that legitimately registered the same shared SST has only one
+        // matching unregister() to balance. Net result: under abort the refcount goes
+        // negative or the entry gets prematurely deleted from the registry, taking the
+        // shared SST out from under a still-live checkpoint. A LinkedHashSet on
+        // StateHandleID guarantees 1:1 between rollback entries and register() bumps that
+        // belong to THIS checkpoint while preserving deterministic order.
         List<HandleAndLocalPath> thisCheckpointRegistrations = new ArrayList<>();
+        java.util.LinkedHashSet<StateHandleID> registeredIds = new java.util.LinkedHashSet<>();
         for (CompletableFuture<HandleAndLocalPath> f : newSstFuts) {
             HandleAndLocalPath hlp = f.get();
             sharedHandles.add(hlp);
-            sstRegistry.register(new StateHandleID(hlp.getLocalPath()), hlp.getHandle());
-            thisCheckpointRegistrations.add(hlp);
+            StateHandleID id = new StateHandleID(hlp.getLocalPath());
+            sstRegistry.register(id, hlp.getHandle());
+            if (registeredIds.add(id)) {
+                thisCheckpointRegistrations.add(hlp);
+            }
         }
         // Also include the shared SSTs: their ref-counts were bumped above so abort must roll those
-        // back as well.
+        // back as well. Dedupe is enforced via registeredIds — if a localPath was already added
+        // from the newSst loop, we skip to keep the 1:1 invariant.
         for (Path p : sharedSstFiles) {
             String localPath = p.getFileName().toString();
-            sstRegistry
-                    .get(new StateHandleID(localPath))
-                    .ifPresent(
-                            h ->
-                                    thisCheckpointRegistrations.add(
-                                            HandleAndLocalPath.of(h, localPath)));
+            StateHandleID id = new StateHandleID(localPath);
+            if (registeredIds.add(id)) {
+                sstRegistry
+                        .get(id)
+                        .ifPresent(
+                                h ->
+                                        thisCheckpointRegistrations.add(
+                                                HandleAndLocalPath.of(h, localPath)));
+            }
         }
-        pendingRegistrations.put(resources.getCheckpointId(), thisCheckpointRegistrations);
+        // E7-H1: append to (don't overwrite) any prior attempt's rollback list for the same
+        // checkpoint id. A partially-failed earlier attempt may have already bumped ref-counts —
+        // those entries must remain rollback-able when the abort eventually fires.
+        pendingRegistrations.merge(
+                resources.getCheckpointId(),
+                thisCheckpointRegistrations,
+                (existing, additions) -> {
+                    existing.addAll(additions);
+                    return existing;
+                });
         // Manifest is private — kept off the shared list. (Carried as the metaStateHandle below.)
 
         // ---- E5-HIGH-2: emit the StateSerializerRegistry blob as a private-state entry. ----

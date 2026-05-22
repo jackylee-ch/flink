@@ -34,6 +34,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.foreign.Arena;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -212,6 +213,86 @@ class ForStRsSnapshotStrategyTest {
                         callCount.get(),
                         "provider must NOT be invoked on the async worker (would race with"
                                 + " concurrent register() writes against the live LinkedHashMap)");
+            }
+        }
+    }
+
+    /**
+     * E7-H1 regression: when Flink retries an async snapshot for the SAME {@code checkpointId}
+     * after a partial failure, the first attempt's pendingRegistrations entries must remain in
+     * place — the second attempt MUST append (merge) rather than overwrite. Otherwise a
+     * subsequent {@code notifyCheckpointAborted} would roll back only the second attempt's
+     * ref-bumps and leak the first attempt's ref-bumps in the SST registry.
+     *
+     * <p>This drives two full async snapshots against the same {@code checkpointId}; the second
+     * call without the merge would replace the first's list. After both, the
+     * {@code takePendingRegistrations} call must return a combined list whose size equals the
+     * sum of both attempts (and the registry ref-count for the shared SSTs has been bumped twice
+     * — once per attempt — so rollback must cover both bumps).
+     */
+    @Test
+    void retriedAsyncSnapshotAppendsToPendingRegistrationsList(@TempDir Path tmp) throws Exception {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpen(arena, tmp.resolve("db").toString());
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                for (int i = 0; i < 8; i++) {
+                    linker.put(db, cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+                }
+
+                ForStRsSstRegistry registry = new ForStRsSstRegistry();
+                ForStRsSstUploader uploader = new ForStRsSstUploader();
+                ForStRsSnapshotStrategy strategy =
+                        new ForStRsSnapshotStrategy(
+                                linker,
+                                db,
+                                UUID.randomUUID(),
+                                new KeyGroupRange(0, 0),
+                                registry,
+                                uploader,
+                                arena,
+                                Map.of("default", 0L));
+                MemCheckpointStreamFactory factory =
+                        new MemCheckpointStreamFactory(64 * 1024 * 1024);
+
+                // ---- Attempt #1 for checkpoint id 1L. ----
+                ForStRsSnapshotResources r1 = strategy.syncPrepareResources(1L);
+                SnapshotResult<?> ignored1 =
+                        strategy.asyncSnapshot(r1, 1L, 0L, factory, null)
+                                .get(new CloseableRegistry());
+                assertNotNull(ignored1);
+
+                // Snapshot the size of the first attempt's pendingRegistrations BEFORE retry,
+                // without consuming the list (peek by re-installing).
+                List<HandleAndLocalPath> firstList = strategy.takePendingRegistrations(1L);
+                assertNotNull(firstList, "attempt #1 must register entries for ckpt id 1");
+                int firstSize = firstList.size();
+                assertTrue(firstSize >= 1);
+                // Re-install the first attempt's list to simulate "previous attempt left state in
+                // place when the second attempt begins".
+                strategy.takePendingRegistrationsForTestsReinstall(1L, firstList);
+
+                // ---- Attempt #2 for the SAME checkpoint id 1L (the retry case). ----
+                // Add new keys so the second attempt produces new SSTs (the bug fires regardless,
+                // but this exercises the merge path with non-empty additions).
+                for (int i = 8; i < 16; i++) {
+                    linker.put(db, cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+                }
+                ForStRsSnapshotResources r2 = strategy.syncPrepareResources(1L);
+                SnapshotResult<?> ignored2 =
+                        strategy.asyncSnapshot(r2, 1L, 0L, factory, null)
+                                .get(new CloseableRegistry());
+                assertNotNull(ignored2);
+
+                List<HandleAndLocalPath> combined = strategy.takePendingRegistrations(1L);
+                assertNotNull(combined, "ckpt id 1 must still have a registrations list");
+                assertTrue(
+                        combined.size() > firstSize,
+                        "retried attempt MUST append to (not overwrite) the prior attempt's list:"
+                                + " expected combined.size() > "
+                                + firstSize
+                                + ", got "
+                                + combined.size());
             }
         }
     }

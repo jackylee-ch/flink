@@ -474,6 +474,12 @@ public class ForStRsRestoreOperation {
                 newRestoreExecutor(
                         Math.min(handles.size(), Runtime.getRuntime().availableProcessors()),
                         "forstrs-restore-rescaling");
+        // A7-M3: track successful materialization so a partial failure during the futures
+        // join can close already-opened native sources before propagating. The outer {@code
+        // finally { restoreExec.shutdown(); }} on its own does NOT close OpenSourceDb
+        // instances, and the post-try resource-management block (which builds {@code
+        // sources} and closes them on its own finally) is unreachable when we throw.
+        boolean joinSucceeded = false;
         try {
             List<Future<OpenSourceDb>> futures = new ArrayList<>(handles.size());
             for (int i = 0; i < handles.size(); i++) {
@@ -521,7 +527,23 @@ public class ForStRsRestoreOperation {
                             cause);
                 }
             }
+            joinSucceeded = true;
         } finally {
+            if (!joinSucceeded) {
+                // A7-M3: close eagerly so native FrsDb / FrsCfHandle leak is contained. Close
+                // BEFORE shutdown so the native side tears down with the executor still alive
+                // in case any close() path needs to schedule work.
+                for (OpenSourceDb s : sourcesArr) {
+                    if (s != null) {
+                        try {
+                            s.close();
+                        } catch (RuntimeException ignored) {
+                            // close() is already best-effort; swallow secondary close errors
+                            // so the original cause propagates unobstructed.
+                        }
+                    }
+                }
+            }
             restoreExec.shutdown();
         }
         List<OpenSourceDb> sources = new ArrayList<>(handles.size());
@@ -576,24 +598,46 @@ public class ForStRsRestoreOperation {
                         re);
             }
 
-            // E6-HIGH-4(b): union-merge the per-source serializer metadata so the target backend's
-            // {@link StateSerializerRegistry} sees the schema snapshot for every state present in
-            // any source, regardless of which subtask uploaded it. De-duped by state name —
-            // well-formed job graphs always carry identical serializer snapshots for the same
-            // state name across subtasks, so last-writer-wins on collisions is benign (and
-            // matches Flink's own contract that schema for a given state name is uniform across
-            // the keyed-stream operator instance). Pre-E5 source handles contribute empty maps
-            // and are absorbed without changing the result.
+            // E6-HIGH-4(b) / E7-H2: union-merge the per-source serializer metadata so the target
+            // backend's {@link StateSerializerRegistry} sees the schema snapshot for every state
+            // present in any source, regardless of which subtask uploaded it. De-duped by state
+            // name — Flink's contract is that schema for a given state name is uniform across the
+            // keyed-stream operator instance, so any collision must carry byte-identical {@link
+            // StateSerializerMetadata}. Pre-E5 source handles contribute empty maps and are
+            // absorbed without changing the result.
             //
-            // The iteration order is the {@code sources} order (which mirrors the input handles'
-            // order), so the resolved metadata for a given state name is deterministic: the
-            // first source listed wins until a later source with the same name overwrites — i.e.
-            // last-writer-wins. Insertion-ordered {@link LinkedHashMap} keeps the union
-            // deterministic for review and tests.
+            // E7-H2: the previous implementation used {@code putAll} (last-writer-wins). Because
+            // source-handle iteration order is not guaranteed deterministic across restore
+            // retries, last-writer-wins meant the "winning" metadata for any genuine collision
+            // could vary between restore attempts — schema-drift detection might fire-or-not-fire
+            // non-deterministically. The fix ASSERTS intra-collision equality via {@link
+            // StateSerializerMetadata#equals}: a mismatch fails loudly with an {@link
+            // IOException} naming the offending state, regardless of iteration order. When all
+            // collisions match the value is well-defined and deterministic by construction —
+            // restore retries see the same metadata for every state name. Insertion-ordered
+            // {@link LinkedHashMap} keeps the entry order stable for review and tests.
             Map<String, StateSerializerMetadata> unionedMetadata = new LinkedHashMap<>();
             for (OpenSourceDb src : sources) {
-                if (src.serializerMetadata != null && !src.serializerMetadata.isEmpty()) {
-                    unionedMetadata.putAll(src.serializerMetadata);
+                if (src.serializerMetadata == null || src.serializerMetadata.isEmpty()) {
+                    continue;
+                }
+                for (Map.Entry<String, StateSerializerMetadata> e :
+                        src.serializerMetadata.entrySet()) {
+                    String name = e.getKey();
+                    StateSerializerMetadata incoming = e.getValue();
+                    StateSerializerMetadata existing = unionedMetadata.get(name);
+                    if (existing == null) {
+                        unionedMetadata.put(name, incoming);
+                    } else if (!existing.equals(incoming)) {
+                        throw new IOException(
+                                "schema mismatch across restore handles for state "
+                                        + name
+                                        + ": found incompatible metadata"
+                                        + " (rescaling union-merge requires every source-handle to"
+                                        + " contribute byte-identical StateSerializerMetadata for"
+                                        + " the same state name)");
+                    }
+                    // else: equal — no-op, deterministic regardless of iteration order.
                 }
             }
             return new RestoreResult(

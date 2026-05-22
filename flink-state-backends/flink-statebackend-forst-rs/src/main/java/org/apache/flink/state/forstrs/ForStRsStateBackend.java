@@ -81,6 +81,13 @@ public class ForStRsStateBackend implements StateBackend {
     public <K>
             org.apache.flink.runtime.state.AsyncKeyedStateBackend<K> createAsyncKeyedStateBackend(
                     StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
+        // E7-H3: assert only one keyed-backend path (V1-sync or async) per operator id. Each
+        // backend has its own private StateSerializerRegistry — cross-path use would silently
+        // bypass schema-drift detection. Fail loudly here at construction time.
+        org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
+                parameters.getOperatorIdentifier(),
+                org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.ASYNC_V2);
+
         Arena arena = Arena.ofShared();
         ForStRsLinker linker = new ForStRsLinker(arena);
         Environment env = parameters.getEnv();
@@ -170,6 +177,13 @@ public class ForStRsStateBackend implements StateBackend {
     @Override
     public <K> CheckpointableKeyedStateBackend<K> createKeyedStateBackend(
             StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
+        // E7-H3: assert only one keyed-backend path (V1-sync or async) per operator id. Each
+        // backend has its own private StateSerializerRegistry — cross-path use would silently
+        // bypass schema-drift detection. Fail loudly here at construction time.
+        org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
+                parameters.getOperatorIdentifier(),
+                org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.SYNC_V1);
+
         ForStRsOptions options = new ForStRsOptions();
         Environment env = parameters.getEnv();
 
