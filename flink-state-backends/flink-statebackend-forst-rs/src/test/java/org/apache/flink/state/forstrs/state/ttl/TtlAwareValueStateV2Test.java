@@ -1,0 +1,175 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.state.forstrs.state.ttl;
+
+import org.apache.flink.api.common.state.StateTtlConfig;
+import org.apache.flink.api.common.state.v2.StateFuture;
+import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.state.v2.internal.InternalValueState;
+
+import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+
+/**
+ * PR-A7 (S1-12): the TTL decorator stamps an expiry on write and filters expired entries on read.
+ *
+ * <p>{@code StateTtlExpiryTest} contract: write at t=0 with TTL=100ms, read at t=200 -> null. The
+ * fresh-read contract: read at t=50 -> returns value.
+ */
+class TtlAwareValueStateV2Test {
+
+    /** Fake in-memory ValueState used to exercise the decorator without the full async machinery. */
+    private static final class InMemoryInner<V> implements InternalValueState<Object, Object, V> {
+        V slot;
+        int clearCount;
+
+        @Override
+        public void setCurrentNamespace(Object namespace) {}
+
+        @Override
+        public V value() {
+            return slot;
+        }
+
+        @Override
+        public void update(V value) {
+            slot = value;
+        }
+
+        @Override
+        public StateFuture<V> asyncValue() {
+            return StateFutureUtils.completedFuture(slot);
+        }
+
+        @Override
+        public StateFuture<Void> asyncUpdate(V value) {
+            slot = value;
+            return StateFutureUtils.completedVoidFuture();
+        }
+
+        @Override
+        public void clear() {
+            slot = null;
+            clearCount++;
+        }
+
+        @Override
+        public StateFuture<Void> asyncClear() {
+            slot = null;
+            clearCount++;
+            return StateFutureUtils.completedVoidFuture();
+        }
+    }
+
+    private static final class ManualClock implements TtlClock {
+        long now;
+
+        ManualClock(long initial) {
+            this.now = initial;
+        }
+
+        @Override
+        public long currentTimeMillis() {
+            return now;
+        }
+    }
+
+    private static StateTtlConfig configWithTtlMillis(long ttlMs) {
+        return StateTtlConfig.newBuilder(Duration.ofMillis(ttlMs))
+                .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+                .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+                .build();
+    }
+
+    @Test
+    void expiredValueReadsAsNull() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        // Write at t=0 with TTL=100ms -> expiry = 100.
+        ttl.update("hello");
+        assertNotNull(inner.slot, "inner must receive the stamped value");
+        assertEquals(100L, inner.slot.getExpiryTimestamp());
+        assertEquals("hello", inner.slot.getValue());
+
+        // Read at t=200 -> expired, must return null AND lazily clear the cell.
+        clock.now = 200L;
+        assertNull(ttl.value(), "post-TTL read must return null");
+    }
+
+    @Test
+    void freshValueReadsThrough() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        ttl.update("hello");
+        clock.now = 50L;
+        assertEquals("hello", ttl.value(), "pre-TTL read must return the value");
+    }
+
+    @Test
+    void asyncExpiredValueReadsAsNull() throws Exception {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        ttl.asyncUpdate("hello");
+        clock.now = 500L;
+
+        // The decorator chains thenApply on a completed future, so the result is materialized
+        // synchronously in StateFutureUtils' inline executor.
+        final String[] captured = new String[1];
+        ttl.asyncValue().thenAccept(v -> captured[0] = v);
+        assertNull(captured[0], "post-TTL asyncValue must yield null");
+    }
+
+    @Test
+    void nullUpdateBypassesStamping() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        ttl.update("v");
+        ttl.update(null);
+        assertNull(inner.slot, "null update must pass through (tombstone), not stamp");
+    }
+
+    @Test
+    void exposesInnerStateForFlushHooks() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        // The snapshot pre-hook needs the real inner state to drain off-heap buffers.
+        assertSame(inner, ttl.getInner());
+    }
+}

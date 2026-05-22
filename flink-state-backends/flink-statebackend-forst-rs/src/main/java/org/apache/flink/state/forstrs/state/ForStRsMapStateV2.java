@@ -164,12 +164,11 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     // Write-through semantics: PUT/REMOVE always update both the cache and the engine, so the two
     // are in sync after any successful write. There is no dirty state to flush at barriers.
     //
-    // asyncClear() is final in AbstractKeyedState and cannot be overridden — instead we hook the
-    // namespace switch on setCurrentNamespace below if needed; for V1 we rely on the fact that
-    // Flink's MapState.clear() is rare enough (end-of-window only in Q11/Q12) that cache staleness
-    // for the cleared operator key is corrected on the next miss-resolve, which fetches from the
-    // engine (where the clear already took effect). The corner case is asyncGet immediately after
-    // asyncClear returning a stale cached value — addressed in V1.2 with a clear-hook.
+    // asyncClear() is final in AbstractKeyedState and cannot be overridden directly. PR-A6
+    // (S1-11 / E2-HIGH-2) addresses this by hooking the CLEAR request inside
+    // buildDBPutRequest() — both the LRU cache and the off-heap arrow buffer are invalidated for
+    // the (operatorKey + namespace) prefix before the engine receives the prefix-delete, so a
+    // subsequent asyncGet under the cleared namespace cannot return a stale cached value.
     // -----------------------------------------------------------------
 
     /**
@@ -430,9 +429,23 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     @Override
     @SuppressWarnings("unchecked")
     public ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request) {
+        StateRequestType type = request.getRequestType();
+        // PR-A6 (S1-11 / E2-HIGH-2): when the framework dispatches asyncClear(), invalidate the
+        // per-instance caches BEFORE the engine sees the prefix-delete. Without this, the cache
+        // and the off-heap arrow buffer continue to hold the pre-clear entries for the cleared
+        // (operatorKey, namespace) and a subsequent asyncGet returns a stale value even though
+        // the engine has correctly deleted the row. asyncClear() itself is final on
+        // AbstractKeyedState (can't override), so we hook the request-build step which the AEC
+        // invokes inside the same RecordContext lock that serializes all per-record state ops.
+        if (type == StateRequestType.CLEAR) {
+            byte[] prefix = getIterPrefix(request);
+            cache.clearForPrefix(prefix);
+            if (offHeapBuf != null) {
+                offHeapBuf.clearForPrefix(prefix, linker, db, cf);
+            }
+        }
         byte[] key = serializeKey(request);
         byte[] value = null;
-        StateRequestType type = request.getRequestType();
         if (type == StateRequestType.MAP_PUT) {
             Tuple2<?, ?> tuple = (Tuple2<?, ?>) request.getPayload();
             value = serializeValue(tuple.f1);

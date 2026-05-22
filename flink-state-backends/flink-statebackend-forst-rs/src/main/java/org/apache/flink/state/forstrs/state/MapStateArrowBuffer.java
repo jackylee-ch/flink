@@ -242,6 +242,33 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         return tombstones.size();
     }
 
+    /**
+     * PR-A6 (S1-11 / E2-HIGH-2): invalidate buffered entries owned by the operator-key + namespace
+     * prefix that is being cleared via {@code StateRequestType.CLEAR}. Because the underlying
+     * {@link ArrowBinaryBuffer} does not expose a public prefix-scan, this drains the entire buffer
+     * to the engine via {@link #flushTo} and then drops every buffered row plus all tombstones.
+     *
+     * <p>Ordering guarantee: the synchronous {@code linker.batchPut} inside {@code flushTo}
+     * completes before this method returns, so a CLEAR request that the framework enqueues
+     * immediately afterwards will be dispatched AFTER the flushed PUTs hit the engine. The engine
+     * then performs the namespace-prefix delete and the next {@code asyncGet} reads the
+     * post-clear state.
+     *
+     * <p>Over-aggressive note: this also flushes pending writes for OTHER (operatorKey, namespace)
+     * pairs that happen to share this buffer instance. That is a perf cost on CLEAR, not a
+     * correctness cost — the staged data is durably persisted, not lost. CLEAR is end-of-window
+     * and rare relative to per-record PUT/GET, so the trade-off is acceptable for V1.
+     */
+    public void clearForPrefix(byte[] prefix, ForStRsLinker linker, FrsDb db, FrsCfHandle cf) {
+        ensureClosed();
+        // Drain any staged PUTs + pending tombstones to the engine first so we don't lose them.
+        flushTo(linker, db, cf);
+        // Then drop every buffered row and any residual tombstones (defensive — flushTo clears
+        // tombstones on return, but a future change in flushTo's contract should not break us).
+        buf.clear();
+        tombstones.clear();
+    }
+
     @Override
     public void close() {
         if (closed) {

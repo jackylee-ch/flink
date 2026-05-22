@@ -165,4 +165,78 @@ class MapStateCacheTest {
             (byte) (v >> 24), (byte) (v >> 16), (byte) (v >> 8), (byte) v
         };
     }
+
+    // -----------------------------------------------------------------
+    // PR-A6 (S1-11): clearForPrefix targeted invalidation.
+    // -----------------------------------------------------------------
+
+    @Test
+    void clearForPrefixRemovesMatchingEntries() {
+        MapStateCache<String> cache = new MapStateCache<>();
+        // Two entries under namespace "n1": prefix [k, /, n, 1]
+        cache.put(new byte[] {'k', '/', 'n', '1', 'a'}, "v1a");
+        cache.put(new byte[] {'k', '/', 'n', '1', 'b'}, "v1b");
+        // One entry under namespace "n2": prefix [k, /, n, 2]
+        cache.put(new byte[] {'k', '/', 'n', '2', 'a'}, "v2a");
+        assertEquals(3, cache.size());
+
+        int removed = cache.clearForPrefix(new byte[] {'k', '/', 'n', '1'});
+        assertEquals(2, removed);
+        assertEquals(1, cache.size());
+        // n1 entries gone, n2 entry survives — the central S1-11 correctness assertion.
+        assertNull(cache.lookup(new byte[] {'k', '/', 'n', '1', 'a'}));
+        assertNull(cache.lookup(new byte[] {'k', '/', 'n', '1', 'b'}));
+        assertNotNull(cache.lookup(new byte[] {'k', '/', 'n', '2', 'a'}));
+    }
+
+    @Test
+    void clearForPrefixOnEmptyCacheReturnsZero() {
+        MapStateCache<String> cache = new MapStateCache<>();
+        assertEquals(0, cache.clearForPrefix(new byte[] {'k', '/'}));
+    }
+
+    @Test
+    void clearForPrefixWithNoMatchesLeavesCacheIntact() {
+        MapStateCache<String> cache = new MapStateCache<>();
+        cache.put(new byte[] {'k', '/', 'n', '1', 'a'}, "v1a");
+        cache.put(new byte[] {'k', '/', 'n', '2', 'a'}, "v2a");
+        int removed = cache.clearForPrefix(new byte[] {'k', '/', 'n', '9'});
+        assertEquals(0, removed);
+        assertEquals(2, cache.size());
+    }
+
+    @Test
+    void clearForPrefixRemovesTombstonesToo() {
+        // The fix must invalidate tombstones (known-missing entries) as well, otherwise an
+        // asyncRemove followed by asyncClear followed by asyncContains would still return false
+        // from the cached tombstone instead of routing through the engine.
+        MapStateCache<String> cache = new MapStateCache<>();
+        cache.remove(new byte[] {'k', '/', 'n', '1', 'a'}); // tombstone under n1
+        cache.put(new byte[] {'k', '/', 'n', '1', 'b'}, "v"); // live under n1
+        assertEquals(2, cache.size());
+
+        cache.clearForPrefix(new byte[] {'k', '/', 'n', '1'});
+        assertEquals(0, cache.size());
+        assertNull(cache.lookup(new byte[] {'k', '/', 'n', '1', 'a'}));
+        assertNull(cache.lookup(new byte[] {'k', '/', 'n', '1', 'b'}));
+    }
+
+    @Test
+    void clearForPrefixEmptyPrefixMatchesEverything() {
+        MapStateCache<String> cache = new MapStateCache<>();
+        cache.put(new byte[] {1}, "a");
+        cache.put(new byte[] {2}, "b");
+        int removed = cache.clearForPrefix(new byte[0]);
+        assertEquals(2, removed);
+        assertEquals(0, cache.size());
+    }
+
+    @Test
+    void clearForPrefixPrefixLongerThanKeyDoesNotMatch() {
+        MapStateCache<String> cache = new MapStateCache<>();
+        cache.put(new byte[] {1, 2}, "a");
+        int removed = cache.clearForPrefix(new byte[] {1, 2, 3});
+        assertEquals(0, removed);
+        assertNotNull(cache.lookup(new byte[] {1, 2}));
+    }
 }

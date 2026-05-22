@@ -122,6 +122,53 @@ public final class MapStateCache<V> {
         entries.clear();
     }
 
+    /**
+     * PR-A6 (S1-11 / E2-HIGH-2): targeted invalidation of cache entries whose composite key starts
+     * with {@code prefix}. Called by {@link
+     * org.apache.flink.state.forstrs.state.ForStRsMapStateV2#buildDBPutRequest} when the framework
+     * dispatches a {@code StateRequestType.CLEAR} — the engine will delete the namespace prefix on
+     * the next batch dispatch, and we must drop matching cache rows here so that a subsequent
+     * {@code asyncGet} for any userKey under the cleared (operatorKey, namespace) does not return a
+     * stale cached value.
+     *
+     * <p>The cache key produced by {@code ForStRsMapStateV2.serializeMapEntryKey} is
+     * {@code [KEY_PREFIX][serialize(K)][/][stateName][/][serialize(N)][serialize(UK)]}. Passing the
+     * iter-prefix bytes (everything up to and including the serialized namespace) here invalidates
+     * exactly the entries owned by the cleared map-state row, without touching entries under other
+     * namespaces or other operator keys that still live in the cache.
+     *
+     * <p>O(n) linear scan over the LRU; acceptable because CLEAR is end-of-window and rare relative
+     * to the per-record GET/PUT path that this cache exists to accelerate. Returns the number of
+     * entries removed (visible for tests / observability).
+     */
+    public int clearForPrefix(byte[] prefix) {
+        if (entries.isEmpty()) {
+            return 0;
+        }
+        int removed = 0;
+        java.util.Iterator<Map.Entry<BytesKey, Object>> it = entries.entrySet().iterator();
+        while (it.hasNext()) {
+            byte[] k = it.next().getKey().bytes;
+            if (startsWith(k, prefix)) {
+                it.remove();
+                removed++;
+            }
+        }
+        return removed;
+    }
+
+    private static boolean startsWith(byte[] key, byte[] prefix) {
+        if (key.length < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (key[i] != prefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     public int size() {
         return entries.size();
     }

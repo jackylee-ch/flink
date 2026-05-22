@@ -61,6 +61,11 @@ import org.apache.flink.state.forstrs.state.ForStRsAsyncReducingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsMapStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsReducingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsValueStateV2;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
+import org.apache.flink.state.forstrs.state.ttl.TtlAwareValueStateV2;
+import org.apache.flink.state.forstrs.state.ttl.TtlClock;
+import org.apache.flink.state.forstrs.state.ttl.TtlSerializer;
+import org.apache.flink.state.forstrs.state.ttl.TtlValue;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
 import javax.annotation.Nonnull;
@@ -204,6 +209,33 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      */
     private final DispatchMetrics dispatchMetrics;
 
+    /**
+     * PR-A11 (E3-HIGH-4): registry of {@code TypeSerializerSnapshot}s for every registered keyed
+     * state. Populated on first {@code getOrCreateKeyedState} for a given state name; PR-A1's
+     * snapshot path will drain this into the checkpoint blob (see {@link StateSerializerRegistry}
+     * for the format spec).
+     *
+     * <p>On restore (after PR-A1 lands and calls {@link StateSerializerRegistry#seedFromRestore}),
+     * the next session's {@code getOrCreateKeyedState} verifies the new {@code TypeSerializer}
+     * against the persisted snapshot via {@link
+     * org.apache.flink.api.common.typeutils.TypeSerializerSnapshot#resolveSchemaCompatibility} and
+     * throws {@link org.apache.flink.util.StateMigrationException} on incompatibility.
+     */
+    private final StateSerializerRegistry stateSerializerRegistry = new StateSerializerRegistry();
+
+    /**
+     * PR-A7 (S1-12): processing-time clock used by the TTL decorators wrapping per-state-type
+     * results when {@code desc.getTtlConfig().isEnabled()}. Default {@link TtlClock#SYSTEM};
+     * overridable from tests via {@link #setTtlClockForTesting(TtlClock)}.
+     */
+    private volatile TtlClock ttlClock = TtlClock.SYSTEM;
+
+    /** PR-A7 test hook: replace the TTL clock with a deterministic source. */
+    @VisibleForTesting
+    public void setTtlClockForTesting(TtlClock clock) {
+        this.ttlClock = clock;
+    }
+
     public ForStRsAsyncKeyedStateBackend(
             Arena arena,
             ForStRsLinker linker,
@@ -332,9 +364,78 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         if (existing != null) {
             return (S) existing;
         }
-        S created = createStateInternal(ns, nsSer, desc);
+        // PR-A11 (E3-HIGH-4): persist the user's TypeSerializerSnapshot alongside the engine's
+        // state data so the next session can detect schema drift. On a restored session (after
+        // PR-A1 wires seedFromRestore), this verify call routes COMPATIBLE_AS_IS through and
+        // throws StateMigrationException on INCOMPATIBLE per Flink's standard contract.
+        // For now, on a fresh session, this is equivalent to a write-only register call.
+        stateSerializerRegistry.verifyOrRegister(
+                desc.getStateId(), desc.getType().ordinal(), desc.getSerializer());
+        // PR-A7 (S1-12): if the descriptor has TTL enabled, wrap the inner state in a TTL
+        // decorator. Pre-A7 the TtlConfig was silently dropped on the floor and TTL never fired.
+        // STORAGE FORMAT BREAK: TTL-enabled state cells now carry an 8-byte expiry prefix;
+        // enabling TTL on existing non-TTL data is not snapshot-compatible.
+        S created;
+        if (desc.getTtlConfig() != null && desc.getTtlConfig().isEnabled()) {
+            created = createTtlAwareStateInternal(ns, nsSer, desc);
+        } else {
+            created = createStateInternal(ns, nsSer, desc);
+        }
         stateCache.put(desc.getStateId(), (InternalKeyedState<K, ?, ?>) created);
         return created;
+    }
+
+    /**
+     * PR-A7 (S1-12): build a TTL-decorated state. Only {@code VALUE} is supported in this PR;
+     * other state types throw {@link UnsupportedOperationException} with a follow-on PR pointer
+     * — this is intentional and replaces the pre-A7 silent-drop behavior with a loud failure.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private <N, S extends State, SV> S createTtlAwareStateInternal(
+            N ns, TypeSerializer<N> nsSer, StateDescriptor<SV> desc) throws Exception {
+        String name = desc.getStateId();
+        switch (desc.getType()) {
+            case VALUE:
+                {
+                    TypeSerializer<SV> userSerializer = desc.getSerializer();
+                    TtlSerializer<SV> ttlSerializer = new TtlSerializer<>(userSerializer);
+                    // Construct the inner state with the TtlSerializer (so the engine sees
+                    // [long expiry][value bytes] as the cell payload) and wrap it.
+                    ForStRsValueStateV2<K, N, TtlValue<SV>> innerState =
+                            new ForStRsValueStateV2<>(
+                                    stateRequestHandler,
+                                    name,
+                                    keySerializer,
+                                    nsSer,
+                                    ttlSerializer);
+                    TtlAwareValueStateV2<K, N, SV> wrapped =
+                            new TtlAwareValueStateV2<>(innerState, desc.getTtlConfig(), ttlClock);
+                    return (S) wrapped;
+                }
+            case MAP:
+            case LIST:
+            case REDUCING:
+            case AGGREGATING:
+                throw new UnsupportedOperationException(
+                        "PR-A7: TTL is wired for ValueState V2 in this PR. "
+                                + desc.getType()
+                                + " state TTL is deferred to follow-on PR (decorator + per-entry "
+                                + "expiry filter on iteration paths). State name: "
+                                + name
+                                + ". Disable TTL or use ValueState in the interim.");
+            default:
+                throw new UnsupportedOperationException("Unsupported state type: " + desc.getType());
+        }
+    }
+
+    /**
+     * PR-A11 (E3-HIGH-4): expose the registry for PR-A1's snapshot/restore wiring. Until PR-A1
+     * lands the registry is consulted only on the write path; tests use this accessor to
+     * pre-seed restored metadata and exercise the read/verify branch.
+     */
+    @VisibleForTesting
+    public StateSerializerRegistry stateSerializerRegistry() {
+        return stateSerializerRegistry;
     }
 
     @Nonnull

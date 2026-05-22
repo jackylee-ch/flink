@@ -30,6 +30,7 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.keyed.sst.SstRetryStrategy;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -80,6 +81,7 @@ public class ForStRsRestoreOperation {
     private final Path targetDir;
     private final KeyGroupRange targetRange;
     private final ForStRsSstRegistry sstRegistry;
+    private final SstRetryStrategy retryStrategy;
 
     public ForStRsRestoreOperation(
             ForStRsLinker linker,
@@ -87,11 +89,27 @@ public class ForStRsRestoreOperation {
             Path targetDir,
             KeyGroupRange targetRange,
             ForStRsSstRegistry sstRegistry) {
+        this(linker, arena, targetDir, targetRange, sstRegistry, SstRetryStrategy.defaultStrategy());
+    }
+
+    /**
+     * Test-friendly constructor that injects a {@link SstRetryStrategy}. Production callers should
+     * use the no-strategy overload, which applies the default policy (5 retries, exponential
+     * backoff 100ms → 30s, jittered). PR-A12.
+     */
+    public ForStRsRestoreOperation(
+            ForStRsLinker linker,
+            Arena arena,
+            Path targetDir,
+            KeyGroupRange targetRange,
+            ForStRsSstRegistry sstRegistry,
+            SstRetryStrategy retryStrategy) {
         this.linker = linker;
         this.arena = arena;
         this.targetDir = targetDir;
         this.targetRange = targetRange;
         this.sstRegistry = sstRegistry;
+        this.retryStrategy = retryStrategy;
     }
 
     /** Result bundle returned by {@link #restore(Collection)}. */
@@ -234,6 +252,11 @@ public class ForStRsRestoreOperation {
      * Reads a {@link StreamStateHandle} into {@code localTarget}. On any failure (handle returns no
      * data, I/O error, or the resulting file is empty) throws a strict-restore exception with
      * {@code logicalPath} + the source handle's checkpoint id.
+     *
+     * <p>The download is wrapped in {@link SstRetryStrategy} (PR-A12): transient I/O faults are
+     * retried with exponential backoff so a single S3 5xx does not fail the restore. The "zero
+     * bytes" guard is treated as a permanent error and is NOT retried — re-downloading a
+     * known-empty handle just slows the failure by O(retries × backoff).
      */
     private void downloadHandleStrict(
             StreamStateHandle handle,
@@ -249,28 +272,41 @@ public class ForStRsRestoreOperation {
         }
         try {
             Files.createDirectories(localTarget.getParent());
-            try (FSDataInputStream in = handle.openInputStream();
-                    OutputStream out = Files.newOutputStream(localTarget)) {
-                byte[] buf = new byte[8 * 1024];
-                int n;
-                long total = 0L;
-                while ((n = in.read(buf)) > 0) {
-                    out.write(buf, 0, n);
-                    total += n;
-                }
-                // Manifest blobs and SST files are never legitimately empty; an empty file means
-                // the handle resolved to a missing/truncated upload — fail strictly.
-                if (total == 0L) {
-                    throw new ForStRsCheckpointRestoreException(
-                            logicalPath,
-                            owner.getCheckpointId(),
-                            "Strict restore: handle for '"
-                                    + logicalPath
-                                    + "' produced 0 bytes (likely deleted upstream)");
-                }
-            }
-        } catch (ForStRsCheckpointRestoreException e) {
-            throw e;
+            retryStrategy.execute(
+                    "download " + logicalPath,
+                    () -> {
+                        // Open fresh source + destination streams per attempt. The local target
+                        // file is truncated (CREATE + TRUNCATE_EXISTING is the default for
+                        // Files.newOutputStream) so a half-written attempt is discarded cleanly.
+                        try (FSDataInputStream in = handle.openInputStream();
+                                OutputStream out = Files.newOutputStream(localTarget)) {
+                            byte[] buf = new byte[8 * 1024];
+                            int n;
+                            long total = 0L;
+                            while ((n = in.read(buf)) > 0) {
+                                out.write(buf, 0, n);
+                                total += n;
+                            }
+                            // Manifest blobs and SST files are never legitimately empty; an
+                            // empty file means the handle resolved to a missing/truncated
+                            // upload — fail strictly. Wrap in a non-IOException so the retry
+                            // strategy doesn't loop on it. We re-throw as a checked exception
+                            // inside the IoOperation by raising a custom IOException
+                            // subclass that the outer catch in this method re-wraps without
+                            // adding another retry layer.
+                            if (total == 0L) {
+                                throw new EmptyHandleException(logicalPath);
+                            }
+                            return null;
+                        }
+                    });
+        } catch (EmptyHandleException ehe) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: handle for '"
+                            + logicalPath
+                            + "' produced 0 bytes (likely deleted upstream)");
         } catch (IOException ioe) {
             throw new ForStRsCheckpointRestoreException(
                     logicalPath,
@@ -282,6 +318,21 @@ public class ForStRsRestoreOperation {
                             + ": "
                             + ioe.getMessage(),
                     ioe);
+        }
+    }
+
+    /**
+     * Sentinel IOException that signals "handle returned 0 bytes" — distinct from a transient I/O
+     * error. Extends {@link java.io.FileNotFoundException} so the {@link
+     * SstRetryStrategy#DEFAULT_TRANSIENT_PREDICATE} classifies it as <i>non-transient</i>: the
+     * retry loop short-circuits on the first occurrence rather than re-downloading a
+     * known-truncated handle 5 more times.
+     */
+    private static final class EmptyHandleException extends java.io.FileNotFoundException {
+        private static final long serialVersionUID = 1L;
+
+        EmptyHandleException(String logicalPath) {
+            super("0-byte download for " + logicalPath);
         }
     }
 

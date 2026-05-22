@@ -49,11 +49,34 @@ import java.util.concurrent.CompletableFuture;
  * <p>Virtual threads suit this workload because each upload is dominated by I/O: the JVM can have
  * thousands of in-flight SST uploads multiplexed onto a handful of carrier threads, matching what
  * Flink's existing async-snapshot scheduler does for parallel state-handle production.
+ *
+ * <p><b>Retry behaviour (PR-A12).</b> The blocking upload body is wrapped in a {@link
+ * SstRetryStrategy} that retries transient I/O errors with exponential backoff (5 retries, 100ms
+ * → 30s, factor 2, jittered). This converts the per-SST failure probability from "any transient
+ * S3 5xx fails the whole ckpt" to "ckpt fails only if the same SST hits 6 consecutive transient
+ * faults" — the latter probability is vanishingly small even at scale. Construct with the {@link
+ * #ForStRsSstUploader(SstRetryStrategy)} constructor to override the default policy (e.g. for
+ * tests).
  */
 @Internal
 public final class ForStRsSstUploader {
 
     private static final int IO_BUFFER_BYTES = 8 * 1024;
+
+    private final SstRetryStrategy retryStrategy;
+
+    /** Constructs an uploader with the production default retry policy. */
+    public ForStRsSstUploader() {
+        this(SstRetryStrategy.defaultStrategy());
+    }
+
+    /**
+     * Constructs an uploader with the given retry policy. Pass a strategy with {@code maxRetries =
+     * 0} to disable retries entirely (useful in tests that want to observe the first failure).
+     */
+    public ForStRsSstUploader(SstRetryStrategy retryStrategy) {
+        this.retryStrategy = retryStrategy;
+    }
 
     /**
      * Uploads {@code file} via {@code factory} under the given {@code scope}; returns a future that
@@ -80,19 +103,30 @@ public final class ForStRsSstUploader {
     /**
      * Synchronous variant — same I/O work as {@link #upload(Path, CheckpointStreamFactory,
      * CheckpointedStateScope)} but executes on the calling thread. Used by the async path above and
-     * directly callable by tests that don't want the virtual-thread dispatch overhead.
+     * directly callable by tests that don't want the virtual-thread dispatch overhead. The body is
+     * wrapped in this uploader's {@link SstRetryStrategy}: each attempt opens a fresh {@link
+     * CheckpointStateOutputStream} and a fresh source-file {@link InputStream} so retries don't
+     * inherit a half-written destination stream or a partially-consumed source.
      */
     public StreamStateHandle uploadBlocking(
             Path file, CheckpointStreamFactory factory, CheckpointedStateScope scope)
             throws IOException {
-        try (CheckpointStateOutputStream out = factory.createCheckpointStateOutputStream(scope);
-                InputStream in = Files.newInputStream(file)) {
-            byte[] buf = new byte[IO_BUFFER_BYTES];
-            int n;
-            while ((n = in.read(buf)) > 0) {
-                out.write(buf, 0, n);
-            }
-            return out.closeAndGetHandle();
-        }
+        return retryStrategy.execute(
+                "upload " + file.getFileName(),
+                () -> {
+                    // IMPORTANT: open fresh streams per attempt. The destination stream from a
+                    // failed attempt is unusable (its handle would be partially populated); the
+                    // source InputStream's position would be at EOF on a successful append loop.
+                    try (CheckpointStateOutputStream out =
+                                    factory.createCheckpointStateOutputStream(scope);
+                            InputStream in = Files.newInputStream(file)) {
+                        byte[] buf = new byte[IO_BUFFER_BYTES];
+                        int n;
+                        while ((n = in.read(buf)) > 0) {
+                            out.write(buf, 0, n);
+                        }
+                        return out.closeAndGetHandle();
+                    }
+                });
     }
 }
