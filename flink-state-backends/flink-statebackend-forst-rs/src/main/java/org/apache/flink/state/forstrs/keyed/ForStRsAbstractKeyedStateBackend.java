@@ -292,6 +292,36 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     }
 
     /**
+     * B4-H6 (zero-copy): byte[]-cached variant of {@link #getOrEncodeKey(String,
+     * ForStRsKeyGroupedSerializer)}. State classes that already cache their state-name UTF-8 bytes
+     * at construction (e.g. {@code ForStRsValueStateV2.stateNameBytes}) should prefer this overload
+     * — it routes through {@link ForStRsKeyGroupedSerializer#encodeForState(int, Object, byte[])}
+     * which skips the per-thread {@code STATE_NAME_BYTES_CACHE} {@link java.util.HashMap#get} +
+     * {@code ThreadLocal.get()} hop that the {@code String}-taking entry point performs once per
+     * record.
+     *
+     * <p>The result cache (kept identical to the {@code String} overload — keyed by stateName
+     * identity and current key-group) reuses the per-record key encoding across multiple
+     * {@code state.value()} / {@code state.update(v)} calls from the same record.
+     */
+    public byte[] getOrEncodeKey(
+            String stateName,
+            byte[] stateNameBytes,
+            ForStRsKeyGroupedSerializer<K> kgSerializer) {
+        if (cachedKeyBytes != null
+                && stateName.equals(cachedStateName)
+                && cachedKeyGroup == getCurrentKeyGroupIndex()) {
+            return cachedKeyBytes;
+        }
+        cachedKeyBytes =
+                kgSerializer.encodeForState(
+                        getCurrentKeyGroupIndex(), getCurrentKey(), stateNameBytes);
+        cachedStateName = stateName;
+        cachedKeyGroup = getCurrentKeyGroupIndex();
+        return cachedKeyBytes;
+    }
+
+    /**
      * Wires the snapshot strategy + SST registry into this backend so {@link #snapshot} can drive
      * checkpoints and {@link #notifyCheckpointComplete}/{@link #notifyCheckpointAborted} can manage
      * the registry's ref-counts. Tests or higher-level builders call this after construction.

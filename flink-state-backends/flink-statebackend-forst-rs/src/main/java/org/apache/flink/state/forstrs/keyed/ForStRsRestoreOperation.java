@@ -748,6 +748,7 @@ public class ForStRsRestoreOperation {
             return new ArrayList<>(java.util.Arrays.asList(resolved));
         }
         ExecutorService dl = newRestoreExecutor(parallelism, "forstrs-restore-sst-download");
+        boolean success = false;
         try {
             List<Future<String>> futures = new ArrayList<>(hlps.size());
             for (int i = 0; i < hlps.size(); i++) {
@@ -796,8 +797,24 @@ public class ForStRsRestoreOperation {
                             cause);
                 }
             }
+            success = true;
         } finally {
-            dl.shutdown();
+            // E4-HIGH-2: on the exception path, force-interrupt in-flight S3 downloads instead of
+            // letting them run to completion. {@code shutdown()} only stops accepting new tasks
+            // but lets queued + in-flight workers continue — for a multi-GB SST download from S3
+            // that means seconds-to-minutes of wasted bandwidth after restore has already
+            // decided to fail. {@code shutdownNow()} sends an interrupt to each worker thread so
+            // the blocking {@code OpenDal}/HTTP read aborts promptly.
+            if (success) {
+                dl.shutdown();
+            } else {
+                dl.shutdownNow();
+                try {
+                    dl.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+            }
         }
         return new ArrayList<>(java.util.Arrays.asList(resolved));
     }

@@ -272,6 +272,16 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         return stateName;
     }
 
+    /**
+     * B4-H4 (zero-copy): override so the classifier's APPEND_MERGE dispatch skips the
+     * {@code listStateNames.contains(name)} {@link java.util.Set#contains(Object)} +
+     * {@link String#hashCode()} per LIST_ADD record.
+     */
+    @Override
+    public boolean isListState() {
+        return true;
+    }
+
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
@@ -426,15 +436,22 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
      * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, mirroring the
      * legacy {@link #deserializeValue(byte[])} logic but without the per-row
      * {@code byte[] = new byte[len]} the default fallback would perform.
+     *
+     * <p>B4-H5 (zero-copy): view held in a {@link ThreadLocal}, eliminating the per-row
+     * {@code new MemorySegmentDataInputView()} on the batched-GET hot path.
      */
+    private static final ThreadLocal<org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView>
+            VIEW_TL =
+                    ThreadLocal.withInitial(
+                            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView::new);
+
     @Override
     public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
         if (len == 0) {
             return new CompleteStateIterator<V>(Collections.emptyList());
         }
         try {
-            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
-                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view = VIEW_TL.get();
             view.rewind(buf, (int) offset, len);
             List<V> list = new ArrayList<>();
             while (view.remaining() > 0) {
@@ -467,9 +484,21 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
 
     @Override
     public ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request) {
+        StateRequestType type = request.getRequestType();
+        // A4-H1 / PR-A6 sibling: when asyncClear() is dispatched, drain the off-heap
+        // ListStateArrowBuffer BEFORE the engine sees the DELETE. Without this, the per-state
+        // accumulator still holds rows that will flush AFTER the DELETE row lands, and those
+        // appends resurrect the entry — state leaks past asyncClear(). The ListStateArrowBuffer
+        // (unlike MapStateV2's offHeapBuf) is not prefix-indexed, so we drain unconditionally;
+        // subsequent appends for OTHER keys are unaffected because the buffer accumulator only
+        // batches appends, not order-dependent reads. Mirrors ForStRsMapStateV2.buildDBPutRequest
+        // (PR-A6, lines 464-470) which invalidates the cache + arrow buffer for the cleared
+        // prefix before the DELETE request goes out.
+        if (type == StateRequestType.CLEAR) {
+            flushIfDirty();
+        }
         byte[] key = serializeKey(request);
         byte[] value = null;
-        StateRequestType type = request.getRequestType();
         if (type != StateRequestType.CLEAR) {
             value = serializeValue(request.getPayload());
         }

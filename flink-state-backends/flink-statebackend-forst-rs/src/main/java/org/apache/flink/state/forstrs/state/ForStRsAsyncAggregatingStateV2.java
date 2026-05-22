@@ -107,9 +107,13 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
 
     /**
      * Pluggable flush handler invoked once per dirty entry on {@link #flushOnBarrier()} (and on
-     * LRU eviction). Receives the composite-key bytes and the serialized accumulator bytes. The
-     * default is a no-op — production wiring to the engine PUT path is gated on PR-A1 / V1.1
-     * (matches the V1 placeholder pattern in {@code ForStRsAggregatingStateV2}).
+     * LRU eviction). Receives the composite-key bytes and the serialized accumulator bytes
+     * ({@code null}/empty bytes means "cleared"). The default is a no-op — A4-H2 correctness
+     * note: production must override via {@link #setFlushHandler}, otherwise every cached
+     * accumulator is silently discarded on every checkpoint. The Flink runtime wires the engine
+     * PUT/DELETE path from {@code ForStRsAsyncKeyedStateBackend#createAggregatingState}; the
+     * no-op default is retained only so unit tests that exercise the cache directly do not have
+     * to stand up a live engine.
      */
     private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
 
@@ -390,15 +394,22 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      * directly out of the native {@code outData} segment via {@link
      * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, skipping the
      * per-row {@code byte[] = new byte[len]} the default fallback would perform.
+     *
+     * <p>B4-H5 (zero-copy): view held in a {@link ThreadLocal}, eliminating the per-row
+     * {@code new MemorySegmentDataInputView()} on the batched-GET hot path.
      */
+    private static final ThreadLocal<org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView>
+            VIEW_TL =
+                    ThreadLocal.withInitial(
+                            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView::new);
+
     @Override
     public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
         if (len == 0) {
             return null;
         }
         try {
-            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
-                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view = VIEW_TL.get();
             view.rewind(buf, (int) offset, len);
             return accSerializer.deserialize(view);
         } catch (IOException e) {

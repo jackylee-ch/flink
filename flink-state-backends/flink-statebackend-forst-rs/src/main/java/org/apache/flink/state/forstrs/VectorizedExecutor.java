@@ -49,6 +49,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * path.
  *
  * <p>See spec {@code docs/superpowers/specs/2026-05-15-forst-rs-vectorized-executor-design.md} §C3.
+ *
+ * <p><b>D-R4-2 (JAVA_INT alignment audit).</b> Every {@link ValueLayout#JAVA_INT} site in this
+ * class — {@code outOffsets}, {@code opsOffSeg}, {@code keysOffSeg}, {@code prefixesOff},
+ * {@code lens}, {@code outRowCount}, {@code outBytesUsed} — is an arena-allocated segment
+ * ({@code arena.allocate(JAVA_INT, ...)} or {@code scratch.allocate(JAVA_INT, ...)}) which the
+ * FFM API guarantees to be at least 4-byte aligned. Indexed access uses either {@code (long) i *
+ * Integer.BYTES} or {@code setAtIndex(JAVA_INT, i, ...)} — both always produce 4-byte-aligned
+ * offsets. None of these segments is a heap-backed slice of a Rust-side struct with non-
+ * multiple-of-4 fields, so {@code JAVA_INT_UNALIGNED} is not required. The unaligned variant is
+ * reserved for cases like the {@code FrsBytes} struct that {@link
+ * org.apache.flink.state.forstrs.ffm.ForStRsLinker} reads from a heap {@code byte[24]}; see the
+ * {@code FRS_BYTES_LAYOUT_UNALIGNED} layout there.
  */
 @Internal
 public class VectorizedExecutor implements StateExecutor {
@@ -708,30 +720,63 @@ public class VectorizedExecutor implements StateExecutor {
                     ptrs.setAtIndex(ValueLayout.ADDRESS, i, nativeV);
                     lens.setAtIndex(ValueLayout.JAVA_INT, i, (int) vLen);
                 }
-                int rc =
-                        linker.frsVecMergeAppend(
-                                db.handle(), cf.handle(), keyPtr, keyLen, ptrs, lens, vs.length);
-                FrsErrorCode code = FrsErrorCode.fromU32(rc);
-                if (code == FrsErrorCode.OK) {
-                    future.complete(null);
-                    rowsProcessed += vs.length;
-                } else if (code.isFailProcess()) {
-                    if (metrics != null) {
-                        metrics.recordFfiError(
-                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
+                // S1-9 (Agent-A correctness): wrap the per-row FFI call in try/catch so a mid-loop
+                // throw (uncaught native panic upcall, RuntimeException from {@code linker}, OOM
+                // inside the scratch Arena allocations above this point, etc.) does NOT leave the
+                // remaining {@code futures[row+1..count-1]} dangling — they would otherwise be
+                // completed by no-one and the AEC's record-context lock would never release,
+                // wedging the operator thread. Complete this row's future + all subsequent rows
+                // exceptionally with the same throwable, then re-throw so the executor sees the
+                // failure (existing snapshot/close paths handle it via fatalHandler).
+                try {
+                    int rc =
+                            linker.frsVecMergeAppend(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyPtr,
+                                    keyLen,
+                                    ptrs,
+                                    lens,
+                                    vs.length);
+                    FrsErrorCode code = FrsErrorCode.fromU32(rc);
+                    if (code == FrsErrorCode.OK) {
+                        future.complete(null);
+                        rowsProcessed += vs.length;
+                    } else if (code.isFailProcess()) {
+                        if (metrics != null) {
+                            metrics.recordFfiError(
+                                    VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
+                        }
+                        FrsEnginePanicError panicErr =
+                                new FrsEnginePanicError(code, "kind=APPEND_MERGE row=" + row);
+                        if (fatalHandler != null) {
+                            fatalHandler.onFatalError(panicErr);
+                        }
+                        future.completeExceptionally(panicErr);
+                    } else {
+                        if (metrics != null) {
+                            metrics.recordFfiError(
+                                    VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
+                        }
+                        future.completeExceptionally(new FrsException(code, row, new byte[0]));
                     }
-                    FrsEnginePanicError panicErr =
-                            new FrsEnginePanicError(code, "kind=APPEND_MERGE row=" + row);
-                    if (fatalHandler != null) {
-                        fatalHandler.onFatalError(panicErr);
+                } catch (Throwable t) {
+                    // Drain ALL pending futures (this row + the unprocessed tail) so no caller
+                    // is left waiting. Order matters: complete `future` first (matches the
+                    // request that actually triggered the throw), then the tail.
+                    future.completeExceptionally(t);
+                    for (int r = row + 1; r < count; r++) {
+                        CompletableFuture<Void> tail = futures.get(r);
+                        if (!tail.isDone()) {
+                            tail.completeExceptionally(
+                                    new RuntimeException(
+                                            "dispatchAppendMergePerRow aborted at row=" + row, t));
+                        }
                     }
-                    future.completeExceptionally(panicErr);
-                } else {
-                    if (metrics != null) {
-                        metrics.recordFfiError(
-                                VectorizedStateRequest.Kind.APPEND_MERGE, "_mixed", code);
-                    }
-                    future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                    // Re-throw so the executor surfaces the fatal condition through the same
+                    // path as a non-batched FFI failure (mirrors how `frsVecMergeAppend`
+                    // non-OK return codes propagate to the upstream snapshot/close handler).
+                    throw t;
                 }
             } finally {
                 scratch.close();

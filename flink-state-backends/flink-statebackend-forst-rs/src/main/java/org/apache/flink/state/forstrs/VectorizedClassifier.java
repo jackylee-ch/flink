@@ -432,15 +432,20 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                 // APPEND_MERGE instead of destructive PUT. Falls back to PUT if the
                 // state is not registered (shouldn't happen via the public API, but
                 // defensive). A null payload still routes to delete.
+                //
+                // B4-H4 (zero-copy): replaces the previous per-record {@code
+                // listStateNames.contains(name)} {@link java.util.Set#contains} + {@code
+                // String.hashCode()} with a single per-state-instance boolean read on the
+                // table itself ({@link ForStRsInnerTable#isListState()}, default-false,
+                // overridden to true by {@code ForStRsAsyncListStateV2}). The
+                // {@link #listStateNames} registry is still maintained for inspection / tests,
+                // but is no longer consulted on the dispatch hot path.
                 if (stateRequest.getPayload() == null) {
                     recordDelete(table, (StateRequest) stateRequest);
+                } else if (table.isListState()) {
+                    recordAppendMerge(table, (StateRequest) stateRequest);
                 } else {
-                    String name = table.getStateName();
-                    if (name != null && listStateNames.contains(name)) {
-                        recordAppendMerge(table, (StateRequest) stateRequest);
-                    } else {
-                        recordPut(table, (StateRequest) stateRequest);
-                    }
+                    recordPut(table, (StateRequest) stateRequest);
                 }
                 break;
             default:

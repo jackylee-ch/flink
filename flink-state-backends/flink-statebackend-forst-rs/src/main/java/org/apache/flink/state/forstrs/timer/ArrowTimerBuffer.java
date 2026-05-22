@@ -23,6 +23,7 @@ import org.apache.flink.annotation.Internal;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 
 /**
  * Off-heap binary min-heap of timer pending-buffer entries (analogue of {@code
@@ -402,24 +403,39 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     // Internal — hash index
     // ------------------------------------------------------------------
 
+    /**
+     * D-R4-4 (SIMD timer hash): per-thread scratch byte[] used to stage the segment slice for
+     * {@link Arrays#hashCode(byte[])}. The JIT intrinsifies {@code Arrays.hashCode(byte[])} to a
+     * vectorized polynomial-31 reduction on AVX2/NEON (the sequential {@code h = 31*h + b}
+     * recurrence is broken via a pre-multiplied 31^k power table inside the intrinsic), which
+     * beats the scalar per-byte {@code seg.get(JAVA_BYTE, off+i)} on the Q12 timer hot path. The
+     * hash output is bitwise-identical to the previous scalar formula — both start the
+     * accumulator at {@code 1} and fold each byte as {@code h = 31*h + b}, so existing
+     * open-addressed slot-layout entries remain compatible.
+     *
+     * <p>For the common Q12 case the timer key size is stable across calls (timestamp + key
+     * encoding), so the scratch buffer is reused without reallocation — the only allocation
+     * happens (a) on first use per thread and (b) on a strict size increase. The whole
+     * {@code scratch} is the input to {@code Arrays.hashCode} so the buffer is sized exactly to
+     * {@code len} after the first miss-match to keep the intrinsic engaged.
+     */
+    private static final ThreadLocal<byte[]> HASH_SCRATCH_TL =
+            ThreadLocal.withInitial(() -> new byte[0]);
+
     private int hashOf(MemorySegment seg, long offset, int len) {
-        // PR-B2 (V2-11 / D-R3-1) — scalar loop retained for the Q12 timer
-        // hot path. Same rationale as ArrowBinaryBuffer.hash: the Java
-        // byte[] hashCode recurrence is sequentially data-dependent on the
-        // previous accumulator, so a SIMD translation requires either a
-        // 31^k power-table per VL-byte block or an alternative hash
-        // function (FNV-1a/xxhash) which would be binary-incompatible with
-        // the open-addressed slot layout already populated in the hash
-        // index. Q12 profiling identified the timer-service factory (heap
-        // vs. engine) as the dominant cost; per-byte hash is a small
-        // residual. Deferred to follow-up "PR-B2.1 alternative hash
-        // function" so the format change can be done as a coordinated
-        // migration alongside ArrowBinaryBuffer.
-        int h = 1;
-        for (int i = 0; i < len; i++) {
-            h = 31 * h + seg.get(ValueLayout.JAVA_BYTE, offset + i);
+        // D-R4-4: copy the segment slice into the exact-size scratch byte[] and route through
+        // {@code Arrays.hashCode(byte[])}, which the JIT intrinsifies. The polynomial-31
+        // accumulator is bitwise-identical to the previous scalar loop, so previously-populated
+        // hash-index slots remain valid.
+        byte[] scratch = HASH_SCRATCH_TL.get();
+        if (scratch.length != len) {
+            scratch = new byte[len];
+            HASH_SCRATCH_TL.set(scratch);
         }
-        return h;
+        if (len > 0) {
+            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, offset, scratch, 0, len);
+        }
+        return Arrays.hashCode(scratch);
     }
 
     private boolean rowKeyEquals(int row, MemorySegment seg, long offset, int len) {

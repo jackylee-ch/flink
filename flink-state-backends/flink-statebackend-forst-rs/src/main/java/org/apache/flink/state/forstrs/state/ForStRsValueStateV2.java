@@ -222,15 +222,24 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
      * java.lang.foreign.MemorySegment, long, int)} fallback would perform; instead reads
      * the value bytes directly from the native {@code outData} segment via {@link
      * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}.
+     *
+     * <p>B4-H5 (zero-copy): the view itself is held in a {@link ThreadLocal}, eliminating
+     * the per-row {@code new MemorySegmentDataInputView()} that was happening inside the
+     * batched-GET completion loop. The view is mutable (its backing segment + position
+     * are reset by {@link MemorySegmentDataInputView#rewind}), so per-thread reuse is safe.
      */
+    private static final ThreadLocal<org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView>
+            VIEW_TL =
+                    ThreadLocal.withInitial(
+                            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView::new);
+
     @Override
     public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
         if (len == 0) {
             return null;
         }
         try {
-            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
-                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view = VIEW_TL.get();
             view.rewind(buf, (int) offset, len);
             return valueSerializer.deserialize(view);
         } catch (IOException e) {

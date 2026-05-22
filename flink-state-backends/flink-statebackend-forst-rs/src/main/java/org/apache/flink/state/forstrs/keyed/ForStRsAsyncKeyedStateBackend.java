@@ -75,12 +75,17 @@ import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -93,6 +98,9 @@ import java.util.concurrent.RunnableFuture;
 
 @Internal
 public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<K> {
+
+    private static final Logger LOG =
+            LoggerFactory.getLogger(ForStRsAsyncKeyedStateBackend.class);
 
     private static final long DEFAULT_SLOT_TURN_BYTES = 8L * 1024 * 1024;
     private static final long DEFAULT_SLOT_CACHE_BYTES = 64L * 1024 * 1024;
@@ -111,11 +119,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * HeapPriorityQueueSetFactory}; FORSTRS uses the engine-backed {@link
      * ForStRsKeyGroupedInternalPriorityQueue}.
      *
-     * <p>Default is HEAP: per {@code project_q12_heap_timer_beats_forst}, the engine-backed timer
-     * queue incurs per-timer FFM crossings that dominate Q11/Q12 wall-clock; switching to HEAP
-     * recovers the v3.3 baselines.
+     * <p>D-R4-1: default is {@code FORSTRS} — the new batched off-heap variant which post-PR-B*
+     * lands 1.x× faster than HEAP on Q11/Q12 with the engine-backed batched flush. The earlier
+     * {@code HEAP} default was the V1 workaround documented in {@code
+     * project_q12_heap_timer_beats_forst} before the timer queue's pending-buffer drain was
+     * batched; that workaround is no longer needed (see {@link #pickTimerFactory}, which now
+     * defaults the system property to {@code FORSTRS}).
      *
-     * <p>Override via {@code -Dforst.rs.timer-service.factory=FORSTRS}.
+     * <p>Override via {@code -Dforst.rs.timer-service.factory=HEAP} for compatibility with
+     * snapshots taken before the batched-engine timer landed, or for benchmarks that need the
+     * heap fallback.
      */
     private enum TimerServiceFactory {
         HEAP,
@@ -355,6 +368,141 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // Phase P5: replace UnregisteredMetricsGroup with real MetricGroup from the
         // TaskExecutorEnvironment / RuntimeEnvironment once the backend is fully integrated.
         this.dispatchMetrics = new DispatchMetrics(new UnregisteredMetricsGroup());
+    }
+
+    /**
+     * PR-A4-H4: restore-aware factory. Materializes the engine from {@code restoredHandles} (via
+     * {@link ForStRsRestoreOperation}'s parallel-restore path — PR-E1), then returns a fresh async
+     * backend wired to the restored {@link FrsDb} + default CF + SST registry + backend identifier
+     * so subsequent incremental snapshots correctly link against the restored shared SSTs.
+     *
+     * <p>Before this method existed the async backend was write-only: PR-A1 landed the WRITE side
+     * of the snapshot machinery, but {@link
+     * org.apache.flink.runtime.state.StateBackend#createKeyedStateBackend} on a restart was
+     * opening a fresh empty engine on disk — every restored handle was silently discarded. This
+     * factory closes that gap by mirroring the V1-sync {@code
+     * ForStRsStateBackend.createKeyedStateBackend} restore branch onto the async path.
+     *
+     * <p>The factory:
+     *
+     * <ol>
+     *   <li>Constructs {@link ForStRsRestoreOperation} bound to a fresh {@link
+     *       ForStRsSstRegistry}.
+     *   <li>Calls {@link ForStRsRestoreOperation#restore} which downloads each handle's manifest +
+     *       SSTs in parallel (PR-E1) and invokes {@link ForStRsLinker#dbOpenFromIncremental} to
+     *       reconstruct the LSM from the manifest.
+     *   <li>Re-publishes the restored handle's backend identifier so {@link
+     *       org.apache.flink.runtime.state.SharedStateRegistry} can resolve the post-restore
+     *       incremental snapshot's shared-SST handles. If multiple handles are present (rescaling)
+     *       we mint a fresh identifier — the SSTs were reshuffled across key groups so the
+     *       resulting engine is logically a new lineage.
+     *   <li>Seeds the {@link StateSerializerRegistry} so the first {@code getOrCreateKeyedState}
+     *       call in the new session verifies the new {@link TypeSerializer} against the persisted
+     *       snapshot. The serializer-metadata blob persistence in {@code snapshot()} is still
+     *       documented TODO (see snapshot() Javadoc), so this seed is best-effort: pre-A11
+     *       snapshots carry no metadata and the registry stays empty (writes are correct on a
+     *       fresh registration). When PR-A11-emit lands, this hook fires verification.
+     * </ol>
+     *
+     * @param arena owned arena that survives the returned backend
+     * @param linker FFI linker bound to {@code arena}
+     * @param keySerializer key serializer
+     * @param keyGroupRange the target key-group range for this subtask
+     * @param totalKeyGroups total number of key groups in the job
+     * @param localDbPath empty local directory to materialize the engine into
+     * @param restoredHandles handles produced by a prior {@code snapshot()}; must be non-empty
+     *     ({@link ForStRsStateBackend#createAsyncKeyedStateBackend} routes empty-handle cases
+     *     through the no-restore path)
+     * @throws IOException on download or engine-open failure
+     */
+    public static <K> ForStRsAsyncKeyedStateBackend<K> restoreFromHandles(
+            Arena arena,
+            ForStRsLinker linker,
+            TypeSerializer<K> keySerializer,
+            KeyGroupRange keyGroupRange,
+            int totalKeyGroups,
+            Path localDbPath,
+            Collection<KeyedStateHandle> restoredHandles)
+            throws IOException {
+        if (restoredHandles == null || restoredHandles.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "restoreFromHandles requires a non-empty handle collection; route empty-restore"
+                            + " through the regular constructor + dbOpen() path");
+        }
+        ForStRsSstRegistry restoredSstRegistry = new ForStRsSstRegistry();
+        ForStRsRestoreOperation restoreOp =
+                new ForStRsRestoreOperation(
+                        linker, arena, localDbPath, keyGroupRange, restoredSstRegistry);
+        ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
+
+        ForStRsAsyncKeyedStateBackend<K> backend =
+                new ForStRsAsyncKeyedStateBackend<>(
+                        arena,
+                        linker,
+                        restored.getDb(),
+                        restored.getDefaultCf(),
+                        keySerializer,
+                        keyGroupRange,
+                        totalKeyGroups,
+                        /* ownsResources= */ true);
+
+        // Preserve the source backend identifier when restoring from a single non-rescaled
+        // handle so SharedStateRegistry resolves the prior session's shared SSTs. On rescaling
+        // (multiple source handles or differing source range) we leave backendIdentifier null and
+        // let ensureSnapshotStrategy mint a fresh UUID — the restored LSM is a new lineage.
+        UUID inherited = inheritBackendIdentifier(restoredHandles, keyGroupRange);
+        if (inherited != null) {
+            backend.backendIdentifier = inherited;
+        }
+
+        // Repopulate the SST registry from the restored handles so post-restore incremental
+        // snapshots reuse SSTs already on S3 without re-uploading.
+        backend.adoptSstRegistry(restoredSstRegistry);
+
+        // Seed the serializer registry. The snapshot() write-path TODO leaves this empty until
+        // PR-A11-emit lands; the seed is therefore a no-op for V1 snapshots but the hook is in
+        // place so a metadata-bearing snapshot is consumed automatically when it ships.
+        backend.stateSerializerRegistry.seedFromRestore(new LinkedHashMap<>());
+
+        return backend;
+    }
+
+    /**
+     * Returns the source backend identifier when {@code handles} is a single
+     * {@link ForStRsIncrementalKeyedStateHandle} whose key-group range exactly matches the target
+     * — i.e. the no-rescaling fast path. Otherwise returns {@code null} so the caller mints a
+     * fresh identifier.
+     */
+    @Nullable
+    private static UUID inheritBackendIdentifier(
+            Collection<KeyedStateHandle> handles, KeyGroupRange target) {
+        if (handles.size() != 1) {
+            return null;
+        }
+        KeyedStateHandle only = handles.iterator().next();
+        if (!(only instanceof ForStRsIncrementalKeyedStateHandle)) {
+            return null;
+        }
+        ForStRsIncrementalKeyedStateHandle inc = (ForStRsIncrementalKeyedStateHandle) only;
+        if (!inc.getKeyGroupRange().equals(target)) {
+            return null;
+        }
+        return inc.getBackendIdentifier();
+    }
+
+    /**
+     * Pre-populate the lazy SST registry slot so the first {@code snapshot()} reuses it instead of
+     * minting a fresh empty one. Called from {@link #restoreFromHandles} after {@link
+     * ForStRsRestoreOperation} has registered the restored shared-SST entries. Idempotent and only
+     * effective before the first {@code snapshot()} call.
+     */
+    private void adoptSstRegistry(ForStRsSstRegistry restoredRegistry) {
+        // ensureSnapshotStrategy synchronizes on `this`; align our lazy-init under the same lock.
+        synchronized (this) {
+            if (this.sstRegistry == null) {
+                this.sstRegistry = restoredRegistry;
+            }
+        }
     }
 
     @Override
@@ -600,7 +748,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                         nsSer,
                         reducingDesc.getSerializer(),
                         reducingDesc.getReduceFunction());
-        // PR-C3 (V12 / B3-H1): register so snapshot's Trace E drain flushes the RMW cache.
+        // PR-C3 (V12 / B3-H1): wire the production flush handler so accumulators captured by the
+        // RMW cache are actually durable on checkpoint. Closes A4-H2 — the previous default of
+        // {@code (k,v) -> {}} silently discarded every cached accumulator at snapshot time. We use
+        // the direct {@code linker.put}/{@code linker.delete} path (engine is the durability
+        // target) instead of synthesizing StateRequest objects, because the original
+        // RecordContext is gone at flush time and a synthetic context would only carry the
+        // operator key — exactly what {@code linker.put} already takes as a raw key.
+        state.setFlushHandler(this::rmwFlushToEngine);
         registeredAsyncReducingStates.add(state);
         return state;
     }
@@ -617,9 +772,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                         nsSer,
                         aggDesc.getSerializer(),
                         aggDesc.getAggregateFunction());
-        // PR-C3 (V12 / B3-H2): register so snapshot's Trace E drain flushes the RMW cache.
+        // PR-C3 (V12 / B3-H2): wire the production flush handler — see createReducingState above
+        // for the A4-H2 rationale.
+        state.setFlushHandler(this::rmwFlushToEngine);
         registeredAsyncAggregatingStates.add(state);
         return state;
+    }
+
+    /**
+     * Production flush handler for {@link ForStRsAsyncReducingStateV2} and
+     * {@link ForStRsAsyncAggregatingStateV2} RMW caches (A4-H2 fix).
+     *
+     * <p>Called once per dirty cache entry during {@code flushOnBarrier()} on the snapshot mailbox
+     * thread (Trace E PHASE 1.d), with the composite-key bytes and the serialized accumulator
+     * bytes. {@code null}/empty accumulator bytes mean "cleared" — route to a DELETE; otherwise
+     * PUT directly through the engine via the FFM linker. Bypassing the classifier here is
+     * intentional and safe: the snapshot pre-flush has already drained the in-flight executor
+     * batches in PHASE 1.a, and PHASE 2 will run {@code flushDirty()} again to fold these direct
+     * PUTs into the SST being snapshotted in PHASE 3.
+     */
+    private void rmwFlushToEngine(byte[] key, byte[] value) {
+        if (value == null || value.length == 0) {
+            linker.delete(db, defaultCf, key);
+        } else {
+            linker.put(db, defaultCf, key, value);
+        }
     }
 
     @Nonnull
@@ -731,10 +908,29 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      */
     @Override
     public RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot(
-            long id, long ts, @Nonnull CheckpointStreamFactory f, @Nonnull CheckpointOptions o) {
+            long id, long ts, @Nonnull CheckpointStreamFactory f, @Nonnull CheckpointOptions o)
+            throws Exception {
         SnapshotType ctype = o.getCheckpointType();
         boolean isSavepoint = ctype.isSavepoint();
         boolean isSync = isSavepoint && ((SavepointType) ctype).isSynchronous();
+
+        // E4-HIGH-1: PR-A8/A9 emit a {@link ForStRsIncrementalKeyedStateHandle} ("incremental
+        // ForSt-RS") for both checkpoints and savepoints; the canonical Flink savepoint format
+        // (loadable by community ForSt / RocksDB) is a follow-on PR. Surface the deferred
+        // canonical-format gap loudly when a savepoint is requested so operators don't get
+        // caught by "savepoint completed" log lines that mask a non-portable handle. The
+        // operation itself succeeds — only the emitted handle's format is non-canonical.
+        if (isSavepoint) {
+            LOG.warn(
+                    "ForStRsAsyncKeyedStateBackend: savepoint requested for checkpoint id={} "
+                            + "(synchronous={}), but the emitted KeyedStateHandle is the "
+                            + "incremental ForSt-RS format — canonical Flink savepoint format "
+                            + "(loadable by community ForSt / RocksDB) is a follow-on PR. The "
+                            + "snapshot is durable and restorable by ForSt-RS itself, but cannot "
+                            + "yet be loaded by other backends.",
+                    id,
+                    isSync);
+        }
 
         // ============================================================
         // PHASE 1 — drain in-flight V2 dispatch + state buffers + timers
@@ -814,17 +1010,24 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // The cancelStreamRegistry may already be closed if a prior checkpoint's async phase
             // failed or the task is being cancelled. In that case the SnapshotStrategyRunner
             // cannot register its cancellation hook and throws "Cannot register Closeable,
-            // registry is already closed." Gracefully abort: return a pre-completed empty future
-            // so the checkpoint coordinator can proceed without hanging the job.
+            // registry is already closed." This is the only documented benign path: the
+            // coordinator already gave up on this checkpoint, so a pre-completed empty future
+            // unblocks the mailbox without hanging the job. Every other IOException — S3
+            // failures, manifest write failures, FFI errors surfaced as IOException — MUST
+            // propagate so the checkpoint coordinator's failedCheckpoints counter increments
+            // and `tolerable-failed-checkpoints` accounting fires (A4-H3 fix).
             if (e.getMessage() != null && e.getMessage().contains("registry is already closed")) {
                 return DoneFuture.of(SnapshotResult.empty());
             }
-            // Wrap any other IO failure into an empty result so the coordinator proceeds —
-            // the V2 async backend's contract returns a RunnableFuture, not throws.
-            return DoneFuture.of(SnapshotResult.empty());
-        } catch (Exception e) {
-            return DoneFuture.of(SnapshotResult.empty());
+            throw e;
         }
+        // Other Exception subtypes (RuntimeException / FFI panics surfaced as Exception via
+        // FrsBackendException) propagate without catch: they signal real backend failure and
+        // MUST be observed by the coordinator. A4-H3: pre-fix, the prior catch(Exception) swallow
+        // returned SnapshotResult.empty() which Flink interpreted as a successful empty snapshot
+        // bypassing tolerable-failed-checkpoints accounting. The contract is now: the snapshot
+        // method throws on real failure, returns a RunnableFuture on success — and the runtime
+        // routes the throw to CheckpointFailureManager.handleCheckpointException.
     }
 
     /**
@@ -844,7 +1047,13 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             if (backendIdentifier == null) {
                 backendIdentifier = UUID.randomUUID();
             }
-            ForStRsSstRegistry reg = new ForStRsSstRegistry();
+            // PR-A4-H4: if a restore pre-populated the SST registry (via adoptSstRegistry), reuse
+            // it so the first post-restore incremental snapshot recognises the inherited shared
+            // SSTs and skips re-uploading them. Otherwise mint a fresh registry as before.
+            ForStRsSstRegistry reg = this.sstRegistry;
+            if (reg == null) {
+                reg = new ForStRsSstRegistry();
+            }
             // V1 wiring: default uploader retry policy. PR-A12 will inject a configured
             // AsyncRetryStrategy here for bounded S3 retries.
             ForStRsSstUploader uploader = new ForStRsSstUploader();

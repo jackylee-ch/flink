@@ -427,15 +427,22 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      * directly out of the native {@code outData} segment via {@link
      * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, skipping the
      * per-row {@code byte[] = new byte[len]} the default fallback would perform.
+     *
+     * <p>B4-H5 (zero-copy): view held in a {@link ThreadLocal}, eliminating the per-row
+     * {@code new MemorySegmentDataInputView()} on the batched-GET hot path.
      */
+    private static final ThreadLocal<org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView>
+            VIEW_TL =
+                    ThreadLocal.withInitial(
+                            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView::new);
+
     @Override
     public Object deserializeValue(MemorySegment buf, long offset, int len) {
         if (len == 0) {
             return null;
         }
         try {
-            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
-                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view = VIEW_TL.get();
             view.rewind(buf, (int) offset, len);
             return userValueSerializer.deserialize(view);
         } catch (IOException e) {

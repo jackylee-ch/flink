@@ -89,6 +89,39 @@ public class ForStRsStateBackend implements StateBackend {
         Files.createDirectories(dbRoot);
         String fileSafeOpId = parameters.getOperatorIdentifier().replaceAll("[^a-zA-Z0-9\\-]", "_");
         Path localDbPath = dbRoot.resolve(fileSafeOpId + "-" + UUID.randomUUID());
+
+        // PR-A4-H4: Flink hands back the prior session's KeyedStateHandles on a job restart
+        // (restart-from-checkpoint / restart-from-savepoint / rescaling). Until this PR the async
+        // backend silently dropped them and opened a fresh empty engine — snapshots were
+        // write-only. Now we route to the restore factory which materialises the engine on disk
+        // before opening, mirroring the V1-sync path in `createKeyedStateBackend(...)`.
+        Collection<KeyedStateHandle> restoredHandles = parameters.getStateHandles();
+        if (restoredHandles != null && !restoredHandles.isEmpty()) {
+            try {
+                return org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend
+                        .restoreFromHandles(
+                                arena,
+                                linker,
+                                parameters.getKeySerializer(),
+                                parameters.getKeyGroupRange(),
+                                parameters.getNumberOfKeyGroups(),
+                                localDbPath,
+                                restoredHandles);
+            } catch (Throwable t) {
+                // Best-effort tear-down on restore failure: the arena owns the linker; closing
+                // it releases every FFM resource the partial restore may have allocated.
+                try {
+                    arena.close();
+                } catch (Throwable ignored) {
+                }
+                if (t instanceof Exception ex) {
+                    throw ex;
+                }
+                throw new Exception(
+                        "ForStRsStateBackend.createAsyncKeyedStateBackend restore failed", t);
+            }
+        }
+
         FrsDb db = linker.dbOpen(arena, localDbPath.toString());
         FrsCfHandle cf = linker.dbDefaultCf(db, arena);
         return new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(

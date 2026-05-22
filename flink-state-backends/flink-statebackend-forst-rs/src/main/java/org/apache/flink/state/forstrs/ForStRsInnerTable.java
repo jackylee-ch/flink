@@ -86,6 +86,19 @@ public interface ForStRsInnerTable<K, N, V> {
         return null;
     }
 
+    /**
+     * B4-H4 (zero-copy): per-state-instance boolean flag indicating whether this table is a
+     * {@code ListState} (V2). The classifier's APPEND_MERGE dispatch path used to call {@code
+     * listStateNames.contains(stateName)} per LIST_ADD record, which on the V1-sync / V2 hot path
+     * was an extra {@code Set.contains(String)} + {@code String.hashCode()} every row. Routing
+     * through this default-false flag (overridden to {@code true} by {@code ForStRsAsyncListStateV2}
+     * / {@code ForStRsListStateV2}) eliminates that lookup. Non-ListState implementations don't
+     * need to override.
+     */
+    default boolean isListState() {
+        return false;
+    }
+
     ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request);
 
     ForStRsDBPutRequest<K, N, ?> buildDBPutRequest(StateRequest<K, N, ?, ?> request);

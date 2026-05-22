@@ -33,6 +33,17 @@ import java.lang.foreign.ValueLayout;
  * <p>This is the Java-side mirror of the Rust-side {@code frs_vectorized_batch_*} FFI calls — see
  * {@code crates/forst-rs-ffi/src/lib.rs} and spec {@code
  * docs/superpowers/specs/2026-05-15-forst-rs-vectorized-executor-design.md} §C1.
+ *
+ * <p><b>D-R4-2 (JAVA_INT alignment audit).</b> Every {@code offsets} access in this class uses
+ * the natively-aligned {@link ValueLayout#JAVA_INT} layout: the backing segment is allocated
+ * via {@code arena.allocate(JAVA_INT, count + 1)} which guarantees 4-byte alignment, and every
+ * indexed access computes the offset as {@code (long) i * Integer.BYTES} — always a multiple of
+ * {@code 4}. Unlike the {@code FrsBytes} struct in {@link
+ * org.apache.flink.state.forstrs.ffm.ForStRsLinker} (which lives in a heap {@code byte[24]} and
+ * therefore uses {@code JAVA_LONG_UNALIGNED}), no segment here is a heap-backed slice of a
+ * Rust-side struct; {@code JAVA_INT} is the correct layout. {@code JAVA_INT_UNALIGNED} would only
+ * be needed if a Rust struct laid out a {@code u32} at an offset that is not a multiple of 4 —
+ * which does not occur on this path.
  */
 @Internal
 public final class ColumnarBatchBuffer {

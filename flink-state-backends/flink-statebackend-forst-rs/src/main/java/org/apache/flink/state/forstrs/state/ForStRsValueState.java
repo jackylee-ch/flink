@@ -364,8 +364,18 @@ public class ForStRsValueState<T> implements ValueState<T> {
         // Reuse the key from the preceding value() call if available
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
         if (writeBufferPut != null) {
-            // Buffered path: the buffer MUST own the value (it stays referenced until the
-            // shared write buffer is drained). Keep the defensive copy.
+            // B4-H2 carry-over: the buffer MUST own the value bytes. {@code writeBufferPut} is
+            // backed by {@code ForStRsKeyedStateBackend.putToWriteBuffer}, which stores the
+            // value in a {@code HashMap<ByteArrayWrapper, byte[]>} until the next batch flush.
+            // The outputBuffer.getSharedBuffer() reference would be clobbered by the very next
+            // {@code update()} call on this state instance (single-threaded operator thread,
+            // serializer-buffer reuse), corrupting all entries in the write buffer queued
+            // between calls. PR-B3's signature-change idea (key, value, valueOff, valueLen) was
+            // explored: it would only avoid the copy if the underlying buffer ALSO becomes a
+            // contiguous arena indexed by (off,len) tuples — a much larger restructuring of
+            // {@link org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend#writeBuffer}.
+            // Until that restructure happens, the buffered path keeps the defensive copy.
+            // Q11 rides this path; the per-update allocation here is the residual cost.
             byte[] payload = outputBuffer.getCopyOfBuffer();
             writeBufferPut.accept(key, payload);
         } else {
