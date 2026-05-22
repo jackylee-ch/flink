@@ -228,7 +228,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private final ThreadLocal<MemorySegment> scratchArenaTL =
             ThreadLocal.withInitial(() -> Arena.ofShared().allocate(65536));
 
-    /** Suppliers passed to off-heap ForStRsValueState. */
+    /**
+     * Suppliers passed to off-heap ForStRsValueState. NOTE: returns 0 unconditionally because
+     * {@code ForStRsKeyedStateBackend} is the V1-sync STANDALONE facade (does not extend
+     * {@link org.apache.flink.runtime.state.AbstractKeyedStateBackend}) and has no key-group
+     * machinery of its own. The Round-3 review S1-6 finding (rescale-broken) is correct in
+     * principle but the surgical fix requires plumbing the key-group range + count through
+     * the constructor — multi-day design. Tracked as architectural-debt in
+     * {@code 2026-05-22-high-issue-remediation-spec.md} Phase A.3.
+     */
     private final java.util.function.IntSupplier offheapKeyGroupSupplier = () -> 0;
 
     private final java.util.function.Supplier<Object> offheapKeySupplier =

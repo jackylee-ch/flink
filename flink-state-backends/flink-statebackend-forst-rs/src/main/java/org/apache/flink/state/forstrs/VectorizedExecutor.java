@@ -224,8 +224,12 @@ public class VectorizedExecutor implements StateExecutor {
                 return CompletableFuture.failedFuture(firstRowFailure);
             }
             return CompletableFuture.completedFuture(null);
-        } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
+        } catch (Throwable t) {
+            // Round-3 fix A3-H2: widen from `catch (Exception)` to `catch (Throwable)`.
+            // FrsEnginePanicError extends Error, so a panic in executeGets/Puts/etc. would
+            // previously escape the outer catch and the container future would never be
+            // returned (operator hangs forever on the unresolved CompletableFuture).
+            return CompletableFuture.failedFuture(t);
         }
     }
 
@@ -240,6 +244,16 @@ public class VectorizedExecutor implements StateExecutor {
         }
         single.initNewKindBuffers(arena);
         single.offer(request);
+        // Round-3 fix A3-H1: wrap dispatch in try/catch so an FFI/engine throw on the sync
+        // path doesn't leak the StateRequest's future (operator would hang).
+        try {
+            executeRequestSyncInner(single);
+        } catch (Throwable t) {
+            completePutExceptionally(request, t);
+        }
+    }
+
+    private void executeRequestSyncInner(VectorizedClassifier single) {
         executePuts(single);
         executeDeletes(single);
         executeGets(single);

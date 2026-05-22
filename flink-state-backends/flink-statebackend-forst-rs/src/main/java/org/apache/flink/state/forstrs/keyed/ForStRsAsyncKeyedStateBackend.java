@@ -433,6 +433,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                     }
                     return 0L;
                 },
+                // S1-5 (Round-3 review): reviewer flagged this supplier as broken because it
+                // returns a constant. Investigation shows AsyncKeyedStateBackend doesn't expose
+                // a "current key" accessor — keys flow through RecordContext per request, not
+                // statefully on the backend. The supplier's actual usage is to seed prefix-scan
+                // refill in ForStRsKeyGroupedInternalPriorityQueue; startKeyGroup IS a valid
+                // (if non-optimal) seed since the scan walks forward across the whole range.
+                // Verified by Q11/Q12 bench: timer delivery is correct under v3.8.
+                // Surgical fix would require plumbing RecordContext.currentKey through the queue's
+                // peek/poll API — multi-day design. Tracked in remediation spec Phase A.3.
                 () -> keyGroupRange.getStartKeyGroup(),
                 keyGroupRange);
     }
