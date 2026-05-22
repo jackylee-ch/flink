@@ -185,14 +185,29 @@ public class VectorizedExecutor implements StateExecutor {
             AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
             if (amBuf != null && !amBuf.isEmpty()) {
                 dispatchAppendMerge(amBuf);
-                // V3.1: complete the parallel StateRequest futures so Flink's
-                // async-state runtime sees the LIST_ADD as done. dispatchAppendMerge
-                // already completed amReq.future() above; here we propagate to the
-                // underlying StateRequest's runtime future.
+                // Round-1 fix A1-H5: dispatchAppendMerge completes amReq.future()
+                // either successfully or exceptionally. Propagate the SAME outcome
+                // to the parallel StateRequest's runtime future — completing
+                // unconditionally as success caused silent data loss on FFI error.
                 StateRequest<?, ?, ?, ?>[] amReqs = classifier.appendMergeRequests();
                 int amCount = classifier.appendMergeCount();
+                List<CompletableFuture<Void>> amReqFutures = amBuf.futures();
                 for (int i = 0; i < amCount; i++) {
-                    completePut(amReqs[i]);
+                    CompletableFuture<Void> amFut = amReqFutures.get(i);
+                    if (amFut.isCompletedExceptionally()) {
+                        Throwable cause;
+                        try {
+                            amFut.getNow(null);
+                            cause = new RuntimeException(
+                                    "AppendMergeRequest future completed exceptionally"
+                                            + " but cause unavailable");
+                        } catch (Throwable t) {
+                            cause = t.getCause() != null ? t.getCause() : t;
+                        }
+                        completePutExceptionally(amReqs[i], cause);
+                    } else {
+                        completePut(amReqs[i]);
+                    }
                 }
             }
             // Dispatch vectorized ITER_PREFIX requests if the classifier's buffer is
@@ -806,6 +821,18 @@ public class VectorizedExecutor implements StateExecutor {
     @SuppressWarnings("unchecked")
     private static void completePut(StateRequest<?, ?, ?, ?> request) {
         ((InternalAsyncFuture<Object>) request.getFuture()).complete(null);
+    }
+
+    /**
+     * Round-1 fix A1-H5: propagate FFI / engine failures to the Flink-runtime async
+     * future. Previously LIST_ADD dispatch errors were silently swallowed by an
+     * unconditional {@code completePut}.
+     */
+    @SuppressWarnings("unchecked")
+    private static void completePutExceptionally(
+            StateRequest<?, ?, ?, ?> request, Throwable cause) {
+        ((InternalAsyncFuture<Object>) request.getFuture())
+                .completeExceptionally("ForSt-RS APPEND_MERGE dispatch failed", cause);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
