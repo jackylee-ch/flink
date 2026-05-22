@@ -183,12 +183,11 @@ public class VectorizedExecutor implements StateExecutor {
             executeIters(classifier);
             // Dispatch vectorized APPEND_MERGE requests (P6-B, ListState path).
             AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
+            Throwable firstRowFailure = null;
             if (amBuf != null && !amBuf.isEmpty()) {
                 dispatchAppendMerge(amBuf);
-                // Round-1 fix A1-H5: dispatchAppendMerge completes amReq.future()
-                // either successfully or exceptionally. Propagate the SAME outcome
-                // to the parallel StateRequest's runtime future — completing
-                // unconditionally as success caused silent data loss on FFI error.
+                // Round-1 fix A1-H5 + Round-2 fix A2-H3: propagate per-row futures
+                // AND track if any row failed so the container future reflects it.
                 StateRequest<?, ?, ?, ?>[] amReqs = classifier.appendMergeRequests();
                 int amCount = classifier.appendMergeCount();
                 List<CompletableFuture<Void>> amReqFutures = amBuf.futures();
@@ -205,6 +204,9 @@ public class VectorizedExecutor implements StateExecutor {
                             cause = t.getCause() != null ? t.getCause() : t;
                         }
                         completePutExceptionally(amReqs[i], cause);
+                        if (firstRowFailure == null) {
+                            firstRowFailure = cause;
+                        }
                     } else {
                         completePut(amReqs[i]);
                     }
@@ -215,6 +217,11 @@ public class VectorizedExecutor implements StateExecutor {
             IterPrefixBatchBuffer ipBuf = classifier.iterPrefixBuffer();
             if (ipBuf != null && !ipBuf.isEmpty()) {
                 dispatchIterPrefix(ipBuf);
+            }
+            // Round-2 fix A2-H3: container future should reflect row failures so the
+            // runtime does not schedule the next batch into the failing engine.
+            if (firstRowFailure != null) {
+                return CompletableFuture.failedFuture(firstRowFailure);
             }
             return CompletableFuture.completedFuture(null);
         } catch (Exception e) {
@@ -227,6 +234,11 @@ public class VectorizedExecutor implements StateExecutor {
         VectorizedClassifier single =
                 new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
         single.reset();
+        // Lazy-init the new-kind buffers (matches createRequestContainer behavior).
+        for (String name : listStateNames) {
+            single.registerListState(name);
+        }
+        single.initNewKindBuffers(arena);
         single.offer(request);
         executePuts(single);
         executeDeletes(single);
@@ -235,6 +247,29 @@ public class VectorizedExecutor implements StateExecutor {
         AppendMergeBatchBuffer amBuf = single.appendMergeBuffer();
         if (amBuf != null && !amBuf.isEmpty()) {
             dispatchAppendMerge(amBuf);
+            // Round-2 fix A2-H1: propagate AppendMergeRequest future outcomes to the
+            // parallel StateRequest's runtime future — same anti-pattern A1-H5 fixed
+            // in executeBatchRequests, the sync sibling was missed.
+            StateRequest<?, ?, ?, ?>[] amReqs = single.appendMergeRequests();
+            int amCount = single.appendMergeCount();
+            List<CompletableFuture<Void>> amReqFutures = amBuf.futures();
+            for (int i = 0; i < amCount; i++) {
+                CompletableFuture<Void> amFut = amReqFutures.get(i);
+                if (amFut.isCompletedExceptionally()) {
+                    Throwable cause;
+                    try {
+                        amFut.getNow(null);
+                        cause = new RuntimeException(
+                                "AppendMergeRequest future completed exceptionally"
+                                        + " but cause unavailable");
+                    } catch (Throwable t) {
+                        cause = t.getCause() != null ? t.getCause() : t;
+                    }
+                    completePutExceptionally(amReqs[i], cause);
+                } else {
+                    completePut(amReqs[i]);
+                }
+            }
         }
         IterPrefixBatchBuffer ipBuf = single.iterPrefixBuffer();
         if (ipBuf != null && !ipBuf.isEmpty()) {
@@ -824,15 +859,23 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     /**
-     * Round-1 fix A1-H5: propagate FFI / engine failures to the Flink-runtime async
-     * future. Previously LIST_ADD dispatch errors were silently swallowed by an
-     * unconditional {@code completePut}.
+     * Round-1 fix A1-H5 + Round-2 fix A2-H2: propagate FFI / engine failures to the
+     * Flink-runtime async future. Preserves the original cause type (FrsException /
+     * FrsEnginePanicError) so per-row diagnostics — including {@code FrsErrorCode} and
+     * row index — are not lost. Does NOT re-invoke the fatal handler when the cause
+     * is already a {@link FrsEnginePanicError}: the dispatcher fired it once and
+     * downstream layers must not double-escalate.
      */
     @SuppressWarnings("unchecked")
     private static void completePutExceptionally(
             StateRequest<?, ?, ?, ?> request, Throwable cause) {
-        ((InternalAsyncFuture<Object>) request.getFuture())
-                .completeExceptionally("ForSt-RS APPEND_MERGE dispatch failed", cause);
+        // Use the cause's own message if specific (FrsException/FrsEnginePanicError
+        // include rc + row index); fall back to a generic label only when message is empty.
+        String msg = cause.getMessage();
+        if (msg == null || msg.isEmpty()) {
+            msg = "ForSt-RS dispatch failed: " + cause.getClass().getSimpleName();
+        }
+        ((InternalAsyncFuture<Object>) request.getFuture()).completeExceptionally(msg, cause);
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
