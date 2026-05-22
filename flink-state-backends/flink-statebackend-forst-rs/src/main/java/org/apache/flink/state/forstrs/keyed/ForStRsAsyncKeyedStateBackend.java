@@ -34,7 +34,6 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
-import org.apache.flink.core.execution.SavepointFormatType;
 import org.apache.flink.runtime.checkpoint.SavepointType;
 import org.apache.flink.runtime.checkpoint.SnapshotType;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
@@ -959,25 +958,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         boolean isSavepoint = ctype.isSavepoint();
         boolean isSync = isSavepoint && ((SavepointType) ctype).isSynchronous();
 
-        // E5-HIGH-1: Canonical savepoint format ({@link SavepointFormatType#CANONICAL}, the
-        // {@link SavepointFormatType#DEFAULT}) requires emitting a backend-portable handle that
+        // E5-HIGH-1 / E6-HIGH-1: Canonical savepoint format ({@link SavepointFormatType#CANONICAL},
+        // the {@link SavepointFormatType#DEFAULT}) requires emitting a backend-portable handle that
         // community ForSt / RocksDB can load. ForSt-RS only emits its incremental native format
         // today, so silently accepting a canonical savepoint request would produce a non-portable
-        // handle that operators discover only at restore time. Fail fast at the request site
-        // with a clear remediation: the operator must explicitly opt into NATIVE format (either
-        // via the CLI {@code --type native} flag or by passing {@link SavepointFormatType#NATIVE}
-        // programmatically) until the canonical-emit PR lands.
+        // handle that operators discover only at restore time. Fail fast at the request site with
+        // a clear remediation: the operator must explicitly opt into NATIVE format (either via
+        // the CLI {@code --type native} flag or by passing {@link SavepointFormatType#NATIVE}
+        // programmatically) until the canonical-emit PR lands. The guard is delegated to {@link
+        // ForStRsSavepointGuards} so the V1-sync {@code ForStRsAbstractKeyedStateBackend.snapshot}
+        // entry point uses the identical contract — E6-HIGH-1 fixed the V1-sync regression where
+        // the gate only existed in this async path.
         //
         // E4-HIGH-1: For NATIVE savepoints we still emit a {@link ForStRsIncrementalKeyedStateHandle}
         // — the format is backend-native by definition, so this is correct. We retain the WARN so
         // operators can see savepoint events in the log; only the canonical-handle gap throws.
+        ForStRsSavepointGuards.rejectCanonicalSavepoint(o);
         if (isSavepoint) {
-            SavepointFormatType formatType = ((SavepointType) ctype).getFormatType();
-            if (formatType == SavepointFormatType.CANONICAL) {
-                throw new UnsupportedOperationException(
-                        "Canonical savepoint format not yet supported by ForSt-RS backend;"
-                                + " use --type native or set SavepointFormatType.NATIVE");
-            }
             LOG.warn(
                     "ForStRsAsyncKeyedStateBackend: NATIVE savepoint requested for checkpoint"
                             + " id={} (synchronous={}). The emitted KeyedStateHandle is the"

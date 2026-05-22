@@ -71,6 +71,22 @@ public final class ReducingAggregatingCache<IN, ACC> {
     private final LinkedHashMap<BytesKey, Entry<ACC>> entries;
 
     /**
+     * A6-H1: per-key generation counter. Bumped on every {@link #invalidate} so a concurrently
+     * in-flight miss-resolve lambda can detect it raced with an {@code onClear} and skip its
+     * stale {@code cache.put}. Survives invalidation (the entry's BytesKey is removed but the
+     * generation entry stays) so the resolve lambda sees the bumped value even after the slot
+     * has been wiped. Pruned lazily on the next successful {@link #putIfGen}.
+     *
+     * <p>Single-mutator contract: mutations happen only on the mailbox thread; the async resolve
+     * lambda reads via {@link #currentGen} but never mutates. The map is therefore only ever
+     * concurrently READ (by the resolve lambda) while WRITES (mailbox thread mutations) are
+     * serialised — but we still keep this on a {@link java.util.concurrent.ConcurrentHashMap} so
+     * the concurrent read is publishable across threads without explicit volatiles.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<BytesKey, Long> generations =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
      * Cleanup-C3: per-cache reusable view of an externally-owned byte buffer slice. Used by the
      * zero-alloc lookup overloads ({@link #tryFold(byte[], int, int, Object)}, {@link
      * #contains(byte[], int, int)}, {@link #peek(byte[], int, int)}). The state class can pass the
@@ -246,6 +262,55 @@ public final class ReducingAggregatingCache<IN, ACC> {
     }
 
     /**
+     * A6-H1: returns the current generation for {@code compositeKey}. A miss-resolve lambda
+     * snapshots this value BEFORE issuing its GET and passes it to {@link #putIfGen}: if the
+     * generation has since been bumped (because {@code onClear → invalidate} fired between the
+     * GET-issue and GET-resolve), the put is skipped — preventing a stale accumulator from
+     * resurrecting the engine-side DELETE.
+     *
+     * <p>Returns {@code 0L} if no generation entry exists for the key (i.e. the key has never
+     * been invalidated in this session). Generation values are strictly monotonic across the
+     * cache lifetime.
+     */
+    public long currentGen(byte[] compositeKey) {
+        return currentGen(compositeKey, 0, compositeKey.length);
+    }
+
+    /** Zero-alloc slice-view variant of {@link #currentGen(byte[])}. */
+    public long currentGen(byte[] buf, int off, int len) {
+        Long g = generations.get(scratch.view(buf, off, len));
+        return g == null ? 0L : g;
+    }
+
+    /**
+     * A6-H1: miss-resolve store path. Inserts {@code (compositeKey, acc)} ONLY if the current
+     * generation matches {@code expectedGen} — i.e. no {@code invalidate} fired in between the
+     * resolve lambda's GET issue and its callback. Returns {@code true} if the put took effect,
+     * {@code false} if it was skipped due to a generation mismatch (the lambda must drop the
+     * value).
+     *
+     * <p>This is the race-safe counterpart of {@link #put(byte[], Object)}: callers on the
+     * miss-resolve path MUST go through this method rather than the unconditional {@code put}
+     * to be A6-H1 correct.
+     */
+    public boolean putIfGen(byte[] compositeKey, ACC acc, long expectedGen) {
+        long current = currentGen(compositeKey);
+        if (current != expectedGen) {
+            return false;
+        }
+        entries.put(new BytesKey(compositeKey), new Entry<>(acc, true));
+        // Lazy GC: if a generation slot existed but matched (i.e. the key was invalidated and
+        // then re-resolved at the same gen — only possible at gen=0), drop the entry so the
+        // map doesn't grow unboundedly across stable steady-state. We only prune when the
+        // generation is at the "no invalidation" baseline; non-zero gens stay to preserve the
+        // race-detection signal for any other in-flight resolves on the same key.
+        if (expectedGen == 0L) {
+            generations.remove(new BytesKey(compositeKey));
+        }
+        return true;
+    }
+
+    /**
      * Flushes all dirty entries via the flush callback. Called on checkpoint barrier (§3 Trace E).
      * Marks entries clean after flushing.
      */
@@ -282,6 +347,14 @@ public final class ReducingAggregatingCache<IN, ACC> {
 
     /** Zero-alloc slice-view variant of {@link #invalidate(byte[])}. */
     public boolean invalidate(byte[] buf, int off, int len) {
+        // A6-H1: bump the generation BEFORE removing the entry so that any concurrently
+        // in-flight miss-resolve lambda (which captured its generation BEFORE issuing the GET)
+        // observes the bump on its subsequent putIfGen check and refuses to write the stale
+        // accumulator back. The generation snapshot is keyed by an owned BytesKey copy so it
+        // survives the entry's removal — the resolve lambda may run after the entries map has
+        // been wiped of this slot.
+        BytesKey owned = scratch.view(buf, off, len).snapshot();
+        generations.merge(owned, 1L, Long::sum);
         return entries.remove(scratch.view(buf, off, len)) != null;
     }
 

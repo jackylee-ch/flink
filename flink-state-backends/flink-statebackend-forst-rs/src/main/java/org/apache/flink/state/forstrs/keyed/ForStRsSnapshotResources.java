@@ -53,17 +53,56 @@ public final class ForStRsSnapshotResources implements SnapshotResources {
     private final long checkpointId;
     private final long baseCheckpointId;
 
+    /**
+     * E6-H3: serializer-registry blob captured on the mailbox thread during {@code
+     * syncPrepareResources}. The async-snapshot worker reads it back via {@link
+     * #getRegistryBlob()} without ever touching the live {@link
+     * org.apache.flink.state.forstrs.state.StateSerializerRegistry#metadataBuffer()}
+     * {@code LinkedHashMap} — which is non-thread-safe and otherwise mutated concurrently
+     * by the mailbox thread (via {@code verifyOrRegister → register → live.put(...)}).
+     *
+     * <p>Holding the bytes (rather than an immutable copy of the map) keeps the async worker
+     * decoupled from the registry's internal types; the byte[] is the same format that the
+     * legacy {@code provider.currentBlob()} returned.
+     */
+    private final byte[] registryBlob;
+
     public ForStRsSnapshotResources(
             ForStRsLinker linker,
             FrsDb db,
             FrsSnapshot snapshot,
             long checkpointId,
             long baseCheckpointId) {
+        this(linker, db, snapshot, checkpointId, baseCheckpointId, null);
+    }
+
+    /**
+     * E6-H3: full constructor that accepts the registry blob bytes captured on the mailbox
+     * thread. May be {@code null} when no {@code RegistryBlobProvider} is wired (test-only
+     * construction) — the async phase then skips emitting the private-state entry.
+     */
+    public ForStRsSnapshotResources(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsSnapshot snapshot,
+            long checkpointId,
+            long baseCheckpointId,
+            byte[] registryBlob) {
         this.linker = linker;
         this.db = db;
         this.snapshot = snapshot;
         this.checkpointId = checkpointId;
         this.baseCheckpointId = baseCheckpointId;
+        this.registryBlob = registryBlob;
+    }
+
+    /**
+     * E6-H3: returns the serializer-registry blob captured on the mailbox thread during the
+     * sync phase, or {@code null} when no provider was wired. The async phase uses this in
+     * place of the racy {@code provider.currentBlob()} call.
+     */
+    public byte[] getRegistryBlob() {
+        return registryBlob;
     }
 
     public FrsSnapshot getSnapshot() {

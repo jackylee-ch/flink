@@ -114,6 +114,17 @@ public final class MapStateCache<V> implements AutoCloseable {
     private final MemorySegment hashIndex; // 2 × capacity × (int hash, int row)
     private final MemorySegment accessTime; // capacity × long8
     private final Object[] values; // capacity Object refs (on-heap; user values can be anything)
+    /**
+     * B6-H6: reverse map row → hash-slot. Lifecycle and capacity mirror {@link #keyOffsets} /
+     * {@link #keyLengths} (allocated on the same {@link #arena}, sized to {@link #capacity}
+     * entries × 4 bytes). Lets {@link #removeFromHashIndex} and {@link #relabelHashIndex} drop
+     * from O(hashSlots) linear scans to O(1) pointer reads.
+     *
+     * <p>Slot id is the integer index into the {@code (hash:int, row:int)} pair table — i.e. the
+     * same {@code i} that the open-addressed probe loop in {@link #insertHashIndex} settled on.
+     * {@code -1} means "no slot" (row is being initialized or has just been evicted).
+     */
+    private final MemorySegment rowToSlot; // capacity × int4
 
     private long keyDataCapacity;
     private long keyDataUsed;
@@ -152,6 +163,15 @@ public final class MapStateCache<V> implements AutoCloseable {
         this.hashIndex = arena.allocate((long) hashSlots * 2 * Integer.BYTES);
         this.accessTime = arena.allocate((long) cap * Long.BYTES);
         this.values = new Object[cap];
+        // B6-H6: reverse map row → slot. Initialized to -1 ("no slot"); written by
+        // insertHashIndex on each successful insert and read by removeFromHashIndex /
+        // relabelHashIndex for O(1) eviction. The -1 init guarantees that a
+        // removeFromHashIndex on a never-inserted row reads the defensive `slot < 0` branch
+        // rather than mis-tombstoning slot 0.
+        this.rowToSlot = arena.allocate((long) cap * Integer.BYTES);
+        for (int i = 0; i < cap; i++) {
+            rowToSlot.set(ValueLayout.JAVA_INT, (long) i * Integer.BYTES, -1);
+        }
         // initialize hash-index rows to EMPTY_SLOT.
         for (int i = 0; i < hashSlots; i++) {
             hashIndex.set(
@@ -226,6 +246,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * invalidation would require a scan).
      */
     public void clear() {
+        int prevSize = size;
         size = 0;
         keyDataUsed = 0;
         clock = 0;
@@ -239,6 +260,12 @@ public final class MapStateCache<V> implements AutoCloseable {
                     ValueLayout.JAVA_INT,
                     (long) i * 2 * Integer.BYTES + Integer.BYTES,
                     EMPTY_SLOT);
+        }
+        // B6-H6: reset only the live prefix of rowToSlot — same bookkeeping cost as the
+        // explicit-null on values[] below. Stale entries past `prevSize` were already -1 from
+        // construction or from prior eviction.
+        for (int i = 0; i < prevSize; i++) {
+            rowToSlot.set(ValueLayout.JAVA_INT, (long) i * Integer.BYTES, -1);
         }
         // Null out values up to the previous size to release Java refs for GC.
         // Captured implicitly by overwriting on next insert — but explicit-null here on clear()
@@ -365,6 +392,8 @@ public final class MapStateCache<V> implements AutoCloseable {
                         ValueLayout.JAVA_INT,
                         (long) slot * 2 * Integer.BYTES + Integer.BYTES,
                         row);
+                // B6-H6: remember which slot this row landed in so eviction is O(1).
+                rowToSlot.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, slot);
                 return;
             }
         }
@@ -429,36 +458,34 @@ public final class MapStateCache<V> implements AutoCloseable {
     }
 
     private void removeFromHashIndex(int row) {
-        // O(hashSlots) linear scan since we don't store row->slot reverse mapping.
-        for (int i = 0; i < hashSlots; i++) {
-            int r =
-                    hashIndex.get(
-                            ValueLayout.JAVA_INT,
-                            (long) i * 2 * Integer.BYTES + Integer.BYTES);
-            if (r == row) {
-                hashIndex.set(
-                        ValueLayout.JAVA_INT,
-                        (long) i * 2 * Integer.BYTES + Integer.BYTES,
-                        TOMBSTONE_SLOT);
-                return;
-            }
+        // B6-H6: O(1) — direct lookup via the reverse map. The previous implementation scanned
+        // all `hashSlots` (= 2 × capacity) entries linearly, which dominated insert cost once
+        // the working set exceeded `maxEntries` and clock-sweep evictions fired on every put.
+        int slot = rowToSlot.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+        if (slot < 0) {
+            // Defensive: row had no recorded slot. Should not occur in steady state because every
+            // live row was inserted via insertHashIndex which writes rowToSlot.
+            return;
         }
+        hashIndex.set(
+                ValueLayout.JAVA_INT,
+                (long) slot * 2 * Integer.BYTES + Integer.BYTES,
+                TOMBSTONE_SLOT);
+        rowToSlot.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, -1);
     }
 
     private void relabelHashIndex(int fromRow, int toRow) {
-        for (int i = 0; i < hashSlots; i++) {
-            int r =
-                    hashIndex.get(
-                            ValueLayout.JAVA_INT,
-                            (long) i * 2 * Integer.BYTES + Integer.BYTES);
-            if (r == fromRow) {
-                hashIndex.set(
-                        ValueLayout.JAVA_INT,
-                        (long) i * 2 * Integer.BYTES + Integer.BYTES,
-                        toRow);
-                return;
-            }
+        // B6-H6: O(1) — single pointer update on both the hashIndex row slot and the reverse map.
+        int slot = rowToSlot.get(ValueLayout.JAVA_INT, (long) fromRow * Integer.BYTES);
+        if (slot < 0) {
+            return;
         }
+        hashIndex.set(
+                ValueLayout.JAVA_INT,
+                (long) slot * 2 * Integer.BYTES + Integer.BYTES,
+                toRow);
+        rowToSlot.set(ValueLayout.JAVA_INT, (long) toRow * Integer.BYTES, slot);
+        rowToSlot.set(ValueLayout.JAVA_INT, (long) fromRow * Integer.BYTES, -1);
     }
 
     private void appendKey(int row, byte[] key) {
@@ -487,14 +514,16 @@ public final class MapStateCache<V> implements AutoCloseable {
         if (len != key.length) {
             return false;
         }
-        // Direct per-byte compare. MemorySegment.mismatch with a heap byte[] would require a
-        // wrapper segment, which itself allocates — defeating the zero-alloc contract.
-        for (int i = 0; i < len; i++) {
-            if (keyData.get(ValueLayout.JAVA_BYTE, kStart + i) != key[i]) {
-                return false;
-            }
+        if (len == 0) {
+            return true;
         }
-        return true;
+        // B6-H7: JIT-intrinsified vectorized compare. Replaces the ~56 single-byte off-heap loads
+        // the previous loop performed on Q12's 56-byte composite key. The MemorySegment.ofArray
+        // wrapper is escape-eliminated by C2 (the segment never escapes this frame), and
+        // MemorySegment.mismatch unrolls to a SIMD-friendly long-stride compare on HotSpot 21+.
+        MemorySegment queryHeapSeg = MemorySegment.ofArray(key);
+        return MemorySegment.mismatch(keyData, kStart, (long) kStart + len, queryHeapSeg, 0L, len)
+                == -1L;
     }
 
     /** Hashes a heap byte[] using the same recurrence as ArrowBinaryBuffer (compat). */
@@ -550,6 +579,7 @@ public final class MapStateCache<V> implements AutoCloseable {
             o++;
         }
         // Reset structures.
+        int prevSize = size;
         size = 0;
         keyDataUsed = 0;
         for (int i = 0; i < hashSlots; i++) {
@@ -557,6 +587,11 @@ public final class MapStateCache<V> implements AutoCloseable {
                     ValueLayout.JAVA_INT,
                     (long) i * 2 * Integer.BYTES + Integer.BYTES,
                     EMPTY_SLOT);
+        }
+        // B6-H6: also reset the row → slot reverse map for live rows so the re-insert loop
+        // below writes fresh slot ids via insertHashIndex.
+        for (int i = 0; i < prevSize; i++) {
+            rowToSlot.set(ValueLayout.JAVA_INT, (long) i * Integer.BYTES, -1);
         }
         java.util.Arrays.fill(values, null);
         // Re-insert survivors preserving access-time stamps and tombstones.

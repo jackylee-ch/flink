@@ -576,18 +576,32 @@ public class ForStRsRestoreOperation {
                         re);
             }
 
-            // E5-HIGH-2: rescaling path does not yet propagate per-source serializer metadata.
-            // A future PR can union the registry blobs across all source handles (de-duped by
-            // state name — well-formed job graphs always carry identical serializer snapshots for
-            // the same state name across subtasks). For now, fall back to an empty map; the
-            // backend treats this as "no schema seed", matching pre-E5 behavior on the rescaling
-            // path only.
+            // E6-HIGH-4(b): union-merge the per-source serializer metadata so the target backend's
+            // {@link StateSerializerRegistry} sees the schema snapshot for every state present in
+            // any source, regardless of which subtask uploaded it. De-duped by state name —
+            // well-formed job graphs always carry identical serializer snapshots for the same
+            // state name across subtasks, so last-writer-wins on collisions is benign (and
+            // matches Flink's own contract that schema for a given state name is uniform across
+            // the keyed-stream operator instance). Pre-E5 source handles contribute empty maps
+            // and are absorbed without changing the result.
+            //
+            // The iteration order is the {@code sources} order (which mirrors the input handles'
+            // order), so the resolved metadata for a given state name is deterministic: the
+            // first source listed wins until a later source with the same name overwrites — i.e.
+            // last-writer-wins. Insertion-ordered {@link LinkedHashMap} keeps the union
+            // deterministic for review and tests.
+            Map<String, StateSerializerMetadata> unionedMetadata = new LinkedHashMap<>();
+            for (OpenSourceDb src : sources) {
+                if (src.serializerMetadata != null && !src.serializerMetadata.isEmpty()) {
+                    unionedMetadata.putAll(src.serializerMetadata);
+                }
+            }
             return new RestoreResult(
                     targetDb,
                     targetCf,
                     mergedCfMap,
                     maxRestoredCkpt,
-                    Collections.emptyMap());
+                    unionedMetadata.isEmpty() ? Collections.emptyMap() : unionedMetadata);
         } finally {
             // Always close the source DBs/CFs, success or failure.
             for (OpenSourceDb src : sources) {
@@ -604,7 +618,13 @@ public class ForStRsRestoreOperation {
                         linker, arena, subDir, handle.getKeyGroupRange(), /* registry= */ null);
         singleOp.ensureTargetDirEmpty();
         RestoreResult r = singleOp.restoreNoRescaling(handle);
-        return new OpenSourceDb(r.getDb(), r.getDefaultCf(), handle.getKeyGroupRange());
+        // E6-HIGH-4(b): forward the per-source serializer metadata so the rescaling caller can
+        // union-merge across all sources before seeding the backend's registry.
+        return new OpenSourceDb(
+                r.getDb(),
+                r.getDefaultCf(),
+                handle.getKeyGroupRange(),
+                r.getRestoredSerializerMetadata());
     }
 
     private static OpenSourceDb findSourceFor(int kg, List<OpenSourceDb> sources) {
@@ -961,11 +981,23 @@ public class ForStRsRestoreOperation {
         final FrsDb db;
         final FrsCfHandle cf;
         final KeyGroupRange range;
+        // E6-HIGH-4(b): per-source serializer metadata extracted from the source handle's
+        // private-state registry blob. Used by {@link #restoreWithRescaling} to union-merge
+        // metadata across all source handles so the target backend's {@link
+        // StateSerializerRegistry} sees the same {@code restoredMetadata} regardless of how many
+        // sources contributed key groups. Empty map for pre-E5 source handles that did not carry
+        // the registry blob.
+        final Map<String, StateSerializerMetadata> serializerMetadata;
 
-        OpenSourceDb(FrsDb db, FrsCfHandle cf, KeyGroupRange range) {
+        OpenSourceDb(
+                FrsDb db,
+                FrsCfHandle cf,
+                KeyGroupRange range,
+                Map<String, StateSerializerMetadata> serializerMetadata) {
             this.db = db;
             this.cf = cf;
             this.range = range;
+            this.serializerMetadata = serializerMetadata;
         }
 
         @Override

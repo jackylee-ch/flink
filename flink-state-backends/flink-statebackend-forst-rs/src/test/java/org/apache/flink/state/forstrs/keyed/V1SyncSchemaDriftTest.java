@@ -1,0 +1,304 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.flink.state.forstrs.keyed;
+
+import org.apache.flink.api.common.ExecutionConfig;
+import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.common.typeutils.base.LongSerializer;
+import org.apache.flink.api.common.typeutils.base.StringSerializer;
+import org.apache.flink.core.execution.SavepointFormatType;
+import org.apache.flink.core.fs.CloseableRegistry;
+import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.CheckpointType;
+import org.apache.flink.runtime.checkpoint.SavepointType;
+import org.apache.flink.runtime.state.CheckpointStorageLocationReference;
+import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyedStateHandle;
+import org.apache.flink.runtime.state.SnapshotResult;
+import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory;
+import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
+import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
+import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
+import org.apache.flink.state.forstrs.state.StateSerializerMetadata;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
+
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+import java.lang.foreign.Arena;
+import java.nio.file.Path;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.UUID;
+import java.util.concurrent.RunnableFuture;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+/**
+ * E6-HIGH-1 / E6-HIGH-2 / E6-HIGH-4 acceptance tests for the V1-sync {@code
+ * ForStRsAbstractKeyedStateBackend} snapshot + restore path.
+ *
+ * <p>Covers:
+ *
+ * <ul>
+ *   <li>E6-HIGH-1: CANONICAL savepoints are rejected at the V1-sync {@code snapshot()} entry point
+ *       (not only on the async path).
+ *   <li>E6-HIGH-2: closed cancel-stream-registry no longer relies on a substring match of the
+ *       exception message — the structural {@code isClosed()} precondition is used instead.
+ *   <li>E6-HIGH-4(a): the V1-sync snapshot strategy now has a registry-blob provider wired, so the
+ *       emitted private state contains {@code _serializer_metadata.bin}.
+ *   <li>E6-HIGH-4(b): {@link ForStRsAbstractKeyedStateBackend#seedRestoredSerializerMetadata}
+ *       correctly forwards a restored (union-merged across sources) metadata map into the backend
+ *       registry so subsequent {@code createOrUpdateInternalState} calls run through {@code
+ *       verifyOrRegister}.
+ * </ul>
+ */
+class V1SyncSchemaDriftTest {
+
+    /** Open a V1-sync backend pair (L5 delegate + Abstract wrapper) against a fresh local DB. */
+    private static V1Pair openV1Pair(Path dbDir) throws Exception {
+        Arena arena = Arena.ofShared();
+        ForStRsLinker linker = new ForStRsLinker(arena);
+        java.nio.file.Files.createDirectories(dbDir);
+        FrsDb db = linker.dbOpen(arena, dbDir.toString());
+        FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+        KeyGroupRange kgr = new KeyGroupRange(0, 0);
+        ForStRsKeyedStateBackend<Integer> delegate =
+                new ForStRsKeyedStateBackend<>(
+                        arena,
+                        linker,
+                        db,
+                        cf,
+                        IntSerializer.INSTANCE,
+                        /* ownsResources= */ true,
+                        kgr,
+                        /* numberOfKeyGroups= */ 1);
+        CloseableRegistry cancelStreamRegistry = new CloseableRegistry();
+        ForStRsAbstractKeyedStateBackend<Integer> backend =
+                new ForStRsAbstractKeyedStateBackend<>(
+                        IntSerializer.INSTANCE,
+                        Thread.currentThread().getContextClassLoader(),
+                        new ExecutionConfig(),
+                        cancelStreamRegistry,
+                        delegate,
+                        kgr,
+                        /* numberOfKeyGroups= */ 1);
+        ForStRsSstRegistry sstReg = new ForStRsSstRegistry();
+        ForStRsSnapshotStrategy strategy =
+                new ForStRsSnapshotStrategy(
+                        linker,
+                        db,
+                        UUID.randomUUID(),
+                        kgr,
+                        sstReg,
+                        new ForStRsSstUploader(),
+                        arena,
+                        Map.of("default", 0L));
+        backend.setSnapshotStrategy(strategy, sstReg);
+        return new V1Pair(backend, linker, db, cf, arena, cancelStreamRegistry);
+    }
+
+    private record V1Pair(
+            ForStRsAbstractKeyedStateBackend<Integer> backend,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            Arena arena,
+            CloseableRegistry cancelStreamRegistry) {}
+
+    /**
+     * E6-HIGH-1: CANONICAL savepoint requests at the V1-sync entry point fail fast with
+     * UnsupportedOperationException. Pre-fix the gate only existed on the async path.
+     */
+    @Test
+    void canonicalSavepointRejectedAtV1SyncEntryPoint(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            // Seed at least one entry so the snapshot has something to flush.
+            pair.linker.put(pair.db, pair.cf, new byte[] {1, 2}, new byte[] {3, 4});
+
+            MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+            SavepointType canonical = SavepointType.savepoint(SavepointFormatType.CANONICAL);
+            CheckpointOptions opts =
+                    CheckpointOptions.alignedNoTimeout(
+                            canonical, CheckpointStorageLocationReference.getDefault());
+
+            UnsupportedOperationException uoe =
+                    assertThrows(
+                            UnsupportedOperationException.class,
+                            () -> pair.backend.snapshot(11L, 0L, factory, opts),
+                            "E6-HIGH-1: V1-sync snapshot() must reject CANONICAL savepoints");
+            assertTrue(
+                    uoe.getMessage().contains("Canonical savepoint format"),
+                    "exception message names the unsupported format: " + uoe.getMessage());
+            assertTrue(
+                    uoe.getMessage().contains("NATIVE"),
+                    "exception message suggests the NATIVE alternative: " + uoe.getMessage());
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
+     * E6-HIGH-2: a closed cancelStreamRegistry causes the V1-sync snapshot path to fall back to a
+     * pre-completed empty future without depending on the IOException message substring.
+     */
+    @Test
+    void closedCancelStreamRegistryYieldsEmptyResultStructurally(@TempDir Path tmp)
+            throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            // Close the registry BEFORE snapshot — mimics a prior checkpoint's abort sequence.
+            pair.cancelStreamRegistry.close();
+            assertTrue(pair.cancelStreamRegistry.isClosed());
+
+            MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+            CheckpointOptions opts =
+                    CheckpointOptions.alignedNoTimeout(
+                            CheckpointType.CHECKPOINT,
+                            CheckpointStorageLocationReference.getDefault());
+
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                    pair.backend.snapshot(7L, 0L, factory, opts);
+            assertTrue(
+                    fut.isDone(),
+                    "E6-HIGH-2: closed cancel registry → DoneFuture is pre-completed");
+            SnapshotResult<KeyedStateHandle> res = fut.get();
+            assertNotNull(res, "result non-null");
+            // SnapshotResult.empty() — JM handle should be null.
+            assertEquals(
+                    null,
+                    res.getJobManagerOwnedSnapshot(),
+                    "E6-HIGH-2: SnapshotResult.empty() carries no JM handle");
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
+     * E6-HIGH-4(a): the V1-sync snapshot strategy now has a registry-blob provider wired (via
+     * {@code setSnapshotStrategy}). Without this fix the privateState entries would never include
+     * the registry blob even when the backend had registered states.
+     */
+    @Test
+    void v1SyncSnapshotEmitsRegistryBlobWhenStatesRegistered(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            // Register two states directly on the backend registry (simulates user state creation
+            // running through createOrUpdateInternalState).
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            reg.register("counter", /* VALUE */ 0, LongSerializer.INSTANCE);
+            reg.register("name", /* VALUE */ 0, StringSerializer.INSTANCE);
+            assertEquals(
+                    2,
+                    reg.metadataBuffer().size(),
+                    "registry holds both registrations before snapshot");
+
+            // Seed some engine bytes so the snapshot has files to upload.
+            for (int i = 0; i < 16; i++) {
+                pair.linker.put(
+                        pair.db, pair.cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+            }
+
+            MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+            CheckpointOptions opts =
+                    CheckpointOptions.alignedNoTimeout(
+                            CheckpointType.CHECKPOINT,
+                            CheckpointStorageLocationReference.getDefault());
+
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                    pair.backend.snapshot(21L, 0L, factory, opts);
+            if (!fut.isDone()) {
+                fut.run();
+            }
+            SnapshotResult<KeyedStateHandle> result = fut.get();
+            ForStRsIncrementalKeyedStateHandle handle =
+                    (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+            assertNotNull(handle, "V1-sync snapshot produced an incremental handle");
+
+            // The registry blob is present in privateState.
+            assertTrue(
+                    handle.getPrivateState().stream()
+                            .anyMatch(
+                                    hlp ->
+                                            ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH
+                                                    .equals(hlp.getLocalPath())),
+                    "E6-HIGH-4(a): V1-sync snapshot emits the registry blob as a private-state"
+                            + " entry");
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
+     * E6-HIGH-4(b): {@link ForStRsAbstractKeyedStateBackend#seedRestoredSerializerMetadata}
+     * (called by {@code ForStRsStateBackend.createKeyedStateBackend} after a restore op completes)
+     * pumps the union-merged map into the registry's restored side, activating it for the next
+     * {@code verifyOrRegister} call.
+     */
+    @Test
+    void seedRestoredSerializerMetadataActivatesRegistry(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            assertFalse(
+                    reg.activatedForRestore(),
+                    "fresh backend has no restore seed before seedRestoredSerializerMetadata"
+                            + " runs");
+
+            // Build a metadata map shaped like the union-merged output of restoreWithRescaling.
+            Map<String, StateSerializerMetadata> restored = new LinkedHashMap<>();
+            // Pre-existing source A contributes "counter" with LongSerializer's snapshot.
+            StateSerializerRegistry seedingA = new StateSerializerRegistry();
+            seedingA.register("counter", /* VALUE */ 0, LongSerializer.INSTANCE);
+            restored.put("counter", seedingA.get("counter"));
+            // Pre-existing source B contributes "name" with StringSerializer's snapshot.
+            StateSerializerRegistry seedingB = new StateSerializerRegistry();
+            seedingB.register("name", /* VALUE */ 0, StringSerializer.INSTANCE);
+            restored.put("name", seedingB.get("name"));
+
+            pair.backend.seedRestoredSerializerMetadata(restored);
+
+            assertTrue(
+                    reg.activatedForRestore(),
+                    "E6-HIGH-4(b): seedRestoredSerializerMetadata flips activatedForRestore so"
+                            + " the verifyOrRegister branch runs against the restored snapshot");
+
+            // verifyOrRegister against the SAME serializer used by the source promotes the entry
+            // to live and returns the supplied serializer (COMPATIBLE_AS_IS).
+            assertNotNull(
+                    reg.verifyOrRegister("counter", /* VALUE */ 0, LongSerializer.INSTANCE),
+                    "verifyOrRegister succeeds for restored 'counter'");
+            assertNotNull(
+                    reg.verifyOrRegister("name", /* VALUE */ 0, StringSerializer.INSTANCE),
+                    "verifyOrRegister succeeds for restored 'name'");
+
+            // Passing null is treated as empty (no-op pre-E5 snapshot path).
+            pair.backend.seedRestoredSerializerMetadata(null);
+        } finally {
+            pair.backend.close();
+        }
+    }
+}

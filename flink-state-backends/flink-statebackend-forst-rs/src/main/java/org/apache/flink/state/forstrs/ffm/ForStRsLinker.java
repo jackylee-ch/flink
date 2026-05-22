@@ -755,14 +755,17 @@ public final class ForStRsLinker {
         //     *const i32 key_offsets, *const u8 key_data,
         //     *const i32 val_offsets, *const u8 val_data,
         //     usize count);
-        // PR-B2 (D-R3-1): critical mode — frs_vectorized_batch_put assembles a
-        // WriteBatch and commits it synchronously (engine memtable write; no
-        // network, no thread-park). MAX_BATCH_COUNT bounds the loop, so the
-        // safepoint-blocked window stays short. Eliminates the per-flush
-        // Arena.allocate + MemorySegment.copy pair on the batched put path —
-        // the same lift that point-op critical mode delivered.
+        // D6-H2: REMOVED critical mode (was PR-B2 / D-R3-1). The batched put can stall
+        // for tens-of-ms to multi-second on WAL fsync, memtable-full waits, or
+        // rate-limited flushes inside the engine's commit path. Holding critical mode
+        // across that pins the JVM safepoint — sibling tasks stall and GC starves.
+        // The MemorySegment args are already implicitly pinned for the duration of the
+        // FFI call when they come from a confined or shared arena (which is the only
+        // way VectorizedExecutor allocates them); critical mode bought us heap-byte[]
+        // acceptance which the batched path never needed (keys/vals are always native
+        // segments from ColumnarBatchBuffer).
         this.frsVectorizedBatchPut =
-                bindCritical(
+                bind(
                         "frs_vectorized_batch_put",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -778,10 +781,12 @@ public final class ForStRsLinker {
         //   int frs_vectorized_batch_delete(
         //     FrsDb, FrsCfHandle,
         //     *const i32 key_offsets, *const u8 key_data, usize count);
-        // PR-B2 (D-R3-1): critical mode — same rationale as the batch_put binding
-        // above. Synchronous WriteBatch commit; bounded by MAX_BATCH_COUNT.
+        // D6-H2: REMOVED critical mode — same rationale as the batch_put binding above.
+        // Synchronous WriteBatch commit, but the commit itself can block on WAL fsync /
+        // memtable-full / rate-limited flush. Critical mode is reserved for truly
+        // bounded ops (single-key get/put/delete/lookup_kv/get_at).
         this.frsVectorizedBatchDelete =
-                bindCritical(
+                bind(
                         "frs_vectorized_batch_delete",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,

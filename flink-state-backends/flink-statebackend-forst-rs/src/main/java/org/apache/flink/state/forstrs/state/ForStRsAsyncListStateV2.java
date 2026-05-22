@@ -170,6 +170,11 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         if (buffer != null && !buffer.isEmpty() && linker != null && db != null && cf != null) {
             buffer.flushTo(linker, db, cf);
         }
+        // B6-H3: clear the dirty bit so the classifier's end-of-batch walk does not re-drain an
+        // already-snapshot-drained buffer. Idempotent: a stale "dirty" without buffered rows
+        // would still be a no-op via the inner isEmpty() check, but clearing it here keeps the
+        // bit's semantics consistent across all drain paths.
+        amDirty = false;
     }
 
     /**
@@ -256,11 +261,36 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         return buffer != null && buffer.shouldAutoFlush();
     }
 
+    /**
+     * B6-H3 (Round 6): cheap dirty bit. The classifier's per-batch off-heap dispatch flips this
+     * to {@code true} after every successful {@link #recordAppendMergeOffHeap} that wrote into
+     * the per-state {@link ListStateArrowBuffer}, and {@link
+     * org.apache.flink.state.forstrs.VectorizedClassifier#flushOffHeapListBuffersIfDirty} reads
+     * it once per state at end-of-batch to skip the {@code IdentityHashMap<...,Boolean>} +
+     * {@code Boolean.TRUE} boxing the old dedup pass paid for. Cleared inside
+     * {@link #flushIfDirty} after the buffer drain so the next batch starts clean.
+     */
+    private boolean amDirty;
+
+    /** B6-H3: classifier-only accessor used to skip duplicate flush walks. */
+    public boolean isAmDirty() {
+        return amDirty;
+    }
+
+    /** B6-H3: marks the per-state buffer as dirty after a successful off-heap append. */
+    public void markAmDirty() {
+        this.amDirty = true;
+    }
+
     /** Drains the buffer if non-empty and the engine handles are configured. */
     public void flushIfDirty() {
         if (buffer != null && !buffer.isEmpty() && linker != null && db != null && cf != null) {
             buffer.flushTo(linker, db, cf);
         }
+        // B6-H3: clear the bit even when buffer was empty / handles unset — keeps the classifier's
+        // dedup walk idempotent on the failure path and prevents stale "dirty" carrying into the
+        // next batch when the buffer was drained via a different code path (pre-snapshot, onClear).
+        amDirty = false;
     }
 
     // ---------------------------------------------------------------

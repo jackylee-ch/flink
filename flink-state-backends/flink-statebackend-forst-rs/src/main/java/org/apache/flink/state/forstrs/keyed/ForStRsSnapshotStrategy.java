@@ -190,7 +190,22 @@ public class ForStRsSnapshotStrategy
         // at the captured seq — concurrent writes do not affect correctness.
         long baseCheckpointId = lastCompletedCheckpointId.get();
 
-        return new ForStRsSnapshotResources(linker, db, snapshot, checkpointId, baseCheckpointId);
+        // E6-H3: capture the serializer-registry blob on the mailbox thread (the sync phase
+        // runs in-mailbox-turn during checkpoint barrier alignment). The async-snapshot
+        // worker would otherwise call {@code provider.currentBlob()} on the worker thread —
+        // which iterates the live {@link
+        // org.apache.flink.state.forstrs.state.StateSerializerRegistry} LinkedHashMap,
+        // racing with concurrent {@code register()} writes also on the mailbox thread (via
+        // {@code verifyOrRegister}). Pulling the bytes here, while the mailbox holds the
+        // turn, makes the snapshot immutable / thread-safe by the time the worker reads it.
+        byte[] capturedRegistryBlob = null;
+        RegistryBlobProvider provider = registryBlobProvider;
+        if (provider != null) {
+            capturedRegistryBlob = provider.currentBlob();
+        }
+
+        return new ForStRsSnapshotResources(
+                linker, db, snapshot, checkpointId, baseCheckpointId, capturedRegistryBlob);
     }
 
     @Override
@@ -316,19 +331,23 @@ public class ForStRsSnapshotStrategy
         // The blob is a small in-memory byte[] produced by {@link StateSerializerRegistry#serialize}.
         // We write it directly into a fresh {@link CheckpointStateOutputStream} (EXCLUSIVE scope —
         // schema registry is checkpoint-local, never shared) and bundle the resulting
-        // StreamStateHandle into privateState under the well-known local path. If no provider is
-        // wired (test-only construction) or the registry is empty the entry is skipped — older
-        // checkpoints that don't carry the blob remain readable by the restore-side guard, which
-        // treats absence as "no metadata seeded" (matches pre-fix behavior).
+        // StreamStateHandle into privateState under the well-known local path.
+        //
+        // E6-H3: the blob bytes were captured on the mailbox thread during
+        // {@link #syncPrepareResources}, NOT read here. Calling
+        // {@code provider.currentBlob()} on this async-worker thread races with concurrent
+        // {@code register()} writes against the live LinkedHashMap (CME / torn read →
+        // corrupt registry blob). {@link ForStRsSnapshotResources#getRegistryBlob()} returns
+        // the immutable snapshot taken sync-phase. If no provider was wired (test-only
+        // construction) or the registry was empty the entry is skipped — older checkpoints
+        // that don't carry the blob remain readable by the restore-side guard, which treats
+        // absence as "no metadata seeded" (matches pre-fix behavior).
         List<HandleAndLocalPath> privateStateEntries = List.of();
-        RegistryBlobProvider provider = registryBlobProvider;
-        if (provider != null) {
-            byte[] registryBlob = provider.currentBlob();
-            if (registryBlob != null && registryBlob.length > 0) {
-                StreamStateHandle registryHandle = uploadRegistryBlob(registryBlob, streamFactory);
-                privateStateEntries =
-                        List.of(HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
-            }
+        byte[] registryBlob = resources.getRegistryBlob();
+        if (registryBlob != null && registryBlob.length > 0) {
+            StreamStateHandle registryHandle = uploadRegistryBlob(registryBlob, streamFactory);
+            privateStateEntries =
+                    List.of(HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
         }
 
         // ---- Build the keyed state handle. ----

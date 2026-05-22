@@ -132,4 +132,87 @@ class ForStRsSnapshotStrategyTest {
             }
         }
     }
+
+    /**
+     * E6-H3 regression: the serializer-registry blob must be captured on the mailbox thread
+     * during {@code syncPrepareResources}, not later by the async-snapshot worker. The fix
+     * pre-reads {@code RegistryBlobProvider#currentBlob()} during the sync phase and stashes
+     * the immutable bytes on {@link ForStRsSnapshotResources}; the async phase reads from
+     * there. This test verifies the blob is captured at sync time by exposing a provider that
+     * records its invocation thread + count and asserting it is called exactly once at sync
+     * time (not at async time).
+     */
+    @Test
+    void registryBlobCapturedOnMailboxThreadInSyncPhase(@TempDir Path tmp) throws Exception {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpen(arena, tmp.resolve("db").toString());
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                for (int i = 0; i < 4; i++) {
+                    linker.put(db, cf, ("k" + i).getBytes(), ("v" + i).getBytes());
+                }
+
+                ForStRsSstRegistry sstReg = new ForStRsSstRegistry();
+                ForStRsSstUploader uploader = new ForStRsSstUploader();
+                ForStRsSnapshotStrategy strategy =
+                        new ForStRsSnapshotStrategy(
+                                linker,
+                                db,
+                                UUID.randomUUID(),
+                                new KeyGroupRange(0, 0),
+                                sstReg,
+                                uploader,
+                                arena,
+                                Map.of("default", 0L));
+
+                java.util.concurrent.atomic.AtomicInteger callCount =
+                        new java.util.concurrent.atomic.AtomicInteger();
+                java.util.concurrent.atomic.AtomicReference<Thread> callerThread =
+                        new java.util.concurrent.atomic.AtomicReference<>();
+                final byte[] blobBytes = new byte[] {(byte) 0xFE, 0x42, 0x01};
+                strategy.setRegistryBlobProvider(
+                        () -> {
+                            callCount.incrementAndGet();
+                            callerThread.set(Thread.currentThread());
+                            return blobBytes;
+                        });
+
+                Thread mailbox = Thread.currentThread();
+                ForStRsSnapshotResources res = strategy.syncPrepareResources(7L);
+                assertEquals(
+                        1,
+                        callCount.get(),
+                        "provider must be called exactly once at sync time (mailbox thread)");
+                assertEquals(
+                        mailbox,
+                        callerThread.get(),
+                        "provider must be invoked on the mailbox thread, not the async worker");
+                assertNotNull(res.getRegistryBlob(), "sync phase must capture the blob");
+                assertEquals(blobBytes.length, res.getRegistryBlob().length);
+
+                // Run the async phase on a different thread to ensure provider is NOT
+                // re-invoked there (would re-introduce the race). The async phase reads the
+                // captured blob from res.getRegistryBlob() directly.
+                MemCheckpointStreamFactory factory =
+                        new MemCheckpointStreamFactory(64 * 1024 * 1024);
+                java.util.concurrent.Callable<SnapshotResult<?>> asyncTask =
+                        () -> strategy.asyncSnapshot(res, 7L, 0L, factory, null)
+                                .get(new CloseableRegistry());
+                java.util.concurrent.ExecutorService pool =
+                        java.util.concurrent.Executors.newSingleThreadExecutor();
+                try {
+                    SnapshotResult<?> sr = pool.submit(asyncTask).get();
+                    assertNotNull(sr);
+                } finally {
+                    pool.shutdownNow();
+                }
+
+                assertEquals(
+                        1,
+                        callCount.get(),
+                        "provider must NOT be invoked on the async worker (would race with"
+                                + " concurrent register() writes against the live LinkedHashMap)");
+            }
+        }
+    }
 }

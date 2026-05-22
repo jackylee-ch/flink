@@ -219,6 +219,10 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         // shared buffer will be overwritten by subsequent calls.
         final byte[] keySnapshot = new byte[keyLen];
         System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
+        // A6-H1: capture the per-key generation BEFORE the engine GET is issued. If onClear()
+        // fires during the GET round-trip, it will bump the generation; the putIfGen check
+        // below will then refuse the stale store, leaving the engine-side DELETE intact.
+        final long capturedGen = cache.currentGen(keySnapshot);
         return asyncGetInternal()
                 .thenApply(
                         oldValue -> {
@@ -227,7 +231,10 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
                                         oldValue == null
                                                 ? value
                                                 : reduceFunction.reduce(oldValue, value);
-                                cache.put(keySnapshot, newAcc);
+                                // A6-H1: gen-checked put. If a concurrent onClear bumped the
+                                // generation while the GET was in flight, this returns false and
+                                // we drop the stale newAcc — the engine-side DELETE wins.
+                                cache.putIfGen(keySnapshot, newAcc, capturedGen);
                                 return null;
                             } catch (Exception e) {
                                 throw new RuntimeException(

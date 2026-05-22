@@ -116,6 +116,18 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     private final List<ForStRsDBIterRequest<?, ?, ?, ?>> iterRequests = new ArrayList<>();
 
+    /**
+     * A6-H4: poison flag set by {@link #recordDelete} when the {@code onClear} hook throws
+     * (typically an FFI {@code linker.batchPut} failure from a per-state list-buffer drain).
+     * {@code VectorizedExecutor#executeBatchRequests} consults {@link #batchPoisonCause()}
+     * BEFORE dispatching each step and aborts with this throwable as the cause — preventing
+     * the partial batch from being silently discarded by the next {@link #reset()}.
+     *
+     * <p>Cleared in {@link #reset()} so a poisoned batch's torn-down state does not bleed into
+     * the next batch.
+     */
+    private volatile Throwable batchPoisonCause = null;
+
     public VectorizedClassifier(
             ColumnarBatchBuffer getKeys,
             ColumnarBatchBuffer putKeys,
@@ -185,6 +197,22 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         if (iterRangeBuffer != null) {
             iterRangeBuffer.reset();
         }
+        // A6-H4: clear the poison once the batch is fully torn down so the next batch
+        // starts in a clean state. Callers must read {@link #batchPoisonCause()} before
+        // calling reset() if they need the cause for diagnostics.
+        batchPoisonCause = null;
+    }
+
+    /**
+     * A6-H4: returns the throwable that poisoned this batch (or {@code null} if the batch is
+     * clean). Set when an {@code onClear} drain throws inside {@link #recordDelete}; cleared by
+     * {@link #reset()}. The {@link
+     * org.apache.flink.state.forstrs.VectorizedExecutor#executeBatchRequests} loop checks this
+     * before each dispatch step and aborts with this cause so the partially-built batch is not
+     * silently dropped.
+     */
+    public Throwable batchPoisonCause() {
+        return batchPoisonCause;
     }
 
     // -----------------------------------------------------------------
@@ -530,6 +558,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         putCount++;
     }
 
+    @SuppressWarnings({"unchecked", "rawtypes"})
     private <K, N, V> void recordDelete(
             ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
         // A5-H1 / A5-H2: fire the pre-DELETE hook BEFORE the DELETE row is enqueued. State
@@ -544,7 +573,45 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         // {@code onClear} at classifier time means the per-state {@code flushIfDirty()} runs
         // SYNCHRONOUSLY (in-mailbox-turn) before {@code executeDeletes} ever sees this row, so
         // pending APPEND_MERGE bytes hit the engine BEFORE the DELETE.
-        table.onClear(request);
+        //
+        // A6-H4: {@code onClear} on a list state triggers an FFI {@code linker.batchPut} via
+        // {@code ListStateArrowBuffer.flushTo}. If that FFI write throws, the partially-built
+        // batch must NOT be silently abandoned by the next {@code reset()} (which is what would
+        // happen if we let the exception escape with no rollback). We catch the throwable,
+        // (1) complete the current request's future exceptionally so its caller sees the
+        // failure, (2) mark the batch poisoned so {@code executeBatchRequests} aborts the
+        // remaining dispatch and propagates the error rather than silently dropping the
+        // in-progress rows, and (3) rethrow so the mailbox-thread caller sees the failure too.
+        try {
+            table.onClear(request);
+        } catch (Throwable t) {
+            // (1) Surface to the request's own future. Cleanup-safe: completeExceptionally is
+            // a no-op if the future was already completed by an earlier path.
+            try {
+                ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>)
+                                request.getFuture())
+                        .completeExceptionally(
+                                "ForSt-RS onClear flush failed: " + t.getClass().getSimpleName(),
+                                t);
+            } catch (Throwable ignore) {
+                // The request may not yet have a future (test path) — swallow so the poison
+                // path below still runs and the original cause is re-thrown.
+            }
+            // (2) Mark the batch poisoned. The executor's executeBatchRequests checks this
+            // before each dispatch step and aborts with the captured cause; reset() then clears
+            // the flag once the batch is fully torn down.
+            this.batchPoisonCause = t;
+            // (3) Re-throw so the mailbox-thread caller (AEC dispatch loop) sees the failure
+            // and bypasses any further offer() calls on this batch.
+            if (t instanceof RuntimeException) {
+                throw (RuntimeException) t;
+            }
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            throw new RuntimeException(
+                    "ForSt-RS onClear flush failed (checked exception wrapped)", t);
+        }
         ensureDeleteCapacity();
         table.serializeKeyInto(request, deleteKeys);
         deleteRequests[deleteCount] = request;
@@ -585,6 +652,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                     ensureOffHeapAppendMergeCapacity();
                     offHeapAppendMergeFutures[appendMergeCount] = fut;
                     offHeapAppendMergeStates[appendMergeCount] = list;
+                    // B6-H3: mark the per-state buffer as dirty so end-of-batch flush walk can
+                    // skip the IdentityHashMap + Boolean boxing dedup pass.
+                    list.markAmDirty();
                     appendMergeCount++;
                     return;
                 }
@@ -599,22 +669,25 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         }
         ensureAppendMergeBuffer();
         ensureAppendMergeCapacity();
-        byte[] keyBytes = table.serializeKey(request);
-        byte[] valBytes = table.serializeValue(request.getPayload());
-        if (valBytes == null) {
-            // Defensive: null payload should already have been routed to recordDelete by the
-            // offer() switch. Fall through to recordDelete here for safety.
+        // B6-H1: defensive payload-null check using getPayload() rather than allocating a
+        // serialized byte[] up-front and inspecting it. serializeValueInto handles non-null
+        // payloads only; null payload routes to recordDelete (preserving previous behavior).
+        if (request.getPayload() == null) {
             recordDelete(table, request);
             return;
         }
-        java.lang.foreign.MemorySegment keySlice = java.lang.foreign.MemorySegment.ofArray(keyBytes);
-        java.lang.foreign.MemorySegment valSlice = java.lang.foreign.MemorySegment.ofArray(valBytes);
-        AppendMergeRequest amReq =
-                new AppendMergeRequest(
-                        table.getStateName(),
-                        keySlice,
-                        new java.lang.foreign.MemorySegment[] {valSlice});
-        appendMergeBuffer.append(amReq);
+        // B6-H1: flow the heap-path key + value bytes directly through the column buffers via
+        // serializeKeyInto / serializeValueInto. Eliminates per-row allocations:
+        //   - byte[] keyBytes (replaced by DataOutputSerializer.getSharedBuffer copy)
+        //   - byte[] valBytes (same)
+        //   - 2× MemorySegment.ofArray(...) wrappers
+        //   - new MemorySegment[]{valSlice} 1-element array
+        //   - new AppendMergeRequest(...) wrapper
+        // The single-operand contract matches dispatchAppendMergeBatch (Phase A.1) which expects
+        // exactly 1 pre-encoded operand per row.
+        table.serializeKeyInto(request, appendMergeBuffer.keyBuffer());
+        table.serializeValueInto(request, appendMergeBuffer.valueBuffer());
+        appendMergeBuffer.appendHeapRow(new java.util.concurrent.CompletableFuture<>());
         appendMergeRequests[appendMergeCount] = request;
         ensureOffHeapAppendMergeCapacity();
         // Mark slot as heap-path (null off-heap future + null off-heap state).
@@ -636,16 +709,17 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         if (offHeapAppendMergeStates == null) {
             return;
         }
-        // Walk the parallel array and flush each unique state instance's buffer once.
-        java.util.IdentityHashMap<
-                        org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2,
-                        Boolean>
-                seen = new java.util.IdentityHashMap<>();
+        // B6-H3: dedup via the `amDirty` bit on each ForStRsAsyncListStateV2 instead of the
+        // IdentityHashMap + Boolean.TRUE boxing the old pass allocated per batch. Walk the same
+        // parallel array, but only call flushIfDirty when the bit is still set — flushIfDirty
+        // clears it inside the same call so subsequent rows that reference the same state become
+        // no-ops. Net effect: 0 allocation per batch on the dispatch boundary; same engine-side
+        // semantics (each unique buffer drained exactly once).
         for (int i = 0; i < appendMergeCount; i++) {
             org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
                     offHeapAppendMergeStates[i];
-            if (s != null && seen.put(s, Boolean.TRUE) == null) {
-                s.flushIfDirty();
+            if (s != null && s.isAmDirty()) {
+                s.flushIfDirty(); // clears amDirty
             }
         }
     }

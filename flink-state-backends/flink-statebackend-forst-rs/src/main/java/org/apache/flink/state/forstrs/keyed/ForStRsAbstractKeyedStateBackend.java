@@ -63,13 +63,17 @@ import org.apache.flink.state.forstrs.async.ForStRsAsyncReducingState;
 import org.apache.flink.state.forstrs.async.ForStRsAsyncValueState;
 import org.apache.flink.state.forstrs.async.PerKeyFuturesChain;
 import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.state.StateSerializerMetadata;
+import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RunnableFuture;
@@ -137,6 +141,22 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * once snapshot wiring is connected.
      */
     private ForStRsSstRegistry sstRegistry;
+
+    /**
+     * E6-HIGH-4(a) (= A6-HIGH-2): per-backend {@link StateSerializerRegistry} tracking the user-
+     * facing {@link TypeSerializer} of every state created via {@link
+     * #createOrUpdateInternalState}. Mirrors the async-backend field of the same name. Wired into
+     * {@link ForStRsSnapshotStrategy#setRegistryBlobProvider} by {@link #setSnapshotStrategy} so
+     * every V1-sync incremental checkpoint emits a non-empty {@code _serializer_metadata.bin}
+     * private-state entry (pre-fix the V1-sync snapshot dropped the blob entirely and restore
+     * could not detect schema drift across checkpoint boundaries).
+     *
+     * <p>Restore-time seeding lands via {@link #seedRestoredSerializerMetadata}, called from
+     * {@link org.apache.flink.state.forstrs.ForStRsStateBackend#createKeyedStateBackend} once the
+     * restore op has parsed the blob (no-rescaling) or union-merged the per-source maps
+     * (rescaling — see E6-HIGH-4(b) in {@link ForStRsRestoreOperation#restoreWithRescaling}).
+     */
+    private final StateSerializerRegistry stateSerializerRegistry = new StateSerializerRegistry();
 
     /**
      * Registry of engine-backed priority queues created via {@link #createInternalPriorityQueue}.
@@ -330,11 +350,42 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             ForStRsSnapshotStrategy strategy, ForStRsSstRegistry sstRegistry) {
         this.snapshotStrategy = strategy;
         this.sstRegistry = sstRegistry;
+        // E6-HIGH-4(a): wire the V1-sync serializer-registry blob provider so each snapshot's
+        // privateState carries the current schema metadata. Without this call the V1-sync
+        // snapshot would always emit an empty {@code _serializer_metadata.bin} and the restore
+        // side would silently bypass {@code verifyOrRegister}'s schema-drift check.
+        if (strategy != null) {
+            strategy.setRegistryBlobProvider(stateSerializerRegistry::serialize);
+        }
     }
 
     /** Test accessor — returns the SST registry, or null if snapshot wiring isn't connected. */
     public ForStRsSstRegistry getSstRegistry() {
         return sstRegistry;
+    }
+
+    /**
+     * E6-HIGH-4(a): exposes the per-backend {@link StateSerializerRegistry} so the SPI path can
+     * seed restored metadata before user-code triggers {@code createOrUpdateInternalState}. Also
+     * used by tests that wish to exercise the schema-drift verification branch directly.
+     */
+    public StateSerializerRegistry stateSerializerRegistry() {
+        return stateSerializerRegistry;
+    }
+
+    /**
+     * E6-HIGH-4(b) (no-rescaling) / (b) (rescaling, union-merged): pump the restored serializer
+     * metadata into the registry so the first {@code createOrUpdateInternalState} for each state
+     * name runs through {@code verifyOrRegister} (and therefore detects schema drift) rather than
+     * silently re-registering as if no prior snapshot existed.
+     *
+     * <p>Passing {@code null} or an empty map is treated as "no restored metadata" — matching pre-
+     * E6 behavior for snapshots that did not carry the registry blob.
+     */
+    public void seedRestoredSerializerMetadata(
+            Map<String, StateSerializerMetadata> restoredMetadata) {
+        stateSerializerRegistry.seedFromRestore(
+                restoredMetadata == null ? Collections.emptyMap() : restoredMetadata);
     }
 
     private static <K> InternalKeyContext<K> defaultKeyContext() {
@@ -393,6 +444,13 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                             + "setSnapshotStrategy(...) — wire the strategy via the builder or"
                             + " test setup");
         }
+        // E6-HIGH-1: reject CANONICAL savepoint format at the request site so the V1-sync path
+        // does not silently emit a non-portable incremental ForSt-RS handle. The async backend
+        // already used to do this inline (E5-HIGH-1); the gate is now shared via {@link
+        // ForStRsSavepointGuards#rejectCanonicalSavepoint} so any future shape changes (new
+        // SavepointFormatType values, additional NATIVE-equivalent aliases) only need to be
+        // updated in one place.
+        ForStRsSavepointGuards.rejectCanonicalSavepoint(checkpointOptions);
         // Flush all buffered writes before capturing the snapshot — correctness requirement:
         // the engine snapshot must include all state mutations up to this barrier.
         delegate.flushWriteBuffer();
@@ -417,13 +475,22 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                             SnapshotExecutionType.ASYNCHRONOUS)
                     .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
         } catch (IOException e) {
-            // The cancelStreamRegistry may already be closed if a prior checkpoint's async
-            // phase failed or the task is being cancelled. In that case the
-            // SnapshotStrategyRunner cannot register its cancellation hook and throws
-            // "Cannot register Closeable, registry is already closed."
-            // Gracefully abort: return a pre-completed future with an empty result so the
-            // checkpoint coordinator can proceed without hanging the job.
-            if (e.getMessage() != null && e.getMessage().contains("registry is already closed")) {
+            // E6-HIGH-2 (mirrors E5-HIGH-3 on the async path): the cancelStreamRegistry may
+            // already be closed if a prior checkpoint's async phase failed or the task is being
+            // cancelled. In that case the SnapshotStrategyRunner cannot register its cancellation
+            // hook and throws "Cannot register Closeable, registry is already closed." Gracefully
+            // abort: return a pre-completed future with an empty result so the checkpoint
+            // coordinator can proceed without hanging the job.
+            //
+            // Precondition the empty-result fallback on the structural {@code
+            // cancelStreamRegistry.isClosed()} check rather than substring-matching the exception
+            // message. The previous match on {@code "registry is already closed"} was brittle: a
+            // downstream change to {@link
+            // org.apache.flink.util.AbstractAutoCloseableRegistry}'s rejection message (or a
+            // translated locale) would have silently flipped real failures into {@code
+            // SnapshotResult.empty()} and bypassed checkpoint-failure accounting. {@code
+            // isClosed()} is stable across Flink versions.
+            if (cancelStreamRegistry.isClosed()) {
                 LOG.info(
                         "Checkpoint {} skipped — cancelStreamRegistry already closed"
                                 + " (prior checkpoint failure or task cancellation).",
@@ -464,6 +531,16 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         if (existing != null) {
             return (IS) existing;
         }
+        // E6-HIGH-4(a): register / verify the user's value serializer against any restored
+        // snapshot before constructing the adapter. The registry holds the live snapshot (drained
+        // into {@code _serializer_metadata.bin} by {@link ForStRsSnapshotStrategy}) and runs the
+        // schema-compatibility check against restored metadata on first encounter. We pass the
+        // *value* serializer because that is the one that observes user-visible payload changes;
+        // the namespace serializer is fixed by Flink's runtime.
+        stateSerializerRegistry.verifyOrRegister(
+                stateDesc.getName(),
+                stateDesc.getType().ordinal(),
+                stateDesc.getSerializer());
         org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> created;
         switch (stateDesc.getType()) {
             case VALUE:

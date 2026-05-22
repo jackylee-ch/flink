@@ -207,6 +207,7 @@ public class ForStRsStateBackend implements StateBackend {
                             && !restoredHandles.isEmpty()
                             && (storageUri == null || storageUri.isEmpty());
 
+            ForStRsRestoreOperation.RestoreResult restored = null;
             if (useRestore) {
                 ForStRsRestoreOperation restoreOp =
                         new ForStRsRestoreOperation(
@@ -215,7 +216,7 @@ public class ForStRsStateBackend implements StateBackend {
                                 localDbPath,
                                 parameters.getKeyGroupRange(),
                                 sstRegistry);
-                ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
+                restored = restoreOp.restore(restoredHandles);
                 db = restored.getDb();
                 cf = restored.getDefaultCf();
             } else if (storageUri != null && !storageUri.isEmpty()) {
@@ -278,6 +279,15 @@ public class ForStRsStateBackend implements StateBackend {
                             arena,
                             Map.of("default", 0L));
             backend.setSnapshotStrategy(strategy, sstRegistry);
+            // E6-HIGH-4(b): seed the per-state serializer metadata into the V1-sync registry so
+            // the first {@code createOrUpdateInternalState} for each state name runs through
+            // {@code verifyOrRegister} with the restored schema. {@code restored} is null on
+            // fresh job starts (no checkpoint to restore from); the no-rescaling path returns the
+            // single source handle's blob and the rescaling path returns the union-merged map
+            // assembled by {@link ForStRsRestoreOperation#restoreWithRescaling}.
+            if (restored != null) {
+                backend.seedRestoredSerializerMetadata(restored.getRestoredSerializerMetadata());
+            }
             return backend;
         } catch (Throwable t) {
             // Best-effort tear-down on construction failure so we don't leak FFM handles.
