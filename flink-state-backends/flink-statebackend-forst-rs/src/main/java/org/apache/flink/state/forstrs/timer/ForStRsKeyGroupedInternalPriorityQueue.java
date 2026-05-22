@@ -23,7 +23,9 @@ import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
@@ -178,6 +180,19 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     private final ArrayDeque<Entry> pollCache = new ArrayDeque<>();
     private int cachedKg = -1; // -1 = cache invalid / empty
 
+    /**
+     * Legacy IntSupplier ctor — kept for backward compatibility with existing tests.
+     *
+     * <p><b>Deprecated</b>: prefer the {@link InternalKeyContext}-based ctor so peek/poll/advance
+     * route to the key group of the <em>current</em> key (PR-A4 / S1-5 fix). The IntSupplier path
+     * keeps the legacy "constant kg" behaviour: if {@code currentKeyGroupSupplier} returns a fixed
+     * value the queue only sees timers in that one key group, which is the original E2-CRIT-2 bug.
+     *
+     * @deprecated use {@link #ForStRsKeyGroupedInternalPriorityQueue(ForStRsLinker, FrsDb,
+     *     FrsCfHandle, Arena, String, TypeSerializer, ToLongFunction, InternalKeyContext, int,
+     *     KeyGroupRange)} instead.
+     */
+    @Deprecated
     public ForStRsKeyGroupedInternalPriorityQueue(
             ForStRsLinker linker,
             FrsDb db,
@@ -201,7 +216,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 /* rebinder= */ null);
     }
 
-    /** Variant with an explicit element rebinder hook (used by timer integrations). */
+    /**
+     * Variant with an explicit element rebinder hook (used by timer integrations).
+     *
+     * @deprecated use the {@link InternalKeyContext}-based ctor.
+     */
+    @Deprecated
     public ForStRsKeyGroupedInternalPriorityQueue(
             ForStRsLinker linker,
             FrsDb db,
@@ -235,6 +255,95 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         this.flushDelDataCapacity = 0L;
         this.emptyValueSeg = flushArena.allocate(1L);
         this.emptyValueSeg.set(ValueLayout.JAVA_BYTE, 0L, (byte) 1);
+    }
+
+    /**
+     * Preferred ctor (PR-A4 / S1-5 fix): derives the current key group from {@code keyContext} on
+     * every {@code peek()}/{@code poll()}/{@code advance()} call so the queue dispatches into the
+     * key group of the <em>current</em> key, not a fixed constant.
+     *
+     * <p>The supplier reads {@code keyContext.getCurrentKey()} and hashes it via {@link
+     * KeyGroupRangeAssignment#assignToKeyGroup(Object, int)}. When the current key is {@code null}
+     * (e.g. before the first record arrives, or during a poll() driven by close()/snapshot() from
+     * the mailbox thread outside any record context), we fall back to {@code
+     * keyGroupRange.getStartKeyGroup()} — the same value the legacy ctor used as its constant.
+     *
+     * <p>Safety: the supplier is invoked from {@code peek/poll/add/remove/advance}. Flink's
+     * async-state V2 contract serializes those calls on the operator's mailbox thread (the
+     * timer-service runs on the same thread as state mutation), so reading the key-context's
+     * current key here is race-free.
+     */
+    public ForStRsKeyGroupedInternalPriorityQueue(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            Arena arena,
+            String stateName,
+            TypeSerializer<T> elementSerializer,
+            ToLongFunction<T> timestampExtractor,
+            InternalKeyContext<?> keyContext,
+            int totalKeyGroups,
+            KeyGroupRange keyGroupRange) {
+        this(
+                linker,
+                db,
+                cf,
+                arena,
+                stateName,
+                elementSerializer,
+                timestampExtractor,
+                deriveSupplier(keyContext, totalKeyGroups, keyGroupRange),
+                keyGroupRange,
+                /* rebinder= */ null);
+    }
+
+    /** Variant of the {@link InternalKeyContext}-based ctor with an explicit rebinder. */
+    public ForStRsKeyGroupedInternalPriorityQueue(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            Arena arena,
+            String stateName,
+            TypeSerializer<T> elementSerializer,
+            ToLongFunction<T> timestampExtractor,
+            InternalKeyContext<?> keyContext,
+            int totalKeyGroups,
+            KeyGroupRange keyGroupRange,
+            LongFunction<T> rebinder) {
+        this(
+                linker,
+                db,
+                cf,
+                arena,
+                stateName,
+                elementSerializer,
+                timestampExtractor,
+                deriveSupplier(keyContext, totalKeyGroups, keyGroupRange),
+                keyGroupRange,
+                rebinder);
+    }
+
+    /**
+     * Builds the {@link java.util.function.IntSupplier} that returns the current-key's key group,
+     * falling back to {@code keyGroupRange.getStartKeyGroup()} when no current key is set.
+     */
+    private static java.util.function.IntSupplier deriveSupplier(
+            InternalKeyContext<?> keyContext, int totalKeyGroups, KeyGroupRange keyGroupRange) {
+        if (keyContext == null) {
+            throw new IllegalArgumentException("keyContext must not be null");
+        }
+        if (totalKeyGroups <= 0) {
+            throw new IllegalArgumentException(
+                    "totalKeyGroups must be > 0, got " + totalKeyGroups);
+        }
+        final int fallback = keyGroupRange.getStartKeyGroup();
+        return () -> {
+            Object k = keyContext.getCurrentKey();
+            if (k == null) {
+                return fallback;
+            }
+            return KeyGroupRangeAssignment.assignToKeyGroup(k, totalKeyGroups);
+        };
     }
 
     // ------------------------------------------------------------------

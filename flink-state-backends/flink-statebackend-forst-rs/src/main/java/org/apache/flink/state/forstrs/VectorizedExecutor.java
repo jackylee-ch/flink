@@ -434,20 +434,22 @@ public class VectorizedExecutor implements StateExecutor {
             }
 
             // Decode results: for each slot, read validity byte and (offsets, data) range.
+            // PR-B1 (V2-6, C-H1, C-H6): pass the native segment slice directly into the
+            // table's MemorySegment overload — eliminates the per-row `new byte[len]`
+            // that used to happen here before deserialisation.
             for (int i = 0; i < n; i++) {
                 byte vld = outValidity.get(ValueLayout.JAVA_BYTE, i);
-                byte[] raw = null;
-                if (vld != 0) {
-                    int start = outOffsets.get(ValueLayout.JAVA_INT, (long) i * Integer.BYTES);
-                    int end =
+                boolean present = vld != 0;
+                int len = 0;
+                long start = 0L;
+                if (present) {
+                    int s = outOffsets.get(ValueLayout.JAVA_INT, (long) i * Integer.BYTES);
+                    int e =
                             outOffsets.get(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES);
-                    int len = end - start;
-                    if (len > 0) {
-                        raw = new byte[len];
-                        MemorySegment.copy(outData, ValueLayout.JAVA_BYTE, start, raw, 0, len);
-                    }
+                    start = s;
+                    len = e - s;
                 }
-                completeGet(reqs[i], tables[i], raw);
+                completeGet(reqs[i], tables[i], present, outData, start, len);
             }
         } catch (Throwable t) {
             // PR-A10 / S1-9: drain every pending GET future on FFI / decode
@@ -994,15 +996,30 @@ public class VectorizedExecutor implements StateExecutor {
         ((InternalAsyncFuture<Object>) request.getFuture()).completeExceptionally(msg, cause);
     }
 
+    /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result completion. The decoded value is read
+     * directly off the native {@code outData} segment via the table's {@link
+     * ForStRsInnerTable#deserializeValue(MemorySegment, long, int)} overload — no per-row
+     * {@code byte[]} allocation. {@code present} encodes the validity bit (null result vs
+     * empty value); MAP_CONTAINS resolves to a boolean derived from {@code present} without
+     * touching the bytes.
+     */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static void completeGet(
-            StateRequest<?, ?, ?, ?> request, ForStRsInnerTable table, byte[] rawValue) {
+            StateRequest<?, ?, ?, ?> request,
+            ForStRsInnerTable table,
+            boolean present,
+            MemorySegment data,
+            long offset,
+            int len) {
         Object result;
         StateRequestType type = request.getRequestType();
         if (type == StateRequestType.MAP_CONTAINS) {
-            result = rawValue != null;
+            result = present;
+        } else if (!present) {
+            result = null;
         } else {
-            result = rawValue == null ? null : table.deserializeValue(rawValue);
+            result = table.deserializeValue(data, offset, len);
         }
         ((InternalAsyncFuture<Object>) request.getFuture()).complete(result);
     }

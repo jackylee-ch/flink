@@ -198,6 +198,28 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
         }
     }
 
+    /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode. Reads accumulator bytes
+     * directly out of the native {@code outData} segment via {@link
+     * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, skipping the
+     * per-row {@code byte[] = new byte[len]} the default fallback would perform.
+     */
+    @Override
+    public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
+        if (len == 0) {
+            return null;
+        }
+        try {
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
+                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            view.rewind(buf, (int) offset, len);
+            return accSerializer.deserialize(view);
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncAggregatingStateV2: failed to decode accumulator off-heap", e);
+        }
+    }
+
     // ---------------------------------------------------------------
     // ForStRsInnerTable — request builders
     // ---------------------------------------------------------------

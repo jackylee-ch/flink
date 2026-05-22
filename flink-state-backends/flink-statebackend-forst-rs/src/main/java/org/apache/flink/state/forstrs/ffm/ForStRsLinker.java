@@ -524,8 +524,12 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // array (FFI_ArrowArray*)
                                 ValueLayout.ADDRESS)); // schema (FFI_ArrowSchema*)
 
+        // PR-B2 (D-H2): critical mode — frs_batch_get_arrow is synchronous (no thread
+        // park, no blocking I/O on the engine path; LSM memtable reads + Arrow C
+        // Data Interface export). The MAX_BATCH_COUNT cap inside the Rust impl
+        // bounds wall-clock so the JVM safepoint window is acceptable.
         this.frsBatchGetArrow =
-                bind(
+                bindCritical(
                         "frs_batch_get_arrow",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -713,8 +717,14 @@ public final class ForStRsLinker {
         //     *const i32 key_offsets, *const u8 key_data,
         //     *const i32 val_offsets, *const u8 val_data,
         //     usize count);
+        // PR-B2 (D-R3-1): critical mode — frs_vectorized_batch_put assembles a
+        // WriteBatch and commits it synchronously (engine memtable write; no
+        // network, no thread-park). MAX_BATCH_COUNT bounds the loop, so the
+        // safepoint-blocked window stays short. Eliminates the per-flush
+        // Arena.allocate + MemorySegment.copy pair on the batched put path —
+        // the same lift that point-op critical mode delivered.
         this.frsVectorizedBatchPut =
-                bind(
+                bindCritical(
                         "frs_vectorized_batch_put",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -730,8 +740,10 @@ public final class ForStRsLinker {
         //   int frs_vectorized_batch_delete(
         //     FrsDb, FrsCfHandle,
         //     *const i32 key_offsets, *const u8 key_data, usize count);
+        // PR-B2 (D-R3-1): critical mode — same rationale as the batch_put binding
+        // above. Synchronous WriteBatch commit; bounded by MAX_BATCH_COUNT.
         this.frsVectorizedBatchDelete =
-                bind(
+                bindCritical(
                         "frs_vectorized_batch_delete",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -963,8 +975,13 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS,
                                 ValueLayout.JAVA_INT)); // P6-B
         // Phase A.1 (audit-design §3 V4): batched merge-append, N rows in 1 FFI call.
+        // PR-B2 (D-R3-3): critical mode — the Rust impl does N synchronous
+        // get/put pairs inside one FFI call (no thread-park). The batch length
+        // is bounded by the Java-side flush threshold, so the safepoint
+        // window stays acceptable. This eliminates the per-batch heap-segment
+        // copy that the non-critical path had to stage through a fresh arena.
         this.frsVecMergeAppendBatch =
-                bind(
+                bindCritical(
                         "frs_vec_merge_append_batch",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT, // return rc
@@ -1467,9 +1484,13 @@ public final class ForStRsLinker {
      * {@code outOffset}; the actual length is returned as a positive int, or -1 if the key was not
      * found.
      *
-     * <p>This is the zero-byte[]-allocation entry point for V1-sync ValueState.value(). Currently
-     * routes through legacy byte[] API and copies the result into outSegment; a follow-up commit
-     * will add a direct frs_get_pinned_segment FFI.
+     * <p>PR-B1 (V2-10): the key slice is passed directly to {@code frs_get_pinned} (no
+     * intermediate {@code byte[]}). On a hit, the value is copied native→native from the pinned
+     * memtable pointer into {@code outSegment} — also no {@code byte[]} hop. Falls back to a
+     * native-{@code outSegment}-based {@code frs_get_fast} path on non-inline values, again
+     * with no Java heap allocation. Only the cold-path {@code get()} fallback (for values
+     * exceeding the GET_INTO_BUF capacity, which is rare) returns through the legacy
+     * {@code byte[]} entry point.
      */
     public int getPinnedSegment(
             FrsDb db,
@@ -1480,15 +1501,88 @@ public final class ForStRsLinker {
             MemorySegment outSegment,
             long outOffset,
             int outMaxLen) {
-        byte[] keyBytes = new byte[keyLen];
-        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
-        byte[] raw = getPinned(db, cf, keyBytes);
-        if (raw == null) {
-            // Fallback: try getFast for non-inline values.
-            raw = getFast(db, cf, keyBytes);
-            if (raw == null) {
+        // ----- 1. frs_get_pinned: pass key slice directly, no byte[] copy.
+        MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
+        byte[] outBuf = PINNED_OUT_BUF.get();
+        MemorySegment pinnedOutSeg = MemorySegment.ofArray(outBuf);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsGetPinned.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySlice,
+                                    (long) keyLen,
+                                    pinnedOutSeg.asSlice(0, 8), // out_ptr
+                                    pinnedOutSeg.asSlice(8, 8)); // out_len
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_get_pinned (segment) threw: " + t.getMessage());
+        }
+        if (rc != FRS_STATUS_FALLBACK) {
+            check(rc, "frs_get_pinned");
+            long ptr =
+                    MemorySegment.ofArray(outBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+            long len =
+                    MemorySegment.ofArray(outBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 8);
+            if (ptr == 0 || len == 0) {
                 return -1;
             }
+            if (len > outMaxLen) {
+                throw new IllegalArgumentException(
+                        "out segment too small: need " + len + " bytes, got " + outMaxLen);
+            }
+            // Native → native copy: no byte[] hop.
+            MemorySegment nativeSrc = MemorySegment.ofAddress(ptr).reinterpret(len);
+            MemorySegment.copy(
+                    nativeSrc, 0L, outSegment, outOffset, len);
+            return (int) len;
+        }
+
+        // ----- 2. Not inline: try frs_get_fast directly into the per-thread native buffer.
+        byte[] fastOutBuf = GET_INTO_BUF.get();
+        MemorySegment fastOutSeg = MemorySegment.ofArray(fastOutBuf);
+        byte[] lenBuf = GET_INTO_LEN_BUF.get();
+        MemorySegment lenSeg = MemorySegment.ofArray(lenBuf);
+        int fastRc;
+        try {
+            fastRc =
+                    (int)
+                            frsGetFast.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySlice,
+                                    (long) keyLen,
+                                    fastOutSeg,
+                                    (long) GET_INTO_BUF_CAP,
+                                    lenSeg);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_get_fast (segment) threw: " + t.getMessage());
+        }
+        if (fastRc == 0) {
+            long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+            if (valLen == 0) {
+                return -1;
+            }
+            if (valLen > outMaxLen) {
+                throw new IllegalArgumentException(
+                        "out segment too small: need " + valLen + " bytes, got " + outMaxLen);
+            }
+            // byte[] → native copy. The byte[] is a JVM ThreadLocal, not a per-call alloc.
+            MemorySegment.copy(
+                    fastOutBuf, 0, outSegment, ValueLayout.JAVA_BYTE, outOffset, (int) valLen);
+            return (int) valLen;
+        }
+
+        // ----- 3. Cold path: value > GET_INTO_BUF_CAP — fall back to legacy byte[] entry.
+        // Rare in practice (state values are typically a few KB; GET_INTO_BUF is 64 KB).
+        byte[] keyBytes = new byte[keyLen];
+        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
+        byte[] raw = get(db, cf, keyBytes);
+        if (raw == null) {
+            return -1;
         }
         if (raw.length > outMaxLen) {
             throw new IllegalArgumentException(
@@ -1499,8 +1593,9 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Segment-based variant of {@link #put}. Caller-owned segments for both key and value. Routes
-     * through legacy byte[]-taking put until a direct FFI is added.
+     * Segment-based variant of {@link #put}. Caller-owned segments for both key and value. The
+     * key/value slices are passed directly to the critical-mode {@code frs_put} FFI (no per-call
+     * {@code byte[]} allocation) — PR-B1 (V2-10).
      */
     public void putSegment(
             FrsDb db,
@@ -1511,24 +1606,51 @@ public final class ForStRsLinker {
             MemorySegment valueSegment,
             long valueOffset,
             int valueLen) {
-        byte[] keyBytes = new byte[keyLen];
-        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
-        byte[] valBytes = new byte[valueLen];
-        MemorySegment.copy(
-                valueSegment, ValueLayout.JAVA_BYTE, valueOffset, valBytes, 0, valueLen);
-        put(db, cf, keyBytes, valBytes);
+        // Slice the caller's segments; both heap- and native-backed MemorySegments work
+        // because frs_put is bound with Linker.Option.critical(true), which pins heap
+        // segments for the duration of the call.
+        MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
+        MemorySegment valSlice = valueSegment.asSlice(valueOffset, valueLen);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsPut.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    keySlice,
+                                    (long) keyLen,
+                                    valSlice,
+                                    (long) valueLen);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_put (segment) threw: " + t.getMessage());
+        }
+        check(rc, "frs_put");
     }
 
-    /** Segment-based delete (key only). */
+    /**
+     * Segment-based delete (key only). The key slice is passed directly to the critical-mode
+     * {@code frs_delete} FFI — no {@code byte[]} allocation (PR-B1 / V2-10).
+     */
     public void deleteSegment(
             FrsDb db,
             FrsCfHandle cf,
             MemorySegment keySegment,
             long keyOffset,
             int keyLen) {
-        byte[] keyBytes = new byte[keyLen];
-        MemorySegment.copy(keySegment, ValueLayout.JAVA_BYTE, keyOffset, keyBytes, 0, keyLen);
-        delete(db, cf, keyBytes);
+        MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDelete.invokeExact(
+                                    db.handle(), cf.handle(), keySlice, (long) keyLen);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_delete (segment) threw: " + t.getMessage());
+        }
+        check(rc, "frs_delete");
     }
 
     /**

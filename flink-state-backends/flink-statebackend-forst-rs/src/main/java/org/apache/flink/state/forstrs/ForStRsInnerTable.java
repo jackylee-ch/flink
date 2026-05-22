@@ -51,6 +51,33 @@ public interface ForStRsInnerTable<K, N, V> {
     Object deserializeValue(byte[] raw);
 
     /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode overload. The vectorized GET path
+     * holds the result bytes in a native {@link java.lang.foreign.MemorySegment} (the
+     * {@code outData} buffer in {@code VectorizedExecutor}); copying each row into a fresh
+     * {@code byte[]} just to feed the legacy {@link #deserializeValue(byte[])} entry point
+     * burns one allocation per GET row on the hot path.
+     *
+     * <p>The default fallback copies into a temporary {@code byte[]} and delegates to the
+     * legacy overload, so existing implementations keep working. State classes on the read
+     * hot path (Value, Map, List, Reducing, Aggregating V2) override this directly with a
+     * {@code MemorySegmentDataInputView} to read straight off-heap.
+     *
+     * @param buf the native segment holding the GET-result bytes
+     * @param offset offset within {@code buf} where this row's value starts
+     * @param len number of value bytes (zero means empty / "no value")
+     * @return the deserialised value, or {@code null} if {@code len == 0}
+     */
+    default Object deserializeValue(
+            java.lang.foreign.MemorySegment buf, long offset, int len) {
+        // Fallback: copy into byte[] and call the legacy overload. State classes that want
+        // zero-copy should override this directly.
+        byte[] tmp = new byte[len];
+        java.lang.foreign.MemorySegment.copy(
+                buf, offset, java.lang.foreign.MemorySegment.ofArray(tmp), 0, len);
+        return deserializeValue(tmp);
+    }
+
+    /**
      * Returns the state name. Used by the classifier's APPEND_MERGE routing (V3.1) to look up
      * the state in the {@code listStateNames} registry. Default impl returns {@code null} so
      * non-ListState implementations don't have to override.

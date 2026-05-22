@@ -466,7 +466,25 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     }
 
     private int hash(MemorySegment seg, long offset, int len) {
-        // Java byte[] hashCode equivalent for a MemorySegment range.
+        // PR-B2 (V2-11 / D-R3-1) — scalar loop retained intentionally.
+        //
+        // The Java byte[] hashCode recurrence `h = 31*h + b[i]` is sequentially
+        // data-dependent: each step needs the previous `h`. A straight SIMD
+        // translation would require either (a) a precomputed 31^k power table
+        // unrolled per VL-byte block, which complicates the code path for a
+        // hash that is *already* JIT-friendly (single-issue ALU op, no loads
+        // beyond the segment scan), or (b) replacing the hash function entirely
+        // (e.g. FNV-1a / xxhash) — which is binary-incompatible with cached
+        // entries and the engine-side hash slot layout.
+        //
+        // The actual measured-hot path on Q11 (V2-9 sweep) was the per-byte
+        // key-equality check, not the hash itself. That was fixed by switching
+        // {@link #keysEqual} to MemorySegment.mismatch() (JDK 22+ JIT
+        // intrinsic; see comment in keysEqual). Profiling after that change
+        // shows hash() at < 5% of cache-lookup cost, so the cost/benefit of an
+        // alternative-hash rewrite is deferred to a follow-up ticket
+        // ("PR-B2.1 alternative hash function") that can take the
+        // serialization-format hit as part of a coordinated migration.
         int h = 1;
         for (int i = 0; i < len; i++) {
             h = 31 * h + seg.get(ValueLayout.JAVA_BYTE, offset + i);

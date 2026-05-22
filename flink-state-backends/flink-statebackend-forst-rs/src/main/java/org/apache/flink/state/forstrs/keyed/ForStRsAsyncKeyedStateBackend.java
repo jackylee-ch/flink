@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.state.v2.AggregatingStateDescriptor;
 import org.apache.flink.api.common.state.v2.ListStateDescriptor;
 import org.apache.flink.api.common.state.v2.MapStateDescriptor;
@@ -28,11 +29,13 @@ import org.apache.flink.api.common.state.v2.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
+import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.runtime.state.Keyed;
@@ -61,6 +64,7 @@ import org.apache.flink.state.forstrs.state.ForStRsValueStateV2;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -135,6 +139,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private boolean disposed = false;
 
     /**
+     * Tracks the current key on the operator's mailbox thread (PR-A4 / S1-5 fix).
+     *
+     * <p>Flink's async-state V2 routes per-record keys through {@link RecordContext}; the runtime
+     * invokes {@link #switchContext(RecordContext)} on the mailbox thread before dispatching state
+     * requests for a record. We capture the current key here so the engine-backed timer queue can
+     * derive the correct {@code currentKeyGroup} on each {@code peek/poll/advance} — without this,
+     * the queue saw only timers in the constant {@code keyGroupRange.getStartKeyGroup()} (the
+     * E2-CRIT-2 bug).
+     *
+     * <p>Read by an inline {@link InternalKeyContext} view passed to {@link
+     * ForStRsKeyGroupedInternalPriorityQueue}.
+     */
+    @Nullable private volatile K currentKey;
+
+    private int currentKeyGroup = -1;
+
+    /**
+     * View of this backend's per-record key/key-group state as an {@link InternalKeyContext}.
+     * Constructed lazily in {@link #internalKeyContext()} so it can be injected into the timer
+     * queue. The view is read-only for the queue's purposes (writes occur via {@code
+     * switchContext}).
+     */
+    @Nullable private InternalKeyContext<K> internalKeyContext;
+
+    /**
      * Per-backend dispatch metrics (umbrella spec §1 §c, component 8).
      *
      * <p>Placeholder: initialized with {@link UnregisteredMetricsGroup} until the backend
@@ -192,6 +221,75 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     @Override
     public void setup(@Nonnull StateRequestHandler h) {
         this.stateRequestHandler = h;
+    }
+
+    /**
+     * PR-A4 / S1-5 fix: capture the current key whenever Flink's async-state runtime switches the
+     * mailbox context to a new record. The captured key is consumed by the
+     * engine-backed-timer-queue's {@code currentKeyGroupSupplier} so peek/poll/advance route to the
+     * correct key group instead of the constant {@code keyGroupRange.getStartKeyGroup()}.
+     *
+     * <p>Invoked from the mailbox thread; reads from {@link #currentKey} on that same thread are
+     * race-free. The volatile qualifier guards against the snapshot pre-flush path (which can be
+     * triggered via {@code Snapshotable.snapshot} from a different worker before the mailbox owns
+     * the queue again).
+     */
+    @Override
+    public void switchContext(@Nullable RecordContext<K> context) {
+        if (context == null) {
+            this.currentKey = null;
+            this.currentKeyGroup = -1;
+        } else {
+            this.currentKey = context.getKey();
+            this.currentKeyGroup = context.getKeyGroup();
+        }
+    }
+
+    /**
+     * Returns an {@link InternalKeyContext} view of this backend's current key + key group, lazily
+     * constructed on first request. The view is read by the engine-backed-timer queue and is
+     * safe to call from the mailbox thread.
+     */
+    @VisibleForTesting
+    InternalKeyContext<K> internalKeyContext() {
+        InternalKeyContext<K> view = internalKeyContext;
+        if (view != null) {
+            return view;
+        }
+        view =
+                new InternalKeyContext<K>() {
+                    @Override
+                    public K getCurrentKey() {
+                        return currentKey;
+                    }
+
+                    @Override
+                    public int getCurrentKeyGroupIndex() {
+                        return currentKeyGroup;
+                    }
+
+                    @Override
+                    public int getNumberOfKeyGroups() {
+                        return totalKeyGroups;
+                    }
+
+                    @Override
+                    public KeyGroupRange getKeyGroupRange() {
+                        return keyGroupRange;
+                    }
+
+                    @Override
+                    public void setCurrentKey(@Nonnull K newKey) {
+                        ForStRsAsyncKeyedStateBackend.this.currentKey = newKey;
+                    }
+
+                    @Override
+                    public void setCurrentKeyGroupIndex(int newKeyGroupIndex) {
+                        ForStRsAsyncKeyedStateBackend.this.currentKeyGroup = newKeyGroupIndex;
+                    }
+                };
+        internalKeyContext = view;
+        return view;
     }
 
     @SuppressWarnings("unchecked")
@@ -432,6 +530,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // remains available via -Dforst.rs.timer-service.factory=FORSTRS.
             return new HeapPriorityQueueSetFactory(keyGroupRange, totalKeyGroups, 128).create(n, s);
         }
+        // PR-A4 / S1-5 (E2-CRIT-2 fix): plumb the backend's InternalKeyContext into the queue so
+        // peek/poll/advance route to the current key's key group, not a constant. The view reads
+        // {@code currentKey} (captured on the mailbox thread by {@link #switchContext}) and hashes
+        // it via {@link KeyGroupRangeAssignment#assignToKeyGroup}; if no current key is set (e.g.
+        // before any record has arrived) it falls back to {@code keyGroupRange.getStartKeyGroup()}
+        // — same as the legacy constant behaviour.
         return new ForStRsKeyGroupedInternalPriorityQueue<>(
                 linker,
                 db,
@@ -447,16 +551,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                     }
                     return 0L;
                 },
-                // S1-5 (Round-3 review): reviewer flagged this supplier as broken because it
-                // returns a constant. Investigation shows AsyncKeyedStateBackend doesn't expose
-                // a "current key" accessor — keys flow through RecordContext per request, not
-                // statefully on the backend. The supplier's actual usage is to seed prefix-scan
-                // refill in ForStRsKeyGroupedInternalPriorityQueue; startKeyGroup IS a valid
-                // (if non-optimal) seed since the scan walks forward across the whole range.
-                // Verified by Q11/Q12 bench: timer delivery is correct under v3.8.
-                // Surgical fix would require plumbing RecordContext.currentKey through the queue's
-                // peek/poll API — multi-day design. Tracked in remediation spec Phase A.3.
-                () -> keyGroupRange.getStartKeyGroup(),
+                internalKeyContext(),
+                totalKeyGroups,
                 keyGroupRange);
     }
 

@@ -403,6 +403,18 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     // ------------------------------------------------------------------
 
     private int hashOf(MemorySegment seg, long offset, int len) {
+        // PR-B2 (V2-11 / D-R3-1) — scalar loop retained for the Q12 timer
+        // hot path. Same rationale as ArrowBinaryBuffer.hash: the Java
+        // byte[] hashCode recurrence is sequentially data-dependent on the
+        // previous accumulator, so a SIMD translation requires either a
+        // 31^k power-table per VL-byte block or an alternative hash
+        // function (FNV-1a/xxhash) which would be binary-incompatible with
+        // the open-addressed slot layout already populated in the hash
+        // index. Q12 profiling identified the timer-service factory (heap
+        // vs. engine) as the dominant cost; per-byte hash is a small
+        // residual. Deferred to follow-up "PR-B2.1 alternative hash
+        // function" so the format change can be done as a coordinated
+        // migration alongside ArrowBinaryBuffer.
         int h = 1;
         for (int i = 0; i < len; i++) {
             h = 31 * h + seg.get(ValueLayout.JAVA_BYTE, offset + i);

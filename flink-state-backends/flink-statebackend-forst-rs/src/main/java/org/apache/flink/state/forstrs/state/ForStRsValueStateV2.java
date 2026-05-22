@@ -185,6 +185,29 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
         }
     }
 
+    /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode. Skips the per-row {@code
+     * byte[] = new byte[len]} that the default {@link ForStRsInnerTable#deserializeValue(
+     * java.lang.foreign.MemorySegment, long, int)} fallback would perform; instead reads
+     * the value bytes directly from the native {@code outData} segment via {@link
+     * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}.
+     */
+    @Override
+    public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
+        if (len == 0) {
+            return null;
+        }
+        try {
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
+                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            view.rewind(buf, (int) offset, len);
+            return valueSerializer.deserialize(view);
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsValueStateV2: failed to decode value off-heap", e);
+        }
+    }
+
     @Override
     public ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request) {
         byte[] key = serializeKey(request);

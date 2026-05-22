@@ -289,6 +289,81 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         }
     }
 
+    // -----------------------------------------------------------------
+    // PR-F1: precomputed dispatch table for offer().
+    //
+    // Replaces the previous ~22-case switch on StateRequestType with a single
+    // array lookup (StateRequestType.ordinal() → DispatchKind) followed by a
+    // small 5-case switch. This is branch-predictor friendly and reduces the
+    // instruction-cache footprint on the hot path; closes V2-7 (B-H7).
+    // -----------------------------------------------------------------
+
+    /**
+     * Coarse-grained routing kind used by {@link #offer(StateRequest)}. The mapping from {@link
+     * StateRequestType} → {@code DispatchKind} is precomputed at class-load time into {@link
+     * #DISPATCH_TABLE}.
+     *
+     * <p>Distinct from {@link VectorizedStateRequest.Kind}: that one is the public sealed-request
+     * tag; this one is an internal classifier-routing tag.
+     */
+    public enum DispatchKind {
+        /** Read paths → recordGet. */
+        GET,
+        /** Write paths whose payload may be null (null → delete) → recordPut or recordDelete. */
+        PUT,
+        /** Pure delete paths → recordDelete. */
+        DELETE,
+        /** Iterator paths → iterRequests.add(...). */
+        ITER,
+        /** LIST_ADD / LIST_ADD_ALL: list-state routes to APPEND_MERGE, else falls back to PUT. */
+        APPEND_MERGE_CANDIDATE
+    }
+
+    /**
+     * Precomputed routing table, indexed by {@link StateRequestType#ordinal()}. A {@code null} entry
+     * means the corresponding {@code StateRequestType} is not handled by {@link
+     * #offer(StateRequest)} and will trigger an {@link UnsupportedOperationException}.
+     *
+     * <p>Visible for the {@code OfferDispatchTableParityTest} regression gate.
+     */
+    public static final DispatchKind[] DISPATCH_TABLE;
+
+    static {
+        StateRequestType[] all = StateRequestType.values();
+        DISPATCH_TABLE = new DispatchKind[all.length];
+        // Default: every slot null (= unsupported) until explicitly populated.
+        DISPATCH_TABLE[StateRequestType.VALUE_GET.ordinal()] = DispatchKind.GET;
+        DISPATCH_TABLE[StateRequestType.LIST_GET.ordinal()] = DispatchKind.GET;
+        DISPATCH_TABLE[StateRequestType.MAP_GET.ordinal()] = DispatchKind.GET;
+        DISPATCH_TABLE[StateRequestType.MAP_CONTAINS.ordinal()] = DispatchKind.GET;
+        DISPATCH_TABLE[StateRequestType.REDUCING_GET.ordinal()] = DispatchKind.GET;
+        DISPATCH_TABLE[StateRequestType.AGGREGATING_GET.ordinal()] = DispatchKind.GET;
+
+        DISPATCH_TABLE[StateRequestType.VALUE_UPDATE.ordinal()] = DispatchKind.PUT;
+        DISPATCH_TABLE[StateRequestType.LIST_UPDATE.ordinal()] = DispatchKind.PUT;
+        DISPATCH_TABLE[StateRequestType.MAP_PUT.ordinal()] = DispatchKind.PUT;
+        DISPATCH_TABLE[StateRequestType.MAP_PUT_ALL.ordinal()] = DispatchKind.PUT;
+        DISPATCH_TABLE[StateRequestType.REDUCING_ADD.ordinal()] = DispatchKind.PUT;
+        DISPATCH_TABLE[StateRequestType.AGGREGATING_ADD.ordinal()] = DispatchKind.PUT;
+
+        DISPATCH_TABLE[StateRequestType.CLEAR.ordinal()] = DispatchKind.DELETE;
+        DISPATCH_TABLE[StateRequestType.MAP_REMOVE.ordinal()] = DispatchKind.DELETE;
+
+        DISPATCH_TABLE[StateRequestType.MAP_IS_EMPTY.ordinal()] = DispatchKind.ITER;
+        DISPATCH_TABLE[StateRequestType.MAP_ITER.ordinal()] = DispatchKind.ITER;
+        DISPATCH_TABLE[StateRequestType.MAP_ITER_KEY.ordinal()] = DispatchKind.ITER;
+        DISPATCH_TABLE[StateRequestType.MAP_ITER_VALUE.ordinal()] = DispatchKind.ITER;
+        DISPATCH_TABLE[StateRequestType.ITERATOR_LOADING.ordinal()] = DispatchKind.ITER;
+
+        DISPATCH_TABLE[StateRequestType.LIST_ADD.ordinal()] = DispatchKind.APPEND_MERGE_CANDIDATE;
+        DISPATCH_TABLE[StateRequestType.LIST_ADD_ALL.ordinal()] =
+                DispatchKind.APPEND_MERGE_CANDIDATE;
+
+        // Intentionally left as null (unsupported by offer()):
+        //   SYNC_POINT — framework sync only, never reaches the classifier
+        //   CUSTOMIZED — backend-defined; not handled by ForSt-RS today
+    }
+
     @Override
     @SuppressWarnings({"unchecked", "rawtypes"})
     public void offer(StateRequest<?, ?, ?, ?> stateRequest) {
@@ -301,21 +376,37 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         }
         ForStRsInnerTable<?, ?, ?> table = (ForStRsInnerTable<?, ?, ?>) state;
         StateRequestType type = stateRequest.getRequestType();
-        switch (type) {
-            case VALUE_GET:
-            case LIST_GET:
-            case MAP_GET:
-            case MAP_CONTAINS:
-            case REDUCING_GET:
-            case AGGREGATING_GET:
+        // Single array load → branch-predictor friendly. JIT can lower the
+        // small 5-case switch below into a tableswitch / jump table.
+        DispatchKind kind = DISPATCH_TABLE[type.ordinal()];
+        if (kind == null) {
+            throw new UnsupportedOperationException("Unsupported state request type: " + type);
+        }
+        switch (kind) {
+            case GET:
                 recordGet(table, (StateRequest) stateRequest);
                 break;
-            case LIST_ADD:
-            case LIST_ADD_ALL:
+            case PUT:
+                // A null payload on an UPDATE/ADD is the canonical Flink idiom
+                // for "clear this entry" (matches the legacy path's
+                // `serializedValue == null → delete` behaviour).
+                if (stateRequest.getPayload() == null) {
+                    recordDelete(table, (StateRequest) stateRequest);
+                } else {
+                    recordPut(table, (StateRequest) stateRequest);
+                }
+                break;
+            case DELETE:
+                recordDelete(table, (StateRequest) stateRequest);
+                break;
+            case ITER:
+                iterRequests.add(buildIterRequest(table, stateRequest));
+                break;
+            case APPEND_MERGE_CANDIDATE:
                 // V3.1: LIST_ADD / LIST_ADD_ALL on a registered ListState routes to
                 // APPEND_MERGE instead of destructive PUT. Falls back to PUT if the
                 // state is not registered (shouldn't happen via the public API, but
-                // defensive).
+                // defensive). A null payload still routes to delete.
                 if (stateRequest.getPayload() == null) {
                     recordDelete(table, (StateRequest) stateRequest);
                 } else {
@@ -327,34 +418,10 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                     }
                 }
                 break;
-            case VALUE_UPDATE:
-            case LIST_UPDATE:
-            case MAP_PUT:
-            case MAP_PUT_ALL:
-            case REDUCING_ADD:
-            case AGGREGATING_ADD:
-                // A null payload on an UPDATE/ADD is the canonical Flink idiom
-                // for "clear this entry" (matches the legacy path's
-                // `serializedValue == null → delete` behaviour).
-                if (stateRequest.getPayload() == null) {
-                    recordDelete(table, (StateRequest) stateRequest);
-                } else {
-                    recordPut(table, (StateRequest) stateRequest);
-                }
-                break;
-            case CLEAR:
-            case MAP_REMOVE:
-                recordDelete(table, (StateRequest) stateRequest);
-                break;
-            case MAP_IS_EMPTY:
-            case MAP_ITER:
-            case MAP_ITER_KEY:
-            case MAP_ITER_VALUE:
-            case ITERATOR_LOADING:
-                iterRequests.add(buildIterRequest(table, stateRequest));
-                break;
             default:
-                throw new UnsupportedOperationException("Unsupported state request type: " + type);
+                // Unreachable: DISPATCH_TABLE only ever stores enum constants above.
+                throw new UnsupportedOperationException(
+                        "Unsupported dispatch kind: " + kind + " (state request type: " + type + ")");
         }
     }
 

@@ -252,6 +252,41 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         }
     }
 
+    /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode. Reads the multi-chunk payload
+     * directly out of the native {@code outData} segment via {@link
+     * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, mirroring the
+     * legacy {@link #deserializeValue(byte[])} logic but without the per-row
+     * {@code byte[] = new byte[len]} the default fallback would perform.
+     */
+    @Override
+    public Object deserializeValue(java.lang.foreign.MemorySegment buf, long offset, int len) {
+        if (len == 0) {
+            return new CompleteStateIterator<V>(Collections.emptyList());
+        }
+        try {
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
+                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            view.rewind(buf, (int) offset, len);
+            List<V> list = new ArrayList<>();
+            while (view.remaining() > 0) {
+                int count = view.readInt();
+                if (count < 0) {
+                    throw new IOException(
+                            "ForStRsAsyncListStateV2: negative count in merged payload: "
+                                    + count);
+                }
+                for (int i = 0; i < count; i++) {
+                    list.add(elementSerializer.deserialize(view));
+                }
+            }
+            return new CompleteStateIterator<>(list);
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsAsyncListStateV2: failed to decode value off-heap", e);
+        }
+    }
+
     // ---------------------------------------------------------------
     // ForStRsInnerTable — request builders
     // ---------------------------------------------------------------

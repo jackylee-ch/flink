@@ -20,6 +20,10 @@ package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
+import java.nio.ByteOrder;
+
 /**
  * GC-free flat hash table for caching state key→value mappings. Uses a single {@code long[]} as the
  * index (open-addressing, linear probing) and a single {@code byte[]} as the data store
@@ -33,6 +37,17 @@ public final class FlatStateCache {
 
     private static final long EMPTY = -1L;
     private static final int HEADER_SIZE = 8; // 4 bytes keyLen + 4 bytes valLen
+
+    /**
+     * Byte-array view VarHandle for 4-byte big-endian int access. PR-B2 (V2-15): replaces the
+     * manual shift-pack implementation of {@code readInt}/{@code writeInt}. The view-VarHandle
+     * is JIT-intrinsified down to a single big-endian load/store (with a byteswap on
+     * little-endian hosts) and elides the per-byte bounds checks the shift form did
+     * implicitly. Byte order matches the legacy implementation (MSB first), so on-disk
+     * payloads stay binary-compatible across versions.
+     */
+    private static final VarHandle INT_VH =
+            MethodHandles.byteArrayViewVarHandle(int[].class, ByteOrder.BIG_ENDIAN);
 
     private final long[] index;
     private final int mask;
@@ -150,17 +165,11 @@ public final class FlatStateCache {
     }
 
     private static int readInt(byte[] buf, int off) {
-        return (buf[off] & 0xFF) << 24
-                | (buf[off + 1] & 0xFF) << 16
-                | (buf[off + 2] & 0xFF) << 8
-                | (buf[off + 3] & 0xFF);
+        return (int) INT_VH.get(buf, off);
     }
 
     private static void writeInt(byte[] buf, int off, int val) {
-        buf[off] = (byte) (val >>> 24);
-        buf[off + 1] = (byte) (val >>> 16);
-        buf[off + 2] = (byte) (val >>> 8);
-        buf[off + 3] = (byte) val;
+        INT_VH.set(buf, off, val);
     }
 
     private static boolean arraysEqual(byte[] a, int aOff, byte[] b, int bOff, int len) {

@@ -257,6 +257,28 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         }
     }
 
+    /**
+     * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode. Reads the user-value bytes
+     * directly out of the native {@code outData} segment via {@link
+     * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, skipping the
+     * per-row {@code byte[] = new byte[len]} the default fallback would perform.
+     */
+    @Override
+    public Object deserializeValue(MemorySegment buf, long offset, int len) {
+        if (len == 0) {
+            return null;
+        }
+        try {
+            org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView view =
+                    new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+            view.rewind(buf, (int) offset, len);
+            return userValueSerializer.deserialize(view);
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsMapStateV2: failed to decode user value off-heap", e);
+        }
+    }
+
     @Override
     public ForStRsDBGetRequest<K, N, ?> buildDBGetRequest(StateRequest<K, N, ?, ?> request) {
         byte[] key = serializeKey(request);
