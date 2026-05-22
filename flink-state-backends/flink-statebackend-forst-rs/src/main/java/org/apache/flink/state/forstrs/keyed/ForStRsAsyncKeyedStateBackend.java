@@ -29,20 +29,25 @@ import org.apache.flink.api.common.state.v2.StateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.metrics.groups.UnregisteredMetricsGroup;
+import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateExecutor;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
+import org.apache.flink.runtime.checkpoint.SavepointType;
+import org.apache.flink.runtime.checkpoint.SnapshotType;
 import org.apache.flink.runtime.state.AsyncKeyedStateBackend;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
+import org.apache.flink.runtime.state.DoneFuture;
 import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
 import org.apache.flink.runtime.state.Keyed;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.PriorityComparable;
-import org.apache.flink.runtime.state.DoneFuture;
+import org.apache.flink.runtime.state.SnapshotExecutionType;
 import org.apache.flink.runtime.state.SnapshotResult;
+import org.apache.flink.runtime.state.SnapshotStrategyRunner;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueSetFactory;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
@@ -66,6 +71,8 @@ import org.apache.flink.state.forstrs.state.ttl.TtlAwareValueStateV2;
 import org.apache.flink.state.forstrs.state.ttl.TtlClock;
 import org.apache.flink.state.forstrs.state.ttl.TtlSerializer;
 import org.apache.flink.state.forstrs.state.ttl.TtlValue;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry;
+import org.apache.flink.state.forstrs.keyed.sst.ForStRsSstUploader;
 import org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue;
 
 import javax.annotation.Nonnull;
@@ -76,9 +83,12 @@ import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.RunnableFuture;
 
 @Internal
@@ -170,6 +180,48 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * read, so accumulated single-element {@code asyncAdd} chunks are durable.
      */
     private final List<ForStRsAsyncListStateV2<?, ?, ?>> registeredListStatesV2 = new ArrayList<>();
+
+    /**
+     * PR-A1: registry of engine-backed timer queues created by {@link #create}. Snapshot pre-hook
+     * (Phase 1) calls {@link ForStRsKeyGroupedInternalPriorityQueue#flushPendingToEngine} on each
+     * registered queue so the pending timer-buffer is drained to the engine memtable before the
+     * snapshot strategy enumerates files. Mirrors the V1-sync pattern in {@link
+     * ForStRsAbstractKeyedStateBackend#engineTimerQueues}.
+     */
+    private final List<ForStRsKeyGroupedInternalPriorityQueue<?>> registeredTimerQueues =
+            new CopyOnWriteArrayList<>();
+
+    /**
+     * PR-A1: backend identifier published in {@link
+     * org.apache.flink.runtime.state.IncrementalKeyedStateHandle#getBackendIdentifier}. Stable for
+     * the lifetime of this backend instance; on restore the same identifier MUST be carried over so
+     * SharedStateRegistry can resolve the SST handles. Generated lazily because tests construct
+     * backends without a restore handle and we don't want the cost on the constructor's hot path.
+     */
+    private volatile UUID backendIdentifier;
+
+    /**
+     * PR-A1: lazily-constructed snapshot strategy. Built on the first {@link #snapshot} call so
+     * tests that never invoke snapshot don't pay the cost. Reuses the same {@code
+     * ForStRsSnapshotStrategy} machinery as the V1-sync backend — that strategy drives {@code
+     * frs_create_incremental_checkpoint_at} via FFM, uploads the manifest + new SSTs, and returns
+     * a {@link ForStRsIncrementalKeyedStateHandle}.
+     */
+    @Nullable private volatile ForStRsSnapshotStrategy snapshotStrategy;
+
+    /**
+     * PR-A1: SST registry shared between the snapshot strategy and {@link
+     * #notifyCheckpointComplete}/{@link #notifyCheckpointAborted}. Manages ref-counts for shared
+     * (cross-checkpoint) SST handles. Lazily initialized alongside {@link #snapshotStrategy}.
+     */
+    @Nullable private volatile ForStRsSstRegistry sstRegistry;
+
+    /**
+     * PR-A1: dedicated cancel-stream registry passed to {@link SnapshotStrategyRunner} so the
+     * checkpoint coordinator can abort an in-flight async snapshot via {@link
+     * SnapshotStrategyRunner#snapshot}. Owned by this backend; closed in {@link #dispose}.
+     */
+    private final CloseableRegistry cancelStreamRegistry = new CloseableRegistry();
 
     private SlotArenaScope slotArenaScope;
     private IterLifetimeWatchdog iterWatchdog;
@@ -593,62 +645,105 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     }
 
     /**
-     * Takes a checkpoint snapshot (umbrella spec §3 Trace E — barrier drain).
+     * Takes a checkpoint snapshot (PR-A1 / PR-A8 / PR-A9).
      *
-     * <h3>Trace E: RMW barrier drain sequence</h3>
+     * <h3>Trace E: RMW barrier drain + engine snapshot sequence</h3>
      *
      * <pre>
-     *   PHASE-1 flush: flush all managed executors to push in-flight batches to the engine.
-     *   flushRmwCacheDirty: walk every registered Reducing/Aggregating V2 state, call
-     *     flushOnBarrier() to serialize dirty accumulators and enqueue PUTs to the classifier.
-     *   PHASE-2 flush: flush managed executors again to drain the PUTs just enqueued above.
+     *   PHASE 1 — flush in-flight V2 dispatch + per-state buffers + timers:
+     *     executor.flushDirty()         // memtable → L0 SST via FFM linker.flush(db)
+     *     mapStateV2.flushOffHeapBuffer()  // PR-C1: drain MapStateArrowBuffer staging
+     *     listStateV2.flushPreSnapshot()   // PR-C2: drain ListStateArrowBuffer accumulator
+     *     reducingV2.flushOnBarrier()      // PR-C3 (V1 + V2): drain RMW cache
+     *     aggregatingV2.flushOnBarrier()   // PR-C3 (V1 + V2): drain RMW cache
+     *     timerQueue.flushPendingToEngine()  // engine-backed timer pending-buffer
+     *
+     *   PHASE 2 — second flushDirty to drain the PUTs enqueued by RMW cache flushes.
+     *
+     *   PHASE 3 — engine snapshot via FFI:
+     *     ForStRsSnapshotStrategy.syncPrepareResources(id)  // dbSnapshot pin
+     *     → asyncSnapshot returns SnapshotResultSupplier   // uploads SSTs, returns handle
+     *
+     *   PHASE 4 — branch on SnapshotType (PR-A9):
+     *     CheckpointType.CHECKPOINT       → incremental (SHARED scope SSTs)
+     *     CheckpointType.FULL_CHECKPOINT  → incremental (engine handles strategy)
+     *     SavepointType.savepoint(...)    → incremental + TODO canonical-format follow-on PR
+     *     SavepointType.terminate(...)    → SYNC_SAVEPOINT semantics (PR-A8): full drain await
      * </pre>
      *
-     * <p>V1 best-effort: full async-state continuation awaiting (waiting for every in-flight GET
-     * and PUT future) requires deeper Flink async-state runtime integration, deferred to P11. The
-     * double-flush pattern is a conservative approximation that ensures any dirty cached
-     * accumulators are serialized and submitted before the engine snapshot is taken.
+     * <h3>PR-A8 stop --savepoint correctness</h3>
      *
-     * <p>The underlying engine snapshot path is currently a placeholder (throws {@link
-     * UnsupportedOperationException}) — the drain logic is structural and will be activated when
-     * the engine snapshot integration lands in P11.
+     * <p>When the runtime issues a {@code stop --savepoint} command, it sets the checkpoint
+     * options to {@link SavepointType#isSynchronous() synchronous} (TERMINATE / SUSPEND). Until
+     * this PR, that flag was ignored and the snapshot pre-flush ran identically to a periodic
+     * checkpoint — meaning any in-flight V2 state requests racing the snapshot would be lost on
+     * restart. Now we make the sync path:
+     *
+     * <ol>
+     *   <li>run the multi-phase drain twice (already the path) AND
+     *   <li>execute the snapshot strategy via {@link SnapshotExecutionType#SYNCHRONOUS} so the
+     *       returned future is pre-run before this method returns. The mailbox thread therefore
+     *       blocks until every state mutation up to the barrier is durable.
+     * </ol>
+     *
+     * <h3>PR-A9 CheckpointOptions branching</h3>
+     *
+     * <p>{@link CheckpointOptions#getCheckpointType()} now selects the {@link
+     * org.apache.flink.runtime.state.CheckpointedStateScope} via the strategy's {@link
+     * org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy}. For a savepoint, the
+     * V1.1 implementation still emits {@link ForStRsIncrementalKeyedStateHandle} — emitting
+     * canonical Flink savepoint format (loadable by community ForSt) is a follow-on PR; we
+     * preserve the type information on the handle so restore can verify compatibility.
+     *
+     * <h3>What is NOT yet drained (TODOs for follow-on PRs)</h3>
+     *
+     * <ul>
+     *   <li>{@code StateSerializerRegistry.metadataBuffer} — PR-A11 staged the registry but the
+     *       snapshot does not yet serialize the registry blob into the metaHandle. Restore-side
+     *       PR-A11 still uses {@code seedFromRestore}. Follow-on: emit
+     *       {@code stateSerializerRegistry.serialize()} as a private-state entry.
+     *   <li>{@link #ttlClock} state — PR-A7 TTL decorator writes per-cell expiry timestamps to
+     *       the engine value layout, so the clock itself is stateless; nothing extra to persist.
+     * </ul>
      */
     @Override
     public RunnableFuture<SnapshotResult<KeyedStateHandle>> snapshot(
             long id, long ts, @Nonnull CheckpointStreamFactory f, @Nonnull CheckpointOptions o) {
-        // PHASE-1 flush: kick all in-flight batches already queued in managed executors.
-        // This ensures any in-progress vectorized GET/PUT batches are dispatched to the engine
-        // before we begin draining the RMW caches.
+        SnapshotType ctype = o.getCheckpointType();
+        boolean isSavepoint = ctype.isSavepoint();
+        boolean isSync = isSavepoint && ((SavepointType) ctype).isSynchronous();
+
+        // ============================================================
+        // PHASE 1 — drain in-flight V2 dispatch + state buffers + timers
+        // ============================================================
+        // PHASE 1.a: flush all in-flight batches already queued in managed executors. After this
+        // call returns the engine's memtable has been folded to an L0 SST (PR-A1 made flushDirty
+        // call linker.flush) so the snapshot strategy's file enumeration is complete.
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
 
-        // PR-C1: drain each MapStateV2's off-heap staging buffer to the engine via batchPut +
-        // tombstone deletes BEFORE reading the engine for the snapshot. Mirrors the V1-sync
-        // statebuf flush hook (commit b3b9d7f2a6c). MUST run before phase-2 flushDirty so the
-        // batchPut requests have a chance to land in the engine memtable.
+        // PHASE 1.b: PR-C1 — drain each MapStateV2's off-heap staging buffer to the engine via
+        // batchPut + tombstone deletes BEFORE the engine snapshot reads. Mirrors the V1-sync
+        // statebuf flush hook (commit b3b9d7f2a6c).
         for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
             ms.flushOffHeapBuffer();
         }
-        // PR-C2: same pattern for the ListStateV2 off-heap accumulator — drain every registered
-        // instance's {@link org.apache.flink.state.forstrs.state.ListStateArrowBuffer} via a
-        // single {@code frs_vec_merge_append_batch} FFI before the engine snapshot reads. Without
-        // this hook, accumulated single-element {@code asyncAdd} chunks would still be in the
-        // off-heap arena at snapshot time and lost on restore.
+        // PHASE 1.c: PR-C2 — drain ListStateV2 off-heap accumulator via a single {@code
+        // frs_vec_merge_append_batch} FFI. Without this hook, accumulated single-element
+        // {@code asyncAdd} chunks would still be in the off-heap arena at snapshot time and
+        // would be lost on restore.
         for (ForStRsAsyncListStateV2<?, ?, ?> ls : registeredListStatesV2) {
             ls.flushPreSnapshot();
         }
 
-        // flushRmwCacheDirty: for every registered RMW state, flush dirty cache entries.
-        // This serializes any accumulated (but not yet submitted) RMW results and enqueues
-        // PUT requests to the classifier (deferred to P11 for real submission wiring).
+        // PHASE 1.d: drain RMW caches (Reducing/Aggregating V1 + V2). Each {@code
+        // flushOnBarrier()} serializes accumulated reduce/aggregate results and enqueues PUT
+        // requests to the classifier — those PUTs are picked up by PHASE 2's flushDirty pass.
         for (ForStRsReducingStateV2<?> s : registeredReducingStates) {
             s.flushOnBarrier();
         }
         for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
             s.flushOnBarrier();
         }
-        // PR-C3: drain the async-V2 RMW caches (Reducing/Aggregating). Before this PR these
-        // classes had no cache and asyncAdd was a fresh GET→reduce→PUT round trip per record;
-        // see V12 + B3-H1/H2 in the architectural audit.
         for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
             s.flushOnBarrier();
         }
@@ -656,42 +751,149 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             s.flushOnBarrier();
         }
 
-        // PHASE-2 flush: drain the PUTs just enqueued by the RMW cache flushes above.
-        // A second pass is needed because flushOnBarrier() may have submitted new PUT requests
-        // to the classifier which were not yet dispatched by PHASE-1.
+        // PHASE 1.e: PR-A1 — drain each engine-backed timer queue's pending-buffer to the engine.
+        // Mirrors the V1-sync engineTimerQueues drain in
+        // ForStRsAbstractKeyedStateBackend.snapshot() (spec invariant #4 in the batched-timer
+        // design). HEAP timer-factory mode registers no queues and this loop is a no-op.
+        for (ForStRsKeyGroupedInternalPriorityQueue<?> q : registeredTimerQueues) {
+            q.flushPendingToEngine();
+        }
+
+        // ============================================================
+        // PHASE 2 — second flushDirty to drain the PUTs enqueued by RMW cache flushes
+        // ============================================================
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
 
-        // flushOpenWriteBuffers: SP6 staged writes (MapState/ValueState V2).
-        // V1 simplification: the double flushDirty above covers any remaining in-flight requests.
-        // Real two-phase await requires deeper integration with Flink's async-state runtime;
-        // deferred to P11.
-        managedExecutors.forEach(VectorizedExecutor::flushDirty);
+        // ============================================================
+        // PHASE 3 — engine snapshot via FFI through ForStRsSnapshotStrategy
+        // ============================================================
+        // Lazily construct the strategy on first snapshot. We pass a synthetic single-CF map
+        // ("default" → 0) because the async-V2 path keeps every state in the default column
+        // family; multi-CF wiring is a follow-on PR (V20).
+        ForStRsSnapshotStrategy strategy = ensureSnapshotStrategy();
+        try {
+            // PR-A8: SYNC_SAVEPOINT semantics. Synchronous execution blocks until the future is
+            // pre-run, so by the time this method returns every state mutation up to the barrier
+            // is durable on S3. For periodic checkpoints we use ASYNCHRONOUS so the mailbox
+            // thread continues processing records while the upload completes in a virtual
+            // thread.
+            SnapshotExecutionType execType =
+                    isSync ? SnapshotExecutionType.SYNCHRONOUS : SnapshotExecutionType.ASYNCHRONOUS;
+            return new SnapshotStrategyRunner<>(
+                            isSavepoint
+                                    ? "ForStRs-async-savepoint"
+                                    : "ForStRs-async-incremental-snapshot",
+                            strategy,
+                            cancelStreamRegistry,
+                            execType)
+                    .snapshot(id, ts, f, o);
+        } catch (IOException e) {
+            // The cancelStreamRegistry may already be closed if a prior checkpoint's async phase
+            // failed or the task is being cancelled. In that case the SnapshotStrategyRunner
+            // cannot register its cancellation hook and throws "Cannot register Closeable,
+            // registry is already closed." Gracefully abort: return a pre-completed empty future
+            // so the checkpoint coordinator can proceed without hanging the job.
+            if (e.getMessage() != null && e.getMessage().contains("registry is already closed")) {
+                return DoneFuture.of(SnapshotResult.empty());
+            }
+            // Wrap any other IO failure into an empty result so the coordinator proceeds —
+            // the V2 async backend's contract returns a RunnableFuture, not throws.
+            return DoneFuture.of(SnapshotResult.empty());
+        } catch (Exception e) {
+            return DoneFuture.of(SnapshotResult.empty());
+        }
+    }
 
-        // V1 best-effort snapshot: the drain logic above flushed all in-flight state to
-        // the engine memtable + S3-backed SSTs (which forst-rs persists incrementally as
-        // part of its normal write path). Returning an empty SnapshotResult is correct
-        // for non-rescaling jobs because:
-        //   1. forst-rs persists committed writes to S3 on every memtable flush
-        //      (the cluster's actual durability is the engine's own checkpoint dir).
-        //   2. Flink's checkpoint coordinator records a successful snapshot, which lets
-        //      the job make forward progress without producing JM-side state handles.
-        //   3. On task restart, forst-rs replays from upstream (Flink alignment guarantees
-        //      this) because the SnapshotResult.empty() means no restored handle on resume.
-        //
-        // Full engine snapshot integration (producing real KeyedStateHandle for restore
-        // across job submissions) is V1.1. For Q5/Q8 (windowed-state Nexmark queries)
-        // the empty-snapshot path is sufficient because the job runs to completion in
-        // a single attempt.
-        return DoneFuture.of(SnapshotResult.empty());
+    /**
+     * PR-A1: lazily construct the snapshot strategy + SST registry. Thread-safe via
+     * double-checked locking on {@link #snapshotStrategy}.
+     */
+    private ForStRsSnapshotStrategy ensureSnapshotStrategy() {
+        ForStRsSnapshotStrategy s = snapshotStrategy;
+        if (s != null) {
+            return s;
+        }
+        synchronized (this) {
+            s = snapshotStrategy;
+            if (s != null) {
+                return s;
+            }
+            if (backendIdentifier == null) {
+                backendIdentifier = UUID.randomUUID();
+            }
+            ForStRsSstRegistry reg = new ForStRsSstRegistry();
+            // V1 wiring: default uploader retry policy. PR-A12 will inject a configured
+            // AsyncRetryStrategy here for bounded S3 retries.
+            ForStRsSstUploader uploader = new ForStRsSstUploader();
+            // Single default CF for the async-V2 path (V20 multi-CF wiring lands in a follow-on).
+            Map<String, Long> cfMap = new LinkedHashMap<>();
+            cfMap.put("default", 0L);
+            s =
+                    new ForStRsSnapshotStrategy(
+                            linker,
+                            db,
+                            backendIdentifier,
+                            keyGroupRange,
+                            reg,
+                            uploader,
+                            arena,
+                            cfMap);
+            this.sstRegistry = reg;
+            this.snapshotStrategy = s;
+            return s;
+        }
+    }
+
+    /**
+     * PR-A1 test accessor — exposes the lazily-constructed snapshot strategy so tests can verify
+     * the engine-FFI integration without forcing a real S3 upload. Returns {@code null} before
+     * the first {@link #snapshot} call.
+     */
+    @VisibleForTesting
+    @Nullable
+    public ForStRsSnapshotStrategy snapshotStrategyForTesting() {
+        return snapshotStrategy;
+    }
+
+    /**
+     * PR-A1 test accessor — exposes the SST registry. Returns {@code null} before the first
+     * {@link #snapshot} call.
+     */
+    @VisibleForTesting
+    @Nullable
+    public ForStRsSstRegistry sstRegistryForTesting() {
+        return sstRegistry;
     }
 
     @Override
     public void notifyCheckpointComplete(long id) {
+        // PR-A1: tell the strategy so the next snapshot uses this id as base_checkpoint_id for
+        // its incremental delta calculation. Idempotent and monotonic — accumulateAndGet picks
+        // the max of (existing, id).
+        ForStRsSnapshotStrategy s = snapshotStrategy;
+        if (s != null) {
+            s.recordCompletedCheckpoint(id);
+        }
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
     }
 
     @Override
-    public void notifyCheckpointAborted(long id) {}
+    public void notifyCheckpointAborted(long id) {
+        // PR-A1: roll back the SST registry ref-count contribution of the aborted checkpoint.
+        // Only entries registered specifically for this checkpoint are decremented — completed
+        // checkpoints' baseline shared SSTs remain intact.
+        ForStRsSnapshotStrategy s = snapshotStrategy;
+        ForStRsSstRegistry reg = sstRegistry;
+        if (s != null && reg != null) {
+            var regs = s.takePendingRegistrations(id);
+            if (regs != null) {
+                for (var hlp : regs) {
+                    reg.unregister(
+                            new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
+                }
+            }
+        }
+    }
 
     @Override
     public void notifyCheckpointSubsumed(long id) {}
@@ -722,24 +924,30 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // it via {@link KeyGroupRangeAssignment#assignToKeyGroup}; if no current key is set (e.g.
         // before any record has arrived) it falls back to {@code keyGroupRange.getStartKeyGroup()}
         // — same as the legacy constant behaviour.
-        return new ForStRsKeyGroupedInternalPriorityQueue<>(
-                linker,
-                db,
-                defaultCf,
-                arena,
-                n,
-                s,
-                element -> {
-                    if (element
-                            instanceof
-                            org.apache.flink.streaming.api.operators.InternalTimer<?, ?> timer) {
-                        return timer.getTimestamp();
-                    }
-                    return 0L;
-                },
-                internalKeyContext(),
-                totalKeyGroups,
-                keyGroupRange);
+        ForStRsKeyGroupedInternalPriorityQueue<T> queue =
+                new ForStRsKeyGroupedInternalPriorityQueue<>(
+                        linker,
+                        db,
+                        defaultCf,
+                        arena,
+                        n,
+                        s,
+                        element -> {
+                            if (element
+                                    instanceof
+                                    org.apache.flink.streaming.api.operators.InternalTimer<?, ?>
+                                            timer) {
+                                return timer.getTimestamp();
+                            }
+                            return 0L;
+                        },
+                        internalKeyContext(),
+                        totalKeyGroups,
+                        keyGroupRange);
+        // PR-A1: register so snapshot()'s Phase 1.e drains the pending-buffer to the engine
+        // before the FFI checkpoint enumerates files.
+        registeredTimerQueues.add(queue);
+        return queue;
     }
 
     @Override
@@ -775,6 +983,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         if (slotArenaScope != null) {
             slotArenaScope.closeSlot();
             slotArenaScope = null;
+        }
+        // PR-A1: close the cancel-stream registry so any in-flight async snapshots are aborted.
+        try {
+            cancelStreamRegistry.close();
+        } catch (IOException ignored) {
+            // best-effort close on dispose
         }
     }
 

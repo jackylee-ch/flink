@@ -331,7 +331,41 @@ public class VectorizedExecutor implements StateExecutor {
     @Override
     public void shutdown() {}
 
-    public void flushDirty() {}
+    /**
+     * Pre-snapshot drain hook (PR-A1 wiring).
+     *
+     * <p>The async-state V2 dispatch loop in {@link #executeBatchRequests} hands every classifier
+     * row to the engine within a single mailbox turn: by the time {@code executeBatchRequests}
+     * returns, every PUT / DELETE / GET / ITER / APPEND_MERGE row has been submitted via FFM, the
+     * engine memtable has applied the mutation, and the per-row futures are resolved. There is no
+     * deferred work owned by this {@link VectorizedExecutor} that {@code flushDirty} needs to
+     * drain — the work is "dirty" in the engine memtable, not on the Java side.
+     *
+     * <p>What we still need to do here, however, is force the engine to fold its in-memory
+     * memtable down to L0 SSTs <em>before</em> the snapshot strategy enumerates files. The
+     * engine's normal flush cadence is asynchronous and L0-rotation-driven; on a checkpoint
+     * barrier the strategy expects every committed write to be reachable as an SST file. Calling
+     * {@link ForStRsLinker#flush} forces a synchronous memtable → L0 conversion so the snapshot's
+     * file enumeration is complete.
+     *
+     * <p>Called from {@code ForStRsAsyncKeyedStateBackend.snapshot()} (PR-A1) and {@code
+     * notifyCheckpointComplete}.
+     */
+    public void flushDirty() {
+        // FFI flush: synchronously fold memtable → L0 SST. Idempotent; engine returns OK if the
+        // memtable is empty. Throws on engine-side error (caller is the snapshot path which will
+        // surface the failure as a failed RunnableFuture).
+        if (linker != null && db != null) {
+            try {
+                linker.flush(db);
+            } catch (RuntimeException re) {
+                // Snapshot pre-flush failures must propagate — there is no value to silently
+                // continuing because the snapshot strategy would then enumerate an incomplete
+                // SST set. Re-throw and let the outer snapshot path mark the future failed.
+                throw re;
+            }
+        }
+    }
 
     // -----------------------------------------------------------------
     // Op-type executors
