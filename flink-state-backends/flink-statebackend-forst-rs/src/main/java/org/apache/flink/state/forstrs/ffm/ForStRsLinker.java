@@ -30,6 +30,7 @@ import java.lang.foreign.StructLayout;
 import java.lang.foreign.SymbolLookup;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
+import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 
@@ -61,6 +62,64 @@ public final class ForStRsLinker {
                     ValueLayout.ADDRESS.withName("data"),
                     ValueLayout.JAVA_LONG.withName("len"),
                     ValueLayout.JAVA_LONG.withName("capacity"));
+
+    /**
+     * Typed VarHandles for {@code FrsBytes} access on native-allocated (8-byte aligned) segments
+     * such as {@code Arena.allocate(FRS_BYTES_LAYOUT.byteSize() * count)} in {@link #batchGet}.
+     *
+     * <p>Replaces magic-offset reads like {@code seg.get(ValueLayout.ADDRESS, 0)} +
+     * {@code seg.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize())} (PR-F2 / D-R2-2).
+     */
+    private static final VarHandle FRS_BYTES_DATA =
+            FRS_BYTES_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("data"));
+
+    private static final VarHandle FRS_BYTES_LEN =
+            FRS_BYTES_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("len"));
+
+    /**
+     * Unaligned (alignment=1) {@code FrsBytes} layout — required when the struct lives in a heap
+     * {@code byte[24]} view (e.g. via {@code MemorySegment.ofArray(byte[])} which only guarantees
+     * 1-byte alignment). The Rust ABI is the same; only the Java-side alignment contract changes.
+     */
+    private static final StructLayout FRS_BYTES_LAYOUT_UNALIGNED =
+            MemoryLayout.structLayout(
+                    ValueLayout.ADDRESS_UNALIGNED.withName("data"),
+                    ValueLayout.JAVA_LONG_UNALIGNED.withName("len"),
+                    ValueLayout.JAVA_LONG_UNALIGNED.withName("capacity"));
+
+    private static final VarHandle FRS_BYTES_DATA_U =
+            FRS_BYTES_LAYOUT_UNALIGNED.varHandle(MemoryLayout.PathElement.groupElement("data"));
+
+    private static final VarHandle FRS_BYTES_LEN_U =
+            FRS_BYTES_LAYOUT_UNALIGNED.varHandle(MemoryLayout.PathElement.groupElement("len"));
+
+    /**
+     * {@code FFI_ArrowArray} struct layout (Arrow C Data Interface, 80 bytes). Used by {@link
+     * #batchGetArrow} to readback typed children/buffers pointers instead of magic-offset reads.
+     */
+    private static final StructLayout FFI_ARROW_ARRAY_LAYOUT =
+            MemoryLayout.structLayout(
+                    ValueLayout.JAVA_LONG.withName("length"),
+                    ValueLayout.JAVA_LONG.withName("null_count"),
+                    ValueLayout.JAVA_LONG.withName("offset"),
+                    ValueLayout.JAVA_LONG.withName("n_buffers"),
+                    ValueLayout.JAVA_LONG.withName("n_children"),
+                    ValueLayout.ADDRESS.withName("buffers"),
+                    ValueLayout.ADDRESS.withName("children"),
+                    ValueLayout.ADDRESS.withName("dictionary"),
+                    ValueLayout.ADDRESS.withName("release"),
+                    ValueLayout.ADDRESS.withName("private_data"));
+
+    private static final VarHandle ARROW_ARRAY_N_BUFFERS =
+            FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("n_buffers"));
+    private static final VarHandle ARROW_ARRAY_N_CHILDREN =
+            FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("n_children"));
+    private static final VarHandle ARROW_ARRAY_BUFFERS =
+            FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("buffers"));
+    private static final VarHandle ARROW_ARRAY_CHILDREN =
+            FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("children"));
+    private static final VarHandle ARROW_ARRAY_RELEASE =
+            FFI_ARROW_ARRAY_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("release"));
 
     /**
      * {@code FrsEngineOptions} struct layout (B-Prod-P7, spec §6d). Mirrors the {@code #[repr(C)]}
@@ -1471,10 +1530,8 @@ public final class ForStRsLinker {
         }
         check(rc, "frs_get_and_put");
 
-        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
-        long len =
-                outBytes.get(
-                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
         if (dataAddr == 0L) {
             return null;
         }
@@ -1611,8 +1668,8 @@ public final class ForStRsLinker {
             byte[][] results = new byte[(int) count][];
             for (int i = 0; i < (int) count; i++) {
                 MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
-                long dataAddr = entry.get(ValueLayout.ADDRESS, 0).address();
-                long len = entry.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
+                long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
+                long len = (long) FRS_BYTES_LEN.get(entry, 0L);
                 if (dataAddr != 0L && len > 0) {
                     MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
                     results[i] = new byte[(int) len];
@@ -1683,8 +1740,8 @@ public final class ForStRsLinker {
             byte[][] results = new byte[count][];
             for (int i = 0; i < count; i++) {
                 MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
-                long dataAddr = entry.get(ValueLayout.ADDRESS, 0).address();
-                long len = entry.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
+                long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
+                long len = (long) FRS_BYTES_LEN.get(entry, 0L);
                 if (dataAddr != 0L && len > 0) {
                     MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
                     results[i] = new byte[(int) len];
@@ -1786,7 +1843,7 @@ public final class ForStRsLinker {
     }
 
     private static final long ARROW_SCHEMA_BYTES = 72L;
-    private static final long ARROW_ARRAY_BYTES = 80L;
+    private static final long ARROW_ARRAY_BYTES = FFI_ARROW_ARRAY_LAYOUT.byteSize();
 
     /**
      * Arrow-based batch get: stages keys as Arrow BinaryArray, calls frs_batch_get_arrow, reads
@@ -1866,16 +1923,19 @@ public final class ForStRsLinker {
             // Parse returned StructArray: children[0] = value (Binary nullable), children[1] =
             // found (Boolean)
             // StructArray layout: n_children=2, children points to [valueArray, foundArray]
-            long nChildren = outArray.get(ValueLayout.JAVA_LONG, 32);
+            // Typed-layout access via FFI_ARROW_ARRAY_LAYOUT VarHandles (PR-F2 / D-R2-2).
+            long nChildren = (long) ARROW_ARRAY_N_CHILDREN.get(outArray, 0L);
             MemorySegment childrenPtr =
-                    outArray.get(ValueLayout.ADDRESS, 48).reinterpret(nChildren * ptrSz);
+                    ((MemorySegment) ARROW_ARRAY_CHILDREN.get(outArray, 0L))
+                            .reinterpret(nChildren * ptrSz);
 
             // Value child (BinaryArray): buffers = [validity, offsets, data]
             MemorySegment valueArrayPtr =
                     childrenPtr.get(ValueLayout.ADDRESS, 0).reinterpret(ARROW_ARRAY_BYTES);
-            long valueNBuffers = valueArrayPtr.get(ValueLayout.JAVA_LONG, 24);
+            long valueNBuffers = (long) ARROW_ARRAY_N_BUFFERS.get(valueArrayPtr, 0L);
             MemorySegment valueBufsPtr =
-                    valueArrayPtr.get(ValueLayout.ADDRESS, 40).reinterpret(valueNBuffers * ptrSz);
+                    ((MemorySegment) ARROW_ARRAY_BUFFERS.get(valueArrayPtr, 0L))
+                            .reinterpret(valueNBuffers * ptrSz);
 
             MemorySegment validityPtr = valueBufsPtr.get(ValueLayout.ADDRESS, 0);
             MemorySegment valueOffsetsPtr =
@@ -1908,7 +1968,7 @@ public final class ForStRsLinker {
             }
 
             // Release the output Arrow structs (call the release callback)
-            MemorySegment outRelease = outArray.get(ValueLayout.ADDRESS, 64);
+            MemorySegment outRelease = (MemorySegment) ARROW_ARRAY_RELEASE.get(outArray, 0L);
             if (outRelease.address() != 0L) {
                 try {
                     Linker.nativeLinker()
@@ -2240,7 +2300,7 @@ public final class ForStRsLinker {
     private static void arrowNoopRelease(MemorySegment self) {
         if (self.address() != 0L) {
             MemorySegment view = self.reinterpret(ARROW_ARRAY_BYTES);
-            view.set(ValueLayout.ADDRESS, 64, MemorySegment.NULL);
+            ARROW_ARRAY_RELEASE.set(view, 0L, MemorySegment.NULL);
         }
     }
 
@@ -2713,10 +2773,8 @@ public final class ForStRsLinker {
         }
         check(rc, fn);
 
-        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
-        long len =
-                outBytes.get(
-                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
         if (dataAddr == 0L) {
             return null; // not found
         }
@@ -2725,8 +2783,8 @@ public final class ForStRsLinker {
 
     /** Reads a non-null FrsBytes payload, copies to byte[], and frees the native buffer. */
     private byte[] copyAndFree(MemorySegment frsBytes, String fn) {
-        long dataAddr = frsBytes.get(ValueLayout.ADDRESS, 0).address();
-        long len = frsBytes.get(ValueLayout.JAVA_LONG, ValueLayout.ADDRESS.byteSize());
+        long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(frsBytes, 0L)).address();
+        long len = (long) FRS_BYTES_LEN.get(frsBytes, 0L);
         if (dataAddr == 0L) {
             // No data — nothing to free, return empty byte[].
             return new byte[0];
@@ -2920,10 +2978,8 @@ public final class ForStRsLinker {
         check(rc, "frs_get_at");
         // Heap byte[24] only guarantees 1-byte alignment; use unaligned reads
         // (mirrors `getInternal` for the non-snapshot Get path).
-        long dataAddr = outBytes.get(ValueLayout.ADDRESS_UNALIGNED, 0L).address();
-        long len =
-                outBytes.get(
-                        ValueLayout.JAVA_LONG_UNALIGNED, ValueLayout.ADDRESS_UNALIGNED.byteSize());
+        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
         if (dataAddr == 0L) {
             // Defensive: native should have returned NOT_FOUND already, but
             // honor the same hit/miss convention as Get.

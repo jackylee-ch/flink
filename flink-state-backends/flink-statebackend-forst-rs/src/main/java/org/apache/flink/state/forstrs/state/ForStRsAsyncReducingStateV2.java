@@ -28,6 +28,7 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.v2.AbstractReducingState;
 import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
@@ -61,6 +62,11 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     private final String stateName;
     private final byte[] stateNameBytes;
     private final TypeSerializer<K> keySerializer;
+    /**
+     * PR-A2 (S1-4 / E2-CRIT-1): namespace serializer for trailing-namespace composite-key
+     * encoding. Hard format break vs v3.x snapshots.
+     */
+    private final TypeSerializer<N> namespaceSerializer;
     private final TypeSerializer<V> valueSerializer;
 
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
@@ -71,12 +77,14 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             StateRequestHandler stateRequestHandler,
             String stateName,
             TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
             TypeSerializer<V> valueSerializer,
             ReduceFunction<V> reduceFunction) {
         super(stateRequestHandler, reduceFunction, valueSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         this.keySerializer = keySerializer;
+        this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
     }
 
@@ -87,6 +95,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -94,6 +103,10 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: trailing namespace bytes.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return keyOut.getCopyOfBuffer();
         } catch (IOException e) {
             throw new RuntimeException("ForStRsAsyncReducingStateV2: failed to serialize key", e);
@@ -103,6 +116,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     @Override
     public int serializeKeyInto(StateRequest<K, N, ?, ?> request, ColumnarBatchBuffer dest) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -110,6 +124,10 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: trailing namespace bytes.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return dest.append(keyOut.getSharedBuffer(), 0, keyOut.length());
         } catch (IOException e) {
             throw new RuntimeException(

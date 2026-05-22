@@ -316,22 +316,38 @@ public class VectorizedExecutor implements StateExecutor {
         if (n == 0) {
             return;
         }
-        long t0 = System.nanoTime();
-        linker.vectorizedBatchPut(
-                db,
-                cf,
-                c.putKeys().offsetsSegment(),
-                c.putKeys().dataSegment(),
-                c.putValues().offsetsSegment(),
-                c.putValues().dataSegment(),
-                n);
-        long latencyNs = System.nanoTime() - t0;
-        if (metrics != null) {
-            metrics.recordDispatch(VectorizedStateRequest.Kind.PUT, MIXED_STATE, n, 0L, latencyNs);
-        }
         StateRequest<?, ?, ?, ?>[] reqs = c.putRequests();
-        for (int i = 0; i < n; i++) {
-            completePut(reqs[i]);
+        long t0 = System.nanoTime();
+        try {
+            invokeVectorizedBatchPut(
+                    c.putKeys().offsetsSegment(),
+                    c.putKeys().dataSegment(),
+                    c.putValues().offsetsSegment(),
+                    c.putValues().dataSegment(),
+                    n);
+            long latencyNs = System.nanoTime() - t0;
+            if (metrics != null) {
+                metrics.recordDispatch(
+                        VectorizedStateRequest.Kind.PUT, MIXED_STATE, n, 0L, latencyNs);
+            }
+            for (int i = 0; i < n; i++) {
+                completePut(reqs[i]);
+            }
+        } catch (Throwable t) {
+            // PR-A10 / S1-9: an FFI throw here previously left every per-row
+            // StateRequest future unresolved — the outer catch in
+            // executeBatchRequests returned a failed container future but the
+            // runtime would still wait on each row's future forever. Drain them
+            // first so the async-state runtime sees them all resolve, then
+            // re-throw so the outer catch can return a failed container future.
+            for (int i = 0; i < n; i++) {
+                try {
+                    completePutExceptionally(reqs[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
+                }
+            }
+            throw t;
         }
     }
 
@@ -340,11 +356,24 @@ public class VectorizedExecutor implements StateExecutor {
         if (n == 0) {
             return;
         }
-        linker.vectorizedBatchDelete(
-                db, cf, c.deleteKeys().offsetsSegment(), c.deleteKeys().dataSegment(), n);
         StateRequest<?, ?, ?, ?>[] reqs = c.deleteRequests();
-        for (int i = 0; i < n; i++) {
-            completePut(reqs[i]);
+        try {
+            invokeVectorizedBatchDelete(
+                    c.deleteKeys().offsetsSegment(), c.deleteKeys().dataSegment(), n);
+            for (int i = 0; i < n; i++) {
+                completeDelete(reqs[i]);
+            }
+        } catch (Throwable t) {
+            // PR-A10 / S1-9: drain per-row futures so the runtime does not hang
+            // on the failing batch's individual StateRequest futures.
+            for (int i = 0; i < n; i++) {
+                try {
+                    completeDeleteExceptionally(reqs[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
+                }
+            }
+            throw t;
         }
     }
 
@@ -353,72 +382,87 @@ public class VectorizedExecutor implements StateExecutor {
         if (n == 0) {
             return;
         }
-        ensureOutCapacity(n);
-
-        long t0 = System.nanoTime();
-        // Retry-with-growth loop: if out_data buffer is too small, grow and retry.
-        while (true) {
-            int rc =
-                    linker.vectorizedBatchGet(
-                            db,
-                            cf,
-                            c.getKeys().offsetsSegment(),
-                            c.getKeys().dataSegment(),
-                            n,
-                            outOffsets,
-                            outData,
-                            outValidity,
-                            outDataCap,
-                            outDataLenSeg);
-            if (rc == FRS_STATUS_OK) {
-                long latencyNs = System.nanoTime() - t0;
-                if (metrics != null) {
-                    metrics.recordDispatch(
-                            VectorizedStateRequest.Kind.GET, MIXED_STATE, n, 0L, latencyNs);
-                }
-                break;
-            }
-            if (rc == FRS_STATUS_BUFFER_TOO_SMALL) {
-                long needed = outDataLenSeg.get(ValueLayout.JAVA_LONG, 0L);
-                long newCap = Math.max(outDataCap * 2L, needed);
-                outData = arena.allocate(newCap);
-                outDataCap = newCap;
-                continue;
-            }
-            // Non-OK, non-BUFFER_TOO_SMALL: classify via FrsErrorCode.
-            FrsErrorCode errCode = FrsErrorCode.fromU32(rc);
-            if (metrics != null) {
-                metrics.recordFfiError(VectorizedStateRequest.Kind.GET, MIXED_STATE, errCode);
-            }
-            if (errCode.isFailProcess()) {
-                FrsEnginePanicError panicErr =
-                        new FrsEnginePanicError(
-                                errCode, "kind=GET state=" + MIXED_STATE + " rc=" + rc);
-                if (fatalHandler != null) {
-                    fatalHandler.onFatalError(panicErr);
-                }
-                throw panicErr;
-            }
-            throw new FrsBackendException(
-                    FrsStatus.fromCode(rc), "frs_vectorized_batch_get rc=" + rc);
-        }
-
-        // Decode results: for each slot, read validity byte and (offsets, data) range.
         StateRequest<?, ?, ?, ?>[] reqs = c.getRequests();
         ForStRsInnerTable<?, ?, ?>[] tables = c.getTables();
-        for (int i = 0; i < n; i++) {
-            byte vld = outValidity.get(ValueLayout.JAVA_BYTE, i);
-            byte[] raw = null;
-            if (vld != 0) {
-                int start = outOffsets.get(ValueLayout.JAVA_INT, (long) i * Integer.BYTES);
-                int end = outOffsets.get(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES);
-                int len = end - start;
-                if (len > 0) {
-                    raw = new byte[len];
-                    MemorySegment.copy(outData, ValueLayout.JAVA_BYTE, start, raw, 0, len);
+        try {
+            ensureOutCapacity(n);
+
+            long t0 = System.nanoTime();
+            // Retry-with-growth loop: if out_data buffer is too small, grow and retry.
+            while (true) {
+                int rc =
+                        invokeVectorizedBatchGet(
+                                c.getKeys().offsetsSegment(),
+                                c.getKeys().dataSegment(),
+                                n,
+                                outOffsets,
+                                outData,
+                                outValidity,
+                                outDataCap,
+                                outDataLenSeg);
+                if (rc == FRS_STATUS_OK) {
+                    long latencyNs = System.nanoTime() - t0;
+                    if (metrics != null) {
+                        metrics.recordDispatch(
+                                VectorizedStateRequest.Kind.GET, MIXED_STATE, n, 0L, latencyNs);
+                    }
+                    break;
+                }
+                if (rc == FRS_STATUS_BUFFER_TOO_SMALL) {
+                    long needed = outDataLenSeg.get(ValueLayout.JAVA_LONG, 0L);
+                    long newCap = Math.max(outDataCap * 2L, needed);
+                    outData = arena.allocate(newCap);
+                    outDataCap = newCap;
+                    continue;
+                }
+                // Non-OK, non-BUFFER_TOO_SMALL: classify via FrsErrorCode.
+                FrsErrorCode errCode = FrsErrorCode.fromU32(rc);
+                if (metrics != null) {
+                    metrics.recordFfiError(VectorizedStateRequest.Kind.GET, MIXED_STATE, errCode);
+                }
+                if (errCode.isFailProcess()) {
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(
+                                    errCode, "kind=GET state=" + MIXED_STATE + " rc=" + rc);
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
+                    }
+                    throw panicErr;
+                }
+                throw new FrsBackendException(
+                        FrsStatus.fromCode(rc), "frs_vectorized_batch_get rc=" + rc);
+            }
+
+            // Decode results: for each slot, read validity byte and (offsets, data) range.
+            for (int i = 0; i < n; i++) {
+                byte vld = outValidity.get(ValueLayout.JAVA_BYTE, i);
+                byte[] raw = null;
+                if (vld != 0) {
+                    int start = outOffsets.get(ValueLayout.JAVA_INT, (long) i * Integer.BYTES);
+                    int end =
+                            outOffsets.get(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES);
+                    int len = end - start;
+                    if (len > 0) {
+                        raw = new byte[len];
+                        MemorySegment.copy(outData, ValueLayout.JAVA_BYTE, start, raw, 0, len);
+                    }
+                }
+                completeGet(reqs[i], tables[i], raw);
+            }
+        } catch (Throwable t) {
+            // PR-A10 / S1-9: drain every pending GET future on FFI / decode
+            // failure. Without this, the outer catch in executeBatchRequests
+            // returns a failed container future but the per-row StateRequest
+            // futures stay unresolved — the operator hangs on the first
+            // transient engine error in the GET path.
+            for (int i = 0; i < n; i++) {
+                try {
+                    completeGetExceptionally(reqs[i], tables[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
                 }
             }
-            completeGet(reqs[i], tables[i], raw);
+            throw t;
         }
     }
 
@@ -864,6 +908,64 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     // -----------------------------------------------------------------
+    // FFI invocation seams — overridable for tests so we can stub the
+    // linker's batch entry points without subclassing the final
+    // ForStRsLinker class. Production code always calls the real linker.
+    // -----------------------------------------------------------------
+
+    /**
+     * PR-A10 / S1-9 test seam: invoked from {@link #executePuts(VectorizedClassifier)}. Production
+     * impl forwards to {@link ForStRsLinker#vectorizedBatchPut}; tests may override to throw a
+     * deterministic exception and verify per-row future propagation.
+     */
+    protected void invokeVectorizedBatchPut(
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            MemorySegment valOffsetsSeg,
+            MemorySegment valDataSeg,
+            long count) {
+        linker.vectorizedBatchPut(
+                db, cf, keyOffsetsSeg, keyDataSeg, valOffsetsSeg, valDataSeg, count);
+    }
+
+    /**
+     * PR-A10 / S1-9 test seam: invoked from {@link #executeDeletes(VectorizedClassifier)}.
+     * Production impl forwards to {@link ForStRsLinker#vectorizedBatchDelete}; tests may override
+     * to throw a deterministic exception and verify per-row future propagation.
+     */
+    protected void invokeVectorizedBatchDelete(
+            MemorySegment keyOffsetsSeg, MemorySegment keyDataSeg, long count) {
+        linker.vectorizedBatchDelete(db, cf, keyOffsetsSeg, keyDataSeg, count);
+    }
+
+    /**
+     * PR-A10 / S1-9 test seam: invoked from {@link #executeGets(VectorizedClassifier)}. Production
+     * impl forwards to {@link ForStRsLinker#vectorizedBatchGet}; tests may override to throw a
+     * deterministic exception and verify per-row future propagation.
+     */
+    protected int invokeVectorizedBatchGet(
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            long count,
+            MemorySegment outOffsetsSeg,
+            MemorySegment outDataSeg,
+            MemorySegment outValiditySeg,
+            long outDataCapArg,
+            MemorySegment outDataLenSegArg) {
+        return linker.vectorizedBatchGet(
+                db,
+                cf,
+                keyOffsetsSeg,
+                keyDataSeg,
+                count,
+                outOffsetsSeg,
+                outDataSeg,
+                outValiditySeg,
+                outDataCapArg,
+                outDataLenSegArg);
+    }
+
+    // -----------------------------------------------------------------
     // Future completion
     // -----------------------------------------------------------------
 
@@ -903,6 +1005,46 @@ public class VectorizedExecutor implements StateExecutor {
             result = rawValue == null ? null : table.deserializeValue(rawValue);
         }
         ((InternalAsyncFuture<Object>) request.getFuture()).complete(result);
+    }
+
+    /**
+     * PR-A10 / S1-9: propagate a GET-path FFI / decode failure to the per-row StateRequest future.
+     * Mirrors {@link #completeGet} but completes the future exceptionally. The {@code table}
+     * argument is accepted for symmetry with {@link #completeGet} (and to mirror the call sites)
+     * but is currently unused — completion does not need to materialize a value on the failure
+     * path.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static void completeGetExceptionally(
+            StateRequest<?, ?, ?, ?> request, ForStRsInnerTable table, Throwable cause) {
+        String msg = cause.getMessage();
+        if (msg == null || msg.isEmpty()) {
+            msg = "ForSt-RS GET dispatch failed: " + cause.getClass().getSimpleName();
+        }
+        ((InternalAsyncFuture<Object>) request.getFuture()).completeExceptionally(msg, cause);
+    }
+
+    /**
+     * PR-A10 / S1-9: DELETE futures are {@code <Void>} so completion is a null-result. Distinct
+     * from {@link #completePut} only for call-site clarity at the dispatcher.
+     */
+    @SuppressWarnings("unchecked")
+    private static void completeDelete(StateRequest<?, ?, ?, ?> request) {
+        ((InternalAsyncFuture<Object>) request.getFuture()).complete(null);
+    }
+
+    /**
+     * PR-A10 / S1-9: propagate a DELETE-path FFI failure to the per-row StateRequest future. Same
+     * shape as {@link #completePutExceptionally} but distinct for call-site clarity.
+     */
+    @SuppressWarnings("unchecked")
+    private static void completeDeleteExceptionally(
+            StateRequest<?, ?, ?, ?> request, Throwable cause) {
+        String msg = cause.getMessage();
+        if (msg == null || msg.isEmpty()) {
+            msg = "ForSt-RS DELETE dispatch failed: " + cause.getClass().getSimpleName();
+        }
+        ((InternalAsyncFuture<Object>) request.getFuture()).completeExceptionally(msg, cause);
     }
 
     // -----------------------------------------------------------------

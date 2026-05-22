@@ -27,6 +27,7 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.v2.AbstractValueState;
 import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
@@ -46,24 +47,36 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
 
     private static final byte[] KEY_PREFIX = "k/".getBytes(StandardCharsets.UTF_8);
     private static final byte[] SLASH = "/".getBytes(StandardCharsets.UTF_8);
+    private static final byte[] EMPTY_BYTES = new byte[0];
 
     private final String stateName;
     private final byte[] stateNameBytes;
     private final TypeSerializer<K> keySerializer;
     private final TypeSerializer<V> valueSerializer;
+    /**
+     * PR-A2 (S1-4 / E2-CRIT-1): namespace serializer used to encode the request namespace as the
+     * trailing component of the storage composite key. Without this, all namespaces for the same
+     * (key, stateName) pair collide on the same storage cell — silent cross-window state
+     * corruption. May be {@code null} only for unit tests using void/no-op namespace; in
+     * production the keyed backend supplies a real serializer.
+     */
+    private final TypeSerializer<N> namespaceSerializer;
     private final DataOutputSerializer keyOut = new DataOutputSerializer(64);
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
+    private final DataOutputSerializer namespaceOut = new DataOutputSerializer(32);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
 
     public ForStRsValueStateV2(
             StateRequestHandler stateRequestHandler,
             String stateName,
             TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
             TypeSerializer<V> valueSerializer) {
         super(stateRequestHandler, valueSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         this.keySerializer = keySerializer;
+        this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
     }
 
@@ -77,11 +90,21 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
         // the same operator. Previously stored a single byte[] composite key, which meant a
         // second ValueState would read the FIRST state's composite (wrong stateName encoded)
         // — silent cross-state corruption. Now keyed by stateName via a Map<String, byte[]>.
+        //
+        // PR-A2 (S1-4 / E2-CRIT-1): cache slot must also be invalidated on namespace switch,
+        // otherwise the same (key, stateName) entry serves stale composite bytes that point at
+        // the previously-encoded namespace. We key the slot by
+        // `stateName + "::" + System.identityHashCode(namespace)`. identityHashCode is constant
+        // for the lifetime of a namespace instance (single-threaded operator thread sees stable
+        // refs from Flink's window/timer scheduler), and a different namespace object yields a
+        // different cache miss, forcing fresh composite-key serialization.
+        N namespace = request.getNamespace();
+        String cacheKey = stateName + "::" + System.identityHashCode(namespace);
         Object extra = ctx.getExtra();
         java.util.Map<String, byte[]> slot;
         if (extra instanceof java.util.Map<?, ?>) {
             slot = (java.util.Map<String, byte[]>) extra;
-            byte[] cached = slot.get(stateName);
+            byte[] cached = slot.get(cacheKey);
             if (cached != null) {
                 return cached;
             }
@@ -90,6 +113,20 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
             ctx.setExtra(slot);
         }
         try {
+            // PR-A2: encode namespace bytes as the trailing component of the composite key.
+            // Pre-A2 v3.x snapshots are NOT compatible with this format — the key format
+            // changed from `[KEY_PREFIX][key][/][stateName][/]` to
+            // `[KEY_PREFIX][key][/][stateName][/][namespaceBytes]`. Restoring an old snapshot
+            // surfaces as missing keys (loud "value() == null" reads), not silent corruption.
+            // See RELEASE-NOTES: "v4.0 keyed-state binary format is incompatible with v3.x".
+            byte[] namespaceBytes;
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceOut.clear();
+                namespaceSerializer.serialize(namespace, namespaceOut);
+                namespaceBytes = namespaceOut.getCopyOfBuffer();
+            } else {
+                namespaceBytes = EMPTY_BYTES;
+            }
             keyOut.clear();
             keySerializer.serialize(ctx.getKey(), keyOut);
             byte[] keyBytes = keyOut.getCopyOfBuffer();
@@ -98,7 +135,8 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
                             + keyBytes.length
                             + SLASH.length
                             + stateNameBytes.length
-                            + SLASH.length;
+                            + SLASH.length
+                            + namespaceBytes.length;
             byte[] composite = new byte[len];
             int off = 0;
             System.arraycopy(KEY_PREFIX, 0, composite, off, KEY_PREFIX.length);
@@ -110,7 +148,9 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
             System.arraycopy(stateNameBytes, 0, composite, off, stateNameBytes.length);
             off += stateNameBytes.length;
             System.arraycopy(SLASH, 0, composite, off, SLASH.length);
-            slot.put(stateName, composite);
+            off += SLASH.length;
+            System.arraycopy(namespaceBytes, 0, composite, off, namespaceBytes.length);
+            slot.put(cacheKey, composite);
             return composite;
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize key", e);
@@ -166,6 +206,7 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
     @Override
     public int serializeKeyInto(StateRequest<K, N, ?, ?> request, ColumnarBatchBuffer dest) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -173,6 +214,10 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: append namespace bytes to match the byte-array serializeKey() path.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return dest.append(keyOut.getSharedBuffer(), 0, keyOut.length());
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize key", e);

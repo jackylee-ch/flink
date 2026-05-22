@@ -32,6 +32,7 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.v2.AbstractMapState;
 import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
@@ -62,6 +63,15 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     private final String stateName;
     private final byte[] stateNameBytes;
     private final TypeSerializer<K> keySerializer;
+    /**
+     * PR-A2 (S1-4 / E2-CRIT-1): namespace serializer used to encode the request namespace into
+     * the composite key between the stateName SLASH and the user key. Layout:
+     * {@code [KEY_PREFIX][serialize(K)][/][stateName][/][serialize(N)][serialize(UK)]}.
+     * Without this, MapState entries for distinct namespaces collide on the same storage row.
+     * NOTE: this is a hard format break vs v3.x snapshots — restoring a pre-A2 snapshot will
+     * surface as missing entries, not silent corruption.
+     */
+    private final TypeSerializer<N> namespaceSerializer;
     private final TypeSerializer<UK> userKeySerializer;
     private final TypeSerializer<UV> userValueSerializer;
     private final DataOutputSerializer keyOut = new DataOutputSerializer(128);
@@ -80,12 +90,14 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             StateRequestHandler stateRequestHandler,
             String stateName,
             TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
             TypeSerializer<UK> userKeySerializer,
             TypeSerializer<UV> userValueSerializer) {
         super(stateRequestHandler, (TypeSerializer<UV>) userValueSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         this.keySerializer = keySerializer;
+        this.namespaceSerializer = namespaceSerializer;
         this.userKeySerializer = userKeySerializer;
         this.userValueSerializer = userValueSerializer;
     }
@@ -110,11 +122,17 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      * Builds the cache key bytes for the given userKey, using the current operator key from the
      * AEC's current RecordContext. Mirrors {@link #serializeKey(StateRequest)} but for the override
      * path where we don't have a StateRequest yet.
+     *
+     * <p>PR-A2: includes serialized namespace bytes between stateName and userKey so the
+     * MapStateCache distinguishes entries that share (operatorKey, stateName, userKey) but differ
+     * by namespace. Otherwise window-keyed MapState reads/writes silently collide across windows.
      */
     private byte[] serializeMapEntryKey(UK userKey) {
         @SuppressWarnings("unchecked")
         AsyncExecutionController<K, ?> aec = (AsyncExecutionController<K, ?>) stateRequestHandler;
         RecordContext<K> ctx = aec.getCurrentContext();
+        @SuppressWarnings("unchecked")
+        N namespace = ctx.getNamespace(this);
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -122,6 +140,11 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            if (namespaceSerializer != null
+                    && namespace != null
+                    && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             userKeySerializer.serialize(userKey, keyOut);
             return keyOut.getCopyOfBuffer();
         } catch (IOException e) {
@@ -175,6 +198,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         RecordContext<K> ctx = request.getRecordContext();
         Object payload = request.getPayload();
         StateRequestType type = request.getRequestType();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -182,6 +206,11 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: namespace BEFORE user key so per-namespace prefix scans remain
+            // contiguous (getIterPrefix builds the same prefix up to-and-including namespace).
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             if (type == StateRequestType.MAP_GET
                     || type == StateRequestType.MAP_PUT
                     || type == StateRequestType.MAP_CONTAINS
@@ -254,6 +283,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         RecordContext<K> ctx = request.getRecordContext();
         Object payload = request.getPayload();
         StateRequestType type = request.getRequestType();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -261,6 +291,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: namespace bytes before user key.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             if (type == StateRequestType.MAP_GET
                     || type == StateRequestType.MAP_PUT
                     || type == StateRequestType.MAP_CONTAINS
@@ -303,6 +337,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     @Override
     public byte[] getIterPrefix(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -310,6 +345,12 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: include namespace in iter prefix so an entries() scan only returns
+            // entries from the current namespace. Without this, the scan would leak entries
+            // across all namespaces sharing the same (operatorKey, stateName) prefix.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return keyOut.getCopyOfBuffer();
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize iter prefix", e);

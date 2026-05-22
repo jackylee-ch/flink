@@ -24,6 +24,8 @@ import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
@@ -119,6 +121,20 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private final FrsCfHandle defaultCf;
     private final TypeSerializer<K> keySerializer;
     private final boolean ownsResources;
+
+    /**
+     * Key-group range this backend services. Set via constructor — production wires the real range
+     * from {@code KeyedStateBackendParameters.getKeyGroupRange()}; legacy/test constructors default
+     * to {@code KeyGroupRange.of(0, 127)} so existing call sites compile without churn.
+     *
+     * <p>PR-A3 (S1-6 / E-CRIT-3): replaces the hard-coded {@code () -> 0} supplier so V1-sync
+     * keyed state correctly partitions keys across rescaling boundaries.
+     */
+    private final KeyGroupRange keyGroupRange;
+
+    /** Total number of key-groups (a.k.a. Flink max-parallelism) for keygroup assignment. */
+    private final int numberOfKeyGroups;
+
     private SlotArenaScope slotArenaScope;
 
     private final DataOutputSerializer keyOutBuffer = new DataOutputSerializer(DEFAULT_KEY_BUFFER);
@@ -244,15 +260,34 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                     });
 
     /**
-     * Suppliers passed to off-heap ForStRsValueState. NOTE: returns 0 unconditionally because
-     * {@code ForStRsKeyedStateBackend} is the V1-sync STANDALONE facade (does not extend
-     * {@link org.apache.flink.runtime.state.AbstractKeyedStateBackend}) and has no key-group
-     * machinery of its own. The Round-3 review S1-6 finding (rescale-broken) is correct in
-     * principle but the surgical fix requires plumbing the key-group range + count through
-     * the constructor — multi-day design. Tracked as architectural-debt in
-     * {@code 2026-05-22-high-issue-remediation-spec.md} Phase A.3.
+     * Supplier passed to off-heap ForStRsValueState that resolves the current key's key-group.
+     *
+     * <p>PR-A3 (S1-6 / E-CRIT-3): previously returned 0 unconditionally, which made V1-sync state
+     * routing collide across key-groups and break rescaling. Now delegates to
+     * {@link #computeCurrentKeyGroup()} which computes the key-group from {@link #getCurrentKey()}
+     * via {@link KeyGroupRangeAssignment#assignToKeyGroup(Object, int)} using the {@link
+     * #numberOfKeyGroups} the constructor was given.
+     *
+     * <p>When the current key is {@code null} (i.e. a state object was instantiated before
+     * {@link #setCurrentKey(Object)} was called — possible in some test paths) the supplier falls
+     * back to the range's start key-group so the encoder still produces a valid, in-range prefix.
+     *
+     * <p>The supplier is a method reference (not an inline lambda) so the field initializer
+     * doesn't trigger the JLS "definite assignment" check on the {@code final} key-group fields
+     * — those are assigned in the constructor body, after this field initializer runs, but
+     * are only <i>read</i> on each {@code getAsInt()} invocation (which is always strictly
+     * later than the constructor return).
      */
-    private final java.util.function.IntSupplier offheapKeyGroupSupplier = () -> 0;
+    private final java.util.function.IntSupplier offheapKeyGroupSupplier =
+            this::computeCurrentKeyGroup;
+
+    private int computeCurrentKeyGroup() {
+        Object cur = getCurrentKey();
+        if (cur == null) {
+            return keyGroupRange.getStartKeyGroup();
+        }
+        return KeyGroupRangeAssignment.assignToKeyGroup(cur, numberOfKeyGroups);
+    }
 
     private final java.util.function.Supplier<Object> offheapKeySupplier =
             () -> (Object) getCurrentKey();
@@ -275,9 +310,20 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private IterLifetimeWatchdog iterWatchdog;
 
     /**
-     * Constructs a backend that <i>owns</i> the supplied resources — {@link #close()} will close
-     * each of them in reverse order. This is the constructor the {@code
-     * ForStRsStateBackend.createKeyedStateBackend} factory uses.
+     * Default sentinel key-group range used by legacy/test constructors that don't care about
+     * rescaling. Matches the canonical Flink "single TM, default max-parallelism = 128" layout.
+     */
+    private static final KeyGroupRange DEFAULT_TEST_KEY_GROUP_RANGE = KeyGroupRange.of(0, 127);
+
+    /** Default sentinel number-of-key-groups for legacy/test constructors. */
+    private static final int DEFAULT_TEST_NUMBER_OF_KEY_GROUPS = 128;
+
+    /**
+     * Legacy 5-arg constructor preserved so existing test sites compile without churn. Defaults
+     * the key-group range to {@link #DEFAULT_TEST_KEY_GROUP_RANGE} and number-of-key-groups to
+     * {@link #DEFAULT_TEST_NUMBER_OF_KEY_GROUPS}. Production code paths should use the 7-arg
+     * constructor that passes the real values from
+     * {@code KeyedStateBackendParameters.getKeyGroupRange() / getNumberOfKeyGroups()}.
      */
     public ForStRsKeyedStateBackend(
             Arena arena,
@@ -285,14 +331,20 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             FrsDb db,
             FrsCfHandle defaultCf,
             TypeSerializer<K> keySerializer) {
-        this(arena, linker, db, defaultCf, keySerializer, /* ownsResources= */ true);
+        this(
+                arena,
+                linker,
+                db,
+                defaultCf,
+                keySerializer,
+                /* ownsResources= */ true,
+                DEFAULT_TEST_KEY_GROUP_RANGE,
+                DEFAULT_TEST_NUMBER_OF_KEY_GROUPS);
     }
 
     /**
-     * Constructs a backend that may or may not own the supplied resources. When {@code
-     * ownsResources} is {@code false}, {@link #close()} will only release the per-state cache and
-     * leave the linker/db/cf/arena untouched — useful for tests that want to share an Arena across
-     * multiple backends.
+     * Legacy 6-arg constructor preserved so existing test sites compile without churn. Defaults
+     * the key-group range and number-of-key-groups as in the 5-arg variant.
      */
     public ForStRsKeyedStateBackend(
             Arena arena,
@@ -301,13 +353,74 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             FrsCfHandle defaultCf,
             TypeSerializer<K> keySerializer,
             boolean ownsResources) {
+        this(
+                arena,
+                linker,
+                db,
+                defaultCf,
+                keySerializer,
+                ownsResources,
+                DEFAULT_TEST_KEY_GROUP_RANGE,
+                DEFAULT_TEST_NUMBER_OF_KEY_GROUPS);
+    }
+
+    /**
+     * Production constructor (PR-A3 / S1-6 fix): accepts explicit {@code keyGroupRange} and
+     * {@code numberOfKeyGroups} so {@link #offheapKeyGroupSupplier} routes V1-sync keys to the
+     * correct key-group via {@link KeyGroupRangeAssignment#assignToKeyGroup(Object, int)}. The
+     * {@code ownsResources=true} variant is the one the production
+     * {@code ForStRsStateBackend.createKeyedStateBackend} factory uses.
+     */
+    public ForStRsKeyedStateBackend(
+            Arena arena,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle defaultCf,
+            TypeSerializer<K> keySerializer,
+            KeyGroupRange keyGroupRange,
+            int numberOfKeyGroups) {
+        this(
+                arena,
+                linker,
+                db,
+                defaultCf,
+                keySerializer,
+                /* ownsResources= */ true,
+                keyGroupRange,
+                numberOfKeyGroups);
+    }
+
+    /**
+     * Full production constructor with both {@code ownsResources} and explicit key-group plumbing.
+     * When {@code ownsResources} is {@code false}, {@link #close()} only releases the per-state
+     * cache and leaves the linker/db/cf/arena untouched — useful for tests that want to share an
+     * Arena across multiple backends and for {@link #restoreFromSnapshot}.
+     */
+    public ForStRsKeyedStateBackend(
+            Arena arena,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle defaultCf,
+            TypeSerializer<K> keySerializer,
+            boolean ownsResources,
+            KeyGroupRange keyGroupRange,
+            int numberOfKeyGroups) {
         FrsAbi.verifyAgainst(linker::frsAbiVersion);
+        if (keyGroupRange == null) {
+            throw new NullPointerException("keyGroupRange must not be null");
+        }
+        if (numberOfKeyGroups <= 0) {
+            throw new IllegalArgumentException(
+                    "numberOfKeyGroups must be > 0 (was " + numberOfKeyGroups + ")");
+        }
         this.arena = arena;
         this.linker = linker;
         this.db = db;
         this.defaultCf = defaultCf;
         this.keySerializer = keySerializer;
         this.ownsResources = ownsResources;
+        this.keyGroupRange = keyGroupRange;
+        this.numberOfKeyGroups = numberOfKeyGroups;
         this.slotArenaScope =
                 SlotArenaScope.openForSlot(DEFAULT_SLOT_TURN_BYTES, DEFAULT_SLOT_CACHE_BYTES);
         this.iterWatchdog = new IterLifetimeWatchdog(slotArenaScope);
@@ -750,6 +863,25 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     public Arena getArena() {
         return arena;
+    }
+
+    /** Returns the key-group range this backend services (PR-A3 / S1-6). */
+    public KeyGroupRange getKeyGroupRange() {
+        return keyGroupRange;
+    }
+
+    /** Returns the total number of key-groups for keygroup assignment (PR-A3 / S1-6). */
+    public int getNumberOfKeyGroups() {
+        return numberOfKeyGroups;
+    }
+
+    /**
+     * Returns the key-group assigned to the current key (or the range's start when no current key
+     * is set). Exposed so tests can verify {@link #offheapKeyGroupSupplier} routes V1-sync state
+     * correctly under rescaling.
+     */
+    public int getCurrentKeyGroup() {
+        return offheapKeyGroupSupplier.getAsInt();
     }
 
     // ------------------------------------------------------------------

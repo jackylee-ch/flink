@@ -28,6 +28,7 @@ import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
+import org.apache.flink.runtime.state.VoidNamespace;
 import org.apache.flink.runtime.state.v2.AbstractListState;
 import org.apache.flink.runtime.state.v2.adaptor.CompleteStateIterator;
 import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
@@ -67,6 +68,12 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
     private final String stateName;
     private final byte[] stateNameBytes;
     private final TypeSerializer<K> keySerializer;
+    /**
+     * PR-A2 (S1-4 / E2-CRIT-1): namespace serializer used to append serialized namespace bytes
+     * as the trailing component of the composite key. Without this, ListState entries for
+     * different windows collide on the same storage cell. Hard format break vs v3.x snapshots.
+     */
+    private final TypeSerializer<N> namespaceSerializer;
     private final TypeSerializer<V> elementSerializer;
 
     // Per-instance (single-threaded operator thread) serializers
@@ -78,11 +85,13 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
             StateRequestHandler stateRequestHandler,
             String stateName,
             TypeSerializer<K> keySerializer,
+            TypeSerializer<N> namespaceSerializer,
             TypeSerializer<V> elementSerializer) {
         super(stateRequestHandler, elementSerializer);
         this.stateName = stateName;
         this.stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         this.keySerializer = keySerializer;
+        this.namespaceSerializer = namespaceSerializer;
         this.elementSerializer = elementSerializer;
     }
 
@@ -98,6 +107,7 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
     @Override
     public byte[] serializeKey(StateRequest<K, N, ?, ?> request) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -105,6 +115,10 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: trailing namespace bytes.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return keyOut.getCopyOfBuffer();
         } catch (IOException e) {
             throw new RuntimeException("ForStRsAsyncListStateV2: failed to serialize key", e);
@@ -114,6 +128,7 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
     @Override
     public int serializeKeyInto(StateRequest<K, N, ?, ?> request, ColumnarBatchBuffer dest) {
         RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
         try {
             keyOut.clear();
             keyOut.write(KEY_PREFIX);
@@ -121,6 +136,10 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
             keyOut.write(SLASH);
             keyOut.write(stateNameBytes);
             keyOut.write(SLASH);
+            // PR-A2: trailing namespace bytes.
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
             return dest.append(keyOut.getSharedBuffer(), 0, keyOut.length());
         } catch (IOException e) {
             throw new RuntimeException("ForStRsAsyncListStateV2: failed to serialize key", e);

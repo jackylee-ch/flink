@@ -174,9 +174,18 @@ public class ForStRsStateBackend implements StateBackend {
             }
 
             TypeSerializer<K> keySerializer = parameters.getKeySerializer();
+            // PR-A3 (S1-6 / E-CRIT-3): pass the real key-group range + number-of-key-groups so
+            // V1-sync state routing partitions keys correctly across rescaling boundaries.
             ForStRsKeyedStateBackend<K> delegate =
                     new ForStRsKeyedStateBackend<>(
-                            arena, linker, db, cf, keySerializer, /* ownsResources= */ true);
+                            arena,
+                            linker,
+                            db,
+                            cf,
+                            keySerializer,
+                            /* ownsResources= */ true,
+                            parameters.getKeyGroupRange(),
+                            parameters.getNumberOfKeyGroups());
 
             // ForStRsAbstractKeyedStateBackend owns the delegate's lifecycle via close().
             ForStRsAbstractKeyedStateBackend<K> backend =

@@ -214,11 +214,21 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             @Nonnull N ns, @Nonnull TypeSerializer<N> nsSer, @Nonnull StateDescriptor<SV> desc)
             throws Exception {
         String name = desc.getStateId();
+        // PR-A2 (S1-4 / E2-CRIT-1): forward `nsSer` to every V2 state constructor so the
+        // composite storage key includes the request namespace. Pre-A2 keys lacked the namespace
+        // suffix, causing all windows for the same (key, stateName) to collide on one cell.
+        // NOTE: this is a hard binary format break vs v3.x snapshots — restoring an old
+        // snapshot will surface as missing keys (loud nulls), not silent state corruption.
+        // See RELEASE-NOTES: "v4.0 keyed-state binary format is incompatible with v3.x".
         switch (desc.getType()) {
             case VALUE:
                 return (S)
                         new ForStRsValueStateV2<>(
-                                stateRequestHandler, name, keySerializer, desc.getSerializer());
+                                stateRequestHandler,
+                                name,
+                                keySerializer,
+                                nsSer,
+                                desc.getSerializer());
             case MAP:
                 var mapDesc = (MapStateDescriptor<?, ?>) desc;
                 return (S)
@@ -226,6 +236,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
+                                nsSer,
                                 mapDesc.getUserKeySerializer(),
                                 mapDesc.getSerializer());
             case LIST:
@@ -240,36 +251,39 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
+                                nsSer,
                                 listDesc.getSerializer());
             case REDUCING:
-                return (S) createReducingState(name, desc);
+                return (S) createReducingState(name, nsSer, desc);
             case AGGREGATING:
-                return (S) createAggregatingState(name, desc);
+                return (S) createAggregatingState(name, nsSer, desc);
             default:
                 throw new UnsupportedOperationException("Unsupported: " + desc.getType());
         }
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private ForStRsAsyncReducingStateV2<K, ?, ?> createReducingState(
-            String name, StateDescriptor<?> desc) {
+    private <N> ForStRsAsyncReducingStateV2<K, N, ?> createReducingState(
+            String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
         ReducingStateDescriptor reducingDesc = (ReducingStateDescriptor) desc;
         return new ForStRsAsyncReducingStateV2<>(
                 stateRequestHandler,
                 name,
                 keySerializer,
+                nsSer,
                 reducingDesc.getSerializer(),
                 reducingDesc.getReduceFunction());
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private ForStRsAsyncAggregatingStateV2<K, ?, ?, ?, ?> createAggregatingState(
-            String name, StateDescriptor<?> desc) {
+    private <N> ForStRsAsyncAggregatingStateV2<K, N, ?, ?, ?> createAggregatingState(
+            String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
         AggregatingStateDescriptor aggDesc = (AggregatingStateDescriptor) desc;
         return new ForStRsAsyncAggregatingStateV2<>(
                 stateRequestHandler,
                 name,
                 keySerializer,
+                nsSer,
                 aggDesc.getSerializer(),
                 aggDesc.getAggregateFunction());
     }
