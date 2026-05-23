@@ -450,17 +450,21 @@ public class VectorizedExecutor implements StateExecutor {
             // path doesn't leak the StateRequest's future (operator would hang).
             executeRequestSyncInner(single);
         } catch (Throwable t) {
-            // R19-H1: double-completion guard. {@code VectorizedClassifier.recordDelete}'s
-            // {@code onClear}-throw handler pre-completes the request's future exceptionally
-            // before rethrowing — the batched path ({@code executeBatchRequests}) relies on
-            // that pre-completion because the framework calls {@code classifier.offer(...)}
-            // OUTSIDE the executor's try block. On the sync path, however, both the
-            // pre-completion (in recordDelete) AND this outer catch would target the SAME
-            // future. In production {@code AsyncFutureImpl.completeExceptionally} delegates
-            // to {@code AsyncFrameworkExceptionHandler.handleException} with NO idempotence —
-            // double-completion → double task-failure log. Guard on {@code isDone()} so
-            // exactly one completion occurs.
-            if (!request.getFuture().isDone()) {
+            // R20-H1: explicit tracking replaces the R19-H1 isDone()-based double-completion
+            // guard. The flink-core {@code AsyncFutureImpl.completeExceptionally(msg, ex)} in
+            // production delegates ONLY to {@code AsyncFrameworkExceptionHandler.handleException}
+            // and does NOT mutate {@code completableFuture} — so {@code getFuture().isDone()}
+            // keeps returning {@code false} even after exceptional completion fired. The
+            // R19-H1 guard was therefore a no-op in production (the test passed only because
+            // the {@code RecordingFuture} mock's {@code isDone()} was wired to a counter,
+            // inverted from production semantics).
+            //
+            // The classifier records every request it already pre-completed exceptionally
+            // inside {@code recordDelete}'s onClear-throw handler. We consult that set here
+            // ({@link VectorizedClassifier#takeClassifierCompletedExceptionally}) instead of
+            // {@code isDone()} so the guard works regardless of {@code AsyncFutureImpl}'s
+            // delegate-only semantics.
+            if (!single.takeClassifierCompletedExceptionally(request)) {
                 completePutExceptionally(request, t);
             }
         }

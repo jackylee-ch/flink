@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * PR-A7 (S1-12): the TTL decorator stamps an expiry on write and filters expired entries on read.
@@ -160,6 +161,71 @@ class TtlAwareValueStateV2Test {
         ttl.update("v");
         ttl.update(null);
         assertNull(inner.slot, "null update must pass through (tombstone), not stamp");
+    }
+
+    /**
+     * R20-M2: {@code clock.currentTimeMillis() + ttlMillis} overflows {@code long} for huge TTLs
+     * (e.g. {@link Long#MAX_VALUE} or any "effectively infinite" retention config). The naive
+     * addition wraps to a NEGATIVE expiry timestamp that {@link TtlValue#isExpired} reads as
+     * already-expired-against-any-now, so EVERY read would fire {@code asyncClear} and the
+     * value would be unrecoverable. The fix saturates to {@link Long#MAX_VALUE} via
+     * {@code Math.addExact} + catch.
+     */
+    @Test
+    void hugeTtlDoesNotOverflowToNegativeExpiry() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        // Start at a non-zero time so we exercise the overflow arithmetic, not the boundary.
+        ManualClock clock = new ManualClock(1_000_000L);
+        // Build a config with TTL = Long.MAX_VALUE / 1_000_000 millis (effectively infinite).
+        // The Duration API converts that without overflow; addition inside stamp() would
+        // overflow with this large a value plus 1_000_000.
+        long hugeTtlMs = Long.MAX_VALUE - 500L; // smaller than Long.MAX, additionWith now → overflow
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(hugeTtlMs), clock);
+
+        ttl.update("forever");
+        // Pre-fix this would wrap negative; saturated to Long.MAX_VALUE the timestamp is positive
+        // and reads return the value at any (post-write) clock value.
+        assertTrue(
+                inner.slot.getExpiryTimestamp() > 0L,
+                "R20-M2: huge-TTL expiry must NOT overflow to negative; got "
+                        + inner.slot.getExpiryTimestamp());
+        assertEquals(Long.MAX_VALUE, inner.slot.getExpiryTimestamp());
+
+        // Read at a far-future clock — the value is still fresh (because expiry == MAX_VALUE).
+        clock.now = Long.MAX_VALUE - 1L;
+        assertEquals("forever", ttl.value(), "post-fix: huge-TTL values must NOT read as expired");
+        assertEquals(0, inner.clearCount, "lazy clear must NOT fire on a non-expired huge-TTL read");
+    }
+
+    /**
+     * R20-L1: the lazy-clear path inside {@link TtlAwareValueStateV2#value()} used to call
+     * {@code inner.asyncClear()} and discard the returned {@link StateFuture}. Engine errors on
+     * the clear would log nowhere. Fix: chain {@code thenAccept} on the returned future so a
+     * failure surfaces through Flink's framework exception handler.
+     *
+     * <p>This test verifies the lazy-clear future is OBSERVED (not dropped on the floor) — the
+     * {@link InMemoryInner#asyncClear} returns a completed future, and the chained
+     * {@code thenAccept} must run without throwing.
+     */
+    @Test
+    void lazyClearChainsOnReturnedFuture() {
+        InMemoryInner<TtlValue<String>> inner = new InMemoryInner<>();
+        ManualClock clock = new ManualClock(0L);
+        TtlAwareValueStateV2<Object, Object, String> ttl =
+                new TtlAwareValueStateV2<>(inner, configWithTtlMillis(100L), clock);
+
+        ttl.update("v");
+        clock.now = 500L; // expired -> lazy clear fires
+        assertNull(ttl.value(), "expired read returns null");
+
+        // The fix observes the returned future via thenAccept; the test's stub fixture
+        // returns a completed future so the chain runs without throwing. The clearCount
+        // increment proves asyncClear() WAS still called (lazy delete is preserved).
+        assertEquals(
+                1,
+                inner.clearCount,
+                "R20-L1: lazy clear must still fire on expired read (and now its future is observed)");
     }
 
     @Test

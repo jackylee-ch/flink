@@ -20,12 +20,12 @@ package org.apache.flink.state.forstrs;
 
 import org.apache.flink.api.common.state.v2.State;
 import org.apache.flink.api.common.state.v2.StateFuture;
+import org.apache.flink.core.asyncprocessing.AsyncFutureImpl;
 import org.apache.flink.runtime.asyncprocessing.EpochManager.Epoch;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestType;
 import org.apache.flink.runtime.state.v2.internal.InternalPartitionedState;
-import org.apache.flink.state.forstrs.BatchedFailurePropagationTestHelpers.RecordingFuture;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
@@ -33,29 +33,48 @@ import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.junit.jupiter.api.Test;
 
 import java.lang.foreign.Arena;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceArray;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * R18-H2 regression: {@link VectorizedExecutor#executeRequestSync} must complete the
- * per-row {@link StateRequest}'s future exceptionally when ANY phase of the request setup
- * (including {@code single.offer(request)} → {@code recordDelete} → {@code onClear}) throws.
+ * R18-H2 / R19-H1 / R20-H1 regression: {@link VectorizedExecutor#executeRequestSync} must
+ * complete the per-row {@link StateRequest}'s future exceptionally EXACTLY ONCE when ANY phase
+ * of the request setup (including {@code single.offer(request)} → {@code recordDelete} →
+ * {@code onClear}) throws.
  *
- * <p>Pre-fix the try/catch in {@code executeRequestSync} only wrapped
+ * <p>Pre-R18 the try/catch in {@code executeRequestSync} only wrapped
  * {@code executeRequestSyncInner}; a throw escaping from {@code single.offer} (when
  * {@link VectorizedClassifier#recordDelete} rethrows the {@code onClear} flush failure)
  * propagated out of {@code executeRequestSync} without ever completing the StateRequest's
  * future, leaving the operator hung on the unresolved {@code CompletableFuture}.
  *
- * <p>Fix widens the try block to cover {@code reset / registerListState / initNewKindBuffers /
- * offer / executeRequestSyncInner}; on any throw the test verifies the future is
- * exceptionally complete (i.e. {@code completePutExceptionally} was reached).
+ * <p>R18-H2 widened the try block. R19-H1 added an {@code isDone()} guard inside the outer
+ * catch to prevent double-completion (since {@code recordDelete} also pre-completes the
+ * request's future before rethrowing). <b>R20-H1</b> replaced that {@code isDone()} guard with
+ * explicit set-based tracking
+ * ({@link VectorizedClassifier#takeClassifierCompletedExceptionally}) because the production
+ * {@link AsyncFutureImpl#completeExceptionally(String, Throwable)} delegates ONLY to the
+ * framework {@code AsyncFrameworkExceptionHandler.handleException} — it does NOT mutate the
+ * internal {@code completableFuture}, so {@code getFuture().isDone()} keeps returning
+ * {@code false} even after exceptional completion fired. The R19-H1 guard would therefore
+ * have been ineffective in production (the older mock's {@code isDone()} was wired to a
+ * counter — inverted from production semantics — so the test passed but the field never
+ * exercised the real guard path).
+ *
+ * <p>This test now uses a REAL {@link AsyncFutureImpl} with an
+ * {@link AsyncFutureImpl.AsyncFrameworkExceptionHandler} that counts
+ * {@code handleException} invocations directly. That counter is the SAME side-channel the
+ * production framework uses to surface async-state failures (task log + lifecycle), so an
+ * assertion of "exactly one handler call on the failure path" enforces the same one-shot
+ * contract the production framework expects.
  */
 class SyncExecuteRequestOnClearThrowTest {
 
     @Test
-    void onClearThrow_completesRequestFutureExceptionally() {
+    void onClearThrow_completesRequestFutureExceptionallyExactlyOnce() {
         RuntimeException cause = new RuntimeException("simulated onClear failure");
 
         try (Arena arena = Arena.ofConfined()) {
@@ -65,9 +84,24 @@ class SyncExecuteRequestOnClearThrowTest {
 
             VectorizedExecutor exec = new VectorizedExecutor(linker, db, cf, arena);
 
-            RecordingFuture<Object> fut = new RecordingFuture<>();
-            // Use a stub that throws from onClear — recordDelete rethrows after marking
-            // batchPoisonCause, and the throw propagates out of single.offer(request).
+            // R20-H1: use a REAL AsyncFutureImpl whose completeExceptionally semantics MATCH
+            // production. The AsyncFrameworkExceptionHandler increments a counter on every
+            // handleException call — this counter is the production-equivalent "did the
+            // framework see this failure?" side channel.
+            CountingExceptionHandler handler = new CountingExceptionHandler();
+            AsyncFutureImpl<Object> realFut =
+                    new AsyncFutureImpl<>(
+                            // CallbackRunner: unused on the failure path because
+                            // completeExceptionally bypasses the completableFuture entirely.
+                            task -> {
+                                try {
+                                    task.run();
+                                } catch (Exception e) {
+                                    handler.handleException("inline-runner", e);
+                                }
+                            },
+                            handler);
+
             ThrowingOnClearStubState state = new ThrowingOnClearStubState(cause);
             RecordContext<Object> ctx =
                     new RecordContext<>(
@@ -80,38 +114,55 @@ class SyncExecuteRequestOnClearThrowTest {
                             /* priority */ 0);
             // CLEAR routes through recordDelete → onClear → throw.
             StateRequest<Object, Object, Object, Object> req =
-                    new StateRequest<>(state, StateRequestType.CLEAR, /* sync */ true, null, fut, ctx);
+                    new StateRequest<>(
+                            state, StateRequestType.CLEAR, /* sync */ true, null, realFut, ctx);
 
-            // executeRequestSync MUST NOT propagate the cause out; instead it must catch it and
-            // complete the request's future exceptionally. Pre-fix the throw escaped and the
-            // future was left unfinished.
+            // executeRequestSync MUST NOT propagate the cause out; instead it must catch it
+            // and complete the request's future exceptionally. Pre-R18 the throw escaped and
+            // the future was left unfinished.
             try {
                 exec.executeRequestSync(req);
             } catch (Throwable t) {
-                // The fix's catch block must absorb the throw. If anything escapes,
-                // the operator hangs in real execution.
                 org.junit.jupiter.api.Assertions.fail(
-                        "R18-H2: executeRequestSync must not propagate the onClear throw — "
-                                + "got: "
+                        "R18-H2: executeRequestSync must not propagate the onClear throw — got: "
                                 + t);
             }
 
-            // R19-H1: must be EXACTLY 1, not >=1. {@code VectorizedClassifier.recordDelete}'s
-            // onClear-throw handler pre-completes the future exceptionally before rethrowing;
-            // the outer catch in {@code executeRequestSync} would re-complete the SAME future
-            // without an idempotence guard. In production
-            // {@code AsyncFutureImpl.completeExceptionally} delegates to
-            // {@code AsyncFrameworkExceptionHandler.handleException} with no idempotence —
-            // double-completion → double task-failure log. The R19-H1 isDone() guard ensures
-            // exactly one exceptional completion.
-            assertThat(fut.exceptionalCalls.get())
-                    .as("R19-H1: request future must be completed exceptionally EXACTLY once on"
-                            + " onClear throw (pre-fix: double-completion via recordDelete +"
-                            + " executeRequestSync outer catch)")
+            // R20-H1 invariant: handleException MUST fire EXACTLY ONCE.
+            //
+            //  - Pre-R19 (no guard): recordDelete completed once, executeRequestSync outer
+            //    catch completed again → handler count = 2 (double task-failure log).
+            //  - R19-H1 with isDone() guard: production AsyncFutureImpl.isDone() always
+            //    returns false after completeExceptionally → guard ineffective → still 2.
+            //  - R20-H1 with takeClassifierCompletedExceptionally(): set marker correctly
+            //    short-circuits the outer catch → handler count = 1. (Asserted here.)
+            assertThat(handler.invocations.get())
+                    .as("R20-H1: AsyncFrameworkExceptionHandler.handleException must fire EXACTLY"
+                            + " once on the onClear-throw path. Pre-R20 the isDone() guard was"
+                            + " ineffective because production AsyncFutureImpl.completeExceptionally"
+                            + " does not mutate the internal completableFuture; double-completion"
+                            + " produced double task-failure logs.")
                     .isEqualTo(1);
-            assertThat(fut.normalCalls.get())
-                    .as("request future must NOT receive a normal completion on the failure path")
-                    .isEqualTo(0);
+            assertThat(handler.lastCause.get())
+                    .as("handler must observe the original onClear-throw cause")
+                    .isSameAs(cause);
+        }
+    }
+
+    /**
+     * R20-H1: real-semantics exception-handler stub. Counts every {@code handleException}
+     * invocation (which is what production {@link AsyncFutureImpl#completeExceptionally}
+     * routes to). Equivalent test signal to "completion fired" in production.
+     */
+    static final class CountingExceptionHandler
+            implements AsyncFutureImpl.AsyncFrameworkExceptionHandler {
+        final AtomicInteger invocations = new AtomicInteger(0);
+        final AtomicReference<Throwable> lastCause = new AtomicReference<>();
+
+        @Override
+        public void handleException(String message, Throwable exception) {
+            invocations.incrementAndGet();
+            lastCause.set(exception);
         }
     }
 

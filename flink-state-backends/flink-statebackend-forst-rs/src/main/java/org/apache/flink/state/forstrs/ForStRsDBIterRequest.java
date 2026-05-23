@@ -123,6 +123,15 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         return existingIterator != null || existingVecHandle != 0L;
     }
 
+    /**
+     * R20-M1: package-private accessor used by {@link VectorizedClassifier} to drain pending
+     * per-row futures when a sibling row's {@code onClear} hook throws. Exposes the underlying
+     * Flink-runtime {@link StateRequest} that owns this iter row's future.
+     */
+    StateRequest<K, N, ?, ?> getStateRequest() {
+        return request;
+    }
+
     public long getExistingVecHandle() {
         return existingVecHandle;
     }

@@ -128,6 +128,26 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
      */
     private volatile Throwable batchPoisonCause = null;
 
+    /**
+     * R20-H1: explicit tracking of which {@link StateRequest}s have already had their future
+     * completed exceptionally by {@link #recordDelete}'s onClear-throw handler. Required because
+     * {@link org.apache.flink.core.asyncprocessing.AsyncFutureImpl#completeExceptionally(String,
+     * Throwable)} in flink-core delegates ONLY to the framework exception handler — it does NOT
+     * touch the internal {@code completableFuture}, so {@code getFuture().isDone()} keeps
+     * returning {@code false} even after exceptional completion fired. The R19-H1 isDone() guard
+     * in {@link VectorizedExecutor#executeRequestSync} was therefore ineffective in production.
+     *
+     * <p>Set membership is the source of truth: {@code recordDelete} adds the request when it
+     * pre-completes the future; {@link VectorizedExecutor#executeRequestSync}'s outer catch
+     * checks {@link #wasClassifierCompletedExceptionally(StateRequest)} to decide whether to
+     * skip the second {@code completePutExceptionally} call.
+     *
+     * <p>Membership is bounded by the number of concurrent {@code recordDelete} calls within a
+     * single batch (= batch size). Cleared on {@link #reset()}.
+     */
+    private final Set<StateRequest<?, ?, ?, ?>> classifierCompletedExceptionally =
+            ConcurrentHashMap.newKeySet();
+
     public VectorizedClassifier(
             ColumnarBatchBuffer getKeys,
             ColumnarBatchBuffer putKeys,
@@ -201,6 +221,28 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         // starts in a clean state. Callers must read {@link #batchPoisonCause()} before
         // calling reset() if they need the cause for diagnostics.
         batchPoisonCause = null;
+        // R20-H1: clear the explicit "classifier already completed this request exceptionally"
+        // tracker so the next batch starts fresh. Membership is meaningful only within a single
+        // batch's offer-phase + executeBatchRequests/executeRequestSync window.
+        classifierCompletedExceptionally.clear();
+    }
+
+    /**
+     * R20-H1: returns {@code true} iff {@code request}'s future has already been completed
+     * exceptionally by {@link #recordDelete} (typically because the state's {@code onClear} hook
+     * threw an FFI failure). The outer catch in {@link VectorizedExecutor#executeRequestSync}
+     * (and the batched-path equivalent) uses this to skip the second
+     * {@code completePutExceptionally} call that would otherwise double-fire the framework
+     * exception handler in production (where
+     * {@link org.apache.flink.core.asyncprocessing.AsyncFutureImpl#completeExceptionally} does
+     * not change {@code isDone()} state).
+     *
+     * <p>This method removes the entry on lookup so the membership set stays bounded by the
+     * number of concurrent in-flight failures, not by the total number of historical failures.
+     * Each request is checked at most once per batch.
+     */
+    public boolean takeClassifierCompletedExceptionally(StateRequest<?, ?, ?, ?> request) {
+        return classifierCompletedExceptionally.remove(request);
     }
 
     /**
@@ -213,6 +255,66 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
      */
     public Throwable batchPoisonCause() {
         return batchPoisonCause;
+    }
+
+    /**
+     * R20-M1: drain every per-row future that has already been classified into this batch with
+     * the given {@code cause}. Called from {@link #recordDelete}'s onClear-throw handler before
+     * the rethrow so rows 0..N-1 don't hang on unresolved futures after
+     * {@code executeBatchRequests} bails out via {@link #batchPoisonCause()}.
+     *
+     * <p>Walks the four classified-row arrays (getRequests, putRequests, deleteRequests,
+     * appendMergeRequests) and the iter list. The current request itself is NOT drained here —
+     * it was already pre-completed by the caller above.
+     *
+     * <p>Each drained request is also added to {@link #classifierCompletedExceptionally} so a
+     * subsequent {@code executeBatchRequests} path (or {@code executeRequestSync} outer catch)
+     * skips re-completion.
+     *
+     * <p>Best-effort: a throw from any individual {@code completeExceptionally} call is
+     * swallowed so the rest of the rows still drain. The set membership marker is set
+     * regardless so the outer catch never re-completes.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void drainClassifiedRowsExceptionally(Throwable cause) {
+        String prefix = "ForSt-RS onClear flush failed (batched-row drain): ";
+        String msg = prefix + cause.getClass().getSimpleName();
+        for (int i = 0; i < getCount; i++) {
+            failPerRowFuture(getRequests[i], msg, cause);
+        }
+        for (int i = 0; i < putCount; i++) {
+            failPerRowFuture(putRequests[i], msg, cause);
+        }
+        for (int i = 0; i < deleteCount; i++) {
+            failPerRowFuture(deleteRequests[i], msg, cause);
+        }
+        for (int i = 0; i < appendMergeCount; i++) {
+            failPerRowFuture(appendMergeRequests[i], msg, cause);
+        }
+        for (int i = 0; i < iterRequests.size(); i++) {
+            ForStRsDBIterRequest<?, ?, ?, ?> ir = iterRequests.get(i);
+            StateRequest<?, ?, ?, ?> sr = ir.getStateRequest();
+            if (sr != null) {
+                failPerRowFuture(sr, msg, cause);
+            }
+        }
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private void failPerRowFuture(StateRequest<?, ?, ?, ?> request, String msg, Throwable cause) {
+        if (request == null) {
+            return;
+        }
+        // Mark first so even if the completion call throws, the outer catch still skips.
+        classifierCompletedExceptionally.add(request);
+        try {
+            ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>)
+                            request.getFuture())
+                    .completeExceptionally(msg, cause);
+        } catch (Throwable ignore) {
+            // Best-effort: continue draining the rest. The set membership marker is already in
+            // place so executeRequestSync's outer catch won't double-fire on this request.
+        }
     }
 
     // -----------------------------------------------------------------
@@ -587,6 +689,13 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         } catch (Throwable t) {
             // (1) Surface to the request's own future. Cleanup-safe: completeExceptionally is
             // a no-op if the future was already completed by an earlier path.
+            //
+            // R20-H1: record the request in {@link #classifierCompletedExceptionally} BEFORE
+            // calling completeExceptionally. The outer catch in
+            // {@code VectorizedExecutor#executeRequestSync} consults this set (not the
+            // production-broken {@code isDone()}) to decide whether to skip its own
+            // completePutExceptionally call.
+            classifierCompletedExceptionally.add(request);
             try {
                 ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>)
                                 request.getFuture())
@@ -595,8 +704,22 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                                 t);
             } catch (Throwable ignore) {
                 // The request may not yet have a future (test path) — swallow so the poison
-                // path below still runs and the original cause is re-thrown.
+                // path below still runs and the original cause is re-thrown. The set entry
+                // remains so the outer catch still skips a duplicate completion attempt.
             }
+            // R20-M1: drain every per-row future from rows already classified into THIS batch
+            // before the throw. The batched path ({@link
+            // VectorizedExecutor#executeBatchRequests}) reads the poison flag and returns a
+            // failed container future WITHOUT entering the per-op executors — those executors
+            // are what would otherwise complete getRequests / putRequests / appendMergeRequests
+            // / iterRequests futures. Without this drain, rows 0..N-1 sit on unresolved futures
+            // forever and AEC hangs waiting on them at the operator level.
+            //
+            // Each completed future is also marked in {@code classifierCompletedExceptionally}
+            // so a subsequent reset()-then-rebuild path cannot re-complete the same future
+            // (defensive — reset() clears the set as part of teardown so this is belt-and-
+            // suspenders rather than load-bearing).
+            drainClassifiedRowsExceptionally(t);
             // (2) Mark the batch poisoned. The executor's executeBatchRequests checks this
             // before each dispatch step and aborts with the captured cause; reset() then clears
             // the flag once the batch is fully torn down.
