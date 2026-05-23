@@ -148,8 +148,22 @@ public final class ForStRsStateMigration {
      * "drop+ingest" recovery pattern where a failed drop should leave the original CF
      * fully accessible).
      *
+     * <p>R26-M4: clarification on the FFM-handle side-effect. This method closes ONLY the
+     * passed {@link FrsCfHandle} instance. The engine-side CF is irrevocably dropped (any
+     * subsequent native call against the dropped CF fails with {@code INVALID_ARGUMENT}),
+     * so observation of the drop from any sibling handle is automatic — but those sibling
+     * handles' {@code isClosed()} flags remain {@code false} because Java has no way to
+     * enumerate all wrappers that were minted from {@code dbDefaultCf} (each call returns a
+     * NEW {@link FrsCfHandle} wrapping the same underlying CF pointer, and there is no
+     * registry of live wrappers). Callers that retained additional handles to the same CF
+     * are responsible for closing them — otherwise the FFM {@code MemorySegment} backing
+     * each wrapper remains live until its owning {@link java.lang.foreign.Arena} closes.
+     *
      * @param db open ForSt-RS database (must outlive this call)
-     * @param cf column-family handle to drop (any clone of the handle observes the drop)
+     * @param cf column-family handle to drop. The engine-side drop is observable from any
+     *     clone of this handle, but this method closes ONLY the PASSED instance — callers
+     *     are responsible for closing every other {@link FrsCfHandle} wrapper they minted
+     *     against the same CF.
      * @throws NullPointerException if any argument is null
      * @throws org.apache.flink.state.forstrs.FrsBackendException if the native call returns a
      *     non-OK status (e.g. caller attempted to drop the default CF)

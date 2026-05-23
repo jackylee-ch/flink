@@ -196,8 +196,15 @@ public final class ForStRsDBWriteBatchWrapper implements AutoCloseable {
             // Always release the native batch — the engine's commit does NOT free it (see
             // contract note above). Order: native release first, then flip Java-side flags so
             // a re-entrant close() through this same wrapper is a structural no-op.
+            // R26-L1: guard against {@code h == 0L} for consistency with {@link #close()}.
+            // The {@code ensureOpen} check at the top of {@code commit()} should make this
+            // unreachable today, but a defensive guard avoids passing a NULL handle to FFI in
+            // the event {@link #handle} is mutated concurrently (and lets static analyzers
+            // see the same guard pattern across both lifecycle exits).
             try {
-                linker.writebatchClose(h);
+                if (h != 0L) {
+                    linker.writebatchClose(h);
+                }
             } catch (Throwable closeFailure) {
                 if (thrown != null) {
                     thrown.addSuppressed(closeFailure);

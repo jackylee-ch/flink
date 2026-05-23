@@ -747,6 +747,36 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         StateTtlConfig ttlConfig = desc.getTtlConfig();
         boolean ttlEnabled = ttlConfig != null && ttlConfig.isEnabled();
         long ttlMillis = ttlEnabled ? ttlConfig.getTimeToLive().toMillis() : 0L;
+        // R26-M1: validate state-type-vs-TTL BEFORE touching the registry. Pre-R26-M1 the
+        // {@code verifyOrRegister} call committed {@code ttlEnabled=true} into the registry
+        // for every state type, then the switch in {@code createTtlAwareStateInternal} below
+        // threw {@code UnsupportedOperationException} for MAP/LIST/REDUCING/AGGREGATING. The
+        // registry mutation persisted across the throw — a subsequent retry (or a snapshot
+        // taken before the catch ran) carried a {@code ttlEnabled=true} entry for state that
+        // never had TTL wrapping applied, the same registry-vs-on-disk-layout mismatch that
+        // R26-H1 fixes on the V1-sync path. Move the unsupported-state-type check up so the
+        // registry only ever records {@code ttlEnabled=true} for state types whose
+        // construction actually applies TtlSerializer wrapping.
+        if (ttlEnabled) {
+            switch (desc.getType()) {
+                case VALUE:
+                    break; // supported — createTtlAwareStateInternal wraps with TtlSerializer
+                case MAP:
+                case LIST:
+                case REDUCING:
+                case AGGREGATING:
+                    throw new UnsupportedOperationException(
+                            "PR-A7: TTL is wired for ValueState V2 in this PR. "
+                                    + desc.getType()
+                                    + " state TTL is deferred to follow-on PR (decorator + "
+                                    + "per-entry expiry filter on iteration paths). State name: "
+                                    + desc.getStateId()
+                                    + ". Disable TTL or use ValueState in the interim.");
+                default:
+                    throw new UnsupportedOperationException(
+                            "Unsupported state type for TTL: " + desc.getType());
+            }
+        }
         stateSerializerRegistry.verifyOrRegister(
                 desc.getStateId(),
                 desc.getType().ordinal(),

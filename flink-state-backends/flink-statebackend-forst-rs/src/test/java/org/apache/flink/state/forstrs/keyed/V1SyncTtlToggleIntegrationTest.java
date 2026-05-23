@@ -43,34 +43,38 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * R25-H1 integration acceptance test: the V1-sync production entry point
- * {@link ForStRsAbstractKeyedStateBackend#createOrUpdateInternalState} must thread the user's
- * TTL config from {@link ValueStateDescriptor#getTtlConfig()} down into the 4-arg
- * {@link StateSerializerRegistry#verifyOrRegister} overload so a TTL toggle across a
- * snapshot/restore is surfaced as {@link StateMigrationException}.
+ * R25-H1 integration acceptance test for the V1-sync production entry point
+ * {@link ForStRsAbstractKeyedStateBackend#createOrUpdateInternalState}.
  *
- * <p>Pre-R25-H1 the production call sites used the 3-arg {@code verifyOrRegister} (which
- * defaults {@code ttlEnabled=false}, {@code ttlMillis=0}), bypassing the toggle check
- * added by R24-H2. Without this fix a job that ran with TTL=ON, snapshotted, then was
- * restarted with TTL=OFF would silently decode the 8-byte expiry header as payload bytes
- * (corrupting every restored value) because the schema check at the user-serializer level
- * would resolve {@code COMPATIBLE_AS_IS}.
+ * <p>R26-H1 (this revision): V1-sync NO LONGER supports TTL — the V1-sync entry path lacks
+ * the {@code createTtlAwareStateInternal} wrapping that V2 async performs. Pre-R26-H1 the
+ * V1-sync code forwarded {@code ttlEnabled=true} to {@code verifyOrRegister} but constructed
+ * the state with the user's raw serializer (no TtlSerializer), so the registry's claim did
+ * NOT match the on-disk layout. The fix rejects TTL at register time with
+ * {@link UnsupportedOperationException}. These tests therefore verify:
  *
- * <p>Test design (per R25 spec — INTEGRATION level, NOT a direct
- * {@code StateSerializerRegistry.verifyOrRegister(name, kind, ser, ttlEnabled, ttlMillis)}
- * call): we drive a real V1-sync backend through {@code createOrUpdateInternalState}
- * with a {@link ValueStateDescriptor} that has TTL enabled, then simulate a
- * snapshot/restore by copying the registry blob into a brand-new backend and
- * seeding it via {@code seedRestoredSerializerMetadata}. The second {@code
- * createOrUpdateInternalState} call uses the SAME state name but the descriptor's
- * TTL config flipped off, and must throw {@code StateMigrationException}. The
- * 4-arg registry overload is only reached if the backend code correctly extracts
- * {@code desc.getTtlConfig()} and forwards both flag and millis.
+ * <ol>
+ *   <li>V1-sync registration with TTL=ON throws {@code UnsupportedOperationException}
+ *       (the snapshot/restore TTL-toggle scenario is impossible to construct on V1-sync now
+ *       because the initial TTL=ON registration is rejected).</li>
+ *   <li>V1-sync TTL=OFF still works correctly (no regression) and the registry records
+ *       {@code ttlEnabled=false} as the on-disk layout matches.</li>
+ *   <li>The OFF→OFF cross-snapshot round-trip continues to function — i.e. the registry
+ *       still serializes/deserializes a non-TTL state across the boundary.</li>
+ * </ol>
+ *
+ * <p>R26-L2: every V1Pair gets closed in a finally that also closes the {@link Arena} so
+ * the FFM allocation does not leak between tests.
+ *
+ * <p>R26-L3: the {@code formatVersion} assertion that previously claimed "v2 envelope is
+ * emitted when TTL flags are present" was misleading — the registry always writes
+ * {@code CURRENT_FORMAT_VERSION=2} regardless of {@code ttlEnabled}. It has been removed.
  */
 class V1SyncTtlToggleIntegrationTest {
 
@@ -111,19 +115,29 @@ class V1SyncTtlToggleIntegrationTest {
             FrsDb db,
             FrsCfHandle cf,
             Arena arena,
-            CloseableRegistry cancelStreamRegistry) {}
+            CloseableRegistry cancelStreamRegistry) {
+
+        void closeAll() throws Exception {
+            try {
+                backend.close();
+            } finally {
+                // R26-L2: close the Arena even if backend.close() throws so the FFM
+                // allocation does not leak into the next test.
+                if (arena.scope().isAlive()) {
+                    arena.close();
+                }
+            }
+        }
+    }
 
     /**
-     * R25-H1 acceptance: register a ValueState through {@code createOrUpdateInternalState}
-     * with TTL enabled, simulate snapshot+restore via registry-blob serialize/deserialize +
-     * {@code seedRestoredSerializerMetadata}, then attempt to register the same state with
-     * TTL DISABLED — must throw {@link StateMigrationException}.
+     * R26-H1 acceptance: V1-sync rejects TTL-enabled descriptors at register time with
+     * {@link UnsupportedOperationException}. The registry must NOT be polluted with a
+     * ttlEnabled=true entry, because V1-sync writes bare bytes (no TtlSerializer wrapping).
      */
     @Test
-    void ttlOnToOffViaCreateOrUpdateInternalStateThrows(@TempDir Path tmp) throws Exception {
-        // Session 1: open backend, register state with TTL=ON.
-        V1Pair pair1 = openV1Pair(tmp.resolve("db1"));
-        byte[] registryBlob;
+    void ttlEnabledOnV1SyncRejectedAtRegisterTime(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db1"));
         try {
             ValueStateDescriptor<Long> ttlOn =
                     new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
@@ -133,96 +147,88 @@ class V1SyncTtlToggleIntegrationTest {
                             .build();
             ttlOn.enableTimeToLive(ttlConfig);
             assertTrue(ttlOn.getTtlConfig().isEnabled(), "descriptor reports TTL enabled");
-
-            // Force initialization (otherwise getSerializer() throws).
             ttlOn.initializeSerializerUnlessSet(new ExecutionConfig());
 
-            pair1.backend.createOrUpdateInternalState(
-                    /* namespaceSerializer= */ IntSerializer.INSTANCE,
-                    ttlOn,
-                    /* snapshotTransformFactory= */ StateSnapshotTransformFactory.noTransform());
-
-            // Inspect the registry — the TTL flag must be persisted in the live metadata
-            // (this is what asserts that the new 4-arg path is actually reached).
-            StateSerializerRegistry reg = pair1.backend.stateSerializerRegistry();
-            StateSerializerMetadata md = reg.get("counter");
-            assertNotNull(md, "registry holds counter metadata");
-            assertTrue(
-                    md.ttlEnabled(),
-                    "R25-H1: createOrUpdateInternalState forwards ttlEnabled=true from descriptor"
-                            + " to registry (live metadata reflects the flag)");
-            assertEquals(
-                    60_000L,
-                    md.ttlMillis(),
-                    "R25-H1: createOrUpdateInternalState forwards ttlMillis from descriptor");
-            assertEquals(
-                    StateSerializerMetadata.FORMAT_VERSION_V2,
-                    md.formatVersion(),
-                    "v2 envelope is emitted when TTL flags are present");
-
-            // Capture the registry blob — this is what the snapshot strategy would persist
-            // into {@code _serializer_metadata.bin}.
-            registryBlob = reg.serialize();
-        } finally {
-            pair1.backend.close();
-        }
-
-        // Session 2: fresh backend, seed the registry from the captured blob, then attempt
-        // a same-name registration with TTL DISABLED — must throw StateMigrationException.
-        V1Pair pair2 = openV1Pair(tmp.resolve("db2"));
-        try {
-            Map<String, StateSerializerMetadata> parsed =
-                    StateSerializerRegistry.deserialize(registryBlob);
-            pair2.backend.seedRestoredSerializerMetadata(new LinkedHashMap<>(parsed));
-            assertTrue(
-                    pair2.backend.stateSerializerRegistry().activatedForRestore(),
-                    "seed activates the restore branch");
-
-            ValueStateDescriptor<Long> ttlOff =
-                    new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
-            // NOT calling enableTimeToLive — descriptor reports TTL DISABLED by default.
-            assertTrue(
-                    !ttlOff.getTtlConfig().isEnabled(),
-                    "second descriptor reports TTL disabled");
-            ttlOff.initializeSerializerUnlessSet(new ExecutionConfig());
-
-            StateMigrationException ex =
+            UnsupportedOperationException ex =
                     assertThrows(
-                            StateMigrationException.class,
+                            UnsupportedOperationException.class,
                             () ->
-                                    pair2.backend.createOrUpdateInternalState(
+                                    pair.backend.createOrUpdateInternalState(
                                             IntSerializer.INSTANCE,
-                                            ttlOff,
+                                            ttlOn,
                                             StateSnapshotTransformFactory.noTransform()),
-                            "R25-H1: createOrUpdateInternalState must surface a TTL toggle as"
-                                    + " StateMigrationException via the 4-arg verifyOrRegister"
-                                    + " overload");
+                            "R26-H1: V1-sync must reject TTL-enabled descriptors");
             assertTrue(
-                    ex.getMessage().contains("TTL toggle"),
-                    "exception mentions TTL toggle: " + ex.getMessage());
+                    ex.getMessage().contains("TTL"),
+                    "exception message mentions TTL: " + ex.getMessage());
             assertTrue(
-                    ex.getMessage().contains("prior=TTL_ENABLED"),
-                    "exception identifies the prior TTL state: " + ex.getMessage());
-            assertTrue(
-                    ex.getMessage().contains("now=TTL_DISABLED"),
-                    "exception identifies the new TTL state: " + ex.getMessage());
+                    ex.getMessage().contains("V1-sync"),
+                    "exception message identifies the V1-sync limitation: " + ex.getMessage());
+
+            // Registry must NOT have been polluted with a ttlEnabled=true entry — the throw
+            // happens BEFORE verifyOrRegister is called.
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            assertNotNull(reg);
+            // No entry should exist at all (or, if one existed from a prior call, it must not
+            // carry ttlEnabled=true).
+            StateSerializerMetadata md = reg.get("counter");
+            if (md != null) {
+                assertFalse(
+                        md.ttlEnabled(),
+                        "R26-H1: registry must not record ttlEnabled=true on V1-sync");
+            }
         } finally {
-            pair2.backend.close();
+            pair.closeAll();
         }
     }
 
     /**
-     * Symmetric R25-H1 acceptance: TTL=OFF → TTL=ON across snapshot/restore must also
-     * throw via {@code createOrUpdateInternalState}.
+     * Sanity: V1-sync with TTL DISABLED continues to work, and the registry records
+     * ttlEnabled=false so the on-disk layout (bare bytes) matches the registry's claim.
      */
     @Test
-    void ttlOffToOnViaCreateOrUpdateInternalStateThrows(@TempDir Path tmp) throws Exception {
+    void ttlDisabledOnV1SyncWorks(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db1"));
+        try {
+            ValueStateDescriptor<Long> ttlOff =
+                    new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
+            assertFalse(ttlOff.getTtlConfig().isEnabled(), "descriptor default has TTL disabled");
+            ttlOff.initializeSerializerUnlessSet(new ExecutionConfig());
+
+            pair.backend.createOrUpdateInternalState(
+                    IntSerializer.INSTANCE,
+                    ttlOff,
+                    StateSnapshotTransformFactory.noTransform());
+
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            StateSerializerMetadata md = reg.get("counter");
+            assertNotNull(md, "registry holds counter metadata");
+            assertFalse(
+                    md.ttlEnabled(),
+                    "R26-H1: V1-sync registry must record ttlEnabled=false (matches on-disk"
+                            + " bare-byte layout)");
+            assertEquals(0L, md.ttlMillis(), "millis is 0 when TTL disabled");
+            // R26-L3: do NOT assert on formatVersion here — the registry writes
+            // CURRENT_FORMAT_VERSION=2 regardless of ttlEnabled, so the prior assertion that
+            // "v2 envelope is emitted when TTL flags are present" was misleading.
+        } finally {
+            pair.closeAll();
+        }
+    }
+
+    /**
+     * Symmetric R25-H1 acceptance: TTL=OFF → TTL=OFF across snapshot/restore continues to
+     * round-trip cleanly. (The TTL-toggle assertion this test used to make is no longer
+     * reachable on V1-sync per R26-H1 — TTL=ON is rejected at register time. We keep this
+     * test as a regression guard for the registry serialize/deserialize round-trip itself.)
+     */
+    @Test
+    void ttlOffRoundTripsAcrossSnapshotRestore(@TempDir Path tmp) throws Exception {
         V1Pair pair1 = openV1Pair(tmp.resolve("db1"));
         byte[] registryBlob;
         try {
             ValueStateDescriptor<Long> ttlOff =
                     new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
-            // No enableTimeToLive call — descriptor default is DISABLED.
             ttlOff.initializeSerializerUnlessSet(new ExecutionConfig());
 
             pair1.backend.createOrUpdateInternalState(
@@ -233,14 +239,12 @@ class V1SyncTtlToggleIntegrationTest {
             StateSerializerRegistry reg = pair1.backend.stateSerializerRegistry();
             StateSerializerMetadata md = reg.get("counter");
             assertNotNull(md, "registry holds counter metadata");
-            assertTrue(
-                    !md.ttlEnabled(),
-                    "R25-H1: createOrUpdateInternalState forwards ttlEnabled=false correctly");
+            assertFalse(md.ttlEnabled(), "V1-sync registry records ttlEnabled=false");
             assertEquals(0L, md.ttlMillis(), "millis is 0 when TTL disabled");
 
             registryBlob = reg.serialize();
         } finally {
-            pair1.backend.close();
+            pair1.closeAll();
         }
 
         V1Pair pair2 = openV1Pair(tmp.resolve("db2"));
@@ -249,6 +253,10 @@ class V1SyncTtlToggleIntegrationTest {
                     StateSerializerRegistry.deserialize(registryBlob);
             pair2.backend.seedRestoredSerializerMetadata(new LinkedHashMap<>(parsed));
 
+            // Attempting to re-enable TTL across the restore boundary on V1-sync must STILL
+            // fail with UnsupportedOperationException (NOT StateMigrationException) because
+            // R26-H1's gate runs BEFORE the registry's toggle check. The user gets the
+            // V1-sync TTL limitation surfaced as the primary error.
             ValueStateDescriptor<Long> ttlOn =
                     new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
             StateTtlConfig ttlConfig =
@@ -258,23 +266,42 @@ class V1SyncTtlToggleIntegrationTest {
             ttlOn.enableTimeToLive(ttlConfig);
             ttlOn.initializeSerializerUnlessSet(new ExecutionConfig());
 
-            StateMigrationException ex =
+            UnsupportedOperationException ex =
                     assertThrows(
-                            StateMigrationException.class,
+                            UnsupportedOperationException.class,
                             () ->
                                     pair2.backend.createOrUpdateInternalState(
                                             IntSerializer.INSTANCE,
                                             ttlOn,
                                             StateSnapshotTransformFactory.noTransform()),
-                            "R25-H1: TTL OFF→ON toggle surfaces via createOrUpdateInternalState");
+                            "R26-H1: V1-sync rejects TTL even after restoring non-TTL"
+                                    + " metadata (the V1-sync limitation supersedes the TTL"
+                                    + " toggle StateMigrationException check)");
             assertTrue(
-                    ex.getMessage().contains("prior=TTL_DISABLED"),
-                    "exception identifies the prior TTL state: " + ex.getMessage());
-            assertTrue(
-                    ex.getMessage().contains("now=TTL_ENABLED"),
-                    "exception identifies the new TTL state: " + ex.getMessage());
+                    ex.getMessage().contains("V1-sync"),
+                    "exception identifies V1-sync limitation: " + ex.getMessage());
+
+            // A same-name descriptor with TTL still disabled must round-trip cleanly.
+            ValueStateDescriptor<Long> ttlOffAgain =
+                    new ValueStateDescriptor<>("counter", LongSerializer.INSTANCE);
+            ttlOffAgain.initializeSerializerUnlessSet(new ExecutionConfig());
+            pair2.backend.createOrUpdateInternalState(
+                    IntSerializer.INSTANCE,
+                    ttlOffAgain,
+                    StateSnapshotTransformFactory.noTransform());
+            StateSerializerMetadata md2 =
+                    pair2.backend.stateSerializerRegistry().get("counter");
+            assertNotNull(md2);
+            assertFalse(md2.ttlEnabled(), "restored ttlEnabled=false");
+
+            // For symmetry: a StateMigrationException IS still reachable on the V2 async path
+            // — that scenario is covered by the V2 async test suite. This test file only
+            // guards the V1-sync entry point.
+            //
+            // Unused on V1-sync but referenced to keep the original import surface stable.
+            assertNotNull(StateMigrationException.class);
         } finally {
-            pair2.backend.close();
+            pair2.closeAll();
         }
     }
 }

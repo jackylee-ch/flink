@@ -563,14 +563,37 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // R25-H1: forward TTL config to the 4-arg overload so a TTL toggle across a snapshot/
         // restore is surfaced as StateMigrationException by the registry. The v1 StateDescriptor
         // returns {@code StateTtlConfig.DISABLED} (non-null) when TTL was never configured.
+        //
+        // R26-H1: V1-sync has NO TTL wrapping path — the createOrUpdateInternalState switch
+        // below constructs the bare ForStRsInternalKvStateAdapters.{Value,List,Map,...}Adapter
+        // with the user's raw serializer; there is no analogue of V2's
+        // createTtlAwareStateInternal that wraps with TtlSerializer/TtlAwareValueStateV2.
+        // Pre-R26-H1 the registry was told ttlEnabled=true even though the state writes bare
+        // bytes (no 8-byte expiry prefix), so the on-disk layout DID NOT match the registry's
+        // claim — restore would then compare a TTL-wrapped serializer against the user-naked
+        // bytes and silently corrupt every read. Reject at register time so the user sees the
+        // error early, not as silent payload corruption after a snapshot/restore. V1-sync TTL
+        // is a documented limitation; users should migrate to the V2 async backend for TTL.
         StateTtlConfig ttlConfig = stateDesc.getTtlConfig();
         boolean ttlEnabled = ttlConfig != null && ttlConfig.isEnabled();
-        long ttlMillis = ttlEnabled ? ttlConfig.getTimeToLive().toMillis() : 0L;
+        if (ttlEnabled) {
+            throw new UnsupportedOperationException(
+                    "TTL is not supported on the V1-sync ForSt-RS state backend (state name '"
+                            + stateDesc.getName()
+                            + "', type "
+                            + stateDesc.getType()
+                            + "). V1-sync writes raw payload bytes with no TtlSerializer"
+                            + " wrapping; enabling TTL here would create a registry/on-disk"
+                            + " format mismatch. Use the V2 async backend"
+                            + " (ForStRsAsyncKeyedStateBackend) for TTL support, or disable"
+                            + " StateTtlConfig on this descriptor.");
+        }
+        long ttlMillis = 0L;
         stateSerializerRegistry.verifyOrRegister(
                 stateDesc.getName(),
                 stateDesc.getType().ordinal(),
                 stateDesc.getSerializer(),
-                ttlEnabled,
+                /* ttlEnabled= */ false,
                 ttlMillis);
         org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> created;
         switch (stateDesc.getType()) {

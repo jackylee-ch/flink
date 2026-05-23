@@ -755,9 +755,45 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
         }
         // Flush buffered writes before checkpoint — correctness requirement.
-        flushWriteBuffer();
-        flushAllMapStates();
-        flushAllOffHeapValueStateBuffers();
+        // R26-M3: mirror the R24-H1 try/finally pattern from close(). If
+        // flushAllMapStates throws (R26-M2 still records aggregate failures but rethrows),
+        // pre-R26-M3 the subsequent flushAllOffHeapValueStateBuffers + createCheckpoint were
+        // skipped — value-state buffer entries that DID drain to the engine on prior flushes
+        // would still be checkpointed, but any value-state writes still living in the
+        // off-heap buffer were lost and the engine snapshot was incomplete in a hidden way.
+        // The try/finally chain gives every flush phase a chance to drain before any throw
+        // propagates, and we deliberately SKIP createCheckpoint if a flush failed (an
+        // incomplete checkpoint is worse than no checkpoint — fail loud).
+        Throwable flushError = null;
+        try {
+            flushWriteBuffer();
+        } catch (Throwable t) {
+            flushError = t;
+        }
+        try {
+            flushAllMapStates();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        try {
+            flushAllOffHeapValueStateBuffers();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        if (flushError != null) {
+            if (flushError instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException("Flush phase failed before snapshot", flushError);
+        }
         linker.createCheckpoint(db, targetDir.toString());
         return targetDir;
     }
@@ -818,9 +854,39 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             throw new IllegalStateException("ForStRsKeyedStateBackend already closed");
         }
         // Flush buffered writes so the scan reflects all pending mutations.
-        flushWriteBuffer();
-        flushAllMapStates();
-        flushAllOffHeapValueStateBuffers();
+        // R26-M3: same try/finally chain as {@link #snapshot}: each flush phase gets a chance
+        // to drain before any throw propagates. If any flush fails the scan is aborted —
+        // returning an iterator over a partially-flushed engine would silently omit keys.
+        Throwable flushError = null;
+        try {
+            flushWriteBuffer();
+        } catch (Throwable t) {
+            flushError = t;
+        }
+        try {
+            flushAllMapStates();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        try {
+            flushAllOffHeapValueStateBuffers();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        if (flushError != null) {
+            if (flushError instanceof RuntimeException re) {
+                throw re;
+            }
+            throw new RuntimeException("Flush phase failed before keys() scan", flushError);
+        }
         byte[] nameBytes = stateName.getBytes(StandardCharsets.UTF_8);
         byte[] tailMarker = new byte[1 + nameBytes.length + 1];
         tailMarker[0] = (byte) '/';
@@ -1288,7 +1354,18 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     public void flushAllMapStates() {
         Throwable firstFailure = null;
-        for (Map.Entry<String, ForStRsMapState<?, ?>> entry : mapStateRegistry.entrySet()) {
+        // R26-M2: snapshot the entry set to a local list BEFORE iterating. {@code
+        // mapStateRegistry} is a plain HashMap and {@code ms.flush()} can — via the engine's
+        // write-buffer flush callbacks — re-enter the backend on the same thread and mutate
+        // the registry (e.g. a registerMapStateForFlush call from a downstream listener), or
+        // a concurrent {@code dispose()} could clear the map mid-iteration. Either path
+        // throws {@code ConcurrentModificationException} on the live entrySet view. A
+        // defensive copy decouples the iteration from concurrent structural mutations; the
+        // entries themselves still point at the same ForStRsMapState instances, so each
+        // flush reaches the live state.
+        java.util.List<Map.Entry<String, ForStRsMapState<?, ?>>> snapshot =
+                new java.util.ArrayList<>(mapStateRegistry.entrySet());
+        for (Map.Entry<String, ForStRsMapState<?, ?>> entry : snapshot) {
             try {
                 entry.getValue().flush();
             } catch (Throwable t) {
