@@ -213,4 +213,76 @@ class ReducingAggregatingCacheTest {
             assertFalse(cache.contains(key));
         }
     }
+
+    // ----------------- E9-H2: drainPendingFlush throw safety -----------------
+
+    /**
+     * E9-H2 regression: when the deferred LRU-eviction flush callback throws (e.g. an FFI
+     * engine-PUT failure), the entry MUST be re-stashed into {@code entries} marked dirty so
+     * the next {@code flushAllDirty} retries it. Prior shape nulled the slot BEFORE invoking
+     * the callback — on throw, the entry was already removed from {@code entries} by
+     * {@code removeEldestEntry}, the slot was nulled, and the data was silently lost.
+     */
+    @Test
+    void drainPendingFlushReStashesOnCallbackThrow() {
+        final java.util.concurrent.atomic.AtomicBoolean shouldThrow =
+                new java.util.concurrent.atomic.AtomicBoolean(true);
+        final List<byte[]> deliveredKeys = new ArrayList<>();
+        final List<Integer> deliveredVals = new ArrayList<>();
+
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(
+                        Integer::sum,
+                        (k, v) -> {
+                            if (shouldThrow.get()) {
+                                throw new RuntimeException("simulated FFI engine-PUT failure");
+                            }
+                            deliveredKeys.add(k);
+                            deliveredVals.add(v);
+                        },
+                        2);
+
+        cache.put(new byte[] {1}, 100);
+        cache.put(new byte[] {2}, 200);
+
+        // Eviction of {1} triggers drainPendingFlush; the callback throws. The current
+        // implementation must re-stash {1} into entries dirty so flushAllDirty retries it.
+        RuntimeException thrown = null;
+        try {
+            cache.put(new byte[] {3}, 300);
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+        assertNotNull(thrown, "the simulated FFI throw must propagate to the caller");
+        assertEquals("simulated FFI engine-PUT failure", thrown.getMessage());
+
+        // {1} was evicted from entries before the deferred flush, so re-stash should restore
+        // it. {2} and {3} should still be present (no eviction race).
+        assertTrue(cache.contains(new byte[] {1}), "evicted key must be re-stashed on flush throw");
+        assertEquals(Integer.valueOf(100), cache.peek(new byte[] {1}));
+        assertTrue(cache.isDirty(new byte[] {1}), "re-stashed entry must be dirty for retry");
+
+        // Now let the next drain succeed; flushAllDirty should deliver {1}'s accumulator.
+        shouldThrow.set(false);
+        cache.flushAllDirty();
+        assertTrue(
+                containsKeyBytes(deliveredKeys, new byte[] {1}),
+                "the re-stashed entry must be flushed on the retry");
+        // Verify the accumulator value survived the throw round-trip.
+        int idx = indexOfKeyBytes(deliveredKeys, new byte[] {1});
+        assertEquals(Integer.valueOf(100), deliveredVals.get(idx));
+    }
+
+    private static boolean containsKeyBytes(List<byte[]> keys, byte[] needle) {
+        return indexOfKeyBytes(keys, needle) >= 0;
+    }
+
+    private static int indexOfKeyBytes(List<byte[]> keys, byte[] needle) {
+        for (int i = 0; i < keys.size(); i++) {
+            if (java.util.Arrays.equals(keys.get(i), needle)) {
+                return i;
+            }
+        }
+        return -1;
+    }
 }

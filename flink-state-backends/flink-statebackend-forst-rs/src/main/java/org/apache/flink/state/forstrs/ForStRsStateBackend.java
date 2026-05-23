@@ -22,6 +22,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackendBuilder;
+import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.OperatorStateBackend;
 import org.apache.flink.runtime.state.StateBackend;
@@ -29,6 +30,7 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.keyed.ForStRsAbstractKeyedStateBackend;
+import org.apache.flink.state.forstrs.keyed.ForStRsIncrementalKeyedStateHandle;
 import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
 import org.apache.flink.state.forstrs.keyed.ForStRsRestoreOperation;
 import org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy;
@@ -86,11 +88,17 @@ public class ForStRsStateBackend implements StateBackend {
         // cross-path use would silently bypass schema-drift detection. Fail loudly at
         // construction time. Keying by (JobID, operatorIdentifier) prevents false-positive
         // cross-job blocks; backend dispose removes the slot so job redeploys do not block.
+        //
+        // A9-H4: record under a try/catch so a ctor failure (any throw from this method) does
+        // not leak the OBSERVED slot. Prior shape recorded BEFORE the try-catch around
+        // dbOpen + backend ctor — a throw left a stale entry, and the next retry saw it as a
+        // false-positive duplicate path and threw IllegalStateException.
         org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
                 parameters.getJobID(),
                 parameters.getOperatorIdentifier(),
                 org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.ASYNC_V2);
-
+        boolean handedOff = false;
+        try {
         Arena arena = Arena.ofShared();
         ForStRsLinker linker = new ForStRsLinker(arena);
         Environment env = parameters.getEnv();
@@ -121,6 +129,7 @@ public class ForStRsStateBackend implements StateBackend {
                 // E8-H4: wire path identity so dispose can release the invariant slot.
                 backend.setBackendPathIdentity(
                         parameters.getJobID(), parameters.getOperatorIdentifier());
+                handedOff = true;
                 return backend;
             } catch (Throwable t) {
                 // Best-effort tear-down on restore failure: the arena owns the linker; closing
@@ -161,6 +170,7 @@ public class ForStRsStateBackend implements StateBackend {
             // E8-H4: wire path identity so dispose can release the invariant slot.
             backend.setBackendPathIdentity(
                     parameters.getJobID(), parameters.getOperatorIdentifier());
+            handedOff = true;
             return backend;
         } catch (Throwable t) {
             if (cf != null) {
@@ -185,6 +195,17 @@ public class ForStRsStateBackend implements StateBackend {
             throw new Exception(
                     "ForStRsStateBackend.createAsyncKeyedStateBackend open failed", t);
         }
+        } finally {
+            // A9-H4: if we did not hand off ownership to a backend, release the
+            // path-invariant slot so the next retry of this operator-on-this-job is not
+            // rejected by recordBackendPath as a duplicate. Backend.setBackendPathIdentity
+            // wires dispose() to call removeBackendPath, but dispose runs only on
+            // successful construction — failures here leak the slot.
+            if (!handedOff) {
+                org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.removeBackendPath(
+                        parameters.getJobID(), parameters.getOperatorIdentifier());
+            }
+        }
     }
 
     @Override
@@ -195,10 +216,17 @@ public class ForStRsStateBackend implements StateBackend {
         // cross-path use would silently bypass schema-drift detection. Fail loudly at
         // construction time. Keying by (JobID, operatorIdentifier) prevents false-positive
         // cross-job blocks; backend dispose removes the slot so job redeploys do not block.
+        //
+        // A9-H4: record under a try/finally so a ctor failure does not leak the OBSERVED
+        // slot. Prior shape recorded BEFORE the try-catch around dbOpen + backend ctor — a
+        // throw left a stale entry, and the next retry saw it as a false-positive duplicate
+        // path and threw IllegalStateException.
         org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
                 parameters.getJobID(),
                 parameters.getOperatorIdentifier(),
                 org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.SYNC_V1);
+        boolean handedOff = false;
+        try {
 
         ForStRsOptions options = new ForStRsOptions();
         Environment env = parameters.getEnv();
@@ -298,11 +326,22 @@ public class ForStRsStateBackend implements StateBackend {
             // We use the single-CF "default" map (cfId=0) which matches the SingleCfRouter
             // default routing. The SST registry is reused from the restore path so SSTs already
             // materialised on disk are recognised as shared and not re-uploaded next checkpoint.
+            //
+            // E9-H3: inherit the source backend identifier on a single-handle, same-range restore
+            // so SharedStateRegistry can resolve the prior session's shared SSTs across restart.
+            // Pre-fix the V1-sync path always minted a fresh UUID — SharedStateRegistry could not
+            // see prior-session SSTs, forcing a full re-upload on the first incremental checkpoint
+            // and breaking shared-state ref-count bookkeeping across the restart boundary. The
+            // async backend has long inherited via {@link
+            // ForStRsAsyncKeyedStateBackend#inheritBackendIdentifier}; this brings V1-sync to
+            // parity.
+            UUID strategyBackendId =
+                    inheritBackendIdentifier(restoredHandles, parameters.getKeyGroupRange());
             ForStRsSnapshotStrategy strategy =
                     new ForStRsSnapshotStrategy(
                             linker,
                             db,
-                            UUID.randomUUID(),
+                            strategyBackendId,
                             parameters.getKeyGroupRange(),
                             sstRegistry,
                             new ForStRsSstUploader(),
@@ -321,6 +360,7 @@ public class ForStRsStateBackend implements StateBackend {
             if (restored != null) {
                 backend.seedRestoredSerializerMetadata(restored.getRestoredSerializerMetadata());
             }
+            handedOff = true;
             return backend;
         } catch (Throwable t) {
             // Best-effort tear-down on construction failure so we don't leak FFM handles.
@@ -344,6 +384,16 @@ public class ForStRsStateBackend implements StateBackend {
                 throw ex;
             }
             throw new Exception("ForStRsStateBackend.createKeyedStateBackend failed", t);
+        }
+        } finally {
+            // A9-H4: if we did not hand off ownership to a backend, release the
+            // path-invariant slot so the next retry is not rejected as a duplicate. Backend
+            // close() calls removeBackendPath via setBackendPathIdentity, but close runs only
+            // on successful construction — failures here would otherwise leak the slot.
+            if (!handedOff) {
+                org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.removeBackendPath(
+                        parameters.getJobID(), parameters.getOperatorIdentifier());
+            }
         }
     }
 
@@ -389,5 +439,39 @@ public class ForStRsStateBackend implements StateBackend {
             arena.close();
             throw e;
         }
+    }
+
+    /**
+     * E9-H3 (V1-sync parity): returns the source backend identifier when {@code handles} is a
+     * single {@link ForStRsIncrementalKeyedStateHandle} whose key-group range exactly matches the
+     * target — i.e. the no-rescaling fast path. Otherwise mints a fresh UUID so the rescaled or
+     * empty-restore lineage is treated as a new shared-state namespace.
+     *
+     * <p>This mirrors the long-standing async backend helper {@code
+     * ForStRsAsyncKeyedStateBackend#inheritBackendIdentifier}. Pre-fix the V1-sync path always
+     * minted a fresh UUID, so on restart-from-checkpoint Flink's {@link
+     * org.apache.flink.runtime.state.SharedStateRegistry} could not resolve the prior session's
+     * shared SSTs by their {@code backendIdentifier} key — every shared SST was uploaded again on
+     * the first post-restart incremental checkpoint, and the shared-state ref-count bookkeeping
+     * was effectively reset across the restart boundary (an old session's ref counts could not
+     * decrement under the new identifier).
+     *
+     * <p>Visibility: package-private so {@code createKeyedStateBackend} can call it and tests in
+     * the same package can drive it directly without a full restore round-trip.
+     */
+    static UUID inheritBackendIdentifier(
+            Collection<KeyedStateHandle> handles, KeyGroupRange target) {
+        if (handles == null || handles.size() != 1) {
+            return UUID.randomUUID();
+        }
+        KeyedStateHandle only = handles.iterator().next();
+        if (!(only instanceof ForStRsIncrementalKeyedStateHandle)) {
+            return UUID.randomUUID();
+        }
+        ForStRsIncrementalKeyedStateHandle inc = (ForStRsIncrementalKeyedStateHandle) only;
+        if (!inc.getKeyGroupRange().equals(target)) {
+            return UUID.randomUUID();
+        }
+        return inc.getBackendIdentifier();
     }
 }

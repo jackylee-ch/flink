@@ -482,19 +482,52 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * entries.put}. The deferred flush is dispatched ONLY after the caller has released any
      * lock it holds, so the engine-PUT FFI never runs while the {@link #generationsLock} (or
      * any future cache-internal lock) is held.
+     *
+     * <p>E9-H2: the captured (k, v) MUST survive a {@code flushCallback} throw. The prior
+     * implementation nulled the slot BEFORE the callback ran — if the engine-PUT FFI threw,
+     * the dirty entry was already gone from {@code entries} (removed by
+     * {@code removeEldestEntry}), the slot was nulled, and the data was lost. The next
+     * {@code flushAllDirty} on barrier would silently miss it. Fix: capture under the lock,
+     * dispatch outside it, and on throw re-stash the entry into {@code entries} marked
+     * dirty so the next {@code flushAllDirty} retries it. The slot is only cleared in the
+     * {@code finally} block, AFTER a successful dispatch (or after re-stash on failure).
      */
     private void drainPendingFlush() {
-        BytesKey k = pendingFlushKey;
-        if (k == null) {
-            return;
+        BytesKey k;
+        ACC v;
+        synchronized (generationsLock) {
+            k = pendingFlushKey;
+            if (k == null) {
+                return;
+            }
+            v = pendingFlushValue;
         }
-        ACC v = pendingFlushValue;
-        // Clear BEFORE dispatching the callback so a re-entrant or follow-up cache mutation
-        // (e.g. the callback itself triggers another eviction via further state ops) finds
-        // an empty slot for its own deferred capture.
-        pendingFlushKey = null;
-        pendingFlushValue = null;
-        flushCallback.accept(k.bytes, v);
+        boolean delivered = false;
+        try {
+            flushCallback.accept(k.bytes, v);
+            delivered = true;
+        } finally {
+            synchronized (generationsLock) {
+                if (!delivered) {
+                    // E9-H2: re-stash so the next flushAllDirty retries the engine-PUT.
+                    // removeEldestEntry already marked the original Entry clean (defensive,
+                    // see line ~196), so we must insert a NEW Entry with dirty=true. Use the
+                    // owned-bytes form of put so the LRU slot owns its key independently of
+                    // the BytesKey we captured. If the same key has since been re-inserted by
+                    // a concurrent putIfGen, do NOT clobber it — its accumulator is fresher.
+                    if (!entries.containsKey(k)) {
+                        entries.put(new BytesKey(k.bytes), new Entry<>(v, true));
+                    }
+                }
+                // Clear the slot only after we have either delivered or re-stashed. The
+                // pendingFlushKey==k guard handles re-entrant flushCallback paths that may
+                // have already overwritten the slot with a fresh eviction.
+                if (pendingFlushKey == k) {
+                    pendingFlushKey = null;
+                    pendingFlushValue = null;
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------

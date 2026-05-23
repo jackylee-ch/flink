@@ -55,32 +55,38 @@ public class ForStRsStateExecutor implements StateExecutor {
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
         ForStRsStateRequestClassifier classifier = (ForStRsStateRequestClassifier) container;
-        // E8-H3: track which phase failed and how many requests inside that phase already
-        // completed successfully BEFORE the throw, so the drain only completes tails that
-        // were left dangling. Calling completeExceptionally on an already-completed Flink
-        // InternalAsyncFuture invokes the framework exceptionHandler — that would raise a
-        // spurious task fail. AsyncExecutionController.executeBatchRequests discards the
+        // E8-H3 / E9-H1: track which phase failed and how many requests inside that phase
+        // already completed successfully BEFORE the throw, so the drain only completes tails
+        // that were left dangling. Calling completeExceptionally on an already-completed
+        // Flink InternalAsyncFuture invokes the framework exceptionHandler — that would raise
+        // a spurious task fail. AsyncExecutionController.executeBatchRequests discards the
         // returned failedFuture, so the per-StateRequest tail futures are what the runtime
         // mailbox joins on. Pattern mirrors VectorizedExecutor.dispatchAppendMergeBatch.
+        //
+        // E9-H1: progress counters live in int[1] sentinels so a row-level throw inside an
+        // execute*() helper leaves the partial count visible to the catch block here. The
+        // prior signature returned an int on success only — if {@code gets.get(i).complete()}
+        // itself threw at row k, the value never made it back, getsCompleted stayed at 0, and
+        // the drain double-completed rows [0, k-1].
         List<ForStRsDBGetRequest<?, ?, ?>> gets = classifier.getGetRequests();
         List<ForStRsDBPutRequest<?, ?, ?>> puts = classifier.getPutRequests();
         List<ForStRsDBIterRequest<?, ?, ?, ?>> iters = classifier.getIterRequests();
-        int getsCompleted = 0;
-        int putsCompleted = 0;
-        int itersCompleted = 0;
+        int[] getsProgress = {0};
+        int[] putsProgress = {0};
+        int[] itersProgress = {0};
         try {
-            getsCompleted = executeGets(gets);
-            putsCompleted = executePuts(puts);
-            itersCompleted = executeIters(iters);
+            executeGets(gets, getsProgress);
+            executePuts(puts, putsProgress);
+            executeIters(iters, itersProgress);
             return CompletableFuture.completedFuture(null);
         } catch (Throwable t) {
             drainTailExceptionally(
                     gets,
-                    getsCompleted,
+                    getsProgress[0],
                     puts,
-                    putsCompleted,
+                    putsProgress[0],
                     iters,
-                    itersCompleted,
+                    itersProgress[0],
                     t);
             if (t instanceof Error) {
                 throw (Error) t;
@@ -93,9 +99,12 @@ public class ForStRsStateExecutor implements StateExecutor {
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
         ForStRsStateRequestClassifier single = new ForStRsStateRequestClassifier();
         single.offer(request);
-        executeGets(single.getGetRequests());
-        executePuts(single.getPutRequests());
-        executeIters(single.getIterRequests());
+        // executeRequestSync has only one request in each phase and propagates exceptions
+        // directly; no drain logic, so the progress counters here are write-only sentinels.
+        int[] progress = {0};
+        executeGets(single.getGetRequests(), progress);
+        executePuts(single.getPutRequests(), progress);
+        executeIters(single.getIterRequests(), progress);
     }
 
     @Override
@@ -147,32 +156,39 @@ public class ForStRsStateExecutor implements StateExecutor {
     }
 
     /**
-     * Returns the number of requests whose tail future was successfully completed. If the
-     * FFI call throws before completion, returns 0 (no per-row completion happened). If a
-     * later phase throws, the caller skips the first {@code getsCompleted} rows during
-     * drain so they are not double-completed.
+     * E9-H1: writes the count of requests whose tail future was successfully completed into
+     * {@code progressOut[0]}. The counter advances AFTER each successful
+     * {@code complete()} call, so if {@code complete()} itself throws at row k, the catch
+     * block sees {@code progressOut[0] == k} and the drain skips rows [0, k). The prior
+     * shape returned the count on the success path only — a throw never reached the return
+     * statement, the outer counter stayed at 0, and the drain double-completed rows
+     * [0, k-1].
      */
-    private int executeGets(List<ForStRsDBGetRequest<?, ?, ?>> gets) {
+    private void executeGets(List<ForStRsDBGetRequest<?, ?, ?>> gets, int[] progressOut) {
+        progressOut[0] = 0;
         if (gets.isEmpty()) {
-            return 0;
+            return;
         }
         int count = gets.size();
         byte[][] keys = new byte[count][];
         for (int i = 0; i < count; i++) {
             keys[i] = gets.get(i).getSerializedKey();
         }
-        byte[][] results = linker.batchGetArrow(db, cf, keys);
-        // E8-H3: complete row-by-row so a deserialization throw mid-loop leaves a precise
-        // completed-count for the drain.
+        byte[][] results = invokeBatchGet(keys);
+        // E8-H3 / E9-H1: complete row-by-row so a deserialization throw mid-loop leaves a
+        // precise completed-count for the drain. progressOut[0] is updated AFTER each
+        // successful complete() so a throw from complete(i) leaves progressOut[0] == i and
+        // the drain skips rows [0, i).
         for (int i = 0; i < count; i++) {
             gets.get(i).complete(results[i]);
+            progressOut[0] = i + 1;
         }
-        return count;
     }
 
-    private int executePuts(List<ForStRsDBPutRequest<?, ?, ?>> puts) {
+    private void executePuts(List<ForStRsDBPutRequest<?, ?, ?>> puts, int[] progressOut) {
+        progressOut[0] = 0;
         if (puts.isEmpty()) {
-            return 0;
+            return;
         }
         List<byte[]> putKeys = new ArrayList<>();
         List<byte[]> putValues = new ArrayList<>();
@@ -182,30 +198,54 @@ public class ForStRsStateExecutor implements StateExecutor {
                 putKeys.add(req.getSerializedKey());
                 putValues.add(val);
             } else {
-                linker.delete(db, cf, req.getSerializedKey());
+                invokeDelete(req.getSerializedKey());
             }
         }
         if (!putKeys.isEmpty()) {
-            linker.batchPut(
-                    db, cf, putKeys.toArray(new byte[0][]), putValues.toArray(new byte[0][]));
+            invokeBatchPut(
+                    putKeys.toArray(new byte[0][]), putValues.toArray(new byte[0][]));
         }
+        // E9-H1: same progress invariant as executeGets — update AFTER each successful
+        // complete(). If complete() throws at row k, progressOut[0] == k and the drain
+        // completes rows [k, size) exceptionally.
         for (int i = 0; i < puts.size(); i++) {
             puts.get(i).complete();
+            progressOut[0] = i + 1;
         }
-        return puts.size();
     }
 
-    private int executeIters(List<ForStRsDBIterRequest<?, ?, ?, ?>> iters) {
+    private void executeIters(List<ForStRsDBIterRequest<?, ?, ?, ?>> iters, int[] progressOut) {
+        progressOut[0] = 0;
         if (iters.isEmpty()) {
-            return 0;
+            return;
         }
-        // E8-H3: process row-by-row; if iter.process throws on row k, the drain completes
-        // rows [k, size) exceptionally. Rows [0, k) are already completed inside process.
-        int completed = 0;
-        for (ForStRsDBIterRequest<?, ?, ?, ?> iter : iters) {
-            iter.process(linker, db, cf, arena);
-            completed++;
+        // E8-H3 / E9-H1: process row-by-row; if iter.process throws on row k, the drain
+        // completes rows [k, size) exceptionally. Rows [0, k) are already completed inside
+        // process. progressOut[0] is updated AFTER each successful process() so a throw
+        // leaves the counter precise.
+        for (int i = 0; i < iters.size(); i++) {
+            iters.get(i).process(linker, db, cf, arena);
+            progressOut[0] = i + 1;
         }
-        return completed;
+    }
+
+    // ----------------- Protected FFI seams (test override points) -----------------
+    // E9-H1 regression test injects throws here without needing native libs. Production
+    // wiring delegates directly to {@link ForStRsLinker}. These seams add no overhead — the
+    // JIT inlines them after class-loading because there are no production subclasses.
+
+    /** Delegates to {@link ForStRsLinker#batchGetArrow}. Test override point only. */
+    protected byte[][] invokeBatchGet(byte[][] keys) {
+        return linker.batchGetArrow(db, cf, keys);
+    }
+
+    /** Delegates to {@link ForStRsLinker#batchPut}. Test override point only. */
+    protected void invokeBatchPut(byte[][] keys, byte[][] values) {
+        linker.batchPut(db, cf, keys, values);
+    }
+
+    /** Delegates to {@link ForStRsLinker#delete}. Test override point only. */
+    protected void invokeDelete(byte[] key) {
+        linker.delete(db, cf, key);
     }
 }

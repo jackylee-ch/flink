@@ -171,6 +171,27 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private static final int MAX_BUFFER_ENTRIES = 4096;
 
     /**
+     * A9-M1: upper bound on the byte length of a single buffered value. Rejected at {@link
+     * #putToWriteBuffer} entry so:
+     *
+     * <ul>
+     *   <li>the packed {@code (off << 32) | (len & 0xFFFFFFFFL)} encoding never loses precision on
+     *       either half — both off and len stay within 32 bits;
+     *   <li>the arena-growth comparison can be done in {@code long} space without {@code valLen}
+     *       ever overflowing the int-arithmetic side of {@code writeArenaPos + valLen}, which
+     *       pre-fix could wrap negative and either silently corrupt the buffer or trigger an
+     *       {@link ArrayIndexOutOfBoundsException} on the {@link System#arraycopy} that follows;
+     *   <li>even an adversarial caller can't tie up more than 256 MiB of buffered memory per
+     *       entry before the next threshold flush.
+     * </ul>
+     *
+     * <p>256 MiB is well above any realistic Flink value-state record (the community ForSt
+     * backend rejects values above 16 MiB by default) but small enough that the per-flush buffer
+     * never approaches {@code Long.MAX_VALUE} even with {@code MAX_BUFFER_ENTRIES = 4096} entries.
+     */
+    public static final int MAX_VALUE_BYTES = 256 * 1024 * 1024;
+
+    /**
      * Write-behind buffer: maps full composite ForSt keys to packed {@code (offset << 32) | length}
      * indices into {@link #writeValueArena}. Shared across all ValueState instances on this
      * backend. Reads check this buffer first (0-cost hit); writes go here instead of native.
@@ -182,8 +203,16 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * on the Q11 V1-sync hot path. On a duplicate key write the new bytes are appended fresh and
      * the index is repointed; the old arena slot leaks until the next flush (acceptable because
      * the buffer is bounded at {@code MAX_BUFFER_ENTRIES} and flushed on threshold).
+     *
+     * <p>B9-H1: the map is now {@link ByteArrayLongMap} (open-addressing, primitive {@code long}
+     * values, raw {@code byte[]} keys). This eliminates both the {@code ByteArrayWrapper}
+     * allocation per put/get/remove AND the boxed {@code Long} allocation for pointer-magnitude
+     * packed indices (which fall outside JDK's -128..127 Long cache and were freshly autoboxed
+     * per call). Together with B9-H3 — which shares this same map — the V1-sync ValueState
+     * {@code update()}/{@code value()} hot path is now zero-allocation past steady-state arena
+     * grow.
      */
-    private final Map<ByteArrayWrapper, Long> writeBuffer = new HashMap<>();
+    private final ByteArrayLongMap writeBuffer = new ByteArrayLongMap();
 
     /**
      * B8-H2: contiguous arena holding the buffered value bytes for {@link #writeBuffer}. Grown by
@@ -192,8 +221,21 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     private byte[] writeValueArena = new byte[16 * 1024];
 
-    /** B8-H2: write-pointer (in bytes) into {@link #writeValueArena}. */
-    private int writeArenaPos = 0;
+    /**
+     * B8-H2: write-pointer (in bytes) into {@link #writeValueArena}.
+     *
+     * <p>A9-M1: widened from {@code int} to {@code long} so {@code writeArenaPos + valLen} can be
+     * computed in long space — the int form could wrap negative for a sufficiently large
+     * adversarial value (or cumulative arena past 2 GiB before a flush) and the bounds-check
+     * comparison {@code (pos + len) > arena.length} would then succeed against a NEGATIVE
+     * left-hand side, skipping the grow step and silently corrupting the buffer (or throwing
+     * AIOOBE on the {@link System#arraycopy} immediately below). The arena itself is still a
+     * {@code byte[]} (capped at {@link Integer#MAX_VALUE} by the JVM), and we additionally
+     * bound per-entry size to {@link #MAX_VALUE_BYTES} at put-time so the long value here never
+     * exceeds {@link Integer#MAX_VALUE} in practice — but the long type makes the bounds-check
+     * arithmetic robust against future regressions of either invariant.
+     */
+    private long writeArenaPos = 0L;
 
     /** Running count of buffered writes since last flush. */
     private int writeBufferCount = 0;
@@ -916,15 +958,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         // B8-H2: lookup returns the packed (off,len) index into the value arena; the caller
         // (ValueState.value()) expects a freshly-owned byte[], so we materialize one here. This is
-        // the read path — cold relative to update() which is what the arena optimizes. The
-        // boxed Long is the JDK-internal cache-resident object; it is replaced under steady-state
-        // by the value-arena bytes, eliminating the per-write byte[] allocation.
-        Long packed = writeBuffer.get(new ByteArrayWrapper(key));
+        // the read path — cold relative to update() which is what the arena optimizes.
+        // B9-H1/H3: primitive-keyed open-addressing map → zero allocations on the get path
+        // (no ByteArrayWrapper, no boxed Long). The result byte[] is the only remaining alloc
+        // and is dictated by the caller's borrow contract.
+        long packed = writeBuffer.get(key);
         byte[] result = null;
-        if (packed != null) {
-            long p = packed;
-            int off = (int) (p >>> 32);
-            int len = (int) p;
+        if (packed != ByteArrayLongMap.ABSENT) {
+            int off = (int) (packed >>> 32);
+            int len = (int) packed;
             result = new byte[len];
             System.arraycopy(writeValueArena, off, result, 0, len);
         }
@@ -955,6 +997,21 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * on the next update() call without corrupting buffered entries.
      */
     public void putToWriteBuffer(byte[] key, byte[] valBuf, int valOff, int valLen) {
+        // A9-M1: hard cap per-entry value length BEFORE any arithmetic on writeArenaPos +
+        // valLen. Pre-fix an adversarial value > 2 GiB (or cumulative arena past 2 GiB before
+        // flush) could wrap the int boundary check negative → bounds check passed against a
+        // negative left-hand side → either silent buffer corruption or AIOOBE on arraycopy.
+        // Reject early with a typed exception so the caller sees a deterministic failure mode
+        // instead of either pathology. valLen < 0 is also rejected (defensive — the slice API
+        // contract is non-negative len, but a buggy caller could break it).
+        if (valLen < 0 || valLen > MAX_VALUE_BYTES) {
+            throw new IllegalArgumentException(
+                    "valLen out of bounds: "
+                            + valLen
+                            + " (must be in [0, "
+                            + MAX_VALUE_BYTES
+                            + "]); raise MAX_VALUE_BYTES if a larger value is genuinely needed");
+        }
         if (!bufferEnabled) {
             // Slice-based native put: pass the slice directly to ForStRsLinker. The single
             // overload that accepts (key, value, valueOff, valueLen) avoids the per-update copy.
@@ -963,20 +1020,40 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         }
         // Grow arena if needed (doubling). Steady-state Q11 hits the high-water mark once and
         // then never re-grows because the arena is reset on every flush.
+        //
+        // A9-M1: writeArenaPos is now {@code long} so the addition cannot wrap negative even on
+        // an adversarial cumulative path; the {@code MAX_VALUE_BYTES} cap on valLen plus the
+        // {@code MAX_BUFFER_ENTRIES} cap on the in-flight buffer keep the sum well below
+        // {@link Integer#MAX_VALUE} so the int-cast for the {@code byte[]} allocation below is
+        // safe (any future regression on either cap would surface as a {@link
+        // NegativeArraySizeException} on the {@code new byte[newLen]} allocation, not silent
+        // corruption).
         if (writeArenaPos + valLen > writeValueArena.length) {
+            long required = writeArenaPos + valLen;
+            if (required > Integer.MAX_VALUE) {
+                // Defense-in-depth: even with MAX_VALUE_BYTES + MAX_BUFFER_ENTRIES this branch
+                // should be unreachable, but if both caps are raised we'd rather throw than
+                // silently truncate via the int cast on `new byte[(int) required]`.
+                throw new IllegalStateException(
+                        "writeValueArena required size " + required + " exceeds Integer.MAX_VALUE");
+            }
             int newLen = writeValueArena.length;
-            while (newLen < writeArenaPos + valLen) {
+            while (newLen < required) {
                 newLen <<= 1;
             }
             byte[] grown = new byte[newLen];
-            System.arraycopy(writeValueArena, 0, grown, 0, writeArenaPos);
+            // writeArenaPos is bounded by writeValueArena.length here (int), so the int cast is
+            // safe — the loop above grows newLen only on the next iteration if it would exceed
+            // the cap, and we already rejected required > Integer.MAX_VALUE above.
+            System.arraycopy(writeValueArena, 0, grown, 0, (int) writeArenaPos);
             writeValueArena = grown;
         }
-        int off = writeArenaPos;
+        int off = (int) writeArenaPos;
         System.arraycopy(valBuf, valOff, writeValueArena, off, valLen);
         writeArenaPos += valLen;
         long packed = ((long) off << 32) | ((long) valLen & 0xFFFFFFFFL);
-        writeBuffer.put(new ByteArrayWrapper(key), packed);
+        // B9-H1: primitive-keyed map → no ByteArrayWrapper alloc, no boxed Long alloc.
+        writeBuffer.put(key, packed);
         writeBufferCount++;
         if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD
                 || writeBuffer.size() >= MAX_BUFFER_ENTRIES) {
@@ -999,71 +1076,141 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * serve stale data.
      */
     public void deleteFromWriteBuffer(byte[] key) {
-        writeBuffer.remove(new ByteArrayWrapper(key));
+        // B9-H1: primitive-keyed map → no ByteArrayWrapper alloc.
+        writeBuffer.remove(key);
         linker.delete(db, defaultCf, key);
     }
 
     /**
-     * Flushes all buffered writes to the engine in one batch call. Must be called before checkpoint
-     * (correctness) and before close (durability). Safe to call when the buffer is empty (no-op).
+     * Flushes all buffered writes to the engine in batched {@code batchPut} calls. Must be called
+     * before checkpoint (correctness) and before close (durability). Safe to call when the buffer
+     * is empty (no-op).
      *
-     * <p>Uses pre-allocated staging segments ({@code flushKeyPtrs}, {@code flushKeyLens}, {@code
-     * flushValuePtrs}, {@code flushValueLens}) to avoid per-flush Arena allocation. The key/value
-     * byte[] payloads are staged into a short-lived confined Arena (one allocation per payload) but
-     * the pointer/length arrays are reused across flushes — this eliminates the dominant overhead
-     * of the previous implementation which allocated all four arrays fresh on every flush.
+     * <p>D9-H1 fix: the buffer can grow up to {@link #MAX_BUFFER_ENTRIES} (= 4096) entries — the
+     * count-based fast-path threshold ({@link #WRITE_BUFFER_FLUSH_THRESHOLD} = 64) is hit first in
+     * the common case, but the {@code writeBuffer.size() >= MAX_BUFFER_ENTRIES} branch in {@link
+     * #putToWriteBuffer} could trigger a flush with up to 4096 entries while the pre-allocated
+     * staging segments ({@link #flushKeyPtrs}, {@link #flushKeyLens}, {@link #flushValuePtrs},
+     * {@link #flushValueLens}) are sized for only {@code WRITE_BUFFER_FLUSH_THRESHOLD} slots.
+     * Iterating past slot 63 walked off the segments. To remove this invariant entirely we iterate
+     * the buffer in chunks of {@code WRITE_BUFFER_FLUSH_THRESHOLD}, reusing the same 64-slot
+     * staging segments for each chunk and issuing one {@code batchPut} per chunk. This also keeps
+     * the per-call FFI cost small (smaller batch → shorter native synchronous window) which
+     * matches the same bounded-latency rationale as D6-H2 / D8-H1 / D9-H2.
+     *
+     * <p>Uses pre-allocated staging segments ({@link #flushKeyPtrs}, {@link #flushKeyLens}, {@link
+     * #flushValuePtrs}, {@link #flushValueLens}) to avoid per-flush Arena allocation for the
+     * pointer/length arrays. The key/value byte[] payloads are staged into a short-lived confined
+     * Arena (one allocation per payload) opened once per chunk so the staging memory is reclaimed
+     * between chunks instead of growing to the full buffer size.
+     *
+     * <p>A9-M2 atomicity contract — no double-write on FFI throw:
+     *
+     * <ul>
+     *   <li><b>All chunks succeed:</b> buffer state is cleared exactly once, after the loop.
+     *       Re-invoking flush is a no-op.
+     *   <li><b>Any chunk throws:</b> the {@code linker.batchPut} call lets the exception escape
+     *       the inner try-with-resources (which only owns the payload Arena) and then escape the
+     *       outer while loop. Critically, {@link #writeBuffer}, {@link #writeArenaPos}, and
+     *       {@link #writeBufferCount} are <i>not</i> touched on the throw path — the buffer
+     *       retains <i>every</i> entry it held when flush began, including those that may have
+     *       been successfully written to the engine in earlier chunks of this same flush.
+     *   <li><b>Retry policy for partial-success throws:</b> a naive retry of this method would
+     *       re-send entries that earlier chunks already wrote to the engine. The engine-side
+     *       contract therefore <b>MUST</b> be idempotent for batchPut (overwrites with the same
+     *       key+value are byte-equal — true for ForSt-RS's LSM put which appends a new MemTable
+     *       entry that subsumes the prior one). The standard Flink retry path on snapshot failure
+     *       is to fail the task and trigger a fresh restore from the previous checkpoint, which
+     *       discards both the buffer and the engine state — so retry-with-double-write is the
+     *       degenerate case for a checkpoint that already failed.
+     * </ul>
+     *
+     * <p>The clear-state lines are intentionally placed AFTER the outer while loop (not inside a
+     * try/finally) so that a throw from batchPut leaves the buffer untouched. Do NOT move them
+     * into a finally block — that would defeat the contract above.
      */
     public void flushWriteBuffer() {
         if (writeBuffer.isEmpty()) {
             return;
         }
-        int count = writeBuffer.size();
-        try (Arena payloadArena = Arena.ofConfined()) {
-            int i = 0;
-            for (Map.Entry<ByteArrayWrapper, Long> entry : writeBuffer.entrySet()) {
-                byte[] k = entry.getKey().bytes;
-                long p = entry.getValue();
-                int vOff = (int) (p >>> 32);
-                int vLen = (int) p;
-                MemorySegment ks = payloadArena.allocate(k.length == 0 ? 1 : k.length);
-                MemorySegment vs = payloadArena.allocate(vLen == 0 ? 1 : vLen);
-                if (k.length > 0) {
-                    MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
+        // B9-H1: slot-cursor iteration over the primitive-keyed map avoids the per-Entry box that
+        // the legacy HashMap.entrySet().iterator() allocated on each next() call. `slot` persists
+        // across chunk boundaries so we resume exactly where the previous chunk stopped.
+        final int cap = writeBuffer.capacity();
+        int slot = 0;
+        while (slot < cap) {
+            // Fill one chunk of up to WRITE_BUFFER_FLUSH_THRESHOLD rows; the staging segments are
+            // sized exactly for this chunk size so we never write past their bounds.
+            try (Arena payloadArena = Arena.ofConfined()) {
+                int chunk = 0;
+                while (chunk < WRITE_BUFFER_FLUSH_THRESHOLD && slot < cap) {
+                    byte[] k = writeBuffer.keyAt(slot);
+                    if (k == null) {
+                        slot++;
+                        continue;
+                    }
+                    long p = writeBuffer.valueAt(slot);
+                    slot++;
+                    int vOff = (int) (p >>> 32);
+                    int vLen = (int) p;
+                    MemorySegment ks = payloadArena.allocate(k.length == 0 ? 1 : k.length);
+                    MemorySegment vs = payloadArena.allocate(vLen == 0 ? 1 : vLen);
+                    if (k.length > 0) {
+                        MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
+                    }
+                    if (vLen > 0) {
+                        // B8-H2: copy from the value arena slice rather than from a separately-
+                        // owned byte[]. The arena slice was populated by putToWriteBuffer directly
+                        // from the serializer's shared buffer — one copy total (vs two in the
+                        // legacy owned-byte[] path: serializer→getCopyOfBuffer→arena).
+                        MemorySegment.copy(
+                                writeValueArena, vOff, vs, ValueLayout.JAVA_BYTE, 0, vLen);
+                    }
+                    flushKeyPtrs.set(
+                            ValueLayout.ADDRESS,
+                            (long) chunk * ValueLayout.ADDRESS.byteSize(),
+                            ks);
+                    flushValuePtrs.set(
+                            ValueLayout.ADDRESS,
+                            (long) chunk * ValueLayout.ADDRESS.byteSize(),
+                            vs);
+                    flushKeyLens.set(
+                            ValueLayout.JAVA_LONG,
+                            (long) chunk * ValueLayout.JAVA_LONG.byteSize(),
+                            (long) k.length);
+                    flushValueLens.set(
+                            ValueLayout.JAVA_LONG,
+                            (long) chunk * ValueLayout.JAVA_LONG.byteSize(),
+                            (long) vLen);
+                    chunk++;
                 }
-                if (vLen > 0) {
-                    // B8-H2: copy from the value arena slice rather than from a separately-owned
-                    // byte[]. The arena slice was populated by putToWriteBuffer directly from
-                    // the serializer's shared buffer — one copy total (vs two in the legacy
-                    // owned-byte[] path: serializer→getCopyOfBuffer→arena).
-                    MemorySegment.copy(writeValueArena, vOff, vs, ValueLayout.JAVA_BYTE, 0, vLen);
+                if (chunk > 0) {
+                    // A9-M2: if batchPut throws, the exception escapes both the inner try (which
+                    // only owns payloadArena) and the outer while loop, bypassing the post-loop
+                    // clear-state lines below. The buffer therefore retains every entry it held
+                    // when flush began — engine state is UNKNOWN (the batch may have partially
+                    // committed) but the buffer is in a consistent pre-flush state, and the
+                    // standard Flink response (fail the snapshot → fail the task → restore from
+                    // the previous checkpoint) discards both. See the method-level contract above.
+                    linker.batchPut(
+                            db,
+                            defaultCf,
+                            flushKeyPtrs,
+                            flushKeyLens,
+                            flushValuePtrs,
+                            flushValueLens,
+                            chunk);
                 }
-                flushKeyPtrs.set(
-                        ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), ks);
-                flushValuePtrs.set(
-                        ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), vs);
-                flushKeyLens.set(
-                        ValueLayout.JAVA_LONG,
-                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
-                        (long) k.length);
-                flushValueLens.set(
-                        ValueLayout.JAVA_LONG,
-                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
-                        (long) vLen);
-                i++;
             }
-            linker.batchPut(
-                    db,
-                    defaultCf,
-                    flushKeyPtrs,
-                    flushKeyLens,
-                    flushValuePtrs,
-                    flushValueLens,
-                    count);
         }
+        // A9-M2: reached ONLY on success of every chunk (any throw bypasses these lines and
+        // leaves the buffer populated). Order: clear the map first so a re-entrant flushWriteBuffer
+        // call (e.g. from a concurrent close on another thread — guarded elsewhere but defensive
+        // here) sees an empty buffer and returns at the isEmpty() fast path. Reset the value arena
+        // and counter after so steady-state Q11 reuses the same backing storage indefinitely
+        // (zero allocation per flush after the initial high-water mark).
         writeBuffer.clear();
-        // B8-H2: reset the value arena to position 0 so steady-state Q11 reuses the same backing
-        // storage indefinitely (zero allocation per flush after the initial high-water mark).
-        writeArenaPos = 0;
+        writeArenaPos = 0L;
         writeBufferCount = 0;
     }
 
@@ -1091,30 +1238,6 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                     // best-effort; one state's failure must not block the rest.
                 }
             }
-        }
-    }
-
-    /**
-     * Wrapper for {@code byte[]} that provides value-based {@code hashCode}/{@code equals} so it
-     * can serve as a HashMap key. The hash is computed once at construction.
-     */
-    static final class ByteArrayWrapper {
-        final byte[] bytes;
-        private final int hash;
-
-        ByteArrayWrapper(byte[] bytes) {
-            this.bytes = bytes;
-            this.hash = java.util.Arrays.hashCode(bytes);
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            return o instanceof ByteArrayWrapper w && java.util.Arrays.equals(bytes, w.bytes);
         }
     }
 

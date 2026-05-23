@@ -201,7 +201,20 @@ public final class ForStRsLinker {
      * path. Strategy (a): per-address cache. Robust to release-fn pointer variation across
      * producers (Arrow C-Data spec allows the producer to choose its release fn; arrow-rs uses a
      * single static fn but other producers may not).
+     *
+     * <p>B9-H2: replaced the previous {@code ConcurrentHashMap<Long, MethodHandle>} hot path with
+     * a single-slot volatile fast path. {@code arrowReleaseFnAddr} and
+     * {@code arrowReleaseHandleFast} are written under racing-but-idempotent semantics — a stale
+     * pointer simply causes a recompute on the next call. The fast path serves 100% of arrow-rs
+     * traffic (single static release fn) with zero allocations — no {@code Long} autobox per
+     * {@code invokeArrowRelease} call. The {@link ConcurrentHashMap} fallback is consulted only
+     * when the address misses the fast slot — rare in steady state, kept for mixed-producer
+     * pipelines that legitimately emit multiple distinct release-fn pointers.
      */
+    private volatile long arrowReleaseFnAddr = 0L;
+
+    private volatile MethodHandle arrowReleaseHandleFast;
+
     private final ConcurrentHashMap<Long, MethodHandle> arrowReleaseHandleCache =
             new ConcurrentHashMap<>();
 
@@ -1021,14 +1034,17 @@ public final class ForStRsLinker {
                 bind(
                         "frs_vec_iter_prefix_abort",
                         FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_LONG));
-        // PR-E3 / E-HIGH-5 / F5-4: batched prefix-iter open.  Critical mode is
-        // safe here because the Rust impl performs N synchronous engine
-        // prefix_scan + fill_chunk operations inside one FFI call; no thread
-        // park, no async wait.  Batch length is bounded by the executor's
-        // batch flush threshold (same bound that PR-D3/PR-D4 rely on), so the
-        // safepoint window stays acceptable.
+        // D9-H2: REMOVED critical mode (was PR-E3 / E-HIGH-5 / F5-4). Same rationale as D6-H2
+        // (vectorized_batch_put/_delete) and D8-H1 (merge_append_batch): the Rust impl performs N
+        // synchronous engine prefix_scan + fill_chunk operations inside one FFI call. While each
+        // individual prefix_scan is bounded, the aggregate wall-clock under back-pressure (LSM
+        // compaction stalls, buffer-pool contention) scales linearly with N and can hold the JVM
+        // safepoint window for ms-scale latency — sibling tasks stall, GC starves. The args from
+        // VectorizedExecutor (prefixes_off / prefixes_data / out_handles / out_first_chunks) are
+        // already confined-arena MemorySegments, so non-critical mode is sufficient — critical-
+        // mode heap byte[] acceptance is not needed here.
         this.frsVecIterPrefixOpenBatch =
-                bindCritical(
+                bind(
                         "frs_vec_iter_prefix_open_batch",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT, // return rc
@@ -1164,12 +1180,28 @@ public final class ForStRsLinker {
         if (addr == 0L) {
             return;
         }
-        MethodHandle handle =
-                arrowReleaseHandleCache.computeIfAbsent(
-                        addr,
-                        a ->
-                                Linker.nativeLinker()
-                                        .downcallHandle(releaseFn, ARROW_RELEASE_DESCRIPTOR));
+        // B9-H2 fast path: single-slot volatile cache. Reads are racy but the only observable
+        // failure mode is a redundant downcallHandle build (correctness-preserving, no autobox).
+        MethodHandle handle = arrowReleaseHandleFast;
+        if (handle == null || addr != arrowReleaseFnAddr) {
+            handle = arrowReleaseHandleCache.get(addr);
+            if (handle == null) {
+                handle =
+                        arrowReleaseHandleCache.computeIfAbsent(
+                                addr,
+                                a ->
+                                        Linker.nativeLinker()
+                                                .downcallHandle(
+                                                        releaseFn, ARROW_RELEASE_DESCRIPTOR));
+            }
+            // Publish to the fast slot. Volatile-write ordering: write the handle before the
+            // address, so a concurrent reader observing the updated address is guaranteed to
+            // observe the matching handle (Java memory model: prior volatile stores happen-
+            // before subsequent volatile stores on the same thread, and a volatile load of the
+            // address synchronizes with the volatile store, transitively observing the handle).
+            arrowReleaseHandleFast = handle;
+            arrowReleaseFnAddr = addr;
+        }
         try {
             handle.invokeExact(target);
         } catch (Throwable ignored) {
