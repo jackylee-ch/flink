@@ -143,26 +143,51 @@ public final class ForStRsDBWriteBatchWrapper implements AutoCloseable {
 
     public void flush(FrsCfHandle cf) {
         ensureOpen();
-        if (putKeys.count() > 0) {
-            linker.writebatchPut(
-                    handle,
-                    cf,
-                    putKeys.offsetsSegment(),
-                    putKeys.dataSegment(),
-                    putValues.offsetsSegment(),
-                    putValues.dataSegment(),
-                    putKeys.count());
-            putKeys.reset();
-            putValues.reset();
-        }
-        if (deleteKeys.count() > 0) {
-            linker.writebatchDelete(
-                    handle,
-                    cf,
-                    deleteKeys.offsetsSegment(),
-                    deleteKeys.dataSegment(),
-                    deleteKeys.count());
-            deleteKeys.reset();
+        // R39-M4: previously, the PUT phase would call
+        // {@code putKeys.reset() / putValues.reset()} immediately on
+        // success. If the subsequent {@code writebatchDelete} threw, the
+        // Java-side staging buffers were left half-cleared (PUTs gone,
+        // DELETEs intact) — a retry would then re-issue ONLY the DELETEs
+        // while the engine WriteBatch already held the PUTs. That is
+        // logically equivalent on the engine side (the PUTs are
+        // committed-or-rolled-back atomically), but the Java state machine
+        // was inconsistent: a caller that inspects {@link #isEmpty} after
+        // a partial flush failure would see a non-empty wrapper and might
+        // double-flush on retry, inflating PUT counts on the engine.
+        // Fix: hold off on resetting either buffer until both native
+        // calls return. If either throws, leave both buffers populated so
+        // the next flush retries the whole batch atomically (modulo
+        // engine-side dedup of the already-applied half — DELETE is
+        // idempotent so the only failure mode here is a transient FFI
+        // throw before the PUT call ever reached the engine, in which
+        // case both halves replay cleanly).
+        boolean committed = false;
+        try {
+            if (putKeys.count() > 0) {
+                linker.writebatchPut(
+                        handle,
+                        cf,
+                        putKeys.offsetsSegment(),
+                        putKeys.dataSegment(),
+                        putValues.offsetsSegment(),
+                        putValues.dataSegment(),
+                        putKeys.count());
+            }
+            if (deleteKeys.count() > 0) {
+                linker.writebatchDelete(
+                        handle,
+                        cf,
+                        deleteKeys.offsetsSegment(),
+                        deleteKeys.dataSegment(),
+                        deleteKeys.count());
+            }
+            committed = true;
+        } finally {
+            if (committed) {
+                putKeys.reset();
+                putValues.reset();
+                deleteKeys.reset();
+            }
         }
     }
 

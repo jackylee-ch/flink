@@ -395,6 +395,19 @@ class ForStRsKeyGroupedInternalPriorityQueueBatchedTest {
         assertThrows(IllegalStateException.class, q::peek);
         assertThrows(IllegalStateException.class, q::isEmpty);
         assertThrows(IllegalStateException.class, () -> q.advance(1000L, e -> {}));
+        // R39-H1: close-gates extended to size / iterator / getSubsetForKeyGroup
+        // / addAll / removeAll. All five paths touch FFM (flushPendingToEngine
+        // or a prefix iterator) and must surface a lifecycle violation as
+        // IllegalStateException, not as a deep FFM arena-closed crash.
+        assertThrows(IllegalStateException.class, q::size);
+        assertThrows(IllegalStateException.class, q::iterator);
+        assertThrows(IllegalStateException.class, () -> q.getSubsetForKeyGroup(0));
+        assertThrows(
+                IllegalStateException.class,
+                () -> q.addAll(java.util.Collections.singletonList(late)));
+        assertThrows(
+                IllegalStateException.class,
+                () -> q.removeAll(java.util.Collections.singletonList(late)));
         // close() itself is still idempotent (no exception on second invocation).
         q.close();
     }

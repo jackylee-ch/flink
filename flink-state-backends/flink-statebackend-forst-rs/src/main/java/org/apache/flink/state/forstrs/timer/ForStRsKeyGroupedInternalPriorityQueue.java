@@ -763,6 +763,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public int size() {
+        // R39-H1: reject post-close access. size() triggers
+        // flushPendingToEngine + per-kg engine scans — both fail opaquely
+        // against the closed arena. Mirror the isEmpty / advance gates.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         flushPendingToEngine();
         invalidateCache();
         int n = 0;
@@ -776,6 +782,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public void addAll(Collection<? extends T> toAdd) {
+        // R39-H1: reject post-close access. Delegates to add(); we gate at
+        // the bulk entry point too so a null-vs-closed mix-up (toAdd == null
+        // returning silently while a real call would throw) is impossible.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         if (toAdd == null) {
             return;
         }
@@ -786,6 +798,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public CloseableIterator<T> iterator() {
+        // R39-H1: reject post-close access. iterator() flushes then opens a
+        // multi-kg iterator — both engine-touching paths require the arena
+        // to still be alive.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         flushPendingToEngine();
         invalidateCache();
         return new MultiKeyGroupIterator();
@@ -793,6 +811,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public Set<T> getSubsetForKeyGroup(int keyGroup) {
+        // R39-H1: reject post-close access. Opens a prefix iterator on the
+        // engine — fails opaquely against the closed arena otherwise.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         flushPendingToEngine();
         invalidateCache();
         Set<T> out = new LinkedHashSet<>();
@@ -817,6 +840,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * the count of elements actually deleted. Goes through the buffered cancellation path.
      */
     public int removeAll(Collection<? extends T> toRemove) {
+        // R39-H1: reject post-close access. removeAll() delegates to
+        // remove() + a trailing flushPendingToEngine; gate at the bulk
+        // entry point so the empty-collection fast path can't bypass.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         if (toRemove == null || toRemove.isEmpty()) {
             return 0;
         }
@@ -937,6 +966,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // flush operations are issued.
 
         // Pass A — REMOVEs first (R38-H3).
+        boolean removesApplied = false;
         if (delCount > 0) {
             ensureFlushDelDataCapacity(totalDelBytes);
             int outIdx = 0;
@@ -960,15 +990,45 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                         ValueLayout.JAVA_INT, (long) outIdx * Integer.BYTES, (int) pos);
             }
             linker.vectorizedBatchDelete(db, cf, flushDelOffsets, flushDelData, outIdx);
+            removesApplied = true;
+        } else {
+            // No REMOVEs to apply — treat pass A as trivially succeeded so
+            // the post-pass-A REMOVE-drop loop runs no rows but the flag
+            // semantics stay simple for pass B.
+            removesApplied = true;
         }
 
-        // Pass B — ADDs after REMOVEs have succeeded.
+        // R39-M2: after pass A succeeds, drop the REMOVE rows from the
+        // pending buffer so a subsequent ADD-throw in pass B does NOT
+        // leave the buffer holding applied REMOVEs alongside un-flushed
+        // ADDs (the prior shape risked a wedged buffer that never
+        // shrank, because the trailing clear() was bypassed by the
+        // throw and the next retry would re-issue idempotent REMOVEs
+        // without ever cleaning them out). REMOVEs are idempotent on
+        // the engine side so re-issue would have been safe; the wedge
+        // here was about buffer-occupancy unboundedness, not engine
+        // correctness. Walking high-to-low keeps removeAt indices
+        // valid (removeAt shifts higher positions down).
+        if (removesApplied && delCount > 0) {
+            for (int i = n - 1; i >= 0; i--) {
+                if (pendingBuffer.opAt(i) == ArrowTimerBuffer.OP_REMOVE) {
+                    pendingBuffer.removeAt(i);
+                }
+            }
+        }
+
+        // Pass B — ADDs after REMOVEs have succeeded. After this call
+        // returns successfully the remaining ADD rows are dropped; if it
+        // throws the buffer still holds the un-applied ADDs and a retry
+        // can reissue them (the dropped REMOVE rows from pass A are
+        // already on the engine so the retry's pass-A no-ops harmlessly).
         if (addCount > 0) {
             byte[][] keys = new byte[addCount][];
             byte[][] vals = new byte[addCount][];
             int outIdx = 0;
             MemorySegment keyDataSeg = pendingBuffer.keyDataSegment();
-            for (int i = 0; i < n; i++) {
+            int remaining = pendingBuffer.size();
+            for (int i = 0; i < remaining; i++) {
                 if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
                     continue;
                 }
@@ -982,6 +1042,9 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             }
             linker.batchPut(db, cf, keys, vals);
         }
+        // Pass B succeeded — drop the ADD rows now (the REMOVE rows
+        // are already gone from the post-pass-A drop loop). A full
+        // clear() is equivalent here since only ADDs can remain.
         pendingBuffer.clear();
         invalidateCache();
     }

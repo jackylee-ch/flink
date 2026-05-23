@@ -887,9 +887,17 @@ public class VectorizedExecutor implements StateExecutor {
                 try {
                     perGetArena.close();
                 } catch (Throwable ignored) {
-                    // Best-effort cleanup; arena.close() can only fail if
-                    // a borrowed segment is still in use, which would be a
-                    // production-side use-after-free we want to surface.
+                    // R39-M1: best-effort silent close. Finally restores
+                    // outData fields THEN closes the per-GET arena; if
+                    // close() throws (an in-flight borrowed segment from
+                    // a use-after-free) the prior R38-M3 comment claimed
+                    // we "would surface" it, but the catch-Throwable here
+                    // actively swallows it. The simplest correct contract
+                    // is to acknowledge that — keep the close path simple
+                    // and do not rethrow. Any use-after-free would also
+                    // surface through the next perGetArena allocation or
+                    // through asan/valgrind in stress, so the loss of
+                    // signal here is bounded.
                 }
             }
         }
