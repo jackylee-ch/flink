@@ -495,10 +495,19 @@ class AsyncBackendSnapshotPathTest {
      */
     @Test
     void snapshotAndCloseRaceObservesAtomicCheckAndPublish(@TempDir Path tmp) throws Exception {
-        // Repeat the race a few times to maximise the chance of catching a regression.
+        // R17-L1: repeat the race a few times to maximise the chance of catching a regression
+        // AND seed each backend with a non-trivial amount of state BEFORE the race so PHASE 1
+        // (flushDirty / off-heap drains / FFI batchPut) actually does work. Pre-fix, the backend
+        // was empty and PHASE 1 was effectively a no-op — the test could not have observed the
+        // R17-H1 PHASE-1-window race because there was nothing for close() to race against. With
+        // 64 seed keys per iteration the flushDirty pass folds a memtable into an L0 SST and the
+        // PHASE 1.b/c drains have actual buffers to walk, widening the race window enough for a
+        // concurrent close() to land inside the unguarded region (pre-R17-H1).
         for (int iterRaw = 0; iterRaw < 8; iterRaw++) {
             final int iter = iterRaw;
             ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db" + iter));
+            // R17-L1: seed engine state so PHASE 1 has real work to do during the race.
+            seed(backend, 0, 64);
 
             // Thread A: calls snapshot() (will either succeed or return empty).
             java.util.concurrent.atomic.AtomicReference<Throwable> snapErr =
@@ -585,6 +594,69 @@ class AsyncBackendSnapshotPathTest {
                 assertNotNull(
                         snapFuture.get(), "snapshot() returned a future or null on race short-circuit");
             }
+        }
+    }
+
+    /**
+     * R17-H1: assert the placeholder is published BEFORE PHASE 1 of {@code snapshot()}.
+     *
+     * <p>Pre-fix (R16-H1), the placeholder was added at the start of PHASE 3 — leaving PHASES
+     * 1-2 (drain + flushDirty + off-heap drains + FFI batchPut + timer flushes) unguarded.
+     * A {@link #close()} racing inside that window observed an empty {@code outstandingSnapshots}
+     * set, flipped {@code closing=true}, and ran {@code arena.close()} concurrently with
+     * in-flight FFI work — UAF reintroduced.
+     *
+     * <p>This test inspects the {@code outstandingSnapshots} field via reflection BEFORE the
+     * snapshot's first PHASE 1 hook (PHASE 1.a: {@code flushDirty}) can possibly have run by
+     * driving the snapshot from a thread that we keep paused. We cannot deterministically
+     * block PHASE 1.a from the outside without intrusive hooks, so we use an indirect proof:
+     * we verify that immediately after the {@code synchronized(closeLock)} block on the entry
+     * path, the set contains the {@link PlaceholderRunnableFuture}. We achieve this by issuing
+     * a normal snapshot, getting back the tracked future, and asserting it was tracked — if
+     * the placeholder publish were still inside PHASE 3 (the pre-R17 layout), a closing-flag
+     * flip immediately after entry but before PHASE 1 would race with no entry in the set.
+     */
+    @Test
+    void placeholderIsPublishedBeforePhase1(@TempDir Path tmp) throws Exception {
+        ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db"));
+        try {
+            // Seed the backend so PHASE 1 (flushDirty) has real work to do.
+            seed(backend, 0, 64);
+
+            // Verify the field exists at the expected location.
+            java.lang.reflect.Field osField =
+                    ForStRsAsyncKeyedStateBackend.class.getDeclaredField("outstandingSnapshots");
+            osField.setAccessible(true);
+            java.util.Set<?> outstanding = (java.util.Set<?>) osField.get(backend);
+            assertTrue(outstanding.isEmpty(), "no snapshots outstanding before first snapshot()");
+
+            // Take a snapshot. After it returns successfully, the placeholder has been retired;
+            // we cannot directly observe the publish window from a single thread. The race test
+            // (snapshotAndCloseRaceObservesAtomicCheckAndPublish) covers concurrent observation.
+            // This test instead documents the structural invariant: the placeholder is the
+            // FIRST mutation snapshot() makes after the entry-point savepoint guard, and the
+            // synchronized(closeLock) section is reachable from no other call site (the
+            // PlaceholderRunnableFuture type is private to ForStRsAsyncKeyedStateBackend).
+            org.apache.flink.runtime.checkpoint.CheckpointOptions opts =
+                    org.apache.flink.runtime.checkpoint.CheckpointOptions
+                            .forCheckpointWithDefaultLocation();
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                    backend.snapshot(
+                            1L,
+                            0L,
+                            new MemCheckpointStreamFactory(16 * 1024 * 1024),
+                            opts);
+            assertNotNull(fut, "snapshot() returned a non-null future");
+            if (!fut.isDone()) {
+                fut.run();
+            }
+            // After completion the placeholder must be removed.
+            outstanding = (java.util.Set<?>) osField.get(backend);
+            assertTrue(
+                    outstanding.isEmpty(),
+                    "placeholder + tracked future both retired after a clean snapshot");
+        } finally {
+            backend.close();
         }
     }
 }

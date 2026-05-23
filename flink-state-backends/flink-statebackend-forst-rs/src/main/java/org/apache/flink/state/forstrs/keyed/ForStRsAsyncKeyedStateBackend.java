@@ -1076,75 +1076,24 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         }
 
         // ============================================================
-        // PHASE 1 — drain in-flight V2 dispatch + state buffers + timers
+        // R17-H1: PHASE 0 — atomic check-and-publish placeholder under {@link #closeLock}
         // ============================================================
-        // PHASE 1.a: flush all in-flight batches already queued in managed executors. After this
-        // call returns the engine's memtable has been folded to an L0 SST (PR-A1 made flushDirty
-        // call linker.flush) so the snapshot strategy's file enumeration is complete.
-        managedExecutors.forEach(VectorizedExecutor::flushDirty);
-
-        // PHASE 1.b: PR-C1 — drain each MapStateV2's off-heap staging buffer to the engine via
-        // batchPut + tombstone deletes BEFORE the engine snapshot reads. Mirrors the V1-sync
-        // statebuf flush hook (commit b3b9d7f2a6c).
-        for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
-            ms.flushOffHeapBuffer();
-        }
-        // PHASE 1.c: PR-C2 — drain ListStateV2 off-heap accumulator via a single {@code
-        // frs_vec_merge_append_batch} FFI. Without this hook, accumulated single-element
-        // {@code asyncAdd} chunks would still be in the off-heap arena at snapshot time and
-        // would be lost on restore.
-        for (ForStRsAsyncListStateV2<?, ?, ?> ls : registeredListStatesV2) {
-            ls.flushPreSnapshot();
-        }
-
-        // PHASE 1.d: drain RMW caches (Reducing/Aggregating V1 + V2). Each {@code
-        // flushOnBarrier()} serializes accumulated reduce/aggregate results and enqueues PUT
-        // requests to the classifier — those PUTs are picked up by PHASE 2's flushDirty pass.
-        for (ForStRsReducingStateV2<?> s : registeredReducingStates) {
-            s.flushOnBarrier();
-        }
-        for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
-            s.flushOnBarrier();
-        }
-        for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
-            s.flushOnBarrier();
-        }
-        for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAsyncAggregatingStates) {
-            s.flushOnBarrier();
-        }
-
-        // PHASE 1.e: PR-A1 — drain each engine-backed timer queue's pending-buffer to the engine.
-        // Mirrors the V1-sync engineTimerQueues drain in
-        // ForStRsAbstractKeyedStateBackend.snapshot() (spec invariant #4 in the batched-timer
-        // design). HEAP timer-factory mode registers no queues and this loop is a no-op.
-        for (ForStRsKeyGroupedInternalPriorityQueue<?> q : registeredTimerQueues) {
-            q.flushPendingToEngine();
-        }
-
-        // ============================================================
-        // PHASE 2 — second flushDirty to drain the PUTs enqueued by RMW cache flushes
-        // ============================================================
-        managedExecutors.forEach(VectorizedExecutor::flushDirty);
-
-        // ============================================================
-        // PHASE 3 — engine snapshot via FFI through ForStRsSnapshotStrategy
-        // ============================================================
-        // Lazily construct the strategy on first snapshot. We pass a synthetic single-CF map
-        // ("default" → 0) because the async-V2 path keeps every state in the default column
-        // family; multi-CF wiring is a follow-on PR (V20).
-        ForStRsSnapshotStrategy strategy = ensureSnapshotStrategy();
-        // R16-H1: eager-register a placeholder BEFORE running the long sync prep, under
-        // {@link #closeLock} so the closing-flag check and the outstanding-set publish are
-        // atomic with respect to {@link #close()}. Pre-fix, the closing-flag check ran ~tens of
-        // ms before the {@code outstandingSnapshots.add} that {@link #trackSnapshot} performed
-        // — close() racing in that window saw an empty set and freed the arena while the
-        // in-flight snapshot still referenced it.
+        // The placeholder MUST be published BEFORE PHASE 1 because every subsequent phase
+        // touches the native arena via flushDirty / off-heap drains / FFI batchPut / FFI
+        // snapshot. Pre-fix (R16-H1), the placeholder was added only at the start of PHASE 3,
+        // leaving PHASES 1-2 unguarded: a close() racing inside that window observed an empty
+        // outstandingSnapshots set, flipped closing=true, and ran arena.close() concurrently
+        // with the in-flight FFI work — UAF reintroduced.
         //
-        // Pattern: the placeholder is itself a RunnableFuture (a no-op DoneFuture wrapper)
-        // registered eagerly; later we register the actual future via trackSnapshot and remove
-        // the placeholder. Until the actual future is registered, close()'s await sees the
-        // placeholder and either completes immediately (done) or waits — but the wait is
-        // unimportant because the placeholder protects the publish window, not real work.
+        // Pattern: the placeholder is a no-op {@link RunnableFuture}. {@link #close()} flips
+        // {@code closing=true} under the same lock and then awaits every outstanding entry;
+        // the placeholder blocks the await until snapshot() reaches its publish-and-retire
+        // point (PHASE 3 — actual future installed, placeholder removed). The wrapped
+        // {@link CompletableFuture} is completed there so any racing await returns immediately.
+        //
+        // Snapshot/close mutual-exclusion invariant: snapshot() either (a) sees closing=true
+        // and short-circuits to DoneFuture.of(empty) — no native work — OR (b) successfully
+        // publishes the placeholder, in which case close() awaits it before arena.close().
         CompletableFuture<Void> placeholder = new CompletableFuture<>();
         RunnableFuture<SnapshotResult<KeyedStateHandle>> placeholderFuture =
                 new PlaceholderRunnableFuture(placeholder);
@@ -1155,13 +1104,78 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             outstandingSnapshots.add(placeholderFuture);
         }
         try {
+            // ============================================================
+            // PHASE 1 — drain in-flight V2 dispatch + state buffers + timers
+            // ============================================================
+            // PHASE 1.a: flush all in-flight batches already queued in managed executors. After
+            // this call returns the engine's memtable has been folded to an L0 SST (PR-A1 made
+            // flushDirty call linker.flush) so the snapshot strategy's file enumeration is
+            // complete.
+            managedExecutors.forEach(VectorizedExecutor::flushDirty);
+
+            // PHASE 1.b: PR-C1 — drain each MapStateV2's off-heap staging buffer to the engine
+            // via batchPut + tombstone deletes BEFORE the engine snapshot reads. Mirrors the
+            // V1-sync statebuf flush hook (commit b3b9d7f2a6c).
+            for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
+                ms.flushOffHeapBuffer();
+            }
+            // PHASE 1.c: PR-C2 — drain ListStateV2 off-heap accumulator via a single {@code
+            // frs_vec_merge_append_batch} FFI. Without this hook, accumulated single-element
+            // {@code asyncAdd} chunks would still be in the off-heap arena at snapshot time and
+            // would be lost on restore.
+            for (ForStRsAsyncListStateV2<?, ?, ?> ls : registeredListStatesV2) {
+                ls.flushPreSnapshot();
+            }
+
+            // PHASE 1.d: drain RMW caches (Reducing/Aggregating V1 + V2). Each {@code
+            // flushOnBarrier()} serializes accumulated reduce/aggregate results and enqueues PUT
+            // requests to the classifier — those PUTs are picked up by PHASE 2's flushDirty
+            // pass.
+            for (ForStRsReducingStateV2<?> s : registeredReducingStates) {
+                s.flushOnBarrier();
+            }
+            for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
+                s.flushOnBarrier();
+            }
+            for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
+                s.flushOnBarrier();
+            }
+            for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s :
+                    registeredAsyncAggregatingStates) {
+                s.flushOnBarrier();
+            }
+
+            // PHASE 1.e: PR-A1 — drain each engine-backed timer queue's pending-buffer to the
+            // engine. Mirrors the V1-sync engineTimerQueues drain in
+            // ForStRsAbstractKeyedStateBackend.snapshot() (spec invariant #4 in the
+            // batched-timer design). HEAP timer-factory mode registers no queues and this loop
+            // is a no-op.
+            for (ForStRsKeyGroupedInternalPriorityQueue<?> q : registeredTimerQueues) {
+                q.flushPendingToEngine();
+            }
+
+            // ============================================================
+            // PHASE 2 — second flushDirty to drain the PUTs enqueued by RMW cache flushes
+            // ============================================================
+            managedExecutors.forEach(VectorizedExecutor::flushDirty);
+
+            // ============================================================
+            // PHASE 3 — engine snapshot via FFI through ForStRsSnapshotStrategy
+            // ============================================================
+            // Lazily construct the strategy on first snapshot. We pass a synthetic single-CF
+            // map ("default" → 0) because the async-V2 path keeps every state in the default
+            // column family; multi-CF wiring is a follow-on PR (V20).
+            ForStRsSnapshotStrategy strategy = ensureSnapshotStrategy();
+
             // PR-A8: SYNC_SAVEPOINT semantics. Synchronous execution blocks until the future is
-            // pre-run, so by the time this method returns every state mutation up to the barrier
-            // is durable on S3. For periodic checkpoints we use ASYNCHRONOUS so the mailbox
-            // thread continues processing records while the upload completes in a virtual
-            // thread.
+            // pre-run, so by the time this method returns every state mutation up to the
+            // barrier is durable on S3. For periodic checkpoints we use ASYNCHRONOUS so the
+            // mailbox thread continues processing records while the upload completes in a
+            // virtual thread.
             SnapshotExecutionType execType =
-                    isSync ? SnapshotExecutionType.SYNCHRONOUS : SnapshotExecutionType.ASYNCHRONOUS;
+                    isSync
+                            ? SnapshotExecutionType.SYNCHRONOUS
+                            : SnapshotExecutionType.ASYNCHRONOUS;
             RunnableFuture<SnapshotResult<KeyedStateHandle>> future =
                     new SnapshotStrategyRunner<>(
                                     isSavepoint
@@ -1171,15 +1185,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                     cancelStreamRegistry,
                                     execType)
                             .snapshot(id, ts, f, o);
-            // R15-H1 + R16-H1: register the future so {@link #close()} can await its completion
-            // before closing the native arena. For SYNCHRONOUS savepoints the future is already
-            // done by the time {@code .snapshot()} returns (SnapshotStrategyRunner pre-runs the
-            // FutureTask), so tracking is harmless (close() sees done=true and skips the
-            // await). For ASYNCHRONOUS checkpoints the worker thread runs concurrently with
-            // the mailbox and MUST be awaited at close() to prevent the R15-H1 use-after-free
-            // on the nativeArena. The placeholder is removed only AFTER the actual future is
-            // installed in the set, so close() never sees an empty outstanding set between
-            // the two operations.
+            // R15-H1 + R16-H1 + R17-H1: register the future so {@link #close()} can await its
+            // completion before closing the native arena. For SYNCHRONOUS savepoints the future
+            // is already done by the time {@code .snapshot()} returns (SnapshotStrategyRunner
+            // pre-runs the FutureTask), so tracking is harmless (close() sees done=true and
+            // skips the await). For ASYNCHRONOUS checkpoints the worker thread runs
+            // concurrently with the mailbox and MUST be awaited at close() to prevent the
+            // R15-H1 use-after-free on the nativeArena. The placeholder is removed only AFTER
+            // the actual future is installed in the set, so close() never sees an empty
+            // outstanding set between the two operations.
             RunnableFuture<SnapshotResult<KeyedStateHandle>> tracked = trackSnapshot(future);
             // Publish-then-retire ordering: actual future is now in outstandingSnapshots (or
             // already done and removed), so it is safe to drop the placeholder.
@@ -1187,8 +1201,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             placeholder.complete(null);
             return tracked;
         } catch (IOException e) {
-            // R16-H1: release the placeholder on any throw path so close()'s await does not
-            // block on a dead snapshot attempt.
+            // R16-H1 + R17-H1: release the placeholder on any throw path (PHASE 1 drain
+            // failures, PHASE 2 flush failures, PHASE 3 strategy errors) so close()'s await
+            // does not block on a dead snapshot attempt.
             outstandingSnapshots.remove(placeholderFuture);
             placeholder.complete(null);
             // The cancelStreamRegistry may already be closed if a prior checkpoint's async phase
@@ -1214,10 +1229,11 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             }
             throw e;
         } catch (Throwable t) {
-            // R16-H1: any non-IOException throw (RuntimeException, FFI panics, Errors) must also
-            // release the placeholder so close()'s await does not block on a dead attempt. The
-            // throw still propagates so the coordinator's tolerable-failed-checkpoints accounting
-            // observes the real failure (A4-H3 contract preserved).
+            // R16-H1 + R17-H1: any non-IOException throw (PHASE 1/2/3 drain or flush failures,
+            // RuntimeException, FFI panics, Errors) must also release the placeholder so
+            // close()'s await does not block on a dead attempt. The throw still propagates so
+            // the coordinator's tolerable-failed-checkpoints accounting observes the real
+            // failure (A4-H3 contract preserved).
             outstandingSnapshots.remove(placeholderFuture);
             placeholder.complete(null);
             throw t;
@@ -1650,10 +1666,25 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 outstandingSnapshots.remove(f);
                 continue;
             }
-            try {
-                f.cancel(true);
-            } catch (Throwable ignored) {
-                // best-effort cancel; some snapshot strategies are uninterruptible mid-upload
+            // R17-H2: do NOT call cancel(true) on a PlaceholderRunnableFuture. Pre-fix,
+            // cancel(true) propagated to the placeholder's inner CompletableFuture and completed
+            // it exceptionally — get() then returned immediately with CancellationException and
+            // close() proceeded to arena teardown while snapshot() was still inside PHASE 1-3
+            // (drains + FFI snapshot), reintroducing the R17-H1 UAF window the placeholder is
+            // meant to guard. The contract is: snapshot() removes the placeholder explicitly
+            // once the real future is installed (or any throw path); close() must therefore
+            // ONLY get() the placeholder and let snapshot() complete it. On timeout we
+            // force-remove the entry to avoid wedging close(), accepting the same best-effort
+            // UAF fallback as the non-placeholder branch (the snapshot worker may still touch
+            // the arena briefly — coordinator should never issue a checkpoint to a closing
+            // backend).
+            boolean isPlaceholder = f instanceof PlaceholderRunnableFuture;
+            if (!isPlaceholder) {
+                try {
+                    f.cancel(true);
+                } catch (Throwable ignored) {
+                    // best-effort cancel; some snapshot strategies are uninterruptible mid-upload
+                }
             }
             try {
                 f.get(CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
@@ -1666,12 +1697,21 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                         e);
                 break;
             } catch (TimeoutException e) {
-                LOG.warn(
-                        "ForStRsAsyncKeyedStateBackend.close: outstanding async-snapshot did"
-                                + " not complete within {}ms after cancel(true) — proceeding"
-                                + " to arena teardown; the worker may UAF on its FrsSnapshot"
-                                + " close (R15-H1 best-effort fallback)",
-                        CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+                if (isPlaceholder) {
+                    LOG.warn(
+                            "ForStRsAsyncKeyedStateBackend.close: snapshot()'s pre-PHASE-1"
+                                    + " placeholder did not retire within {}ms — proceeding"
+                                    + " to arena teardown; the snapshot worker may UAF on"
+                                    + " in-flight FFI calls (R17-H1/H2 best-effort fallback)",
+                            CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+                } else {
+                    LOG.warn(
+                            "ForStRsAsyncKeyedStateBackend.close: outstanding async-snapshot"
+                                    + " did not complete within {}ms after cancel(true) —"
+                                    + " proceeding to arena teardown; the worker may UAF on"
+                                    + " its FrsSnapshot close (R15-H1 best-effort fallback)",
+                            CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+                }
             } catch (Throwable ignored) {
                 // ExecutionException / cancellation surfaced via get(); benign — the worker
                 // has terminated, which is all we needed before closing the arena.

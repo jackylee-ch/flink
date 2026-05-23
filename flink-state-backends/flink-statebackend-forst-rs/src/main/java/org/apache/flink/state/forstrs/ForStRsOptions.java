@@ -152,11 +152,32 @@ public final class ForStRsOptions {
         if (mb < 0) {
             throw new IllegalArgumentException("cacheCapacityMb must be >= 0, got " + mb);
         }
+        // R17-M2: guard against MiB → bytes overflow. The conversion in
+        // {@link #cacheCapacityBytes()} multiplies by 1024 * 1024; without this check, an
+        // adversarial {@code mb == 9007199254741L} would overflow to a NEGATIVE byte count and
+        // the engine would reject the cache request with an obscure error. Validate at the
+        // setter so misconfiguration fails fast with a clear message.
+        long maxMb = Long.MAX_VALUE / (1024L * 1024L);
+        if (mb > maxMb) {
+            throw new IllegalArgumentException(
+                    "cacheCapacityMb="
+                            + mb
+                            + " exceeds the maximum representable in bytes (max="
+                            + maxMb
+                            + " MiB = "
+                            + (maxMb * 1024L * 1024L)
+                            + " bytes)");
+        }
         this.cacheCapacityMb = mb;
         return this;
     }
 
-    /** Convenience: cache capacity converted to bytes for the FFI call. */
+    /**
+     * Convenience: cache capacity converted to bytes for the FFI call.
+     *
+     * <p>R17-M2: the setter validates {@code mb <= Long.MAX_VALUE / (1024 * 1024)} so this
+     * multiplication can never overflow.
+     */
     public long cacheCapacityBytes() {
         return cacheCapacityMb * 1024L * 1024L;
     }
