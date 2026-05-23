@@ -582,14 +582,35 @@ public class VectorizedExecutor implements StateExecutor {
         // FFI flush: synchronously fold memtable → L0 SST. Idempotent; engine returns OK if the
         // memtable is empty. Throws on engine-side error (caller is the snapshot path which will
         // surface the failure as a failed RunnableFuture).
+        //
+        // R24-M1: the catch (RuntimeException) wrapper here was a no-op (just re-threw). It
+        // also let Error subclasses (StackOverflowError, OutOfMemoryError) skip the
+        // snapshot-bookkeeping path — the caller's failure-marker logic only runs if the throw
+        // propagates, which it does directly without the catch. Widen to Throwable and convert
+        // to FrsBackendException so the snapshot path observes a uniform exception shape and
+        // surfaces a clean error message; rethrow Errors after wrapping is not appropriate
+        // because Errors typically indicate VM-level conditions that should not be wrapped.
+        // Strategy: let RuntimeException propagate unchanged; wrap checked-style failures from
+        // the FFI into FrsBackendException with status=INTERNAL_ERROR; rethrow Error subclasses
+        // as-is so the JVM-level signal is not laundered.
         if (linker != null && db != null) {
             try {
                 linker.flush(db);
+            } catch (Error err) {
+                // VM-level: rethrow without wrapping so JVM-level signals (OOM, stack overflow)
+                // reach the snapshot path's outer error handler in their original form.
+                throw err;
             } catch (RuntimeException re) {
-                // Snapshot pre-flush failures must propagate — there is no value to silently
-                // continuing because the snapshot strategy would then enumerate an incomplete
-                // SST set. Re-throw and let the outer snapshot path mark the future failed.
+                // Already RuntimeException — propagate unchanged; the snapshot path observes
+                // this and marks the future failed.
                 throw re;
+            } catch (Throwable t) {
+                // Anything else (checked-style FFI surprises): wrap in the project's uniform
+                // backend-exception shape so the snapshot path's failure marker is consistent
+                // across flush failure modes.
+                throw new FrsBackendException(
+                        org.apache.flink.state.forstrs.FrsStatus.INTERNAL,
+                        "flushDirty: engine flush failed: " + t.getMessage());
             }
         }
     }

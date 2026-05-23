@@ -301,17 +301,58 @@ public final class ForStRsKeyGroupedSerializer<K> {
         return new byte[] {(byte) ((keyGroup >>> 8) & 0xFF), (byte) (keyGroup & 0xFF)};
     }
 
+    /**
+     * R24-L1: returns the key-group portion of the composite key — the supplied {@code
+     * stateName} is intentionally ignored. The historical name {@code keyGroupAndStatePrefix}
+     * was misleading because the state-name discriminator sits AFTER the user-key portion of
+     * the composite, so a "state-only" prefix is not a clean byte prefix unless the user-key
+     * serialization is fixed-length; in the variable-length case (the common one) callers must
+     * post-filter by state name during iteration.
+     *
+     * @deprecated retained as a thin alias to {@link #keyGroupPrefixOnly(int, String)} for
+     *     backwards compatibility with one test caller; new code should use
+     *     {@link #keyGroupPrefixOnly} directly.
+     */
+    @Deprecated
     public byte[] keyGroupAndStatePrefix(int keyGroup, String stateName) {
-        // For per-state-per-keygroup scans we need the kg prefix; the state name
-        // discriminator inside the composite key follows the user-key portion,
-        // so a "state-only" prefix isn't a clean byte prefix unless the user-key
-        // serialization is fixed-length. For variable-length user keys we just
-        // use the kg prefix and post-filter by state name during iteration.
-        // This method exists for the fixed-length case (tests cover the kg
-        // portion only).
+        return keyGroupPrefixOnly(keyGroup, stateName);
+    }
+
+    /**
+     * R24-L1: returns only the 2-byte big-endian key-group prefix. The {@code stateName}
+     * parameter is preserved on the signature to document caller intent (the caller wanted a
+     * per-state-per-keygroup scan), but the returned prefix is the key-group bytes only —
+     * the state-name discriminator must be applied as a post-filter during iteration. See
+     * the deprecated {@link #keyGroupAndStatePrefix} for the rationale on why a true "state
+     * prefix" is not byte-prefix-shaped in the general case.
+     */
+    public byte[] keyGroupPrefixOnly(int keyGroup, String stateName) {
         return keyGroupPrefix(keyGroup);
     }
 
+    /**
+     * Decode a composite key produced by {@link #encodeForState} or {@link #encodeForMap}.
+     *
+     * <p><b>R24-L2 limitation — TEST-ONLY ROUTE.</b> The decoder finds the state-name slice by
+     * scanning for the LAST {@code 0x2F} ({@code '/'}) in the composite. This is a heuristic:
+     * if the user-key serializer (UK) emits a {@code 0x2F} byte inside the serialized map-key
+     * portion of a {@link #encodeForMap} composite, the heuristic mis-splits the boundary and
+     * the decoded {@code stateName} truncates at the spurious slash. Concrete example: a
+     * {@code StringSerializer} emitting the UTF-8 string {@code "a/b"} as the map user-key
+     * embeds an unescaped {@code 0x2F} in the body.
+     *
+     * <p>Production code paths do NOT use {@link #decode}; the engine reads the composite key
+     * back through the keyed-state classes which already know their own state name. {@link
+     * #decode} exists for test reconstruction only — tests must avoid UK serializers that emit
+     * {@code 0x2F}, or use fixed-width UK serializers and reconstruct the boundary by length.
+     *
+     * <p>A proper fix would change the encoding to length-prefix the state name (e.g. write
+     * {@code [u16 nameLen][nameBytes]} between the user-key SEP and the map-key portion) so
+     * the boundary is unambiguous regardless of UK byte content. That change is a wire-format
+     * break and is deferred to a dedicated encoder follow-up; the cost of the break is
+     * non-trivial (every persisted state on disk depends on the current layout) and exceeds
+     * the LOW-severity scope of this round.
+     */
     public Decoded<K> decode(byte[] composite) {
         if (composite.length < 4) {
             throw new IllegalArgumentException("composite too short: " + composite.length);

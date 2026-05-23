@@ -337,13 +337,17 @@ class SerializerEvolutionTest {
     @Test
     void deserializeRejectsOutOfBoundsPerEntryBytes() throws Exception {
         // Hand-build a blob whose first entry claims a bytesLen above MAX_SNAPSHOT_BYTES.
+        // R24-H2: this test exercises the bytesLen bound, not TTL handling — use the v1
+        // per-entry envelope explicitly so the wire shape stays {fmtVer, kindOrd, bytesLen}
+        // with no TTL fields in between. The bytesLen-bounds reject must trigger before TTL
+        // fields are consulted (v1 envelopes have none).
         org.apache.flink.core.memory.DataOutputSerializer out =
                 new org.apache.flink.core.memory.DataOutputSerializer(64);
         out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_MAGIC);
         out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_FORMAT_V1);
         out.writeInt(1); // one entry
         out.writeUTF("s");
-        out.writeInt(StateSerializerMetadata.CURRENT_FORMAT_VERSION);
+        out.writeInt(StateSerializerMetadata.FORMAT_VERSION_V1);
         out.writeInt(0); // VALUE kind ordinal
         out.writeInt(StateSerializerRegistry.MAX_SNAPSHOT_BYTES + 1);
         IOException ioe =
@@ -351,8 +355,9 @@ class SerializerEvolutionTest {
                         IOException.class,
                         () -> StateSerializerRegistry.deserialize(out.getCopyOfBuffer()));
         assertTrue(
-                ioe.getMessage()
-                        .contains("bytesLen=" + (StateSerializerRegistry.MAX_SNAPSHOT_BYTES + 1)),
+                ioe.getMessage() != null
+                        && ioe.getMessage()
+                                .contains("bytesLen=" + (StateSerializerRegistry.MAX_SNAPSHOT_BYTES + 1)),
                 "expected bytesLen-bounds message, got: " + ioe.getMessage());
     }
 

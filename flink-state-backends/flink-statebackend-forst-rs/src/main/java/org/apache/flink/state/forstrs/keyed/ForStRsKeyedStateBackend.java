@@ -1307,76 +1307,120 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             return;
         }
         closed = true;
-        // 1b.3 + 1c.1: drain off-heap ValueState AND MapState buffers BEFORE closing the
-        // underlying ArrowBinaryBuffers. Without this, any state writes that never crossed the
-        // auto-flush threshold are silently lost on shutdown.
-        flushAllOffHeapValueStateBuffers();
-        flushAllMapStates();
-        // Release off-heap ArrowBinaryBuffers owned by ValueState + MapState instances.
-        for (ArrowBinaryBuffer b : ownedBuffers) {
-            try {
-                b.close();
-            } catch (Throwable ignore) {
-                // best-effort; close() continues with the rest of the chain.
-            }
-        }
-        ownedBuffers.clear();
-        // PR-M1 (D-R2-5): close all per-thread scratch Arenas so their 64 KB allocations
-        // are reclaimed instead of leaking until JVM shutdown.
-        synchronized (threadLocalArenas) {
-            for (Arena a : threadLocalArenas) {
+        // R24-H1: close() previously set {@code closed=true} BEFORE running
+        // {@link #flushAllOffHeapValueStateBuffers}, {@link #flushAllMapStates}, and {@link
+        // #flushWriteBuffer} without a try/finally guard around the resource-release block. A
+        // throw from any of those flush calls leaked the slot arena scope, defaultCf, db, and
+        // backing arena because {@code closed=true} blocked any retry through {@link
+        // #dispose}. The fix wraps the FLUSH PHASE in a try-block that captures (but does not
+        // swallow) the first flush error, runs the full RESOURCE-RELEASE PHASE inside the
+        // finally, and surfaces the flush error AFTER all native handles are freed. The
+        // release phase itself follows the existing first-error capture pattern so a failure
+        // in one step does not skip the next.
+        Throwable flushError = null;
+        try {
+            // 1b.3 + 1c.1: drain off-heap ValueState AND MapState buffers BEFORE closing the
+            // underlying ArrowBinaryBuffers. Without this, any state writes that never crossed
+            // the auto-flush threshold are silently lost on shutdown.
+            flushAllOffHeapValueStateBuffers();
+            flushAllMapStates();
+            // Release off-heap ArrowBinaryBuffers owned by ValueState + MapState instances.
+            for (ArrowBinaryBuffer b : ownedBuffers) {
                 try {
-                    a.close();
+                    b.close();
+                } catch (Throwable ignore) {
+                    // best-effort; close() continues with the rest of the chain.
+                }
+            }
+            ownedBuffers.clear();
+            // PR-M1 (D-R2-5): close all per-thread scratch Arenas so their 64 KB allocations
+            // are reclaimed instead of leaking until JVM shutdown.
+            synchronized (threadLocalArenas) {
+                for (Arena a : threadLocalArenas) {
+                    try {
+                        a.close();
+                    } catch (Throwable ignore) {
+                        // best-effort
+                    }
+                }
+                threadLocalArenas.clear();
+            }
+            // Flush any buffered writes before releasing resources.
+            flushWriteBuffer();
+        } catch (Throwable t) {
+            // Capture and proceed — the finally block MUST run the resource-release chain so
+            // we don't leak slotArenaScope / defaultCf / db / arena on flush throw. Re-thrown
+            // below after release completes.
+            flushError = t;
+        } finally {
+            stateCache.clear();
+            if (iterWatchdog != null) {
+                try {
+                    iterWatchdog.stop();
+                } catch (Throwable ignore) {
+                    // best-effort: must not block resource release below.
+                }
+                iterWatchdog = null;
+            }
+            if (slotArenaScope != null) {
+                try {
+                    slotArenaScope.closeSlot();
                 } catch (Throwable ignore) {
                     // best-effort
                 }
+                slotArenaScope = null;
             }
-            threadLocalArenas.clear();
-        }
-        // Flush any buffered writes before releasing resources.
-        flushWriteBuffer();
-        stateCache.clear();
-        if (iterWatchdog != null) {
-            iterWatchdog.stop();
-            iterWatchdog = null;
-        }
-        if (slotArenaScope != null) {
-            slotArenaScope.closeSlot();
-            slotArenaScope = null;
-        }
-        if (!ownsResources) {
-            return;
-        }
-        // Close in reverse order of construction; each step swallows-and-rethrows the first
-        // exception so that we always attempt the full chain.
-        Throwable first = null;
-        try {
-            defaultCf.close();
-        } catch (Throwable t) {
-            first = t;
-        }
-        try {
-            db.close();
-        } catch (Throwable t) {
-            if (first == null) {
-                first = t;
+            if (ownsResources) {
+                // Close in reverse order of construction; each step swallows-and-rethrows the
+                // first exception so that we always attempt the full chain. Releasing the
+                // native handles must NEVER be skipped by an earlier failure — that was the
+                // original R24-H1 leak.
+                Throwable first = null;
+                try {
+                    defaultCf.close();
+                } catch (Throwable t) {
+                    first = t;
+                }
+                try {
+                    db.close();
+                } catch (Throwable t) {
+                    if (first == null) {
+                        first = t;
+                    }
+                }
+                try {
+                    arena.close();
+                } catch (Throwable t) {
+                    if (first == null) {
+                        first = t;
+                    }
+                }
+                if (first != null) {
+                    // If the flush phase ALSO threw, prefer the flush error (more
+                    // actionable for users — it is what caused the close) and attach the
+                    // release error as a suppressed exception. Otherwise surface the
+                    // release error directly.
+                    if (flushError != null) {
+                        flushError.addSuppressed(first);
+                    } else if (first instanceof RuntimeException re) {
+                        throw re;
+                    } else if (first instanceof Error err) {
+                        throw err;
+                    } else {
+                        throw new IOException("ForStRsKeyedStateBackend close failed", first);
+                    }
+                }
             }
         }
-        try {
-            arena.close();
-        } catch (Throwable t) {
-            if (first == null) {
-                first = t;
-            }
-        }
-        if (first != null) {
-            if (first instanceof RuntimeException re) {
+        if (flushError != null) {
+            if (flushError instanceof RuntimeException re) {
                 throw re;
             }
-            if (first instanceof Error err) {
+            if (flushError instanceof Error err) {
                 throw err;
             }
-            throw new IOException("ForStRsKeyedStateBackend close failed", first);
+            throw new IOException(
+                    "ForStRsKeyedStateBackend close failed during flush phase", flushError);
         }
     }
 

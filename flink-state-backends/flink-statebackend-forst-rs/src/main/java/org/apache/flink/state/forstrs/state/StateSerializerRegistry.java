@@ -132,6 +132,28 @@ public final class StateSerializerRegistry {
      */
     public <T> void register(String stateName, int stateKindOrdinal, TypeSerializer<T> serializer)
             throws IOException {
+        // R24-H2: thin alias for back-compat — TTL fields default to off/0. Callers that know
+        // their state's TTL configuration must route through {@link #register(String, int,
+        // TypeSerializer, boolean, long)} so the flag is persisted; otherwise a TTL toggle
+        // across sessions cannot be detected.
+        register(stateName, stateKindOrdinal, serializer, false, 0L);
+    }
+
+    /**
+     * R24-H2: TTL-aware registration. Captures {@code ttlEnabled} + {@code ttlMillis} at
+     * registration time and persists them in the metadata. {@link #verifyOrRegister} compares
+     * the persisted flag against the new descriptor's flag on restore and throws {@link
+     * StateMigrationException} on mismatch — the on-disk layout differs ({@code [long expiry]
+     * [value]} vs {@code [value]}) so reading through the wrong serializer silently corrupts
+     * every restored value.
+     */
+    public <T> void register(
+            String stateName,
+            int stateKindOrdinal,
+            TypeSerializer<T> serializer,
+            boolean ttlEnabled,
+            long ttlMillis)
+            throws IOException {
         StateSerializerMetadata existing = live.get(stateName);
         if (existing != null) {
             // R21-L1: duplicate registration must agree on state-kind. The previous behavior
@@ -151,6 +173,19 @@ public final class StateSerializerRegistry {
                                 + " reading through the wrong kind decodes garbage. Choose a"
                                 + " different state name.");
             }
+            // R24-H2: duplicate registration must also agree on TTL config — toggling within a
+            // single session would mean two state objects are reading/writing the same engine
+            // keys through serializers with incompatible byte layouts.
+            if (existing.ttlEnabled() != ttlEnabled) {
+                throw new IllegalStateException(
+                        "Duplicate state registration with different TTL flag: " + stateName
+                                + " (previously "
+                                + (existing.ttlEnabled() ? "TTL_ENABLED" : "TTL_DISABLED")
+                                + ", now "
+                                + (ttlEnabled ? "TTL_ENABLED" : "TTL_DISABLED")
+                                + "). The on-disk layout differs (TTL prefixes an 8-byte expiry);"
+                                + " choose a different state name.");
+            }
             return;
         }
         TypeSerializerSnapshot<T> snap = serializer.snapshotConfiguration();
@@ -163,7 +198,9 @@ public final class StateSerializerRegistry {
                         stateName,
                         stateKindOrdinal,
                         StateSerializerMetadata.CURRENT_FORMAT_VERSION,
-                        bytes));
+                        bytes,
+                        ttlEnabled,
+                        ttlMillis));
     }
 
     /**
@@ -184,10 +221,50 @@ public final class StateSerializerRegistry {
     public <T> TypeSerializer<T> verifyOrRegister(
             String stateName, int stateKindOrdinal, TypeSerializer<T> serializer)
             throws IOException, StateMigrationException {
+        // R24-H2: TTL-unaware overload — back-compat for callers that have not been migrated.
+        // Routes through the full overload with both flags defaulted off, which matches
+        // pre-R24-H2 behaviour and is safe because a restored entry with ttlEnabled=true
+        // would be caught by the new mismatch check (prior.ttlEnabled=true vs new=false).
+        return verifyOrRegister(stateName, stateKindOrdinal, serializer, false, 0L);
+    }
+
+    /**
+     * R24-H2: TTL-aware overload. The {@code ttlEnabled}/{@code ttlMillis} are compared against
+     * the persisted values on restore; a mismatch on {@code ttlEnabled} throws {@link
+     * StateMigrationException} because the on-disk byte layout for TTL vs non-TTL is
+     * incompatible (TTL prefixes an 8-byte expiry timestamp). {@code ttlMillis} changes are
+     * NOT a fatal toggle (the in-memory expiry comparison handles a window change at runtime),
+     * but are logged via the persisted metadata for forensic visibility.
+     */
+    public <T> TypeSerializer<T> verifyOrRegister(
+            String stateName,
+            int stateKindOrdinal,
+            TypeSerializer<T> serializer,
+            boolean ttlEnabled,
+            long ttlMillis)
+            throws IOException, StateMigrationException {
         StateSerializerMetadata prior = restored.get(stateName);
         if (prior == null) {
-            register(stateName, stateKindOrdinal, serializer);
+            register(stateName, stateKindOrdinal, serializer, ttlEnabled, ttlMillis);
             return serializer;
+        }
+        // R24-H2: assert TTL invariance BEFORE schema-compat. The element-serializer snapshot
+        // does NOT include the TTL wrapper (PR-A7 deferred snapshotConfiguration for
+        // TtlSerializer), so a toggle would otherwise resolve as COMPATIBLE_AS_IS and the
+        // read path would decode the 8-byte expiry header as the value head, silently
+        // corrupting every restored value. Surface the toggle here as a hard failure with an
+        // actionable message.
+        if (prior.ttlEnabled() != ttlEnabled) {
+            throw new StateMigrationException(
+                    "TTL toggle detected for state '" + stateName
+                            + "'; storage layout incompatible: prior="
+                            + (prior.ttlEnabled() ? "TTL_ENABLED" : "TTL_DISABLED")
+                            + ", now="
+                            + (ttlEnabled ? "TTL_ENABLED" : "TTL_DISABLED")
+                            + ". The TTL serializer prefixes each value with an 8-byte expiry"
+                            + " timestamp; reading TTL data through a non-TTL serializer (or"
+                            + " vice-versa) silently decodes garbage. Restart from a clean state"
+                            + " or restore with the original TTL configuration.");
         }
         // R15-H2: assert state-kind invariance BEFORE running the value-element schema compat
         // check. The element types of a ValueState<List<Foo>> and a ListState<Foo> can both
@@ -234,10 +311,12 @@ public final class StateSerializerRegistry {
         // For now we promote the new serializer; release notes flag this lazy-on-read behavior.
 
         // Promote: replace the restored entry with a fresh registration under the *new*
-        // serializer's snapshot so subsequent snapshots persist the current schema.
+        // serializer's snapshot so subsequent snapshots persist the current schema. R24-H2:
+        // carry forward the (verified-equal) TTL params so the v2 envelope is re-emitted on
+        // the next snapshot.
         restored.remove(stateName);
         live.remove(stateName);
-        register(stateName, stateKindOrdinal, effective);
+        register(stateName, stateKindOrdinal, effective, ttlEnabled, ttlMillis);
         return effective;
     }
 
@@ -292,7 +371,7 @@ public final class StateSerializerRegistry {
      * a private-state entry in the checkpoint blob. PR-A1's snapshot path drains this into the
      * checkpoint upload; {@link #deserialize(byte[])} reads the inverse.
      *
-     * <p><b>Wire format (v1)</b>:
+     * <p><b>Wire format (envelope v1; per-entry v1 or v2)</b>:
      *
      * <pre>
      *   |  4 bytes  | magic = {@link #REGISTRY_BLOB_MAGIC} (big-endian)                |
@@ -300,14 +379,20 @@ public final class StateSerializerRegistry {
      *   |  4 bytes  | entry count                                                      |
      *   | per entry:                                                                   |
      *   |    UTF8   | state name (via DataOutputSerializer.writeUTF — 2-byte length)   |
-     *   |  4 bytes  | per-entry format version (see {@link StateSerializerMetadata})   |
+     *   |  4 bytes  | per-entry format version (1 or 2; see {@link StateSerializerMetadata}) |
      *   |  4 bytes  | stateKindOrdinal                                                 |
+     *   | (v2 only) |                                                                  |
+     *   |  1 byte   | ttlEnabled flag (R24-H2)                                         |
+     *   |  8 bytes  | ttlMillis (R24-H2; 0 when ttlEnabled=false)                      |
+     *   | (end v2)  |                                                                  |
      *   |  4 bytes  | serializerSnapshot byte length                                   |
      *   |  N bytes  | serializerSnapshot bytes                                         |
      * </pre>
      *
-     * <p>The blob is self-describing — the magic + format-version pair makes corruption / wrong
-     * blob detection trivial on restore.
+     * <p>The blob is self-describing — the magic + envelope-version pair makes corruption /
+     * wrong blob detection trivial on restore. The per-entry version makes TTL evolution
+     * backward-compatible: v1 envelopes parse with ttlEnabled=false, ttlMillis=0; new writes
+     * always emit v2.
      */
     public static byte[] serialize(Map<String, StateSerializerMetadata> entries) throws IOException {
         DataOutputSerializer out = new DataOutputSerializer(128 + entries.size() * 64);
@@ -317,8 +402,16 @@ public final class StateSerializerRegistry {
         for (Map.Entry<String, StateSerializerMetadata> e : entries.entrySet()) {
             StateSerializerMetadata md = e.getValue();
             out.writeUTF(e.getKey());
+            // R24-H2: ALWAYS emit the per-entry envelope version that the metadata carries.
+            // Writers today create v2 (current); legacy in-memory metadata that pre-dates this
+            // change may still carry v1, in which case we emit a v1-shaped entry (no TTL
+            // fields) so the wire format stays consistent with the declared fmtVer.
             out.writeInt(md.formatVersion());
             out.writeInt(md.stateKindOrdinal());
+            if (md.formatVersion() >= StateSerializerMetadata.FORMAT_VERSION_V2) {
+                out.writeBoolean(md.ttlEnabled());
+                out.writeLong(md.ttlMillis());
+            }
             byte[] bytes = md.serializerSnapshotBytes();
             out.writeInt(bytes.length);
             out.write(bytes);
@@ -371,17 +464,20 @@ public final class StateSerializerRegistry {
             String name = in.readUTF();
             int fmtVer = in.readInt();
             int kindOrd = in.readInt();
-            int bytesLen = in.readInt();
-            // R16-M3: bound the per-entry envelope-version BEFORE allocating any further
-            // state. v1 is the only known per-entry format; a malformed/hostile blob may
-            // embed a non-{1} value to confuse downstream decode logic, so reject it at
-            // the boundary with a clear error message rather than letting an arbitrary
-            // integer propagate into the consumer.
-            if (fmtVer != REGISTRY_BLOB_FORMAT_V1) {
+            // R24-H2: bytesLen is read AFTER the optional v2 TTL fields below (the wire format
+            // places ttlEnabled+ttlMillis between kindOrd and bytesLen). Pre-fix this line
+            // read bytesLen eagerly; the value is now bound below after the fmtVer-gated
+            // TTL block.
+            // R16-M3 + R24-H2: per-entry envelope versions v1 and v2 are accepted; v2 adds
+            // a 1-byte ttlEnabled + 8-byte ttlMillis BEFORE the bytesLen. Anything outside
+            // {1, 2} is malformed/hostile and we reject at the boundary.
+            if (fmtVer != StateSerializerMetadata.FORMAT_VERSION_V1
+                    && fmtVer != StateSerializerMetadata.FORMAT_VERSION_V2) {
                 throw new IOException(
                         "StateSerializerRegistry blob malformed: fmtVer=" + fmtVer
                                 + " for state '" + name + "' (expected "
-                                + REGISTRY_BLOB_FORMAT_V1 + ")");
+                                + StateSerializerMetadata.FORMAT_VERSION_V1 + " or "
+                                + StateSerializerMetadata.FORMAT_VERSION_V2 + ")");
             }
             // R16-M3: bound the state-kind ordinal to the known enum range. Flink's
             // StateDescriptor.Type has 5 values (VALUE=0, LIST=1, REDUCING=2,
@@ -392,6 +488,22 @@ public final class StateSerializerRegistry {
                         "StateSerializerRegistry blob malformed: kindOrd=" + kindOrd
                                 + " for state '" + name + "' (expected 0..4)");
             }
+            // R24-H2: read the TTL fields when the per-entry envelope is v2; v1 entries
+            // default to ttlEnabled=false, ttlMillis=0 (no TTL info was persisted).
+            boolean ttlEnabled = false;
+            long ttlMillis = 0L;
+            if (fmtVer == StateSerializerMetadata.FORMAT_VERSION_V2) {
+                ttlEnabled = in.readBoolean();
+                ttlMillis = in.readLong();
+                if (ttlMillis < 0L) {
+                    // A negative TTL window is meaningless and would interact badly with
+                    // overflow-prone arithmetic in the TTL expiry comparison; reject early.
+                    throw new IOException(
+                            "StateSerializerRegistry blob malformed: ttlMillis=" + ttlMillis
+                                    + " for state '" + name + "' (must be >= 0)");
+                }
+            }
+            int bytesLen = in.readInt();
             // R15-M1: bound the per-entry snapshot size BEFORE allocating the byte[]. The
             // upper cap matches the largest plausible TypeSerializerSnapshot envelope (a few MB
             // for pathological POJO graphs); anything larger is corruption, not legitimate
@@ -404,7 +516,8 @@ public final class StateSerializerRegistry {
             }
             byte[] bytes = new byte[bytesLen];
             in.readFully(bytes);
-            out.put(name, new StateSerializerMetadata(name, kindOrd, fmtVer, bytes));
+            out.put(name, new StateSerializerMetadata(
+                    name, kindOrd, fmtVer, bytes, ttlEnabled, ttlMillis));
         }
         return out;
     }

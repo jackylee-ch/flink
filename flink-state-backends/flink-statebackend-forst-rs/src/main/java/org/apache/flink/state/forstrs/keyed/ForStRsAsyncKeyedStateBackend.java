@@ -1458,55 +1458,104 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         synchronized (closeLock) {
             closing = true;
         }
-        awaitOutstandingSnapshots();
-        managedExecutors.forEach(VectorizedExecutor::flushDirty);
-        managedExecutors.forEach(VectorizedExecutor::shutdown);
-        managedExecutors.clear();
-        // D5-H2: release each MapStateV2's MapStateCache arena BEFORE clearing the state cache
-        // and dropping registry references. Pre-fix, the cache's Arena.ofShared() (and its 5
-        // off-heap segments) survived to JVM exit — one perma-leak per V2 MapState instance.
-        for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
-            try {
-                ms.close();
-            } catch (Throwable ignored) {
-                // Per-state close is best-effort on dispose; a failure here must not block
-                // subsequent state tear-down (engine close, arena close).
-            }
-        }
-        registeredMapStatesV2.clear();
-        stateCache.clear();
-        if (iterWatchdog != null) {
-            iterWatchdog.stop();
-            iterWatchdog = null;
-        }
-        if (slotArenaScope != null) {
-            slotArenaScope.closeSlot();
-            slotArenaScope = null;
-        }
-        // PR-A1: close the cancel-stream registry so any in-flight async snapshots are aborted.
+        // R24-H1 (parity with sync backend): wrap the awaitOutstandingSnapshots + executor
+        // flush/shutdown + state-cache teardown phase in a try/finally so any throw is
+        // captured AND the native-resource release (slotArenaScope, cancelStreamRegistry,
+        // backendPathInvariant, releaseNativeResources) ALWAYS runs. Pre-fix, a throw in any
+        // of the early steps (e.g. {@link VectorizedExecutor#flushDirty} surfacing a snapshot
+        // pre-flush failure, or a per-state {@code ms.close()} throwing because its arena was
+        // already torn down by a racing slot exit) leaked the slot arena, cancel-stream
+        // registry, and most importantly db/defaultCf/arena because {@code disposed=true} at
+        // the top of dispose() blocks any retry through the close()→dispose() path.
+        //
+        // R23-M1 extension: the original R23-M1 fix moved the native release into a shared
+        // helper but kept it OUTSIDE the try/finally. This change now puts the entire
+        // teardown chain inside a finally so the order is preserved AND the native release
+        // is guaranteed to run regardless of intermediate failures.
+        Throwable disposeError = null;
         try {
-            cancelStreamRegistry.close();
-        } catch (IOException ignored) {
-            // best-effort close on dispose
-        }
-        // E8-H4: release the path-invariant slot so a subsequent job redeploy / restart on the
-        // same (jobId, operatorIdentifier) can re-register without a false-positive cross-path
-        // block. Best-effort — never throws to the caller.
-        if (backendPathOperatorId != null) {
-            try {
-                ForStRsBackendPathInvariant.removeBackendPath(
-                        backendPathJobId, backendPathOperatorId);
-            } catch (Throwable ignored) {
+            awaitOutstandingSnapshots();
+            managedExecutors.forEach(VectorizedExecutor::flushDirty);
+            managedExecutors.forEach(VectorizedExecutor::shutdown);
+            managedExecutors.clear();
+            // D5-H2: release each MapStateV2's MapStateCache arena BEFORE clearing the state
+            // cache and dropping registry references. Pre-fix, the cache's Arena.ofShared()
+            // (and its 5 off-heap segments) survived to JVM exit — one perma-leak per V2
+            // MapState instance.
+            for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
+                try {
+                    ms.close();
+                } catch (Throwable ignored) {
+                    // Per-state close is best-effort on dispose; a failure here must not
+                    // block subsequent state tear-down (engine close, arena close).
+                }
             }
-            backendPathOperatorId = null;
-            backendPathJobId = null;
+            registeredMapStatesV2.clear();
+            stateCache.clear();
+        } catch (Throwable t) {
+            disposeError = t;
+        } finally {
+            if (iterWatchdog != null) {
+                try {
+                    iterWatchdog.stop();
+                } catch (Throwable ignored) {
+                    // best-effort
+                }
+                iterWatchdog = null;
+            }
+            if (slotArenaScope != null) {
+                try {
+                    slotArenaScope.closeSlot();
+                } catch (Throwable ignored) {
+                    // best-effort: native release below must still run.
+                }
+                slotArenaScope = null;
+            }
+            // PR-A1: close the cancel-stream registry so any in-flight async snapshots are
+            // aborted.
+            try {
+                cancelStreamRegistry.close();
+            } catch (IOException ignored) {
+                // best-effort close on dispose
+            } catch (Throwable ignored) {
+                // belt-and-suspenders: defend against non-IOException unchecked throws so
+                // the native release below is never skipped.
+            }
+            // E8-H4: release the path-invariant slot so a subsequent job redeploy / restart on
+            // the same (jobId, operatorIdentifier) can re-register without a false-positive
+            // cross-path block. Best-effort — never throws to the caller.
+            if (backendPathOperatorId != null) {
+                try {
+                    ForStRsBackendPathInvariant.removeBackendPath(
+                            backendPathJobId, backendPathOperatorId);
+                } catch (Throwable ignored) {
+                }
+                backendPathOperatorId = null;
+                backendPathJobId = null;
+            }
+            // R22-H1 + R24-H1: release native db / defaultCf / arena unconditionally — this
+            // is the critical step that MUST run even when an earlier teardown step threw.
+            // Idempotent via {@link #nativeReleased} so the close()→dispose() chain doesn't
+            // double-close.
+            try {
+                releaseNativeResources();
+            } catch (Throwable releaseError) {
+                if (disposeError == null) {
+                    disposeError = releaseError;
+                } else {
+                    disposeError.addSuppressed(releaseError);
+                }
+            }
         }
-        // R22-H1: release native db / defaultCf / arena from dispose() too. Pre-fix, only close()
-        // performed this release — a direct dispose() call (AbstractStreamOperator#dispose on
-        // task cancellation that did not go through close()) leaked the FrsDb, FrsCfHandle, and
-        // backing Arena to process exit. Idempotent via {@link #nativeReleased} so the
-        // close()→dispose() chain doesn't double-close.
-        releaseNativeResources();
+        if (disposeError != null) {
+            if (disposeError instanceof RuntimeException re) {
+                throw re;
+            }
+            if (disposeError instanceof Error err) {
+                throw err;
+            }
+            throw new RuntimeException("ForStRsAsyncKeyedStateBackend dispose failed", disposeError);
+        }
     }
 
     /**

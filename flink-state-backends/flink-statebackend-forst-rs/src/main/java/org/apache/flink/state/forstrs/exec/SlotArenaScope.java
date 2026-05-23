@@ -219,13 +219,29 @@ public final class SlotArenaScope {
     /**
      * Registers an iter handle so the scope can force-close leaked handles at turn boundaries.
      *
+     * <p>R24-M2: the {@code closed} check and {@code put} were not atomic. Race window: the
+     * watchdog thread (P3 component 6) calls {@link #closeSlot()} concurrently with the mailbox
+     * thread calling {@code registerIter}. Pre-fix, the mailbox could read {@code closed=false},
+     * pause; {@code closeSlot()} could flip {@code closed=true} and iterate an empty registry;
+     * the mailbox could then complete the {@code put}, leaking the handle past slot teardown
+     * (its arena is closed, but the handle survives in a registry that will never be drained).
+     *
+     * <p>Fix: synchronize check+put against {@link #iterRegistry} as the monitor. {@link
+     * #closeSlot()} takes the same monitor around its drain-and-clear loop so the two
+     * operations are mutually exclusive. ConcurrentHashMap itself stays — we still want
+     * lock-free reads from the watchdog (which observes via {@link #iterHandles()} /
+     * {@link #iterRegistrySize()}) — and the synchronized block only serializes the
+     * close/register edges.
+     *
      * @throws IllegalStateException if the scope has been closed
      */
     public void registerIter(FrsIterHandle h) {
-        if (closed) {
-            throw new IllegalStateException("SlotArenaScope is closed");
+        synchronized (iterRegistry) {
+            if (closed) {
+                throw new IllegalStateException("SlotArenaScope is closed");
+            }
+            iterRegistry.put(h.handleId(), h);
         }
-        iterRegistry.put(h.handleId(), h);
     }
 
     /** Unregisters an iter handle by its ID (called from {@link FrsIterHandle#close()}). */
@@ -259,18 +275,26 @@ public final class SlotArenaScope {
      * Idempotent — subsequent calls are no-ops.
      */
     public void closeSlot() {
-        if (closed) {
-            return;
-        }
-        closed = true;
-        for (FrsIterHandle h : iterRegistry.values()) {
-            try {
-                h.forceClose();
-            } catch (Throwable t) {
-                LOG.warn("forceClose on closeSlot", t);
+        // R24-M2: serialize the close-flip + drain against {@link #registerIter} so a
+        // concurrent watchdog-vs-mailbox race cannot deposit a handle after the registry has
+        // been cleared. The synchronized block straddles BOTH the {@code closed=true} write
+        // and the iteration so a registerIter blocked on the same monitor sees closed=true
+        // when it resumes and throws (its handle is never inserted), while any handle that
+        // raced ahead is observed by this drain loop.
+        synchronized (iterRegistry) {
+            if (closed) {
+                return;
             }
+            closed = true;
+            for (FrsIterHandle h : iterRegistry.values()) {
+                try {
+                    h.forceClose();
+                } catch (Throwable t) {
+                    LOG.warn("forceClose on closeSlot", t);
+                }
+            }
+            iterRegistry.clear();
         }
-        iterRegistry.clear();
         for (Arena a : overflowArenasThisTurn) {
             try {
                 a.close();

@@ -251,6 +251,16 @@ public final class MapStateCache<V> implements AutoCloseable {
         keyDataUsed = 0;
         clock = 0;
         clockHand = 0;
+        // R24-M3: reset the LIVE PREFIX of accessTime to 0 so the next eviction after a
+        // re-fill cannot inherit a stale clock stamp from before the clear. We bound the
+        // sweep to {@code prevSize} (not {@code capacity}) so the cost stays proportional
+        // to the working set, not the total allocation. The {@link #evictClockSweep} fix
+        // (seed `oldest=Long.MAX_VALUE`) handles this defensively too; the two fixes work
+        // together — this one is correctness in {@code clear()}, that one is correctness
+        // at the comparison site.
+        for (int i = 0; i < prevSize; i++) {
+            accessTime.set(ValueLayout.JAVA_LONG, (long) i * Long.BYTES, 0L);
+        }
         // We don't need to zero the values[] entries individually — they're shadowed by size.
         // But for GC promptness, drop references on the live prefix only.
         // (Not iterating the whole capacity to avoid touching 1M slots on every clear.)
@@ -413,9 +423,16 @@ public final class MapStateCache<V> implements AutoCloseable {
      * worst case but amortized closer to O(N / hot-set-size) by starting at clockHand.
      */
     private void evictClockSweep() {
-        // Linear scan to find the row with the oldest access-time stamp.
+        // R24-M3: seed `oldest` with Long.MAX_VALUE rather than reading accessTime[clockHand].
+        // Pre-fix, immediately after {@link #clear()} the {@code accessTime} segment still
+        // held stamps from before the clear (clear() reset {@code clock=0} and {@code
+        // clockHand=0} but did NOT zero the live prefix of accessTime), so the first eviction
+        // after a re-fill compared fresh post-clear stamps against a stale pre-clear stamp
+        // at slot 0 and biased the victim toward whatever row happened to inherit row 0.
+        // Seeding with MAX_VALUE forces the scan to pick a real row's stamp on the first
+        // iteration regardless of any residual data at clockHand.
         int victim = clockHand;
-        long oldest = accessTime.get(ValueLayout.JAVA_LONG, (long) victim * Long.BYTES);
+        long oldest = Long.MAX_VALUE;
         for (int i = 0; i < size; i++) {
             int row = (clockHand + i) % size;
             long ts = accessTime.get(ValueLayout.JAVA_LONG, (long) row * Long.BYTES);
