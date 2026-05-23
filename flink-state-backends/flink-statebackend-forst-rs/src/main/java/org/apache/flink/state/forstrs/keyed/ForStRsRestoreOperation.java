@@ -608,41 +608,64 @@ public class ForStRsRestoreOperation {
             }
         }
 
-        // R31-M1: pre-flight overlap detection. {@link #findSourceFor} returns the FIRST source
-        // whose KeyGroupRange covers a given kg, so two sources that both claim the same kg would
-        // silently lose half the data on restore (the second source's contents for the shared kgs
-        // would never be copied because the first source already matched). The earlier check at
-        // checkpoint time SHOULD have produced disjoint ranges, but operator bugs or hand-edited
-        // metadata can produce overlaps; failing loudly here prevents corrupt restores.
+        // R31-M1 + R32-L3: pre-flight overlap detection. {@link #findSourceFor} returns the
+        // FIRST source whose KeyGroupRange covers a given kg, so two sources that both claim
+        // the same kg would silently lose half the data on restore (the second source's
+        // contents for the shared kgs would never be copied because the first source already
+        // matched). The earlier check at checkpoint time SHOULD have produced disjoint ranges,
+        // but operator bugs or hand-edited metadata can produce overlaps; failing loudly here
+        // prevents corrupt restores.
+        //
+        // R32-L3: replace the O(N^2) all-pairs comparison with a sort-by-startKeyGroup + linear
+        // sweep (O(N log N)). After sorting by start, we track {@code maxEndSoFar} — the maximum
+        // endKeyGroup seen across all already-visited ranges. For the current range b, if
+        // {@code b.start <= maxEndSoFar}, then b overlaps the range that contributed
+        // {@code maxEndSoFar} (which we remember via {@code maxEndOwnerIdx}). This correctly
+        // catches the "nested" case (e.g. [0,100], [10,20], [50,60]) that a simple adjacent-pair
+        // check would miss. We sort INDICES, not the sources list itself, so error messages
+        // preserve the original ordering callers expect.
+        Integer[] sortedIdx = new Integer[sources.size()];
         for (int i = 0; i < sources.size(); i++) {
-            KeyGroupRange a = sources.get(i).range;
-            for (int j = i + 1; j < sources.size(); j++) {
-                KeyGroupRange b = sources.get(j).range;
-                int overlapStart = Math.max(a.getStartKeyGroup(), b.getStartKeyGroup());
-                int overlapEnd = Math.min(a.getEndKeyGroup(), b.getEndKeyGroup());
-                if (overlapStart <= overlapEnd) {
-                    String msg =
-                            "Overlapping source ranges: indices "
-                                    + i
-                                    + " ("
-                                    + a
-                                    + ") and "
-                                    + j
-                                    + " ("
-                                    + b
-                                    + ") both claim kg "
-                                    + overlapStart;
-                    // Close any opened sources before throwing — they own native handles.
-                    for (OpenSourceDb s : sources) {
-                        try {
-                            s.close();
-                        } catch (Throwable ignored) {
-                            // best-effort during cleanup
-                        }
+            sortedIdx[i] = i;
+        }
+        java.util.Arrays.sort(
+                sortedIdx,
+                (x, y) ->
+                        Integer.compare(
+                                sources.get(x).range.getStartKeyGroup(),
+                                sources.get(y).range.getStartKeyGroup()));
+        int maxEndSoFar = Integer.MIN_VALUE;
+        int maxEndOwnerIdx = -1;
+        for (int k = 0; k < sortedIdx.length; k++) {
+            int curr = sortedIdx[k];
+            KeyGroupRange b = sources.get(curr).range;
+            if (k > 0 && b.getStartKeyGroup() <= maxEndSoFar) {
+                KeyGroupRange a = sources.get(maxEndOwnerIdx).range;
+                String msg =
+                        "Overlapping source ranges: indices "
+                                + maxEndOwnerIdx
+                                + " ("
+                                + a
+                                + ") and "
+                                + curr
+                                + " ("
+                                + b
+                                + ") both claim kg "
+                                + b.getStartKeyGroup();
+                // Close any opened sources before throwing — they own native handles.
+                for (OpenSourceDb s : sources) {
+                    try {
+                        s.close();
+                    } catch (Throwable ignored) {
+                        // best-effort during cleanup
                     }
-                    throw new ForStRsCheckpointRestoreException(
-                            targetDir.toString(), maxRestoredCkpt, msg);
                 }
+                throw new ForStRsCheckpointRestoreException(
+                        targetDir.toString(), maxRestoredCkpt, msg);
+            }
+            if (b.getEndKeyGroup() > maxEndSoFar) {
+                maxEndSoFar = b.getEndKeyGroup();
+                maxEndOwnerIdx = curr;
             }
         }
 
@@ -978,12 +1001,20 @@ public class ForStRsRestoreOperation {
         if (!Files.exists(p)) {
             return;
         }
-        // R31-L2: collect per-entry failures into a suppressed list and log at WARN. Pre-fix the
-        // catch was a silent {@code ignored}, so a partially-cleaned restore directory would
-        // surface as a confusing engine error later (e.g. "engine refused to open: stale MANIFEST
-        // present"). Logging WARN lets operators correlate the engine failure with the cleanup
-        // problem; surfacing the first suppressed cause via the outer IOException's
-        // {@link Throwable#addSuppressed(Throwable)} chain keeps the API contract unchanged.
+        // R31-L2 + R32-M2: collect per-entry failures into a suppressed list and log
+        // at WARN, then re-scan to determine whether the leftover is real.
+        //
+        // R31-L2 (history): pre-fix the catch was a silent {@code ignored}, so a
+        // partially-cleaned restore directory would surface as a confusing engine
+        // error later (e.g. "engine refused to open: stale MANIFEST present").
+        // R31-L2's throw-on-first-IOException turned WARN-only into throw-on-flake.
+        //
+        // R32-M2: throwing on transient flakes (Windows AV scanner holds a handle,
+        // remote-FS retry-able EBUSY, GC pause that re-locks the file) aborted the
+        // restore for a no-op cleanup that would have succeeded on retry. Fix:
+        // (1) complete the loop and collect failures as before, (2) re-scan after
+        // the loop, (3) throw ONLY if the re-scan still finds entries. This keeps
+        // the loud-on-real-leftover semantics while tolerating transient FS latency.
         java.util.List<IOException> suppressed = new java.util.ArrayList<>();
         try (var stream = Files.walk(p)) {
             // Reverse-order so directories come last.
@@ -1001,16 +1032,51 @@ public class ForStRsRestoreOperation {
                                 }
                             });
         }
-        if (!suppressed.isEmpty()) {
-            // Surface a single IOException carrying the rest as suppressed so callers that DO
-            // care (e.g. unit tests) can introspect; the engine's open() will still fail loudly
-            // if a leftover file truly blocks the restore.
-            IOException head = suppressed.get(0);
-            for (int i = 1; i < suppressed.size(); i++) {
-                head.addSuppressed(suppressed.get(i));
-            }
-            throw head;
+        if (suppressed.isEmpty()) {
+            return;
         }
+        // R32-M2: re-scan. If the loop's failures were transient (AV scanner /
+        // FS retry / GC), the entries may already be gone now. Only the entries
+        // still on disk count as a real cleanup failure.
+        java.util.List<Path> stillPresent = new java.util.ArrayList<>();
+        if (Files.exists(p)) {
+            try (var stream2 = Files.walk(p)) {
+                stream2.sorted((a, b) -> b.getNameCount() - a.getNameCount())
+                        .forEach(
+                                child -> {
+                                    if (!child.equals(p) && Files.exists(child)) {
+                                        try {
+                                            // One more best-effort delete in case the FS just
+                                            // caught up; only record what's STILL present after.
+                                            Files.deleteIfExists(child);
+                                            if (Files.exists(child)) {
+                                                stillPresent.add(child);
+                                            }
+                                        } catch (IOException ignored) {
+                                            stillPresent.add(child);
+                                        }
+                                    }
+                                });
+            }
+        }
+        if (stillPresent.isEmpty()) {
+            LOG.warn(
+                    "deleteRecursively: {} transient failures cleared on re-scan; continuing",
+                    suppressed.size());
+            return;
+        }
+        // Real leftover — surface the head IOException with the rest chained as
+        // suppressed so callers / unit tests can introspect the root cause.
+        IOException head = suppressed.get(0);
+        for (int i = 1; i < suppressed.size(); i++) {
+            head.addSuppressed(suppressed.get(i));
+        }
+        LOG.warn(
+                "deleteRecursively: re-scan still found {} entries under '{}' after best-effort"
+                        + " cleanup; failing restore",
+                stillPresent.size(),
+                p);
+        throw head;
     }
 
     /**

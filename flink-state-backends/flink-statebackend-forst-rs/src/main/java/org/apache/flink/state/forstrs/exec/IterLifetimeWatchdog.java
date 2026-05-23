@@ -122,15 +122,37 @@ public final class IterLifetimeWatchdog {
                 if (h.closeRequested()) {
                     continue; // already flagged — operator thread will observe
                 }
-                // R31-H3: skip handles currently executing a native next() call. The idle
-                // timer measures time since {@code lastNextNs}, which is updated only AFTER
-                // the FFI call returns — so a slow but in-flight call (large remote-storage
-                // prefix scan, GC pause inside the native side) would otherwise trip
-                // {@code idleMs > idleTimeoutMs} mid-call and request close on a healthy
-                // handle. {@link FrsIterHandle#isInCall()} flips true around the native call
-                // (set before, cleared in finally), so any sweep observing inCall=true
-                // defers eviction to the next sweep after the call completes.
+                // R31-H3 + R32-M1: in-call gating applies ONLY to the idle branch.
+                //
+                // R31-H3 (idle): skip handles currently executing a native next() call.
+                // The idle timer measures time since {@code lastNextNs}, which is
+                // updated only AFTER the FFI call returns — so a slow but in-flight
+                // call (large remote-storage prefix scan, GC pause inside the native
+                // side) would otherwise trip {@code idleMs > idleTimeoutMs} mid-call
+                // and request close on a healthy handle. Defer the idle eviction to
+                // the next sweep after the call completes.
+                //
+                // R32-M1 (max-lifetime): a handle stuck past {@code maxLifetimeMs}
+                // with isInCall=true is exactly the pathological case the max-
+                // lifetime guard exists to catch (runaway prefix scan, hung remote
+                // I/O). Pre-fix, the {@code continue} short-circuited BOTH branches,
+                // so such a handle was un-evictable — defeating the watchdog. Fix:
+                // when isInCall=true AND lifetime is past max, escalate to
+                // {@link FrsIterHandle#forceClose()} which calls
+                // {@code frs_vec_iter_prefix_abort} first to break the in-flight FFI
+                // call before close.
+                long lifetimeMs = nowMs - h.openedAtMs();
                 if (h.isInCall()) {
+                    if (lifetimeMs > maxLifetimeMs) {
+                        maxLifetimeAborts.incrementAndGet();
+                        LOG.warn(
+                                "Forst-RS iter handle {} held for {}ms (max={}ms) while in-call"
+                                        + " — force-closing (abort + release)",
+                                h.handleId(),
+                                lifetimeMs,
+                                maxLifetimeMs);
+                        h.forceClose();
+                    }
                     continue;
                 }
                 long idleMs = TimeUnit.NANOSECONDS.toMillis(nowNs - h.lastNextNs());
@@ -144,7 +166,6 @@ public final class IterLifetimeWatchdog {
                     h.requestClose();
                     continue;
                 }
-                long lifetimeMs = nowMs - h.openedAtMs();
                 if (lifetimeMs > maxLifetimeMs) {
                     maxLifetimeAborts.incrementAndGet();
                     LOG.warn(
