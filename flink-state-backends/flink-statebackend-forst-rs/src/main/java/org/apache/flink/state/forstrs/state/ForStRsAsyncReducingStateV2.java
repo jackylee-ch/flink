@@ -24,6 +24,8 @@ import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.state.v2.ReducingState;
 import org.apache.flink.api.common.state.v2.StateFuture;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.api.common.typeutils.base.LongSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.core.state.StateFutureUtils;
@@ -38,6 +40,7 @@ import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.cache.LongReducingAggregatingCache;
 import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
@@ -105,8 +108,40 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * Per-instance RMW cache (PR-C3 / B3-H1). Combiner invokes {@link
      * ReduceFunction#reduce(Object, Object)} on the operator thread. flushCallback materializes
      * the dirty accumulator and routes it to {@link #flushHandler}.
+     *
+     * <p>B10-H2: exactly one of {@link #cache} / {@link #longCache} is non-null at any time. The
+     * primitive-{@code long} specialization is selected when {@code valueSerializer instanceof
+     * LongSerializer} (or {@code IntSerializer} — promoted to long-storage); otherwise the
+     * general {@code BiFunction}-typed path is used. The branch is on a {@code final} field so
+     * JIT speculates and inlines the chosen path — there is no runtime dispatch overhead on the
+     * hot tryFold call.
      */
     private final ReducingAggregatingCache<V, V> cache;
+
+    /**
+     * B10-H2: long-specialized RMW cache. Active when {@link #usePrimitiveLongCache} is true.
+     * Stores the accumulator as a primitive {@code long} per entry; combiner is invoked as a
+     * {@link java.util.function.LongBinaryOperator} so there is no {@code Long.valueOf} write-back
+     * box per hit. The user's {@link ReduceFunction} is wrapped by an unboxing shim at
+     * construction time.
+     */
+    private final LongReducingAggregatingCache longCache;
+
+    /**
+     * B10-H2 routing flag — captured at construction. Equal to {@code longCache != null} but
+     * stored explicitly so the hot path can read a single primitive boolean instead of two
+     * field loads on every {@code asyncAdd}.
+     */
+    private final boolean usePrimitiveLongCache;
+
+    /**
+     * B10-H2 helper for the {@code Integer}-promotion case: when the upstream serializer is
+     * {@link IntSerializer} we still use the long-specialized cache (long storage subsumes int)
+     * and unbox via {@code ((Integer) in).intValue()} → {@code long}. This flag tells the
+     * miss-resolve path to re-box back to {@link Integer} for the user's {@link ReduceFunction}
+     * call signature.
+     */
+    private final boolean accIsInteger;
 
     /**
      * Pluggable flush handler invoked once per dirty entry on {@link #flushOnBarrier()} (and on
@@ -120,6 +155,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      */
     private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
 
+    @SuppressWarnings({"unchecked", "rawtypes"})
     public ForStRsAsyncReducingStateV2(
             StateRequestHandler stateRequestHandler,
             String stateName,
@@ -134,17 +170,59 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
         this.reduceFunction = reduceFunction;
-        this.cache =
-                new ReducingAggregatingCache<>(
-                        (acc, in) -> {
-                            try {
-                                return reduceFunction.reduce(acc, in);
-                            } catch (Exception e) {
-                                throw new RuntimeException(
-                                        "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
-                            }
-                        },
-                        this::flushEntry);
+        // B10-H2: detect primitive-long-friendly accumulator types via the value serializer.
+        // LongSerializer / IntSerializer cover the Q12 SumAgg / CountAgg cases that hit the
+        // ReducingAggregatingCache combiner millions of times per second. Everything else
+        // falls back to the general BiFunction-typed cache below.
+        boolean isLong = valueSerializer instanceof LongSerializer;
+        boolean isInt = valueSerializer instanceof IntSerializer;
+        this.usePrimitiveLongCache = isLong || isInt;
+        this.accIsInteger = isInt;
+        if (this.usePrimitiveLongCache) {
+            // Unwrap the user's ReduceFunction<Long|Integer> into a LongBinaryOperator. We still
+            // pay one boxed Long/Integer per combiner call (the user's reduce() signature is
+            // Object-typed, no way around it), but the WRITE-BACK box that the general cache
+            // pays on every hit is gone — the result long is written straight into the entry's
+            // primitive field. Net allocation cost on a Q12-pattern cache-hit run is halved.
+            final ReduceFunction rawReduce = reduceFunction;
+            final boolean asInt = isInt;
+            java.util.function.LongBinaryOperator longCombiner =
+                    (accL, inL) -> {
+                        try {
+                            Object acc = asInt ? Integer.valueOf((int) accL) : Long.valueOf(accL);
+                            Object in = asInt ? Integer.valueOf((int) inL) : Long.valueOf(inL);
+                            Object out = rawReduce.reduce(acc, in);
+                            return asInt
+                                    ? ((Integer) out).longValue()
+                                    : ((Long) out).longValue();
+                        } catch (Exception e) {
+                            throw new RuntimeException(
+                                    "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
+                        }
+                    };
+            LongReducingAggregatingCache.LongFlushCallback longFlush =
+                    (keyBytes, acc) -> {
+                        Object boxedAcc = asInt ? Integer.valueOf((int) acc) : Long.valueOf(acc);
+                        byte[] valBytes = serializeValueBytes((V) boxedAcc);
+                        flushHandler.accept(keyBytes, valBytes);
+                    };
+            this.longCache = ReducingAggregatingCache.forLong(longCombiner, longFlush);
+            this.cache = null;
+        } else {
+            this.longCache = null;
+            this.cache =
+                    new ReducingAggregatingCache<>(
+                            (acc, in) -> {
+                                try {
+                                    return reduceFunction.reduce(acc, in);
+                                } catch (Exception e) {
+                                    throw new RuntimeException(
+                                            "ForStRsAsyncReducingStateV2: ReduceFunction threw",
+                                            e);
+                                }
+                            },
+                            this::flushEntry);
+        }
     }
 
     // ---------------------------------------------------------------
@@ -209,6 +287,39 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         }
         int keyLen = writeCacheKeyToKeyOut();
         byte[] keyBuf = keyOut.getSharedBuffer();
+        // B10-H2: branch on the routing flag (constant after construction — JIT inlines the
+        // taken path). Primitive long cache: unbox once on input, write back primitive long.
+        if (usePrimitiveLongCache) {
+            long inLong = accIsInteger ? ((Integer) value).longValue() : ((Long) value).longValue();
+            if (longCache.tryFold(keyBuf, 0, keyLen, inLong)) {
+                return StateFutureUtils.completedVoidFuture();
+            }
+            final byte[] keySnapshot = new byte[keyLen];
+            System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
+            final long capturedGen = longCache.currentGen(keySnapshot);
+            final boolean asInt = accIsInteger;
+            final V inputCapture = value;
+            return asyncGetInternal()
+                    .thenApply(
+                            oldValue -> {
+                                try {
+                                    Object newAcc =
+                                            oldValue == null
+                                                    ? inputCapture
+                                                    : reduceFunction.reduce(oldValue, inputCapture);
+                                    long newLong =
+                                            asInt
+                                                    ? ((Integer) newAcc).longValue()
+                                                    : ((Long) newAcc).longValue();
+                                    longCache.putIfGen(keySnapshot, newLong, capturedGen);
+                                    return null;
+                                } catch (Exception e) {
+                                    throw new RuntimeException(
+                                            "ForStRsAsyncReducingStateV2: ReduceFunction threw on miss",
+                                            e);
+                                }
+                            });
+        }
         // B8-H1: tryFold returns boolean — no Optional wrapper per cache HIT.
         if (cache.tryFold(keyBuf, 0, keyLen, value)) {
             return StateFutureUtils.completedVoidFuture();
@@ -251,10 +362,24 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      *
      * <p>Cleanup-C3: probes via the shared-buffer slice view; no byte[] allocation on hit.
      */
+    @SuppressWarnings("unchecked")
     @Override
     public StateFuture<V> asyncGet() {
         int keyLen = writeCacheKeyToKeyOut();
         byte[] keyBuf = keyOut.getSharedBuffer();
+        if (usePrimitiveLongCache) {
+            if (longCache.contains(keyBuf, 0, keyLen)) {
+                // Single box on read path — acceptable: reads on cached state are far less
+                // frequent than writes (asyncAdd) on Q12-style accumulator workloads, and the
+                // caller's StateFuture<V> contract demands a boxed V anyway.
+                long v = longCache.peekOr(keyBuf, 0, keyLen, 0L);
+                // Disambiguate the conditional's static type: Java would otherwise unbox both
+                // arms to long. Compute the boxed result as an Object first, then cast to V.
+                Object boxed = accIsInteger ? (Object) Integer.valueOf((int) v) : (Object) Long.valueOf(v);
+                return StateFutureUtils.completedFuture((V) boxed);
+            }
+            return asyncGetInternal();
+        }
         if (cache.contains(keyBuf, 0, keyLen)) {
             return StateFutureUtils.completedFuture(cache.peek(keyBuf, 0, keyLen));
         }
@@ -267,7 +392,11 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * decides how to route them (production: engine PUT; tests: capture).
      */
     public void flushOnBarrier() {
-        cache.flushAllDirty();
+        if (usePrimitiveLongCache) {
+            longCache.flushAllDirty();
+        } else {
+            cache.flushAllDirty();
+        }
     }
 
     /**
@@ -286,7 +415,11 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     @Override
     public void onClear(StateRequest<K, N, ?, ?> request) {
         int keyLen = writeRequestKeyToKeyOut(request);
-        cache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
+        if (usePrimitiveLongCache) {
+            longCache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
+        } else {
+            cache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
+        }
     }
 
     /**
@@ -328,7 +461,56 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     /** Returns the number of cache entries. Exposed for tests / diagnostics. */
     @VisibleForTesting
     public int cacheSize() {
-        return cache.size();
+        return usePrimitiveLongCache ? longCache.size() : cache.size();
+    }
+
+    /**
+     * B10-H2 test hook — reports whether this state instance is routing through the primitive
+     * {@code long} cache. Used by unit tests that want to assert detection fired for a given
+     * value-serializer / reduce-function combination.
+     */
+    @VisibleForTesting
+    public boolean isUsingPrimitiveLongCache() {
+        return usePrimitiveLongCache;
+    }
+
+    /**
+     * B10-H2 test hook — backend-agnostic {@code cache.put} adapter. Existing tests reach into
+     * the private {@code cache} field via reflection and call {@code cache.put(...)} to bypass
+     * the AEC-bound asyncAdd path; after B10-H2 the field may be {@code null} (the long cache
+     * holds the data instead), so we expose this method to keep the test contract simple.
+     *
+     * <p>Routes to the active backing cache. For the primitive-long backend a {@code null}
+     * accumulator is encoded as the {@link LongReducingAggregatingCache#ABSENT_SENTINEL}
+     * sentinel — tests that want the "tombstone / cleared" semantic should pass {@code null}.
+     */
+    @VisibleForTesting
+    public void testOnlyDirectCachePut(byte[] compositeKey, V acc) {
+        if (usePrimitiveLongCache) {
+            if (acc == null) {
+                // Tombstone path — mirror the general cache's null-accumulator behaviour by
+                // routing through the flush callback directly (the long cache cannot store a
+                // "null" sentinel without losing primitive semantics). The flush callback
+                // receives null bytes and the production handler routes that to engine DELETE.
+                flushHandler.accept(compositeKey, null);
+            } else {
+                long v =
+                        accIsInteger
+                                ? ((Integer) acc).longValue()
+                                : ((Long) acc).longValue();
+                longCache.put(compositeKey, v);
+            }
+        } else {
+            cache.put(compositeKey, acc);
+        }
+    }
+
+    /** B10-H2 test hook — backend-agnostic {@code cache.contains} adapter. */
+    @VisibleForTesting
+    public boolean testOnlyDirectCacheContains(byte[] compositeKey) {
+        return usePrimitiveLongCache
+                ? longCache.contains(compositeKey)
+                : cache.contains(compositeKey);
     }
 
     private void flushEntry(byte[] keyBytes, V acc) {

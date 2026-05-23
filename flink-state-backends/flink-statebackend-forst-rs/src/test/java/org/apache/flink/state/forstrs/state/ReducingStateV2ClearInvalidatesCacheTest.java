@@ -103,7 +103,9 @@ class ReducingStateV2ClearInvalidatesCacheTest {
                             IntSerializer.INSTANCE,
                             LongSerializer.INSTANCE,
                             SUM);
-            ReducingAggregatingCache<Long, Long> cache = reflectCache(state);
+            // B10-H2: Long-typed state may route to the primitive-long cache; use the
+            // backend-agnostic test adapters instead of reflecting into the (possibly null)
+            // general cache field.
             RecordContext<Long> ctx = contextWithNamespace(7L, state, 0);
 
             // Seed the cache directly: simulate a hit-resolve that left a dirty accumulator for
@@ -111,9 +113,11 @@ class ReducingStateV2ClearInvalidatesCacheTest {
             // composite key bytes that ForStRsAsyncReducingStateV2.serializeKey() would produce.
             byte[] compositeKey = state.serializeKey(
                     request(state, StateRequestType.REDUCING_ADD, 42L, ctx));
-            cache.put(compositeKey, 42L);
+            state.testOnlyDirectCachePut(compositeKey, 42L);
             assertEquals(1, state.cacheSize(), "cache must hold the seeded dirty entry pre-CLEAR");
-            assertTrue(cache.contains(compositeKey), "cache must contain the seeded key");
+            assertTrue(
+                    state.testOnlyDirectCacheContains(compositeKey),
+                    "cache must contain the seeded key");
 
             // Dispatch CLEAR through the vectorized classifier — recordDelete fires onClear which
             // must invalidate the cache slot before the DELETE row lands in the engine batch.
@@ -129,7 +133,7 @@ class ReducingStateV2ClearInvalidatesCacheTest {
             assertEquals(1, classifier.deleteCount(), "CLEAR routes to DELETE in vectorized path");
             assertEquals(0, state.cacheSize(), "onClear must invalidate the cache slot");
             assertTrue(
-                    !cache.contains(compositeKey),
+                    !state.testOnlyDirectCacheContains(compositeKey),
                     "cache must no longer contain the cleared key");
         }
     }
@@ -147,17 +151,18 @@ class ReducingStateV2ClearInvalidatesCacheTest {
                             LongSerializer.INSTANCE,
                             SUM);
             state.setFlushHandler((k, v) -> flushCount.incrementAndGet());
-            ReducingAggregatingCache<Long, Long> cache = reflectCache(state);
+            // B10-H2: backend-agnostic seed via the test adapter (Long state may route to the
+            // primitive-long cache and the legacy `cache` field is null in that case).
             RecordContext<Long> ctx = contextWithNamespace(7L, state, 0);
 
             // Seed two cache slots. Only one will be cleared.
             byte[] keyToClear =
                     state.serializeKey(request(state, StateRequestType.REDUCING_ADD, 1L, ctx));
-            cache.put(keyToClear, 1L);
+            state.testOnlyDirectCachePut(keyToClear, 1L);
             RecordContext<Long> ctx2 = contextWithNamespace(8L, state, 0);
             byte[] keyToKeep =
                     state.serializeKey(request(state, StateRequestType.REDUCING_ADD, 2L, ctx2));
-            cache.put(keyToKeep, 2L);
+            state.testOnlyDirectCachePut(keyToKeep, 2L);
             assertEquals(2, state.cacheSize());
 
             // CLEAR on key 7 — recordDelete → onClear invalidates only that slot.

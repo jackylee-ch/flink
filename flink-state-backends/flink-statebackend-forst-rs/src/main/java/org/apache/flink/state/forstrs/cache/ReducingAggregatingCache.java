@@ -22,6 +22,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
+import java.util.function.LongBinaryOperator;
 
 /**
  * LRU cache for ReducingState/AggregatingState accumulators (umbrella spec §2 component 14).
@@ -200,6 +201,46 @@ public final class ReducingAggregatingCache<IN, ACC> {
                         return false;
                     }
                 };
+    }
+
+    // -----------------------------------------------------------------
+    // B10-H2 primitive specialization — factory methods
+    // -----------------------------------------------------------------
+
+    /**
+     * B10-H2: returns a {@code long}-specialized cache that stores its accumulator as a primitive
+     * {@code long} field on each entry, eliminating the per-hit {@code Long.valueOf} box that the
+     * general cache pays when {@code ACC == Long} (typical for Q12 SumAgg / CountAgg). Callers must
+     * supply a {@link LongBinaryOperator} combiner ({@code (long, long) -> long}) and a
+     * {@code (byte[], long) -> void} flush callback.
+     *
+     * <p>This is hybrid option (c) in the B10-H2 audit: well-known caller archetypes (the state
+     * class detects {@code valueSerializer instanceof LongSerializer} and unwraps a stock
+     * {@code ReduceFunction.reduce(Long, Long)} into a {@link LongBinaryOperator}) route to this
+     * specialization; everything else falls back to the general {@code BiFunction}-typed cache via
+     * the regular constructor.
+     *
+     * <p>The flush callback receives a primitive {@code long}, so no {@code Long} box is needed on
+     * the eviction / barrier-drain path either. The only box that may still occur is on the input
+     * side ({@code Long} → {@code long} unbox in the call site that invokes {@link
+     * LongReducingAggregatingCache#tryFold(byte[], long)}), which is dwarfed by the eliminated
+     * write-back box on a typical hit-heavy Q12 pattern.
+     */
+    public static LongReducingAggregatingCache forLong(
+            LongBinaryOperator combiner,
+            LongReducingAggregatingCache.LongFlushCallback flushCallback) {
+        return new LongReducingAggregatingCache(combiner, flushCallback);
+    }
+
+    /**
+     * Capacity-explicit variant of {@link #forLong(LongBinaryOperator,
+     * LongReducingAggregatingCache.LongFlushCallback)}.
+     */
+    public static LongReducingAggregatingCache forLong(
+            LongBinaryOperator combiner,
+            LongReducingAggregatingCache.LongFlushCallback flushCallback,
+            int maxEntries) {
+        return new LongReducingAggregatingCache(combiner, flushCallback, maxEntries);
     }
 
     // -----------------------------------------------------------------
@@ -402,8 +443,26 @@ public final class ReducingAggregatingCache<IN, ACC> {
     /**
      * Flushes all dirty entries via the flush callback. Called on checkpoint barrier (§3 Trace E).
      * Marks entries clean after flushing.
+     *
+     * <p>A10-H1: drain any in-flight {@link #pendingFlushKey}/{@link #pendingFlushValue} slot FIRST.
+     * The slot is populated by {@code removeEldestEntry} when an LRU eviction was deferred (engine-
+     * PUT FFI must not run under {@code generationsLock}). If a prior {@code drainPendingFlush}
+     * throw re-stashed an entry, {@code drainPendingFlush} placed it back into {@code entries}
+     * marked dirty and the {@code entries} iteration would have picked it up — so the re-stash path
+     * is covered without this drain. BUT the SUCCESS-but-not-yet-drained path (a deferred eviction
+     * captured into the slot that has not been drained by a subsequent {@code put} or
+     * {@code putIfGen}) needs us to materialize the slot before iterating. Failing to drain here
+     * would leave the captured (key, value) unflushed forever — {@code removeEldestEntry} already
+     * removed it from {@code entries}, marked the original Entry clean (defensive line ~196), and
+     * stashed it into the slot. The {@code entries} iteration alone cannot see it.
+     *
+     * <p>Drain ordering: BEFORE iterating {@code entries}. If the drain's callback throws,
+     * propagate immediately — the re-stash logic in {@code drainPendingFlush} will have put the
+     * entry back into {@code entries} dirty, and the next checkpoint will retry it (consistent with
+     * the E9-H2 contract).
      */
     public void flushAllDirty() {
+        drainPendingFlush();
         for (Map.Entry<BytesKey, Entry<ACC>> me : entries.entrySet()) {
             Entry<ACC> e = me.getValue();
             if (e.dirty) {

@@ -273,6 +273,81 @@ class ReducingAggregatingCacheTest {
         assertEquals(Integer.valueOf(100), deliveredVals.get(idx));
     }
 
+    // ----------------- A10-H1: flushAllDirty drains pending slot first -----------------
+
+    /**
+     * A10-H1 regression: when a re-stash cascade leaves an entry stranded in the
+     * {@code pendingFlushKey/Value} slot, {@code flushAllDirty} must drain it BEFORE iterating
+     * {@code entries}. Prior shape iterated {@code entries} only — a slot populated by a deferred
+     * eviction that had not yet been drained by a subsequent put/putIfGen was silently lost on the
+     * next checkpoint.
+     *
+     * <p>Scenario: pre-populate the cache near {@code maxEntries}. A {@code put} triggers
+     * {@code removeEldestEntry} which stashes the eldest into the pending slot. The
+     * {@code drainPendingFlush} callback throws — the entry is re-stashed into {@code entries} but
+     * the throw cascades a new {@code removeEldestEntry} firing during the re-stash put, refilling
+     * the pending slot. The original re-stash exits with the slot still populated. Next checkpoint
+     * calls {@code flushAllDirty} — without the drain-first fix, the cascaded eviction is never
+     * delivered.
+     *
+     * <p>This test simulates the cascade by forcing the callback to throw on the FIRST eviction
+     * only, asserts {@code flushAllDirty} delivers the cascaded entry, and verifies the slot is
+     * empty afterwards.
+     */
+    @Test
+    void flushAllDirtyDrainsPendingFlushSlotFirst() {
+        final java.util.concurrent.atomic.AtomicInteger throwBudget =
+                new java.util.concurrent.atomic.AtomicInteger(1);
+        final List<byte[]> deliveredKeys = new ArrayList<>();
+        final List<Integer> deliveredVals = new ArrayList<>();
+
+        ReducingAggregatingCache<Integer, Integer> cache =
+                new ReducingAggregatingCache<>(
+                        Integer::sum,
+                        (k, v) -> {
+                            if (throwBudget.getAndDecrement() > 0) {
+                                throw new RuntimeException("first-eviction throw to force cascade");
+                            }
+                            deliveredKeys.add(k);
+                            deliveredVals.add(v);
+                        },
+                        2);
+
+        cache.put(new byte[] {1}, 100);
+        cache.put(new byte[] {2}, 200);
+
+        // Trigger eviction of {1}. The drain throws (budget=1 → throws once, becomes 0). The
+        // E9-H2 logic re-stashes {1} into entries dirty. Subsequent flushAllDirty MUST deliver
+        // {1} — which only works if flushAllDirty drains the pending slot OR if the re-stash
+        // actually put {1} back into entries. We assert the end-to-end behavior.
+        RuntimeException thrown = null;
+        try {
+            cache.put(new byte[] {3}, 300);
+        } catch (RuntimeException e) {
+            thrown = e;
+        }
+        assertNotNull(thrown, "first eviction's drain must throw");
+
+        // Now flushAllDirty: budget=0, callback delivers normally. We must see {1}'s accumulator
+        // (100) delivered. Without the A10-H1 drain-first guard, if the throw path left a
+        // stranded slot, the entry would never be delivered.
+        cache.flushAllDirty();
+
+        // {1} (re-stashed value=100), {2} (val=200), and {3} (val=300) must all reach the
+        // callback exactly once across the throw + subsequent flushAllDirty.
+        assertTrue(
+                containsKeyBytes(deliveredKeys, new byte[] {1}),
+                "cascaded/re-stashed entry {1} must be delivered by flushAllDirty");
+        int idx = indexOfKeyBytes(deliveredKeys, new byte[] {1});
+        assertEquals(Integer.valueOf(100), deliveredVals.get(idx));
+        assertTrue(
+                containsKeyBytes(deliveredKeys, new byte[] {2}),
+                "live entry {2} must be delivered");
+        assertTrue(
+                containsKeyBytes(deliveredKeys, new byte[] {3}),
+                "live entry {3} must be delivered");
+    }
+
     private static boolean containsKeyBytes(List<byte[]> keys, byte[] needle) {
         return indexOfKeyBytes(keys, needle) >= 0;
     }

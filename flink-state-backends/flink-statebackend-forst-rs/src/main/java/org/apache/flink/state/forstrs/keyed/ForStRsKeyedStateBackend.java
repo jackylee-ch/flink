@@ -258,25 +258,31 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     /** Long-lived arena for the pre-allocated flush staging segments. */
     private final Arena flushArena = Arena.ofAuto();
 
-    /** Pre-allocated: FLUSH_THRESHOLD × ADDRESS slots for key pointers. */
+    /**
+     * Pre-allocated: FLUSH_THRESHOLD × ADDRESS slots for key pointers.
+     *
+     * <p>D10-M1: explicit 8-byte alignment. {@code JAVA_LONG.set}/{@code ADDRESS.set} require
+     * segment alignment ≥ 8; the default {@code allocate(byteSize)} grants alignment=1 and only
+     * works by happenstance of allocator natural alignment.
+     */
     private final MemorySegment flushKeyPtrs =
             flushArena.allocate(
-                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.ADDRESS.byteSize());
+                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.ADDRESS.byteSize(), 8);
 
-    /** Pre-allocated: FLUSH_THRESHOLD × JAVA_LONG slots for key lengths. */
+    /** Pre-allocated: FLUSH_THRESHOLD × JAVA_LONG slots for key lengths. D10-M1: align=8. */
     private final MemorySegment flushKeyLens =
             flushArena.allocate(
-                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.JAVA_LONG.byteSize());
+                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.JAVA_LONG.byteSize(), 8);
 
-    /** Pre-allocated: FLUSH_THRESHOLD × ADDRESS slots for value pointers. */
+    /** Pre-allocated: FLUSH_THRESHOLD × ADDRESS slots for value pointers. D10-M1: align=8. */
     private final MemorySegment flushValuePtrs =
             flushArena.allocate(
-                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.ADDRESS.byteSize());
+                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.ADDRESS.byteSize(), 8);
 
-    /** Pre-allocated: FLUSH_THRESHOLD × JAVA_LONG slots for value lengths. */
+    /** Pre-allocated: FLUSH_THRESHOLD × JAVA_LONG slots for value lengths. D10-M1: align=8. */
     private final MemorySegment flushValueLens =
             flushArena.allocate(
-                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.JAVA_LONG.byteSize());
+                    (long) WRITE_BUFFER_FLUSH_THRESHOLD * ValueLayout.JAVA_LONG.byteSize(), 8);
 
     // ------------------------------------------------------------------
     // Off-heap (Arrow) state plumbing (Task 1b.2).
@@ -1037,10 +1043,19 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 throw new IllegalStateException(
                         "writeValueArena required size " + required + " exceeds Integer.MAX_VALUE");
             }
-            int newLen = writeValueArena.length;
-            while (newLen < required) {
-                newLen <<= 1;
+            // D10-H2: use long arithmetic to avoid `int` overflow if the doubling loop ever
+            // approaches Integer.MAX_VALUE (sign-bit flip → infinite loop). The `required >
+            // Integer.MAX_VALUE` guard above bounds the target, but the multiplier itself
+            // must also be computed in `long` so a single `<<= 1` past 2^30 doesn't wrap.
+            long doubled = (long) writeValueArena.length;
+            while (doubled < required) {
+                doubled <<= 1;
             }
+            if (doubled > Integer.MAX_VALUE) {
+                throw new IllegalStateException(
+                        "writeValueArena grown size " + doubled + " exceeds Integer.MAX_VALUE");
+            }
+            int newLen = (int) doubled;
             byte[] grown = new byte[newLen];
             // writeArenaPos is bounded by writeValueArena.length here (int), so the int cast is
             // safe — the loop above grows newLen only on the next iteration if it would exceed
@@ -1138,10 +1153,28 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // across chunk boundaries so we resume exactly where the previous chunk stopped.
         final int cap = writeBuffer.capacity();
         int slot = 0;
-        while (slot < cap) {
-            // Fill one chunk of up to WRITE_BUFFER_FLUSH_THRESHOLD rows; the staging segments are
-            // sized exactly for this chunk size so we never write past their bounds.
-            try (Arena payloadArena = Arena.ofConfined()) {
+        // B10-H1: hoist Arena.ofConfined OUTSIDE the chunk loop. The prior shape opened a fresh
+        // Arena per chunk — fine on the normal Q11 V1-sync path (count threshold 64 fires first
+        // so 1 arena per flush) but pathological on the heavy Map/duplicate path where 4096
+        // entries / 64 chunk size = 64 arena opens per flushWriteBuffer call. Each
+        // Arena.ofConfined is ~µs (Cleaner registration + native allocator setup), adding
+        // multi-ms latency per flush.
+        //
+        // Lifetime safety: each chunk's per-slot payload allocations (ks, vs) are scoped to
+        // payloadArena. They are referenced by flushKeyPtrs/flushValuePtrs/flushKeyLens/
+        // flushValueLens — staging segments that the engine reads synchronously inside batchPut
+        // and copies into the LSM MemTable. Once batchPut returns for a chunk, the staging
+        // segments are free to be overwritten by the next chunk's allocations. payloadArena's
+        // try-with-resources close at method exit then releases all chunk allocations as a unit
+        // — no UAF because batchPut has fully returned for every chunk by then.
+        //
+        // The staging segments themselves (flushKeyPtrs/Lens etc) are field-initialized in the
+        // global arena (see field declarations) and live for the backend lifetime — they are
+        // overwritten per chunk, so they do not depend on payloadArena's lifetime.
+        try (Arena payloadArena = Arena.ofConfined()) {
+            while (slot < cap) {
+                // Fill one chunk of up to WRITE_BUFFER_FLUSH_THRESHOLD rows; the staging segments
+                // are sized exactly for this chunk size so we never write past their bounds.
                 int chunk = 0;
                 while (chunk < WRITE_BUFFER_FLUSH_THRESHOLD && slot < cap) {
                     byte[] k = writeBuffer.keyAt(slot);
@@ -1153,8 +1186,16 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                     slot++;
                     int vOff = (int) (p >>> 32);
                     int vLen = (int) p;
-                    MemorySegment ks = payloadArena.allocate(k.length == 0 ? 1 : k.length);
-                    MemorySegment vs = payloadArena.allocate(vLen == 0 ? 1 : vLen);
+                    // D10-M3: skip Arena allocation for empty key/value — store
+                    // {@link MemorySegment#NULL} in the pointer slot (len=0 in the
+                    // matching length slot). Avoids a wasted 1-byte slot per empty payload
+                    // and keeps the pointer/length pair internally consistent.
+                    MemorySegment ks =
+                            k.length == 0
+                                    ? MemorySegment.NULL
+                                    : payloadArena.allocate(k.length);
+                    MemorySegment vs =
+                            vLen == 0 ? MemorySegment.NULL : payloadArena.allocate(vLen);
                     if (k.length > 0) {
                         MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
                     }
@@ -1186,7 +1227,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 }
                 if (chunk > 0) {
                     // A9-M2: if batchPut throws, the exception escapes both the inner try (which
-                    // only owns payloadArena) and the outer while loop, bypassing the post-loop
+                    // owns payloadArena via its try-with-resources) and the outer while loop,
+                    // bypassing the post-loop
                     // clear-state lines below. The buffer therefore retains every entry it held
                     // when flush began — engine state is UNKNOWN (the batch may have partially
                     // committed) but the buffer is in a consistent pre-flush state, and the

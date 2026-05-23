@@ -92,10 +92,13 @@ class ReducingStateSnapshotFlushHandlerTest {
                 // RecordContext-bound asyncAdd path because exercising AEC is out of scope for
                 // this correctness test — the contract under test is "cache → flushHandler →
                 // engine".
-                ReducingAggregatingCache<Long, Long> cache = reducingCache(state);
+                //
+                // B10-H2: for Long-typed states the active cache may be the primitive-long
+                // specialization (longCache), not the general cache. Use the backend-agnostic
+                // testOnlyDirectCachePut adapter which routes correctly regardless.
                 long[] expected = {10L, 20L, 30L, 40L, 50L};
                 for (int i = 0; i < 5; i++) {
-                    cache.put(FIVE_KEYS[i], expected[i]);
+                    state.testOnlyDirectCachePut(FIVE_KEYS[i], expected[i]);
                 }
                 assertEquals(5, state.cacheSize());
 
@@ -148,7 +151,9 @@ class ReducingStateSnapshotFlushHandlerTest {
                 assertArrayEquals(pre, linker.get(db, cf, FIVE_KEYS[0]));
 
                 // Cache contains a tombstone (null acc) — flushHandler must route to delete.
-                reducingCache(state).put(FIVE_KEYS[0], null);
+                // B10-H2: testOnlyDirectCachePut with null acc routes through the tombstone path
+                // for both the general cache and the primitive-long specialization.
+                state.testOnlyDirectCachePut(FIVE_KEYS[0], null);
                 state.flushOnBarrier();
 
                 assertNull(
@@ -245,7 +250,8 @@ class ReducingStateSnapshotFlushHandlerTest {
                         LongSerializer.INSTANCE,
                         sum);
 
-        reducingCache(state).put(FIVE_KEYS[0], 1L);
+        // B10-H2: backend-agnostic put (Long-typed state may route to the primitive-long cache).
+        state.testOnlyDirectCachePut(FIVE_KEYS[0], 1L);
         // Must not throw: the default handler is (k,v) -> {} and the cache simply marks the
         // entry clean. The accumulator IS discarded — but only because no flush handler was
         // wired. The previous A4-H2 bug was that this same silent-discard behaviour applied to

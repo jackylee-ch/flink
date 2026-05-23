@@ -34,6 +34,7 @@ import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * JDK 25 FFM bridge to libforst_rs_ffi.{dylib,so,dll}.
@@ -203,17 +204,41 @@ public final class ForStRsLinker {
      * single static fn but other producers may not).
      *
      * <p>B9-H2: replaced the previous {@code ConcurrentHashMap<Long, MethodHandle>} hot path with
-     * a single-slot volatile fast path. {@code arrowReleaseFnAddr} and
-     * {@code arrowReleaseHandleFast} are written under racing-but-idempotent semantics — a stale
-     * pointer simply causes a recompute on the next call. The fast path serves 100% of arrow-rs
-     * traffic (single static release fn) with zero allocations — no {@code Long} autobox per
+     * a single-slot volatile fast path. The fast path serves 100% of arrow-rs traffic (single
+     * static release fn) with zero allocations — no {@code Long} autobox per
      * {@code invokeArrowRelease} call. The {@link ConcurrentHashMap} fallback is consulted only
      * when the address misses the fast slot — rare in steady state, kept for mixed-producer
      * pipelines that legitimately emit multiple distinct release-fn pointers.
+     *
+     * <p>A10-H2: the prior two-field fast slot ({@code arrowReleaseFnAddr} and
+     * {@code arrowReleaseHandleFast}) had a publication ordering race on mixed-producer pipelines.
+     * Writer order was {@code handle = h; addr = a;} (handle first, address second). Reader order
+     * was {@code h = handle; a = addr;} (handle first, address second), then verified
+     * {@code a == releaseFn.address()}. A concurrent producer switch could interleave so that the
+     * reader observed the NEW handle but the OLD address — the address check then matched the OLD
+     * address against the OLD {@code releaseFn} (same producer's frame), accepting a handle bound
+     * to a different release fn. The result: {@code invokeExact(target)} dispatched the wrong
+     * native callback → JVM crash or silent payload corruption.
+     *
+     * <p>Fix: single-reference publication via {@link AtomicReference}. A {@link Slot} carries both
+     * fields together; readers do one atomic-reference load (observing both fields as a unit) and
+     * writers do one atomic-reference set. The race is eliminated because there is no longer a
+     * window where one field is updated and the other is stale. Cost is one {@code Slot}
+     * allocation per producer change — a rare event (the fast slot is only repopulated when the
+     * incoming release-fn address differs from the cached one, which on steady-state arrow-rs
+     * traffic never happens after the first call).
      */
-    private volatile long arrowReleaseFnAddr = 0L;
+    private static final class ArrowReleaseSlot {
+        final long addr;
+        final MethodHandle handle;
 
-    private volatile MethodHandle arrowReleaseHandleFast;
+        ArrowReleaseSlot(long addr, MethodHandle handle) {
+            this.addr = addr;
+            this.handle = handle;
+        }
+    }
+
+    private final AtomicReference<ArrowReleaseSlot> arrowReleaseSlot = new AtomicReference<>();
 
     private final ConcurrentHashMap<Long, MethodHandle> arrowReleaseHandleCache =
             new ConcurrentHashMap<>();
@@ -1180,27 +1205,32 @@ public final class ForStRsLinker {
         if (addr == 0L) {
             return;
         }
-        // B9-H2 fast path: single-slot volatile cache. Reads are racy but the only observable
-        // failure mode is a redundant downcallHandle build (correctness-preserving, no autobox).
-        MethodHandle handle = arrowReleaseHandleFast;
-        if (handle == null || addr != arrowReleaseFnAddr) {
-            handle = arrowReleaseHandleCache.get(addr);
-            if (handle == null) {
-                handle =
-                        arrowReleaseHandleCache.computeIfAbsent(
-                                addr,
-                                a ->
-                                        Linker.nativeLinker()
-                                                .downcallHandle(
-                                                        releaseFn, ARROW_RELEASE_DESCRIPTOR));
-            }
-            // Publish to the fast slot. Volatile-write ordering: write the handle before the
-            // address, so a concurrent reader observing the updated address is guaranteed to
-            // observe the matching handle (Java memory model: prior volatile stores happen-
-            // before subsequent volatile stores on the same thread, and a volatile load of the
-            // address synchronizes with the volatile store, transitively observing the handle).
-            arrowReleaseHandleFast = handle;
-            arrowReleaseFnAddr = addr;
+        // A10-H2 fast path: single-reference atomic publication. One atomic-reference load sees
+        // both fields as a unit, so there is no window where (handle, addr) can be observed
+        // half-updated. On the steady-state arrow-rs traffic this is one ARef read + one
+        // compare → no allocations, no autobox, no race.
+        ArrowReleaseSlot snap = arrowReleaseSlot.get();
+        MethodHandle handle;
+        if (snap != null && snap.addr == addr) {
+            handle = snap.handle;
+        } else {
+            // Slow path: miss in the fast slot (first call or producer switch). Resolve via the
+            // ConcurrentHashMap (canonical owner) and publish a new Slot. computeIfAbsent
+            // guarantees one downcallHandle build per distinct address across all threads.
+            handle =
+                    arrowReleaseHandleCache.computeIfAbsent(
+                            addr,
+                            a ->
+                                    Linker.nativeLinker()
+                                            .downcallHandle(
+                                                    releaseFn, ARROW_RELEASE_DESCRIPTOR));
+            // Single atomic publication of (addr, handle). A racing producer switch may CAS in
+            // a different Slot; we accept the loss — the next call will observe the winner and
+            // either match or repeat the slow path. Both Slots reference the SAME handle for
+            // their own address (because computeIfAbsent is the canonical builder), so the only
+            // observable effect of a CAS loss is a redundant Slot allocation on the loser's
+            // thread. Correctness-preserving.
+            arrowReleaseSlot.set(new ArrowReleaseSlot(addr, handle));
         }
         try {
             handle.invokeExact(target);
