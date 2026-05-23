@@ -195,9 +195,32 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             // ReduceFunction to be inspectable.
             final ReduceFunction rawReduce = reduceFunction;
             final boolean asInt = isInt;
-            java.util.function.LongBinaryOperator longCombiner =
-                    tryUnwrapPrimitiveSumReducer(reduceFunction);
-            if (longCombiner == null) {
+            // A12-H1: pass the accumulator-domain flag so the fast-path detection can reject
+            // lambdas whose primitive signature does not match the value-serializer domain.
+            // A long-form reducer + IntSerializer (or vice-versa) would silently truncate at
+            // flush; we instead fall through to the boxing shim, which preserves the legacy
+            // ClassCastException semantic on domain mismatch.
+            java.util.function.LongBinaryOperator detected =
+                    tryUnwrapPrimitiveSumReducer(reduceFunction, isInt);
+            java.util.function.LongBinaryOperator longCombiner;
+            if (detected != null) {
+                // A12-M1 — uniform exception wrapping. Wrap the fast-path operator in the same
+                // try/catch envelope as the boxing shim so any exception (e.g.
+                // ArithmeticException from Math::addExact overflow) is wrapped in
+                // {@link RuntimeException} with the same message prefix. Downstream callers
+                // that {@code catch (RuntimeException)} therefore see a consistent chain
+                // regardless of which path was selected.
+                final java.util.function.LongBinaryOperator inner = detected;
+                longCombiner =
+                        (accL, inL) -> {
+                            try {
+                                return inner.applyAsLong(accL, inL);
+                            } catch (RuntimeException e) {
+                                throw new RuntimeException(
+                                        "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
+                            }
+                        };
+            } else {
                 // Fallback boxing shim (halved alloc — write-back box eliminated, input box kept).
                 longCombiner =
                         (accL, inL) -> {
@@ -563,13 +586,31 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      *       use {@code Long::sum} directly.
      * </ul>
      *
+     * <h3>A12-H1 — domain-matched gating (CORRECTNESS, SILENT DATA CORRUPTION).</h3>
+     *
+     * <p>Detection used to match purely on {@code implMethodSignature}. That allowed a fast-path
+     * install when the user's reducer was {@code Long::sum} but the value serializer was
+     * {@link IntSerializer} (or vice-versa). The downstream flush callback at the call site does
+     * {@code (int) acc} when {@code accIsInteger} is true, which truncates a {@code long}-domain
+     * accumulator on every flush — silent data corruption.
+     *
+     * <p>The legacy boxing shim would have surfaced this immediately as a {@link ClassCastException}
+     * because {@code (Long) out} in the {@code (asInt ? (Integer) out : (Long) out)} branch
+     * detects domain mismatch.
+     *
+     * <p>Fix: take the caller's accumulator domain ({@code accIsInteger}) as an explicit parameter
+     * and gate fast-path selection on BOTH the serialized-lambda signature AND the matching
+     * domain. {@code Long::sum} with an {@link IntSerializer}-typed state — or
+     * {@code Integer::sum} with a {@link LongSerializer}-typed state — now falls through to the
+     * boxing shim, preserving the legacy ClassCastException-on-mismatch behaviour.
+     *
      * <p>If introspection itself throws (e.g. reducer is not serializable, lambda is from a
      * non-LambdaMetafactory source, or the JVM is hardened against {@code writeReplace} access),
      * we silently return {@code null} and fall back — correctness is unaffected.
      */
     @SuppressWarnings("rawtypes")
     private static java.util.function.LongBinaryOperator tryUnwrapPrimitiveSumReducer(
-            ReduceFunction reducer) {
+            ReduceFunction reducer, boolean accIsInteger) {
         if (reducer == null) {
             return null;
         }
@@ -588,24 +629,36 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             String implClass = sl.getImplClass();
             String implMethod = sl.getImplMethodName();
             String implSig = sl.getImplMethodSignature();
-            // Method reference forms: Long::sum, Integer::sum, Math::addExact.
-            if ("java/lang/Long".equals(implClass)
+            // A12-H1: only accept long-form reducers when the accumulator domain is also long
+            // (accIsInteger == false). A long-form reducer paired with an IntSerializer would
+            // truncate at flush (`(int) acc`); the boxing shim throws ClassCastException on
+            // that mismatch, so we preserve that behaviour by falling through to null.
+            if (!accIsInteger
+                    && "java/lang/Long".equals(implClass)
                     && "sum".equals(implMethod)
                     && "(JJ)J".equals(implSig)) {
                 return Long::sum;
             }
-            if ("java/lang/Integer".equals(implClass)
+            // A12-H1: int-form reducers paired with a LongSerializer-typed state would silently
+            // promote to long-domain arithmetic; this differs from the boxing shim, which would
+            // throw ClassCastException on `(Long) out` of an Integer-returning reduce. Require
+            // the domain to also be int.
+            if (accIsInteger
+                    && "java/lang/Integer".equals(implClass)
                     && "sum".equals(implMethod)
                     && "(II)I".equals(implSig)) {
-                // Promote to long-domain (storage uses long); no overflow on simple sums.
+                // Promote to long-domain (cache storage uses long); no overflow on simple sums
+                // within int range.
                 return (a, b) -> (long) ((int) a + (int) b);
             }
-            if ("java/lang/Math".equals(implClass)
+            if (!accIsInteger
+                    && "java/lang/Math".equals(implClass)
                     && "addExact".equals(implMethod)
                     && "(JJ)J".equals(implSig)) {
                 return Math::addExact;
             }
-            if ("java/lang/Math".equals(implClass)
+            if (accIsInteger
+                    && "java/lang/Math".equals(implClass)
                     && "addExact".equals(implMethod)
                     && "(II)I".equals(implSig)) {
                 return (a, b) -> Math.addExact((int) a, (int) b);
