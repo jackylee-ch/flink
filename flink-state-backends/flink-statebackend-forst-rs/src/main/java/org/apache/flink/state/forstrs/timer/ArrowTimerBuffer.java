@@ -24,6 +24,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.Arrays;
+import java.util.function.Supplier;
 
 /**
  * Off-heap binary min-heap of timer pending-buffer entries (analogue of {@code
@@ -92,6 +93,14 @@ public final class ArrowTimerBuffer implements AutoCloseable {
      */
     private final byte[] heapSwapScratch = new byte[HEAP_ROW_BYTES];
 
+    /**
+     * D8-H4 test seam: supplier of a fresh {@link Arena} used by {@link #resize(int)}. Production
+     * code uses {@link Arena#ofShared()}; tests can inject a Supplier that returns an Arena whose
+     * {@code allocate()} throws on the N-th call, to verify that {@code resize()} rolls back
+     * cleanly and does not leak the old arena nor half-mutate instance state.
+     */
+    private Supplier<Arena> arenaSupplier = Arena::ofShared;
+
     /** Visitor for {@link #drainUnordered(FlushVisitor)} / {@link #drainTo(FlushVisitor)}. */
     public interface FlushVisitor {
         void visit(int op, MemorySegment keyData, int keyOff, int keyLen, long ts);
@@ -121,6 +130,19 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         for (int i = 0; i < cap * 2; i++) {
             hashIndex.set(ValueLayout.JAVA_INT, (long) i * HASH_SLOT_BYTES + 4L, EMPTY_SLOT);
         }
+    }
+
+    /**
+     * D8-H4 test seam: replaces the {@link Arena} supplier used by {@link #resize(int)}. Visible
+     * for tests in this package only.
+     */
+    void setArenaSupplierForTest(Supplier<Arena> supplier) {
+        this.arenaSupplier = supplier;
+    }
+
+    /** D8-H4 test seam: returns the current {@link Arena} (visible for tests in this package). */
+    Arena arenaForTest() {
+        return arena;
     }
 
     public int size() {
@@ -572,20 +594,45 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         if (newCapacity > maxCapacity) {
             newCapacity = maxCapacity;
         }
-        Arena oldArena = arena;
-        MemorySegment oldHeapArray = heapArray;
-        MemorySegment oldKeyData = keyData;
-        int oldSize = size;
-        long oldKeyDataUsed = keyDataUsed;
+        // Snapshot CURRENT (old) state. We must not mutate any instance field until all newArena
+        // allocations have succeeded — otherwise an OOM mid-resize would leave the instance in a
+        // half-mutated state AND leak oldArena (D8-H4).
+        final Arena oldArena = arena;
+        final MemorySegment oldHeapArray = heapArray;
+        final MemorySegment oldKeyData = keyData;
+        final MemorySegment oldHashIndex = hashIndex;
+        final int oldCapacity = capacity;
+        final long oldKeyDataCapacity = keyDataCapacity;
+        final int oldSize = size;
+        final long oldKeyDataUsed = keyDataUsed;
 
-        Arena newArena = Arena.ofShared();
+        final long newKeyDataCapacity = Math.max((long) newCapacity * 64L, oldKeyDataUsed);
+
+        // Allocate everything on newArena up-front; if ANY allocate() throws, close newArena and
+        // re-throw — instance fields are untouched, so the caller still has a valid buffer.
+        final Arena newArena = arenaSupplier.get();
+        final MemorySegment newHeapArray;
+        final MemorySegment newKeyData;
+        final MemorySegment newHashIndex;
+        try {
+            newHeapArray = newArena.allocate((long) newCapacity * HEAP_ROW_BYTES);
+            newKeyData = newArena.allocate(newKeyDataCapacity == 0 ? 1 : newKeyDataCapacity);
+            newHashIndex = newArena.allocate((long) newCapacity * 2 * HASH_SLOT_BYTES);
+        } catch (Throwable t) {
+            // D8-H4: rollback. Close the partially-populated newArena; instance fields are still
+            // pointing at oldArena's segments which remain valid. Re-throw so the caller can react.
+            newArena.close();
+            throw t;
+        }
+
+        // All allocations succeeded — now commit the new state. From here on, no further allocs
+        // happen and the operations below are infallible (segment-typed set/copy + index rebuild).
         this.arena = newArena;
         this.capacity = newCapacity;
-        // Re-allocate fresh (heapArray + keyData + hashIndex).
-        this.keyDataCapacity = Math.max((long) newCapacity * 64L, oldKeyDataUsed);
-        this.heapArray = arena.allocate((long) newCapacity * HEAP_ROW_BYTES);
-        this.keyData = arena.allocate(keyDataCapacity == 0 ? 1 : keyDataCapacity);
-        this.hashIndex = arena.allocate((long) newCapacity * 2 * HASH_SLOT_BYTES);
+        this.keyDataCapacity = newKeyDataCapacity;
+        this.heapArray = newHeapArray;
+        this.keyData = newKeyData;
+        this.hashIndex = newHashIndex;
         for (int i = 0; i < newCapacity * 2; i++) {
             hashIndex.set(ValueLayout.JAVA_INT, (long) i * HASH_SLOT_BYTES + 4L, EMPTY_SLOT);
         }
@@ -601,6 +648,13 @@ public final class ArrowTimerBuffer implements AutoCloseable {
                     heapArray.get(ValueLayout.JAVA_INT, (long) row * HEAP_ROW_BYTES + HASH_OFF);
             hashInsert(hash, row);
         }
+        // Suppress unused-warning on the old segment locals — they intentionally pin the old
+        // arena's memory through this call so the copies above are sound.
+        assert oldHeapArray.address() != 0L
+                && oldKeyData.address() != 0L
+                && oldHashIndex.address() != 0L
+                && oldCapacity >= 0
+                && oldKeyDataCapacity >= 0L;
         oldArena.close();
     }
 }

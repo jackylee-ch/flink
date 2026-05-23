@@ -28,7 +28,6 @@ import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 
 import java.io.IOException;
-import java.util.Optional;
 
 /**
  * V2 AggregatingState using cache-mediated read-modify-write (umbrella spec §2 component 13 + §3
@@ -131,8 +130,8 @@ public class ForStRsAggregatingStateV2<IN, ACC, OUT> {
         if (value == null) {
             return;
         }
-        Optional<ACC> hit = cache.tryFold(compositeKey, value);
-        if (hit.isPresent()) {
+        // B8-H1: tryFold returns boolean — no Optional wrapper per cache HIT.
+        if (cache.tryFold(compositeKey, value)) {
             return;
         }
         // Cache miss — enqueue or join convoy

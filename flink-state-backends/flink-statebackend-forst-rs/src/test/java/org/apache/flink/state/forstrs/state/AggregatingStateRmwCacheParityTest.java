@@ -144,8 +144,8 @@ class AggregatingStateRmwCacheParityTest {
 
             // Cache path: tryFold on hit; on cold miss, seed via createAccumulator() and add
             // — exactly what the async-V2 class's asyncAdd override does.
-            var hit = cache.tryFold(composite, value);
-            if (hit.isEmpty()) {
+            // B8-H1: tryFold returns boolean.
+            if (!cache.tryFold(composite, value)) {
                 long[] cold = AVG.add(value, AVG.createAccumulator());
                 cache.put(composite, cold);
             }

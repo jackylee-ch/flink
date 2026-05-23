@@ -33,6 +33,7 @@ import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * JDK 25 FFM bridge to libforst_rs_ffi.{dylib,so,dll}.
@@ -191,6 +192,21 @@ public final class ForStRsLinker {
 
     private final Linker linker;
     private final SymbolLookup lookup;
+
+    /**
+     * D8-H2 cache for Arrow C Data Interface release-callback {@link MethodHandle}s, keyed by the
+     * release fn pointer address. Each call into {@code batchGetArrow} historically spun a fresh
+     * {@code Linker.nativeLinker().downcallHandle(...)} per release call (2× per call) which pins
+     * JIT metadata and spins LambdaForm bytecode — wasteful on the high-throughput vectorized read
+     * path. Strategy (a): per-address cache. Robust to release-fn pointer variation across
+     * producers (Arrow C-Data spec allows the producer to choose its release fn; arrow-rs uses a
+     * single static fn but other producers may not).
+     */
+    private final ConcurrentHashMap<Long, MethodHandle> arrowReleaseHandleCache =
+            new ConcurrentHashMap<>();
+
+    private static final FunctionDescriptor ARROW_RELEASE_DESCRIPTOR =
+            FunctionDescriptor.ofVoid(ValueLayout.ADDRESS);
 
     // --- 0. ABI version negotiation ---
     private final MethodHandle frsAbiVersion;
@@ -1037,13 +1053,16 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS,
                                 ValueLayout.JAVA_INT)); // P6-B
         // Phase A.1 (audit-design §3 V4): batched merge-append, N rows in 1 FFI call.
-        // PR-B2 (D-R3-3): critical mode — the Rust impl does N synchronous
-        // get/put pairs inside one FFI call (no thread-park). The batch length
-        // is bounded by the Java-side flush threshold, so the safepoint
-        // window stays acceptable. This eliminates the per-batch heap-segment
-        // copy that the non-critical path had to stage through a fresh arena.
+        // D8-H1: REMOVED critical mode (was PR-B2 / D-R3-3). The Rust impl performs N
+        // synchronous put() calls (one per distinct key), each of which can stall on
+        // WAL fsync, memtable-full waits, or rate-limited flushes inside the engine's
+        // commit path. Holding critical mode across that pins the JVM safepoint —
+        // sibling tasks stall and GC starves. Same rationale as D6-H2 for
+        // frs_vectorized_batch_put/_delete. The MemorySegment args (keys/ops off+data)
+        // are already from VectorizedExecutor's confined arena, so non-critical mode
+        // is sufficient — no heap byte[] acceptance is needed.
         this.frsVecMergeAppendBatch =
-                bindCritical(
+                bind(
                         "frs_vec_merge_append_batch",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT, // return rc
@@ -1124,6 +1143,39 @@ public final class ForStRsLinker {
                                                 "symbol not found in cdylib: " + name));
         // allowHeapAccess=true so MemorySegment.ofArray(byte[]) is acceptable.
         return linker.downcallHandle(sym, descriptor, Linker.Option.critical(true));
+    }
+
+    /**
+     * Invokes the Arrow C Data Interface release callback {@code releaseFn} on {@code target},
+     * caching the {@link MethodHandle} per release-fn pointer address.
+     *
+     * <p>D8-H2 fix: previously each call into {@link #batchGetArrow} spun up a fresh
+     * {@code Linker.nativeLinker().downcallHandle(...)} for the array's release callback and another
+     * for the schema's release callback — two per call. This pinned JIT metadata and spun
+     * LambdaForm bytecode on the high-throughput vectorized read path. Caching by address handles
+     * the common case (single static fn from arrow-rs) optimally while remaining safe to mixed
+     * producers that emit distinct release fns.
+     *
+     * <p>If {@code releaseFn} is the null pointer, this method is a no-op (Arrow C-Data
+     * convention: released arrays/schemas have their release fn cleared to null).
+     */
+    private void invokeArrowRelease(MemorySegment releaseFn, MemorySegment target) {
+        long addr = releaseFn.address();
+        if (addr == 0L) {
+            return;
+        }
+        MethodHandle handle =
+                arrowReleaseHandleCache.computeIfAbsent(
+                        addr,
+                        a ->
+                                Linker.nativeLinker()
+                                        .downcallHandle(releaseFn, ARROW_RELEASE_DESCRIPTOR));
+        try {
+            handle.invokeExact(target);
+        } catch (Throwable ignored) {
+            // Swallow per existing batchGetArrow contract — release callbacks must not propagate
+            // exceptions to the caller; the caller's results are still valid.
+        }
     }
 
     // ------------------------------------------------------------------
@@ -2213,28 +2265,13 @@ public final class ForStRsLinker {
                 }
             }
 
-            // Release the output Arrow structs (call the release callback)
+            // Release the output Arrow structs (call the release callback).
+            // D8-H2: use the cached release-handle lookup; was spinning a fresh
+            // downcallHandle per call which pinned JIT metadata on the hot read path.
             MemorySegment outRelease = (MemorySegment) ARROW_ARRAY_RELEASE.get(outArray, 0L);
-            if (outRelease.address() != 0L) {
-                try {
-                    Linker.nativeLinker()
-                            .downcallHandle(
-                                    outRelease, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS))
-                            .invokeExact(outArray);
-                } catch (Throwable ignored) {
-                }
-            }
+            invokeArrowRelease(outRelease, outArray);
             MemorySegment outSchemaRelease = outSchema.get(ValueLayout.ADDRESS, 56);
-            if (outSchemaRelease.address() != 0L) {
-                try {
-                    Linker.nativeLinker()
-                            .downcallHandle(
-                                    outSchemaRelease,
-                                    FunctionDescriptor.ofVoid(ValueLayout.ADDRESS))
-                            .invokeExact(outSchema);
-                } catch (Throwable ignored) {
-                }
-            }
+            invokeArrowRelease(outSchemaRelease, outSchema);
 
             return results;
         }

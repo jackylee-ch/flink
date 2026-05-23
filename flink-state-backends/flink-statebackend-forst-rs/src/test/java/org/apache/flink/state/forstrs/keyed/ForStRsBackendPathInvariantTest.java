@@ -18,11 +18,14 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.api.common.JobID;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 /**
@@ -98,5 +101,111 @@ class ForStRsBackendPathInvariantTest {
                 () ->
                         ForStRsBackendPathInvariant.recordBackendPath(
                                 "", ForStRsBackendPathInvariant.Path.ASYNC_V2));
+    }
+
+    /**
+     * E8-H4 regression: keying by {@code (JobID, operatorIdentifier)} permits the same operator
+     * identifier to appear in two DIFFERENT jobs under different paths. The pre-fix single-arg
+     * map would falsely block the second job; the fixed composite key isolates the two
+     * lifecycles.
+     */
+    @Test
+    void differentJobsMayUseDifferentPathsForSameOperatorId() {
+        JobID jobA = new JobID();
+        JobID jobB = new JobID();
+        ForStRsBackendPathInvariant.recordBackendPath(
+                jobA, "op-shared", ForStRsBackendPathInvariant.Path.SYNC_V1);
+        // Job B can wire the same operator id under a DIFFERENT path without a false-positive
+        // cross-path block — the two jobs are independent lifecycles.
+        assertDoesNotThrow(
+                () ->
+                        ForStRsBackendPathInvariant.recordBackendPath(
+                                jobB,
+                                "op-shared",
+                                ForStRsBackendPathInvariant.Path.ASYNC_V2));
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.SYNC_V1,
+                ForStRsBackendPathInvariant.observedPathForTests(jobA, "op-shared"));
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.ASYNC_V2,
+                ForStRsBackendPathInvariant.observedPathForTests(jobB, "op-shared"));
+    }
+
+    /**
+     * E8-H4 regression: within a single job, the cross-path invariant still fires. Even with the
+     * composite key, a second backend on the same {@code (jobID, operatorIdentifier)} pair under
+     * a different path must throw — the underlying schema-drift-bypass risk is unchanged.
+     */
+    @Test
+    void crossPathWithinSameJobStillThrows() {
+        JobID job = new JobID();
+        ForStRsBackendPathInvariant.recordBackendPath(
+                job, "op-X", ForStRsBackendPathInvariant.Path.SYNC_V1);
+        IllegalStateException ex =
+                assertThrows(
+                        IllegalStateException.class,
+                        () ->
+                                ForStRsBackendPathInvariant.recordBackendPath(
+                                        job,
+                                        "op-X",
+                                        ForStRsBackendPathInvariant.Path.ASYNC_V2));
+        String msg = ex.getMessage();
+        org.junit.jupiter.api.Assertions.assertTrue(msg.contains("op-X"), msg);
+        org.junit.jupiter.api.Assertions.assertTrue(msg.contains("SYNC_V1"), msg);
+        org.junit.jupiter.api.Assertions.assertTrue(msg.contains("ASYNC_V2"), msg);
+    }
+
+    /**
+     * E8-H4 regression: dispose-time removal of the path slot lets a job redeploy on the same
+     * {@code (jobID, operatorIdentifier)} re-register WITH A DIFFERENT PATH. The pre-fix static
+     * map had no remove hook, so a V1→V2 toggle on redeploy would crash with a misleading
+     * "previously observed" error even though the prior backend was disposed.
+     */
+    @Test
+    void removeBackendPathPermitsRedeployUnderDifferentPath() {
+        JobID job = new JobID();
+        ForStRsBackendPathInvariant.recordBackendPath(
+                job, "op-redeploy", ForStRsBackendPathInvariant.Path.SYNC_V1);
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.SYNC_V1,
+                ForStRsBackendPathInvariant.observedPathForTests(job, "op-redeploy"));
+        // Backend.dispose() releases the slot.
+        ForStRsBackendPathInvariant.removeBackendPath(job, "op-redeploy");
+        assertNull(ForStRsBackendPathInvariant.observedPathForTests(job, "op-redeploy"));
+        // Redeploy under V2 — must not throw.
+        assertDoesNotThrow(
+                () ->
+                        ForStRsBackendPathInvariant.recordBackendPath(
+                                job,
+                                "op-redeploy",
+                                ForStRsBackendPathInvariant.Path.ASYNC_V2));
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.ASYNC_V2,
+                ForStRsBackendPathInvariant.observedPathForTests(job, "op-redeploy"));
+    }
+
+    /**
+     * Legacy single-arg path remains backwards compatible: tests / non-runtime callers that
+     * never had a JobID see the same observation behaviour as before E8-H4 — they implicitly
+     * key the slot under a synthetic {@code null} job id that cannot collide with a runtime
+     * (real JobID) record.
+     */
+    @Test
+    void legacySingleArgPathDoesNotCollideWithRuntimeKeyedEntries() {
+        JobID job = new JobID();
+        // Runtime path records under (job, "op-shared")
+        ForStRsBackendPathInvariant.recordBackendPath(
+                job, "op-shared", ForStRsBackendPathInvariant.Path.ASYNC_V2);
+        // Legacy path records under (null, "op-shared") — different key, no collision.
+        assertDoesNotThrow(
+                () ->
+                        ForStRsBackendPathInvariant.recordBackendPath(
+                                "op-shared", ForStRsBackendPathInvariant.Path.SYNC_V1));
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.ASYNC_V2,
+                ForStRsBackendPathInvariant.observedPathForTests(job, "op-shared"));
+        assertEquals(
+                ForStRsBackendPathInvariant.Path.SYNC_V1,
+                ForStRsBackendPathInvariant.observedPathForTests("op-shared"));
     }
 }

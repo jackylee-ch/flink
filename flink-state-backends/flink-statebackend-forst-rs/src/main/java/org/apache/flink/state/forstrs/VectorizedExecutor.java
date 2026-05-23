@@ -921,46 +921,63 @@ public class VectorizedExecutor implements StateExecutor {
         ColumnarBatchBuffer valBuf = buffer.valueBuffer(); // B6-H1: heap-path value column
         List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
         List<CompletableFuture<Void>> futures = buffer.futures();
-        // B6-H4: lift the per-row List.get(row) interface dispatch onto a flattened scratch array
-        // via the same exponential-grow pattern as flattenHeapFutures. Reused across batches.
-        MemorySegment[] scratchSlices = flattenValueSlices(valueSliceLists);
-        // B6-H5: index-based completion loop — flatten the per-row futures list into a primitive
-        // array so the OK / error completion loops below don't allocate an ArrayList.Itr.
-        CompletableFuture<Void>[] futuresArr = flattenHeapFutures(futures);
 
-        // A6-H3 / B6-H2 / D6-H1: per-batch Arena.ofConfined so opsOffSeg + opsDataSeg
-        // segments are reclaimed deterministically when the dispatch returns. The FFI
-        // call (frs_vec_merge_append_batch) is synchronous — engine copies the bytes
-        // into the WriteBatch before returning, so the scratch is safe to close. This
-        // replaces the previous "allocate from executor arena" path that caused
-        // monotonic growth at the audited rate of ~MB/s on a 10K-batch/s stream.
-        // B5-H7: opsOffsets uses the reusable scratchOpsOffsets field (grows on demand)
-        // so we don't `new int[count+1]` per dispatch; only the MemorySegment scratch
-        // moves to per-batch confined.
-        // Compute total ops byte size and per-row offset.
-        int[] opsOffsets = ensureScratchOpsOffsets(count + 1);
-        int opsTotal = 0;
-        MemorySegment valOffSeg = valBuf.offsetsSegment();
-        for (int row = 0; row < count; row++) {
-            MemorySegment vs = scratchSlices[row];
-            int opLen;
-            if (vs == null) {
-                // B6-H1: value lives in valBuf at this index — use its offset delta as the size.
-                int vStart = valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-                int vEnd = valOffSeg.get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                opLen = vEnd - vStart;
-            } else {
-                opLen = (int) vs.byteSize();
-            }
-            opsOffsets[row] = opsTotal;
-            opsTotal += opLen;
-        }
-        opsOffsets[count] = opsTotal;
-
+        // A8-M2: widen the try/catch added by A7-H1 to cover ALL allocation + dispatch work,
+        // including {@link #flattenValueSlices}, {@link #flattenHeapFutures}, {@link
+        // #ensureScratchOpsOffsets}, and the per-row opsTotal sizing loop. Any of these can
+        // throw (OOM on the exponential-grow scratch arrays, panic upcalls from native code
+        // touching valBuf, IndexOutOfBoundsException on malformed offsets). If they throw
+        // BEFORE the inner try fires, the row futures held in {@code futures} are NEVER
+        // completed and AsyncExecutionController hangs. Drain from the original {@code
+        // futures} List on the early-throw path (futuresArr may not have been built yet);
+        // once futuresArr is populated, prefer it because it's already a flat array.
+        CompletableFuture<Void>[] futuresArr = null;
         int rc;
         FrsErrorCode code;
         try (Arena scratch = Arena.ofConfined()) {
             try {
+                // B6-H4: lift the per-row List.get(row) interface dispatch onto a flattened
+                // scratch array via the same exponential-grow pattern as flattenHeapFutures.
+                // Reused across batches.
+                MemorySegment[] scratchSlices = flattenValueSlices(valueSliceLists);
+                // B6-H5: index-based completion loop — flatten the per-row futures list into
+                // a primitive array so the OK / error completion loops below don't allocate
+                // an ArrayList.Itr.
+                futuresArr = flattenHeapFutures(futures);
+
+                // A6-H3 / B6-H2 / D6-H1: per-batch Arena.ofConfined so opsOffSeg + opsDataSeg
+                // segments are reclaimed deterministically when the dispatch returns. The FFI
+                // call (frs_vec_merge_append_batch) is synchronous — engine copies the bytes
+                // into the WriteBatch before returning, so the scratch is safe to close. This
+                // replaces the previous "allocate from executor arena" path that caused
+                // monotonic growth at the audited rate of ~MB/s on a 10K-batch/s stream.
+                // B5-H7: opsOffsets uses the reusable scratchOpsOffsets field (grows on demand)
+                // so we don't `new int[count+1]` per dispatch; only the MemorySegment scratch
+                // moves to per-batch confined.
+                // Compute total ops byte size and per-row offset.
+                int[] opsOffsets = ensureScratchOpsOffsets(count + 1);
+                int opsTotal = 0;
+                MemorySegment valOffSeg = valBuf.offsetsSegment();
+                for (int row = 0; row < count; row++) {
+                    MemorySegment vs = scratchSlices[row];
+                    int opLen;
+                    if (vs == null) {
+                        // B6-H1: value lives in valBuf at this index — use its offset delta
+                        // as the size.
+                        int vStart =
+                                valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                        int vEnd =
+                                valOffSeg.get(
+                                        ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                        opLen = vEnd - vStart;
+                    } else {
+                        opLen = (int) vs.byteSize();
+                    }
+                    opsOffsets[row] = opsTotal;
+                    opsTotal += opLen;
+                }
+                opsOffsets[count] = opsTotal;
+
                 MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
                 MemorySegment opsDataSeg =
                         opsTotal == 0 ? MemorySegment.NULL : scratch.allocate(opsTotal);
@@ -1026,10 +1043,26 @@ public class VectorizedExecutor implements StateExecutor {
                 // pending futures exceptionally before re-raising, mirroring the
                 // per-row path's pattern. The outer try-with-resources closes
                 // `scratch` in its finally before the throw escapes.
-                for (int r = 0; r < count; r++) {
-                    CompletableFuture<Void> f = futuresArr[r];
-                    if (f != null && !f.isDone()) {
-                        f.completeExceptionally(t);
+                //
+                // A8-M2 widening: futuresArr may still be {@code null} if the throw came from
+                // {@link #flattenValueSlices} or {@link #flattenHeapFutures} itself (the
+                // latter constructs and returns futuresArr — a partial assignment is not
+                // possible at the source level). In that case, drain from the original
+                // List<CompletableFuture> the caller handed us.
+                if (futuresArr != null) {
+                    for (int r = 0; r < count; r++) {
+                        CompletableFuture<Void> f = futuresArr[r];
+                        if (f != null && !f.isDone()) {
+                            f.completeExceptionally(t);
+                        }
+                    }
+                } else {
+                    int sz = futures.size();
+                    for (int r = 0; r < sz; r++) {
+                        CompletableFuture<Void> f = futures.get(r);
+                        if (f != null && !f.isDone()) {
+                            f.completeExceptionally(t);
+                        }
                     }
                 }
                 if (metrics != null) {

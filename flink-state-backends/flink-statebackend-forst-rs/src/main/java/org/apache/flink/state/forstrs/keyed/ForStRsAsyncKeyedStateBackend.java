@@ -264,6 +264,27 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private boolean disposed = false;
 
     /**
+     * E8-H4: identity of the (JobID, operatorIdentifier) slot this backend occupies in
+     * {@link ForStRsBackendPathInvariant}. Captured at factory time and used on {@link
+     * #dispose()} to release the slot so a subsequent job redeploy / restart on the same
+     * operator can re-register without a false-positive cross-path violation. {@code null} if
+     * the factory did not wire the identity (tests, non-runtime construction).
+     */
+    private org.apache.flink.api.common.JobID backendPathJobId;
+
+    private String backendPathOperatorId;
+
+    /**
+     * E8-H4: wire the {@link ForStRsBackendPathInvariant} identity so {@link #dispose()} can
+     * release the slot. Called once by the factory site immediately after construction.
+     */
+    public void setBackendPathIdentity(
+            org.apache.flink.api.common.JobID jobId, String operatorIdentifier) {
+        this.backendPathJobId = jobId;
+        this.backendPathOperatorId = operatorIdentifier;
+    }
+
+    /**
      * Tracks the current key on the operator's mailbox thread (PR-A4 / S1-5 fix).
      *
      * <p>Flink's async-state V2 routes per-record keys through {@link RecordContext}; the runtime
@@ -1193,12 +1214,18 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         ForStRsSnapshotStrategy s = snapshotStrategy;
         ForStRsSstRegistry reg = sstRegistry;
         if (s != null && reg != null) {
-            var regs = s.takePendingRegistrations(id);
+            var regs = s.takePendingRegistrationsForAbort(id);
             if (regs != null) {
                 for (var hlp : regs) {
                     reg.unregister(
                             new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
                 }
+            }
+            // E8-H2 post-abort drain: catch any entries that landed after the initial take.
+            var late = s.drainLatePendingRegistrations(id);
+            for (var hlp : late) {
+                reg.unregister(
+                        new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
             }
         }
     }
@@ -1309,6 +1336,18 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             cancelStreamRegistry.close();
         } catch (IOException ignored) {
             // best-effort close on dispose
+        }
+        // E8-H4: release the path-invariant slot so a subsequent job redeploy / restart on the
+        // same (jobId, operatorIdentifier) can re-register without a false-positive cross-path
+        // block. Best-effort — never throws to the caller.
+        if (backendPathOperatorId != null) {
+            try {
+                ForStRsBackendPathInvariant.removeBackendPath(
+                        backendPathJobId, backendPathOperatorId);
+            } catch (Throwable ignored) {
+            }
+            backendPathOperatorId = null;
+            backendPathJobId = null;
         }
     }
 

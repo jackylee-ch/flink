@@ -142,6 +142,17 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
      * {@link IteratorEntryView} (wrapping a small heap {@link MemorySegment}) so it can feed the
      * unified view-based {@link #completeWithEntries} decoder.
      */
+    /**
+     * E8-H3: completes the underlying {@code InternalAsyncFuture} with a failure so the
+     * runtime mailbox unblocks when the executor catches a throw before completing the
+     * iterator normally.
+     */
+    @SuppressWarnings("unchecked")
+    public void completeExceptionally(Throwable t) {
+        ((InternalAsyncFuture<Object>) (InternalAsyncFuture<?>) request.getFuture())
+                .completeExceptionally("ITER request failed", t);
+    }
+
     @SuppressWarnings("unchecked")
     public void completeBatch(
             ForStRsLinker.IteratorEntry[] entries,

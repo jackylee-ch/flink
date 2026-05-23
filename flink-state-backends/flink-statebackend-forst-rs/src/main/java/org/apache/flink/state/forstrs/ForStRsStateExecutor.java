@@ -55,13 +55,37 @@ public class ForStRsStateExecutor implements StateExecutor {
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
         ForStRsStateRequestClassifier classifier = (ForStRsStateRequestClassifier) container;
+        // E8-H3: track which phase failed and how many requests inside that phase already
+        // completed successfully BEFORE the throw, so the drain only completes tails that
+        // were left dangling. Calling completeExceptionally on an already-completed Flink
+        // InternalAsyncFuture invokes the framework exceptionHandler — that would raise a
+        // spurious task fail. AsyncExecutionController.executeBatchRequests discards the
+        // returned failedFuture, so the per-StateRequest tail futures are what the runtime
+        // mailbox joins on. Pattern mirrors VectorizedExecutor.dispatchAppendMergeBatch.
+        List<ForStRsDBGetRequest<?, ?, ?>> gets = classifier.getGetRequests();
+        List<ForStRsDBPutRequest<?, ?, ?>> puts = classifier.getPutRequests();
+        List<ForStRsDBIterRequest<?, ?, ?, ?>> iters = classifier.getIterRequests();
+        int getsCompleted = 0;
+        int putsCompleted = 0;
+        int itersCompleted = 0;
         try {
-            executeGets(classifier.getGetRequests());
-            executePuts(classifier.getPutRequests());
-            executeIters(classifier.getIterRequests());
+            getsCompleted = executeGets(gets);
+            putsCompleted = executePuts(puts);
+            itersCompleted = executeIters(iters);
             return CompletableFuture.completedFuture(null);
-        } catch (Exception e) {
-            return CompletableFuture.failedFuture(e);
+        } catch (Throwable t) {
+            drainTailExceptionally(
+                    gets,
+                    getsCompleted,
+                    puts,
+                    putsCompleted,
+                    iters,
+                    itersCompleted,
+                    t);
+            if (t instanceof Error) {
+                throw (Error) t;
+            }
+            return CompletableFuture.failedFuture(t);
         }
     }
 
@@ -84,9 +108,53 @@ public class ForStRsStateExecutor implements StateExecutor {
 
     public void flushDirty() {}
 
-    private void executeGets(List<ForStRsDBGetRequest<?, ?, ?>> gets) {
+    /**
+     * E8-H3: drain only the requests whose tail futures were NOT yet completed when the
+     * phase threw. Requests already completed by an earlier phase (or by the earlier rows
+     * of the failing phase) are skipped so we don't double-complete and trigger the
+     * framework exceptionHandler twice.
+     */
+    private void drainTailExceptionally(
+            List<ForStRsDBGetRequest<?, ?, ?>> gets,
+            int getsCompleted,
+            List<ForStRsDBPutRequest<?, ?, ?>> puts,
+            int putsCompleted,
+            List<ForStRsDBIterRequest<?, ?, ?, ?>> iters,
+            int itersCompleted,
+            Throwable t) {
+        for (int i = getsCompleted; i < gets.size(); i++) {
+            try {
+                gets.get(i).completeExceptionally(t);
+            } catch (RuntimeException ignored) {
+                // exceptionHandler.handleException may throw; swallow secondary so the
+                // original cause propagates.
+            }
+        }
+        for (int i = putsCompleted; i < puts.size(); i++) {
+            try {
+                puts.get(i).completeExceptionally(t);
+            } catch (RuntimeException ignored) {
+                // see above
+            }
+        }
+        for (int i = itersCompleted; i < iters.size(); i++) {
+            try {
+                iters.get(i).completeExceptionally(t);
+            } catch (RuntimeException ignored) {
+                // see above
+            }
+        }
+    }
+
+    /**
+     * Returns the number of requests whose tail future was successfully completed. If the
+     * FFI call throws before completion, returns 0 (no per-row completion happened). If a
+     * later phase throws, the caller skips the first {@code getsCompleted} rows during
+     * drain so they are not double-completed.
+     */
+    private int executeGets(List<ForStRsDBGetRequest<?, ?, ?>> gets) {
         if (gets.isEmpty()) {
-            return;
+            return 0;
         }
         int count = gets.size();
         byte[][] keys = new byte[count][];
@@ -94,14 +162,17 @@ public class ForStRsStateExecutor implements StateExecutor {
             keys[i] = gets.get(i).getSerializedKey();
         }
         byte[][] results = linker.batchGetArrow(db, cf, keys);
+        // E8-H3: complete row-by-row so a deserialization throw mid-loop leaves a precise
+        // completed-count for the drain.
         for (int i = 0; i < count; i++) {
             gets.get(i).complete(results[i]);
         }
+        return count;
     }
 
-    private void executePuts(List<ForStRsDBPutRequest<?, ?, ?>> puts) {
+    private int executePuts(List<ForStRsDBPutRequest<?, ?, ?>> puts) {
         if (puts.isEmpty()) {
-            return;
+            return 0;
         }
         List<byte[]> putKeys = new ArrayList<>();
         List<byte[]> putValues = new ArrayList<>();
@@ -121,14 +192,20 @@ public class ForStRsStateExecutor implements StateExecutor {
         for (int i = 0; i < puts.size(); i++) {
             puts.get(i).complete();
         }
+        return puts.size();
     }
 
-    private void executeIters(List<ForStRsDBIterRequest<?, ?, ?, ?>> iters) {
+    private int executeIters(List<ForStRsDBIterRequest<?, ?, ?, ?>> iters) {
         if (iters.isEmpty()) {
-            return;
+            return 0;
         }
+        // E8-H3: process row-by-row; if iter.process throws on row k, the drain completes
+        // rows [k, size) exceptionally. Rows [0, k) are already completed inside process.
+        int completed = 0;
         for (ForStRsDBIterRequest<?, ?, ?, ?> iter : iters) {
             iter.process(linker, db, cf, arena);
+            completed++;
         }
+        return completed;
     }
 }

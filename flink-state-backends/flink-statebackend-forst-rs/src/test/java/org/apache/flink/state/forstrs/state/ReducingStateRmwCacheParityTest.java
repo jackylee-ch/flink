@@ -139,8 +139,8 @@ class ReducingStateRmwCacheParityTest {
             // Cache path: tryFold on hit; on miss, simulate asyncGetInternal returning null and
             // populate. This is the exact code path of ForStRsAsyncReducingStateV2#asyncAdd's
             // override.
-            var hit = cache.tryFold(composite, value);
-            if (hit.isEmpty()) {
+            // B8-H1: tryFold returns boolean.
+            if (!cache.tryFold(composite, value)) {
                 cache.put(composite, value);
             }
         }

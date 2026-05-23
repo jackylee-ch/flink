@@ -480,8 +480,14 @@ public class ForStRsRestoreOperation {
         // instances, and the post-try resource-management block (which builds {@code
         // sources} and closes them on its own finally) is unreachable when we throw.
         boolean joinSucceeded = false;
+        // A8-H6 / D8-H3: hold the futures list at method scope so the finally block can
+        // iterate any slots that completed AFTER we decided to fail (shutdownNow interrupts
+        // in-flight workers, but a Callable that already returned an OpenSourceDb before the
+        // interrupt landed will still hold a native FrsDb / FrsCfHandle. Without inspecting
+        // those slots post-termination, those handles leak.
+        List<Future<OpenSourceDb>> futuresOuter = new ArrayList<>(handles.size());
         try {
-            List<Future<OpenSourceDb>> futures = new ArrayList<>(handles.size());
+            List<Future<OpenSourceDb>> futures = futuresOuter;
             for (int i = 0; i < handles.size(); i++) {
                 final ForStRsIncrementalKeyedStateHandle h = handles.get(i);
                 final Path subDir = targetDir.resolve("_restore_src_" + i);
@@ -530,9 +536,40 @@ public class ForStRsRestoreOperation {
             joinSucceeded = true;
         } finally {
             if (!joinSucceeded) {
-                // A7-M3: close eagerly so native FrsDb / FrsCfHandle leak is contained. Close
-                // BEFORE shutdown so the native side tears down with the executor still alive
-                // in case any close() path needs to schedule work.
+                // A8-H6 / D8-H3: A7-M3 left {@code shutdown()} here, which only stops accepting
+                // new tasks — in-flight workers past the failure index continue running and may
+                // open additional {@link OpenSourceDb} instances. Since the join loop has
+                // already iterated past those slots, the native handles would leak. Force
+                // interrupt with {@code shutdownNow()} + {@code awaitTermination(5s)} (mirrors
+                // E5-HIGH-2 in the parallel SST download path) and ONLY THEN sweep the futures
+                // array to close any sources that managed to complete despite the interrupt.
+                restoreExec.shutdownNow();
+                try {
+                    restoreExec.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {
+                    Thread.currentThread().interrupt();
+                }
+                // After termination, any future that finished (isDone && !isCancelled) holds
+                // an OpenSourceDb the join loop never saw. Close them.
+                for (int i = 0; i < futuresOuter.size(); i++) {
+                    if (sourcesArr[i] != null) {
+                        // Already discovered by the join loop — close below in the unified sweep.
+                        continue;
+                    }
+                    Future<OpenSourceDb> f = futuresOuter.get(i);
+                    if (f.isDone() && !f.isCancelled()) {
+                        try {
+                            sourcesArr[i] = f.get();
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        } catch (ExecutionException ignored) {
+                            // Worker failed — nothing to close for this slot.
+                        }
+                    }
+                }
+                // Close eagerly so native FrsDb / FrsCfHandle leak is contained. The
+                // post-try resource-management block (which builds {@code sources} and closes
+                // them on its own finally) is unreachable when we throw.
                 for (OpenSourceDb s : sourcesArr) {
                     if (s != null) {
                         try {
@@ -543,8 +580,10 @@ public class ForStRsRestoreOperation {
                         }
                     }
                 }
+            } else {
+                // Success path: drain the executor gracefully.
+                restoreExec.shutdown();
             }
-            restoreExec.shutdown();
         }
         List<OpenSourceDb> sources = new ArrayList<>(handles.size());
         for (OpenSourceDb s : sourcesArr) {

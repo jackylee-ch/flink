@@ -25,8 +25,10 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -152,6 +154,112 @@ class ArrowTimerBufferTest {
             int found2 = buf.find(scratch, 0L, len);
             assertNotEquals(-1, found2);
             assertEquals(50L, buf.tsAt(found2));
+        }
+    }
+
+    /**
+     * D8-H4: resize() must roll back cleanly when an allocate() throws on the new arena. Verifies:
+     * <ul>
+     *   <li>the failed newArena was closed (no native leak),
+     *   <li>the buffer's old arena is still alive (instance state pristine),
+     *   <li>the buffer remains fully functional — subsequent insert / drain succeed.
+     * </ul>
+     */
+    @Test
+    void resizeRollsBackOnAllocFailure() {
+        try (ArrowTimerBuffer buf = new ArrowTimerBuffer(16, 1024)) {
+            // Pre-populate up to initial capacity so the NEXT insertAdd triggers a resize.
+            int initialCap = buf.capacity();
+            for (int i = 0; i < initialCap; i++) {
+                scratch.set(ValueLayout.JAVA_INT, 0L, i);
+                buf.insertAdd(scratch, 0L, 4, 100L + i);
+            }
+            assertEquals(initialCap, buf.size());
+            Arena oldArena = buf.arenaForTest();
+            int snapshotSize = buf.size();
+
+            // Inject a faulty Arena supplier — second allocate() on the new arena (i.e. keyData
+            // allocate inside resize) throws. Track the produced arena so we can verify it gets
+            // closed by the rollback path.
+            List<Arena> producedArenas = new ArrayList<>();
+            buf.setArenaSupplierForTest(
+                    () -> {
+                        Arena failing = new FailingArena(Arena.ofShared(), 2);
+                        producedArenas.add(failing);
+                        return failing;
+                    });
+
+            // The very next insert sees size >= capacity → resize → throws.
+            scratch.set(ValueLayout.JAVA_INT, 0L, 9000);
+            Throwable observed = null;
+            try {
+                buf.insertAdd(scratch, 0L, 4, 200L);
+            } catch (Throwable t) {
+                observed = t;
+            }
+            assertNotEquals(null, observed, "resize() should have propagated the alloc failure");
+            assertTrue(
+                    observed instanceof OutOfMemoryError,
+                    "expected OutOfMemoryError, got " + observed);
+
+            // The faulty arena must have been closed exactly once by the rollback path.
+            assertEquals(1, producedArenas.size(), "supplier should fire exactly once");
+            assertFalse(
+                    producedArenas.get(0).scope().isAlive(),
+                    "failed newArena must be closed by the rollback path");
+
+            // The buffer's instance arena must still point at the original (old) arena and be
+            // alive — the rollback path must not have swapped any field.
+            assertTrue(oldArena.scope().isAlive(), "old arena must remain alive after rollback");
+            assertEquals(oldArena, buf.arenaForTest(), "arena field must not have been swapped");
+            assertEquals(snapshotSize, buf.size(), "size must not have been touched");
+            assertEquals(initialCap, buf.capacity(), "capacity must not have been touched");
+
+            // Restore the default supplier so a real grow can happen on the next insert.
+            buf.setArenaSupplierForTest(Arena::ofShared);
+
+            // The buffer must still be fully functional — insert succeeds (now triggers a real
+            // resize on the same insertAdd path).
+            scratch.set(ValueLayout.JAVA_INT, 0L, 9999);
+            buf.insertAdd(scratch, 0L, 4, 50L);
+            assertEquals(snapshotSize + 1, buf.size(), "post-rollback insert should succeed");
+            // Min-heap root is now the new entry with ts=50.
+            assertEquals(50L, buf.tsAt(0));
+        }
+    }
+
+    /**
+     * Wrapper {@link Arena} whose {@link #allocate(long, long)} throws an OutOfMemoryError on the
+     * N-th call (1-indexed). Used by {@link #resizeRollsBackOnAllocFailure} to simulate mid-resize
+     * allocation failure.
+     */
+    private static final class FailingArena implements Arena {
+        private final Arena delegate;
+        private final AtomicInteger calls = new AtomicInteger(0);
+        private final int failOnCall;
+
+        FailingArena(Arena delegate, int failOnCall) {
+            this.delegate = delegate;
+            this.failOnCall = failOnCall;
+        }
+
+        @Override
+        public MemorySegment allocate(long byteSize, long byteAlignment) {
+            int n = calls.incrementAndGet();
+            if (n == failOnCall) {
+                throw new OutOfMemoryError("FailingArena: forced failure on call " + n);
+            }
+            return delegate.allocate(byteSize, byteAlignment);
+        }
+
+        @Override
+        public MemorySegment.Scope scope() {
+            return delegate.scope();
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
         }
     }
 

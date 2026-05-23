@@ -89,4 +89,15 @@ public non-sealed class ForStRsDBPutRequest<K, N, V> implements VectorizedStateR
         ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>) request.getFuture())
                 .complete(null);
     }
+
+    /**
+     * E8-H3: completes the underlying {@code InternalAsyncFuture} with a failure so the
+     * runtime mailbox unblocks when the executor catches a throw before calling {@link
+     * #complete()}.
+     */
+    @SuppressWarnings("unchecked")
+    public void completeExceptionally(Throwable t) {
+        ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>) request.getFuture())
+                .completeExceptionally("PUT request failed", t);
+    }
 }

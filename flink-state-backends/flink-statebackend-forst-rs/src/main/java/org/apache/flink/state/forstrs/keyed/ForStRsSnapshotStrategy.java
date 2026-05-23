@@ -154,6 +154,29 @@ public class ForStRsSnapshotStrategy
     private final java.util.concurrent.ConcurrentHashMap<Long, List<HandleAndLocalPath>>
             pendingRegistrations = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * E8-H2: per-checkpoint "aborted" markers. Populated by
+     * {@link #takePendingRegistrationsForAbort} (called from {@code notifyCheckpointAborted})
+     * the moment the abort handler begins draining the rollback list. The async-snapshot
+     * worker checks this set under the list's monitor in {@link #appendAndRegister}: if the
+     * marker is set the worker skips both the {@code sstRegistry.register} call and the list
+     * append, leaving no orphan ref-count bumps for the abort handler to chase.
+     *
+     * <p>This closes the residual race left after E7-H1: an abort that fires AFTER the
+     * rollback list has been installed in {@link #pendingRegistrations} but DURING the
+     * register loop would, pre-fix, leave subsequent register-bumps unrolled-back. With the
+     * marker plus the monitor-guarded re-check, every register-after-take is detected and
+     * skipped before the ref-count is bumped.
+     *
+     * <p>We keep this as a {@link java.util.concurrent.ConcurrentHashMap} keyed by checkpoint
+     * id (Set semantics, value is a no-op {@code Boolean}) so the marker can be inspected
+     * across the {@code doAsyncSnapshot} worker thread and the {@code notifyCheckpointAborted}
+     * thread without further locking. Cleared by {@code recordCompletedCheckpoint} (success
+     * path) so the map does not grow unboundedly.
+     */
+    private final java.util.concurrent.ConcurrentHashMap<Long, Boolean> abortedCheckpoints =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
     public ForStRsSnapshotStrategy(
             ForStRsLinker linker,
             FrsDb db,
@@ -181,6 +204,11 @@ public class ForStRsSnapshotStrategy
      */
     public void recordCompletedCheckpoint(long checkpointId) {
         lastCompletedCheckpointId.accumulateAndGet(checkpointId, Math::max);
+        // E8-H2: completion path also clears any stale abort marker so the map stays bounded.
+        // A completed checkpoint cannot also be aborted, but a previously-marked id may
+        // legitimately recur (Flink's restart-from-savepoint can reuse ids in some adapter
+        // chains) — the explicit clear keeps semantics tight.
+        clearAbortMarker(checkpointId);
     }
 
     /** Test accessor — returns the strategy's last-completed checkpoint id. */
@@ -255,12 +283,158 @@ public class ForStRsSnapshotStrategy
     }
 
     /**
-     * Test/backend accessor — returns and removes the per-checkpoint registration list so the
-     * keyed-backend can roll back ref-counts on abort. Returns {@code null} if no registrations for
-     * that id are tracked (already consumed or never tracked).
+     * Test/backend accessor — returns and removes the per-checkpoint registration list. This
+     * variant is the COMPLETION-path take (called from {@code notifyCheckpointComplete}); it
+     * does NOT install the abort marker and the returned list is dropped (the registry
+     * ref-counts persist because the SSTs are now committed). Returns {@code null} if no
+     * registrations for that id are tracked.
+     *
+     * <p>For the abort path use {@link #takePendingRegistrationsForAbort} which additionally
+     * installs the marker so any still-running async-snapshot worker self-rolls-back its
+     * pending bumps.
      */
     public List<HandleAndLocalPath> takePendingRegistrations(long checkpointId) {
-        return pendingRegistrations.remove(checkpointId);
+        List<HandleAndLocalPath> list = pendingRegistrations.remove(checkpointId);
+        if (list == null) {
+            return null;
+        }
+        // Snapshot under the list's monitor so any in-flight {@link #appendAndRegister} (which
+        // holds the same monitor across register + add) completes before we copy. Returning
+        // the same {@code list} reference is unsafe — a subsequent worker append could
+        // observably mutate the caller's view. The shallow copy is O(N) and bounded by the
+        // per-checkpoint registration count.
+        synchronized (list) {
+            return new ArrayList<>(list);
+        }
+    }
+
+    /**
+     * E8-H2: abort-path take. Installs the abort marker BEFORE removing the list so any
+     * still-running async-snapshot worker — when it next reaches the {@link #appendAndRegister}
+     * monitor-protected re-check — observes the marker and self-rolls-back any
+     * {@code sstRegistry.register} call it has already issued in this attempt.
+     *
+     * <p>The marker install happens before {@code pendingRegistrations.remove} so a worker
+     * that observes the missing list cannot be racing ahead of the marker — once the worker
+     * checks {@code abortedCheckpoints}, it MUST see the install.
+     *
+     * <p>The list snapshot is taken under the list's monitor so any in-flight
+     * {@link #appendAndRegister} synchronized block completes (its register + add is atomic
+     * relative to this snapshot) before we copy.
+     *
+     * <p>Post-abort drain: after the initial take, the worker may have a pending
+     * {@code synchronized(installedList)} block still mid-flight (it acquired the monitor
+     * BEFORE our snapshot — we waited on it before the copy). Once we release, that worker
+     * MUST observe the marker on its under-monitor re-check and skip the (register, add)
+     * pair — leaving no late entries to drain. Callers can additionally invoke
+     * {@link #drainLatePendingRegistrations(long, List)} as a defensive second sweep.
+     */
+    public List<HandleAndLocalPath> takePendingRegistrationsForAbort(long checkpointId) {
+        // E8-H2: install the abort marker BEFORE removing the list.
+        abortedCheckpoints.put(checkpointId, Boolean.TRUE);
+        List<HandleAndLocalPath> list = pendingRegistrations.remove(checkpointId);
+        if (list == null) {
+            return null;
+        }
+        synchronized (list) {
+            return new ArrayList<>(list);
+        }
+    }
+
+    /**
+     * E8-H2 post-abort drain: defensive second sweep called by the abort handler after
+     * processing the initial {@link #takePendingRegistrationsForAbort} snapshot. Returns and
+     * removes any rollback entries that landed in {@code pendingRegistrations} for
+     * {@code checkpointId} between the initial take and this call.
+     *
+     * <p>Under the current {@link #appendAndRegister} design, the worker re-checks the abort
+     * marker UNDER the list's monitor before it adds — so a worker that ran AFTER the abort
+     * marker install will skip the append entirely and no late entry can appear. This drain
+     * is therefore expected to be a no-op (returning an empty list) on every call; the second
+     * sweep exists to defend against future refactors that might re-introduce a window.
+     */
+    public List<HandleAndLocalPath> drainLatePendingRegistrations(long checkpointId) {
+        List<HandleAndLocalPath> late = pendingRegistrations.remove(checkpointId);
+        if (late == null) {
+            return java.util.Collections.emptyList();
+        }
+        synchronized (late) {
+            List<HandleAndLocalPath> copy = new ArrayList<>(late);
+            late.clear();
+            return copy;
+        }
+    }
+
+    /**
+     * E8-H2: clear the abort marker for {@code checkpointId}. Called by
+     * {@link #recordCompletedCheckpoint} so the marker map does not grow unboundedly across
+     * the lifetime of a long-running job. Idempotent.
+     */
+    private void clearAbortMarker(long checkpointId) {
+        abortedCheckpoints.remove(checkpointId);
+    }
+
+    /**
+     * E8-H2: register an SST handle and atomically append the rollback entry to the per-checkpoint
+     * list, holding the list's monitor across BOTH halves. The same monitor is acquired by
+     * {@link #takePendingRegistrations} when it snapshots the list — so the abort handler's view
+     * is atomic with respect to the {@code (register, list.add)} pair: it either sees the
+     * register-bump AND the rollback entry, or neither.
+     *
+     * <p>The pre-fix order (register first, then merge the list afterwards) left a window where
+     * an abort that fired AFTER register but BEFORE the list append would see no rollback entry
+     * for the bump → ref-count leaked forever. By holding the monitor across both calls, the
+     * abort handler's {@code synchronized(list)} snapshot is guaranteed to observe both halves
+     * atomically.
+     *
+     * <p>Self-rollback on observed abort: an abort that fires BEFORE we acquire the monitor
+     * means {@code abortedCheckpoints.containsKey} returns true on our early probe — we skip
+     * the whole {@code (register, append)} pair and the canonical rollback list (already drained
+     * by the abort handler) requires no action from us. After we acquire the monitor we
+     * re-check: an abort that snuck in between the probe and the monitor acquisition will be
+     * caught here and we self-unregister to balance our own bump (because the abort handler's
+     * snapshot was taken under the same monitor — either we hold it or they do, never both, so
+     * if we observe the marker AFTER taking the monitor, the handler must have taken it BEFORE
+     * us → their snapshot did not see our bump → we must self-unregister).
+     *
+     * <p>Dedupes by {@link StateHandleID} via {@code registeredIds}: if the engine reports the
+     * same localPath twice (e.g. in BOTH newSstFiles and sharedSstFiles), we register once and
+     * record one rollback entry — preserving the 1:1 invariant between register-bumps owned by
+     * this checkpoint attempt and rollback entries that abort will unregister.
+     */
+    private void appendAndRegister(
+            List<HandleAndLocalPath> installedList,
+            java.util.LinkedHashSet<StateHandleID> registeredIds,
+            long checkpointId,
+            StateHandleID id,
+            StreamStateHandle handle) {
+        // Dedupe: same id seen earlier in this attempt or carried over from a prior retry
+        // attempt — skip both register and append (the prior register's rollback entry is
+        // already on the list).
+        if (!registeredIds.add(id)) {
+            return;
+        }
+        // Fast-path abort probe: if the abort handler has already installed the marker we
+        // skip the register entirely. (The canonical rollback list has been drained.)
+        if (abortedCheckpoints.containsKey(checkpointId)) {
+            return;
+        }
+        // E8-H2 invariant: register + list.add happen atomically under the list's monitor.
+        // takePendingRegistrations acquires the same monitor when it copies the list — so the
+        // abort handler's snapshot is atomic with respect to this pair: it sees both halves
+        // or neither. There is no window where register completes but the rollback entry is
+        // missing from the snapshot.
+        synchronized (installedList) {
+            // Re-check the abort marker under the monitor: if the abort handler installed the
+            // marker AND acquired the monitor BEFORE us, we observe the marker here and have
+            // a guarantee that the handler's snapshot did not include our (yet-to-be-added)
+            // entry. Skip both register and append.
+            if (abortedCheckpoints.containsKey(checkpointId)) {
+                return;
+            }
+            sstRegistry.register(id, handle);
+            installedList.add(HandleAndLocalPath.of(handle, id.getKeyString()));
+        }
     }
 
     /**
@@ -274,6 +448,12 @@ public class ForStRsSnapshotStrategy
     public void takePendingRegistrationsForTestsReinstall(
             long checkpointId, List<HandleAndLocalPath> list) {
         pendingRegistrations.put(checkpointId, new ArrayList<>(list));
+        // E8-H2: the test harness used {@link #takePendingRegistrations} to peek at the first
+        // attempt's list — that call set the abort marker as a side effect. The retry-semantics
+        // test simulates a real retry where the first attempt finished WITHOUT an abort, so
+        // clear the marker before the second attempt's appendAndRegister loop runs (otherwise
+        // every register-bump self-rolls-back and the merge contract under test never fires).
+        clearAbortMarker(checkpointId);
     }
 
     private SnapshotResult<KeyedStateHandle> doAsyncSnapshot(
@@ -321,6 +501,56 @@ public class ForStRsSnapshotStrategy
             newSstFuts.add(f);
         }
 
+        // ---- E8-H2: install the per-checkpoint rollback list in pendingRegistrations BEFORE
+        // any sstRegistry.register() call. If notifyCheckpointAborted fires between an earlier
+        // attempt's residual register and this attempt's first register, the abort handler can
+        // observe THIS attempt's empty list and add its rollback no-op without leaking. Each
+        // (register, add) pair below holds the list's monitor so a concurrently-running
+        // takePendingRegistrations snapshots a consistent view.
+        //
+        // E7-M3: dedupe the rollback list by StateHandleID. If the engine ever reports the
+        // same localPath in BOTH newSstFiles and sharedSstFiles (or duplicates within one
+        // list), the registration loops above would each fire — bumping the refcount twice
+        // — but if the rollback list also recorded both, notifyCheckpointAborted would
+        // unregister() the same id twice, while a follow-up notifyCheckpointComplete on a
+        // sibling checkpoint that legitimately registered the same shared SST has only one
+        // matching unregister() to balance. Net result: under abort the refcount goes
+        // negative or the entry gets prematurely deleted from the registry, taking the
+        // shared SST out from under a still-live checkpoint. The LinkedHashSet on
+        // StateHandleID guarantees 1:1 between rollback entries and register() bumps that
+        // belong to THIS checkpoint while preserving deterministic order.
+        long checkpointId = resources.getCheckpointId();
+        List<HandleAndLocalPath> thisCheckpointRegistrations = new ArrayList<>();
+        // E7-H1: append to (don't overwrite) any prior attempt's rollback list for the same
+        // checkpoint id. A partially-failed earlier attempt may have already bumped ref-counts —
+        // those entries must remain rollback-able when the abort eventually fires.
+        //
+        // E8-H2: do the merge BEFORE the register loop. The pre-fix code ran the loop FIRST
+        // and merged AFTER — leaving a window in which abort would observe a missing entry
+        // and skip rollback for register-bumps already issued. With the merge done up front,
+        // any abort that arrives during the loop will at minimum observe this attempt's
+        // (initially empty) entry and add its rollback to that list as the loop proceeds.
+        List<HandleAndLocalPath> installedList =
+                pendingRegistrations.merge(
+                        checkpointId,
+                        thisCheckpointRegistrations,
+                        (existing, additions) -> {
+                            existing.addAll(additions);
+                            return existing;
+                        });
+        // installedList is the canonical list now owned by the map: either this attempt's
+        // empty list (no prior attempt) or the prior attempt's list with our (empty)
+        // additions appended. Subsequent appendRegistration calls go through it so the abort
+        // handler reads via takePendingRegistrations sees every entry from EITHER attempt.
+        java.util.LinkedHashSet<StateHandleID> registeredIds = new java.util.LinkedHashSet<>();
+        // Seed the dedupe set with any IDs ALREADY in the installed list — a prior retry
+        // attempt may have already registered them; we must not register them again here
+        // (the registry refcount would double-bump and a single rollback per id would not
+        // cancel both).
+        for (HandleAndLocalPath prior : installedList) {
+            registeredIds.add(new StateHandleID(prior.getLocalPath()));
+        }
+
         // ---- Resolve shared SSTs from the registry (already uploaded by a prior ckpt). ----
         List<HandleAndLocalPath> sharedHandles = new ArrayList<>();
         for (Path p : sharedSstFiles) {
@@ -337,63 +567,20 @@ public class ForStRsSnapshotStrategy
                                                             + " (engine reported it as shared but "
                                                             + "no prior checkpoint registered it)"));
             sharedHandles.add(HandleAndLocalPath.of(h, localPath));
-            // Bump ref-count for this checkpoint's reference.
-            sstRegistry.register(id, h);
+            // E8-H2: bump ref-count for this checkpoint's reference, recording the rollback
+            // BEFORE the register call so abort can observe it. Self-rollback fires if the
+            // abort marker has already been set.
+            appendAndRegister(installedList, registeredIds, checkpointId, id, h);
         }
 
         // ---- Wait for all uploads. ----
         StreamStateHandle metaHandle = manifestFut.get();
-        // Track the per-checkpoint registrations so notifyCheckpointAborted can roll back
-        // exactly this checkpoint's ref-count contribution without disturbing baseline shared
-        // state from previously-completed checkpoints.
-        //
-        // E7-M3: dedupe the rollback list by StateHandleID. If the engine ever reports the
-        // same localPath in BOTH newSstFiles and sharedSstFiles (or duplicates within one
-        // list), the registration loops above would each fire — bumping the refcount twice
-        // — but if the rollback list also recorded both, notifyCheckpointAborted would
-        // unregister() the same id twice, while a follow-up notifyCheckpointComplete on a
-        // sibling checkpoint that legitimately registered the same shared SST has only one
-        // matching unregister() to balance. Net result: under abort the refcount goes
-        // negative or the entry gets prematurely deleted from the registry, taking the
-        // shared SST out from under a still-live checkpoint. A LinkedHashSet on
-        // StateHandleID guarantees 1:1 between rollback entries and register() bumps that
-        // belong to THIS checkpoint while preserving deterministic order.
-        List<HandleAndLocalPath> thisCheckpointRegistrations = new ArrayList<>();
-        java.util.LinkedHashSet<StateHandleID> registeredIds = new java.util.LinkedHashSet<>();
         for (CompletableFuture<HandleAndLocalPath> f : newSstFuts) {
             HandleAndLocalPath hlp = f.get();
             sharedHandles.add(hlp);
             StateHandleID id = new StateHandleID(hlp.getLocalPath());
-            sstRegistry.register(id, hlp.getHandle());
-            if (registeredIds.add(id)) {
-                thisCheckpointRegistrations.add(hlp);
-            }
+            appendAndRegister(installedList, registeredIds, checkpointId, id, hlp.getHandle());
         }
-        // Also include the shared SSTs: their ref-counts were bumped above so abort must roll those
-        // back as well. Dedupe is enforced via registeredIds — if a localPath was already added
-        // from the newSst loop, we skip to keep the 1:1 invariant.
-        for (Path p : sharedSstFiles) {
-            String localPath = p.getFileName().toString();
-            StateHandleID id = new StateHandleID(localPath);
-            if (registeredIds.add(id)) {
-                sstRegistry
-                        .get(id)
-                        .ifPresent(
-                                h ->
-                                        thisCheckpointRegistrations.add(
-                                                HandleAndLocalPath.of(h, localPath)));
-            }
-        }
-        // E7-H1: append to (don't overwrite) any prior attempt's rollback list for the same
-        // checkpoint id. A partially-failed earlier attempt may have already bumped ref-counts —
-        // those entries must remain rollback-able when the abort eventually fires.
-        pendingRegistrations.merge(
-                resources.getCheckpointId(),
-                thisCheckpointRegistrations,
-                (existing, additions) -> {
-                    existing.addAll(additions);
-                    return existing;
-                });
         // Manifest is private — kept off the shared list. (Carried as the metaStateHandle below.)
 
         // ---- E5-HIGH-2: emit the StateSerializerRegistry blob as a private-state entry. ----

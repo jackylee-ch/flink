@@ -42,7 +42,6 @@ import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.Optional;
 import java.util.function.BiConsumer;
 
 /**
@@ -210,8 +209,8 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         }
         int keyLen = writeCacheKeyToKeyOut();
         byte[] keyBuf = keyOut.getSharedBuffer();
-        Optional<V> hit = cache.tryFold(keyBuf, 0, keyLen, value);
-        if (hit.isPresent()) {
+        // B8-H1: tryFold returns boolean — no Optional wrapper per cache HIT.
+        if (cache.tryFold(keyBuf, 0, keyLen, value)) {
             return StateFutureUtils.completedVoidFuture();
         }
         // Cache miss — fetch existing accumulator from the engine, fold, populate cache. We

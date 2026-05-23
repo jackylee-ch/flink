@@ -20,7 +20,6 @@ package org.apache.flink.state.forstrs.cache;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 
@@ -30,11 +29,11 @@ import java.util.function.BiFunction;
  * <h3>Hit path</h3>
  *
  * <p>{@link #tryFold(byte[], Object)} combines the new input in-place on the operator thread, marks
- * the entry dirty, and returns the new accumulator. No engine I/O needed.
+ * the entry dirty, and returns {@code true}. No engine I/O needed.
  *
  * <h3>Miss path</h3>
  *
- * <p>Caller detects the miss via {@link #tryFold(byte[], Object)} returning empty and routes
+ * <p>Caller detects the miss via {@link #tryFold(byte[], Object)} returning {@code false} and routes
  * through {@link PendingMissTable} for convoy coalescing. Once the GET resolves, caller calls
  * {@link #put(byte[], Object)} to populate the cache entry.
  *
@@ -94,6 +93,31 @@ public final class ReducingAggregatingCache<IN, ACC> {
 
     /** Monitor guarding {@link #generations} for cross-thread reads from miss-resolve callbacks. */
     private final Object generationsLock = new Object();
+
+    /**
+     * E8-H1: pending-flush slot for evictions that fire while {@link #generationsLock} is held.
+     *
+     * <p>The LRU's {@code removeEldestEntry} hook runs inside {@code entries.put} — which we may
+     * be calling from inside {@link #putIfGen} under the {@code generationsLock}. Invoking the
+     * engine-PUT {@code flushCallback} directly from that hook would dispatch an FFI call (a
+     * potentially-blocking mailbox-stalling operation) WHILE the monitor is held. Any
+     * cross-thread {@code currentGen} read (e.g. from the async miss-resolve callback) would
+     * stall behind the engine PUT for an arbitrary duration.
+     *
+     * <p>Fix: when {@code removeEldestEntry} fires and the evicted entry is dirty, stash
+     * {@code (key, acc)} into this slot instead of flushing. The caller (the lock-holding
+     * method) reads + clears the slot after releasing the lock and dispatches the FFI flush
+     * then.
+     *
+     * <p>Single-slot is sufficient because each {@code entries.put} can evict at most one
+     * eldest entry (the LinkedHashMap LRU contract). Concurrent access to this field is
+     * impossible under the cache's single-mailbox-thread mutation contract: only one
+     * mailbox-thread mutator runs at a time, and the async miss-resolve callback only reads
+     * {@link #generations} (never {@link #entries}).
+     */
+    private BytesKey pendingFlushKey;
+
+    private ACC pendingFlushValue;
 
     /**
      * Cleanup-C3: per-cache reusable view of an externally-owned byte buffer slice. Used by the
@@ -160,7 +184,16 @@ public final class ReducingAggregatingCache<IN, ACC> {
                         if (size() > maxEntries) {
                             Entry<ACC> e = eldest.getValue();
                             if (e.dirty) {
-                                flushOne(eldest.getKey().bytes, e);
+                                // E8-H1: do NOT call flushCallback here — that would dispatch
+                                // an engine-PUT FFI call while we may be inside the
+                                // generationsLock (putIfGen path). Stash the eldest dirty
+                                // entry into the pendingFlush slot; the caller drains it
+                                // AFTER releasing the lock.
+                                pendingFlushKey = eldest.getKey();
+                                pendingFlushValue = e.acc;
+                                // Mark clean so a concurrent flushAllDirty (no path today,
+                                // but defensive) cannot double-flush the same entry.
+                                e.dirty = false;
                             }
                             return true;
                         }
@@ -215,14 +248,19 @@ public final class ReducingAggregatingCache<IN, ACC> {
 
     /**
      * Cache-hit fold: combines {@code input} in-place on the operator thread. Updates the LRU
-     * access order, marks the entry dirty, and returns the new accumulator wrapped in {@link
-     * Optional}. Returns {@link Optional#empty()} on miss (caller must go to miss path).
+     * access order, marks the entry dirty, and returns {@code true} on hit. Returns {@code false}
+     * on miss (caller must go to miss path).
+     *
+     * <p>B8-H1: tryFold returns a bare {@code boolean} instead of {@code Optional<ACC>} so the
+     * per-record cache-hit path on Q12 incurs no Optional wrapper allocation. Callers that need
+     * the post-fold accumulator value can read it via {@link #peek(byte[])} after a {@code true}
+     * return (all current callers only need the hit/miss signal, so they never re-probe).
      *
      * @param compositeKey raw composite key bytes
      * @param input the value being added
-     * @return the new accumulator on hit, or empty on miss
+     * @return {@code true} on hit (folded in place), {@code false} on miss
      */
-    public Optional<ACC> tryFold(byte[] compositeKey, IN input) {
+    public boolean tryFold(byte[] compositeKey, IN input) {
         return tryFold(compositeKey, 0, compositeKey.length, input);
     }
 
@@ -230,21 +268,24 @@ public final class ReducingAggregatingCache<IN, ACC> {
      * Cleanup-C3: zero-alloc lookup overload. Probes the cache using a slice {@code (buf, off,
      * len)} of an externally-owned byte buffer (typically {@code keyOut.getSharedBuffer()} from a
      * {@code DataOutputSerializer}). On hit, folds in place — no allocation. On miss, returns
-     * empty; the caller must subsequently snapshot the slice via {@link #put(byte[], Object)}
+     * {@code false}; the caller must subsequently snapshot the slice via {@link #put(byte[], Object)}
      * (passing {@code keyOut.getCopyOfBuffer()} — the only allocation on the miss path) to seed
      * the cache.
      *
      * <p>The scratch slice view is reused across calls; the single-threaded contract of this
      * cache (per-RecordContext lock) guarantees no interleaved probe can clobber it.
+     *
+     * <p>B8-H1: see {@link #tryFold(byte[], Object)} — returns a bare {@code boolean} to avoid
+     * per-call {@code Optional.of(...)} allocation on the Q12 hot path.
      */
-    public Optional<ACC> tryFold(byte[] buf, int off, int len, IN input) {
+    public boolean tryFold(byte[] buf, int off, int len, IN input) {
         Entry<ACC> e = entries.get(scratch.view(buf, off, len));
         if (e == null) {
-            return Optional.empty();
+            return false;
         }
         e.acc = combiner.apply(e.acc, input);
         e.dirty = true;
-        return Optional.of(e.acc);
+        return true;
     }
 
     /**
@@ -258,6 +299,9 @@ public final class ReducingAggregatingCache<IN, ACC> {
      */
     public void put(byte[] compositeKey, ACC acc) {
         entries.put(new BytesKey(compositeKey), new Entry<>(acc, true));
+        // E8-H1: drain any deferred eviction flush from removeEldestEntry. No lock is held
+        // here, so the engine-PUT can run without blocking cross-thread generation reads.
+        drainPendingFlush();
     }
 
     /**
@@ -269,6 +313,8 @@ public final class ReducingAggregatingCache<IN, ACC> {
         byte[] owned = new byte[len];
         System.arraycopy(buf, off, owned, 0, len);
         entries.put(new BytesKey(owned), new Entry<>(acc, true));
+        // E8-H1: drain any deferred eviction flush from removeEldestEntry.
+        drainPendingFlush();
     }
 
     /**
@@ -318,6 +364,15 @@ public final class ReducingAggregatingCache<IN, ACC> {
         // mailbox-thread invalidate cannot slip a generation bump in between. Without this,
         // the gen-check could see expectedGen, invalidate could bump and remove the entry,
         // then we'd resurrect the stale acc into entries despite the bump.
+        //
+        // E8-H1: the {@code entries.put} below may trigger {@code removeEldestEntry}, which
+        // would historically invoke {@code flushCallback} (engine-PUT FFI) DIRECTLY — i.e.
+        // a potentially-blocking engine call while {@code generationsLock} is held. Any
+        // cross-thread {@link #currentGen} read from the async miss-resolve callback would
+        // stall behind that FFI. The {@code removeEldestEntry} override now defers the flush
+        // into a {@link #pendingFlushKey}/{@link #pendingFlushValue} slot; we drain it OUTSIDE
+        // the synchronized block.
+        boolean inserted;
         synchronized (generationsLock) {
             BytesKey probe = new BytesKey().view(compositeKey, 0, compositeKey.length);
             Long g = generations.get(probe);
@@ -335,8 +390,13 @@ public final class ReducingAggregatingCache<IN, ACC> {
             if (expectedGen == 0L) {
                 generations.remove(probe);
             }
-            return true;
+            inserted = true;
         }
+        // E8-H1: drain the deferred eviction flush OUTSIDE the lock — the engine PUT may
+        // block on the engine's classifier queue, but no other thread can be blocked on
+        // generationsLock waiting for us to release.
+        drainPendingFlush();
+        return inserted;
     }
 
     /**
@@ -414,6 +474,27 @@ public final class ReducingAggregatingCache<IN, ACC> {
     private void flushOne(byte[] keyBytes, Entry<ACC> entry) {
         flushCallback.accept(keyBytes, entry.acc);
         entry.dirty = false;
+    }
+
+    /**
+     * E8-H1: drain the deferred LRU-eviction flush slot. Called by every public mutator that
+     * may have triggered {@code removeEldestEntry} — i.e. all paths that call {@code
+     * entries.put}. The deferred flush is dispatched ONLY after the caller has released any
+     * lock it holds, so the engine-PUT FFI never runs while the {@link #generationsLock} (or
+     * any future cache-internal lock) is held.
+     */
+    private void drainPendingFlush() {
+        BytesKey k = pendingFlushKey;
+        if (k == null) {
+            return;
+        }
+        ACC v = pendingFlushValue;
+        // Clear BEFORE dispatching the callback so a re-entrant or follow-up cache mutation
+        // (e.g. the callback itself triggers another eviction via further state ops) finds
+        // an empty slot for its own deferred capture.
+        pendingFlushKey = null;
+        pendingFlushValue = null;
+        flushCallback.accept(k.bytes, v);
     }
 
     // -----------------------------------------------------------------

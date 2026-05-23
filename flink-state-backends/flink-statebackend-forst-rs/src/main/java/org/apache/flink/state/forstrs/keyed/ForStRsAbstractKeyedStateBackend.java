@@ -174,6 +174,27 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
     private volatile PerKeyFuturesChain<K> asyncChain;
 
     /**
+     * E8-H4: identity of the (JobID, operatorIdentifier) slot this backend occupies in
+     * {@link ForStRsBackendPathInvariant}. Captured at factory time and used on {@link #close()}
+     * to release the slot so a subsequent job redeploy / restart can re-register without a
+     * false-positive cross-path violation. {@code null} if the factory did not wire the identity
+     * (tests, non-runtime construction).
+     */
+    private org.apache.flink.api.common.JobID backendPathJobId;
+
+    private String backendPathOperatorId;
+
+    /**
+     * E8-H4: wire the {@link ForStRsBackendPathInvariant} identity so {@link #close()} can
+     * release the slot. Called once by the factory site immediately after construction.
+     */
+    public void setBackendPathIdentity(
+            org.apache.flink.api.common.JobID jobId, String operatorIdentifier) {
+        this.backendPathJobId = jobId;
+        this.backendPathOperatorId = operatorIdentifier;
+    }
+
+    /**
      * Executor backing {@link #asyncChain}. Owned by this backend; closed in {@link #close()}.
      * Lazily created via {@link #ensureAsyncChain()}.
      */
@@ -738,11 +759,20 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         if (sstRegistry == null || snapshotStrategy == null) {
             return;
         }
-        List<HandleAndLocalPath> rollback = snapshotStrategy.takePendingRegistrations(checkpointId);
-        if (rollback == null) {
-            return;
+        List<HandleAndLocalPath> rollback =
+                snapshotStrategy.takePendingRegistrationsForAbort(checkpointId);
+        if (rollback != null) {
+            for (HandleAndLocalPath h : rollback) {
+                sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
+            }
         }
-        for (HandleAndLocalPath h : rollback) {
+        // E8-H2 post-abort drain: defensive second sweep for entries that landed AFTER the
+        // initial take. With the current appendAndRegister design (re-check under monitor) the
+        // worker self-skips on observed marker so this is expected to be empty — guards against
+        // future refactors re-introducing a window.
+        List<HandleAndLocalPath> late =
+                snapshotStrategy.drainLatePendingRegistrations(checkpointId);
+        for (HandleAndLocalPath h : late) {
             sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
         }
     }
@@ -851,6 +881,18 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                 asyncExecutor.shutdownNow();
             }
             delegate.close();
+            // E8-H4: release the path-invariant slot so a subsequent job redeploy / restart on
+            // the same (jobId, operatorIdentifier) can re-register without a false-positive
+            // cross-path block. Best-effort — never throws to the caller.
+            if (backendPathOperatorId != null) {
+                try {
+                    ForStRsBackendPathInvariant.removeBackendPath(
+                            backendPathJobId, backendPathOperatorId);
+                } catch (Throwable ignored) {
+                }
+                backendPathOperatorId = null;
+                backendPathJobId = null;
+            }
         }
     }
 }

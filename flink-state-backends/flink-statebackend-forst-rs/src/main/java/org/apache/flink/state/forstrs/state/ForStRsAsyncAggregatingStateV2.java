@@ -42,7 +42,6 @@ import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.Optional;
 import java.util.function.BiConsumer;
 
 /**
@@ -195,8 +194,8 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
         }
         int keyLen = writeCacheKeyToKeyOut();
         byte[] keyBuf = keyOut.getSharedBuffer();
-        Optional<ACC> hit = cache.tryFold(keyBuf, 0, keyLen, value);
-        if (hit.isPresent()) {
+        // B8-H1: tryFold returns boolean — no Optional wrapper per cache HIT.
+        if (cache.tryFold(keyBuf, 0, keyLen, value)) {
             return StateFutureUtils.completedVoidFuture();
         }
         // Cache miss — snapshot the key bytes (the only allocation on the miss path) so that

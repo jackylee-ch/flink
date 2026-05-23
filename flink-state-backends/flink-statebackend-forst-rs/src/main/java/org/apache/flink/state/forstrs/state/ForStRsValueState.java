@@ -52,6 +52,20 @@ import java.util.function.Supplier;
 @Internal
 public class ForStRsValueState<T> implements ValueState<T> {
 
+    /**
+     * B8-H2: write-buffer PUT that copies value bytes by slice ({@code valBuf, valOff, valLen})
+     * directly into the backend's arena. Replaces the previous {@code BiConsumer<byte[], byte[]>}
+     * whose contract forced {@link ForStRsValueState#update} to call {@code
+     * outputBuffer.getCopyOfBuffer()} per call — a per-record byte[] allocation on the Q11 V1-sync
+     * hot path. The slice form lets the caller pass the serializer's shared buffer directly; the
+     * arena-backed backend copies into its own owned storage so the shared buffer can be reused
+     * on the next update().
+     */
+    @FunctionalInterface
+    public interface WriteBufferSlicePut {
+        void put(byte[] key, byte[] valBuf, int valOff, int valLen);
+    }
+
     /** Initial buffer size for value serialization (grows on demand). */
     private static final int DEFAULT_OUTPUT_BUFFER = 64;
 
@@ -76,8 +90,12 @@ public class ForStRsValueState<T> implements ValueState<T> {
     /** Reads from the shared write buffer; returns null on miss. */
     private final Function<byte[], byte[]> writeBufferGet;
 
-    /** Writes to the shared write buffer (deferred native put). */
-    private final java.util.function.BiConsumer<byte[], byte[]> writeBufferPut;
+    /**
+     * Writes to the shared write buffer (deferred native put). B8-H2: slice-based to avoid the
+     * per-update {@code outputBuffer.getCopyOfBuffer()} allocation; the implementation copies
+     * directly into a backend-owned arena.
+     */
+    private final WriteBufferSlicePut writeBufferPut;
 
     /** Deletes from the shared write buffer + issues native delete. */
     private final Consumer<byte[]> writeBufferDelete;
@@ -141,7 +159,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
             byte[] keyPrefix,
             TypeSerializer<T> serializer,
             Function<byte[], byte[]> writeBufferGet,
-            java.util.function.BiConsumer<byte[], byte[]> writeBufferPut,
+            WriteBufferSlicePut writeBufferPut,
             Consumer<byte[]> writeBufferDelete) {
         this.linker = linker;
         this.db = db;
@@ -364,20 +382,13 @@ public class ForStRsValueState<T> implements ValueState<T> {
         // Reuse the key from the preceding value() call if available
         byte[] key = (lastValueKey != null) ? lastValueKey : computeKey();
         if (writeBufferPut != null) {
-            // B4-H2 carry-over: the buffer MUST own the value bytes. {@code writeBufferPut} is
-            // backed by {@code ForStRsKeyedStateBackend.putToWriteBuffer}, which stores the
-            // value in a {@code HashMap<ByteArrayWrapper, byte[]>} until the next batch flush.
-            // The outputBuffer.getSharedBuffer() reference would be clobbered by the very next
-            // {@code update()} call on this state instance (single-threaded operator thread,
-            // serializer-buffer reuse), corrupting all entries in the write buffer queued
-            // between calls. PR-B3's signature-change idea (key, value, valueOff, valueLen) was
-            // explored: it would only avoid the copy if the underlying buffer ALSO becomes a
-            // contiguous arena indexed by (off,len) tuples — a much larger restructuring of
-            // {@link org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend#writeBuffer}.
-            // Until that restructure happens, the buffered path keeps the defensive copy.
-            // Q11 rides this path; the per-update allocation here is the residual cost.
-            byte[] payload = outputBuffer.getCopyOfBuffer();
-            writeBufferPut.accept(key, payload);
+            // B8-H2: slice-based PUT — the backend's arena copies these bytes into its own owned
+            // storage, so we can hand it the serializer's shared buffer directly. Eliminates the
+            // {@code outputBuffer.getCopyOfBuffer()} byte[] allocation on the Q11 V1-sync hot path
+            // (one per update()). The B4-H2 hazard (shared-buffer clobber by the next update) is
+            // resolved by the arena copy happening inside writeBufferPut.put before this method
+            // returns — by the time outputBuffer is reused, the bytes are owned by the arena.
+            writeBufferPut.put(key, outputBuffer.getSharedBuffer(), 0, outputBuffer.length());
         } else {
             // Immediate path: the engine consumes the value bytes synchronously inside the
             // critical-mode FFM call, so we can reuse the serializer's internal buffer

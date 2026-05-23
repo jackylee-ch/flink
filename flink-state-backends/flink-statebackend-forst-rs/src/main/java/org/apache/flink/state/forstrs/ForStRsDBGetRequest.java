@@ -106,4 +106,15 @@ public non-sealed class ForStRsDBGetRequest<K, N, V> implements VectorizedStateR
         ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>) request.getFuture())
                 .complete(result);
     }
+
+    /**
+     * E8-H3: completes the underlying {@code InternalAsyncFuture} with a failure so the
+     * runtime mailbox unblocks when the executor catches a throw before calling {@link
+     * #complete(byte[])}.
+     */
+    @SuppressWarnings("unchecked")
+    public void completeExceptionally(Throwable t) {
+        ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>) request.getFuture())
+                .completeExceptionally("GET request failed", t);
+    }
 }

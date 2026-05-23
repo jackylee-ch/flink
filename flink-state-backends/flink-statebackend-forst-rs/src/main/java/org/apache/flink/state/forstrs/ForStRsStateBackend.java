@@ -81,10 +81,13 @@ public class ForStRsStateBackend implements StateBackend {
     public <K>
             org.apache.flink.runtime.state.AsyncKeyedStateBackend<K> createAsyncKeyedStateBackend(
                     StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
-        // E7-H3: assert only one keyed-backend path (V1-sync or async) per operator id. Each
-        // backend has its own private StateSerializerRegistry — cross-path use would silently
-        // bypass schema-drift detection. Fail loudly here at construction time.
+        // E7-H3 / E8-H4: assert only one keyed-backend path (V1-sync or async) per operator id
+        // WITHIN A SINGLE JOB. Each backend has its own private StateSerializerRegistry —
+        // cross-path use would silently bypass schema-drift detection. Fail loudly at
+        // construction time. Keying by (JobID, operatorIdentifier) prevents false-positive
+        // cross-job blocks; backend dispose removes the slot so job redeploys do not block.
         org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
+                parameters.getJobID(),
                 parameters.getOperatorIdentifier(),
                 org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.ASYNC_V2);
 
@@ -105,15 +108,20 @@ public class ForStRsStateBackend implements StateBackend {
         Collection<KeyedStateHandle> restoredHandles = parameters.getStateHandles();
         if (restoredHandles != null && !restoredHandles.isEmpty()) {
             try {
-                return org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend
-                        .restoreFromHandles(
-                                arena,
-                                linker,
-                                parameters.getKeySerializer(),
-                                parameters.getKeyGroupRange(),
-                                parameters.getNumberOfKeyGroups(),
-                                localDbPath,
-                                restoredHandles);
+                org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<K> backend =
+                        org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend
+                                .restoreFromHandles(
+                                        arena,
+                                        linker,
+                                        parameters.getKeySerializer(),
+                                        parameters.getKeyGroupRange(),
+                                        parameters.getNumberOfKeyGroups(),
+                                        localDbPath,
+                                        restoredHandles);
+                // E8-H4: wire path identity so dispose can release the invariant slot.
+                backend.setBackendPathIdentity(
+                        parameters.getJobID(), parameters.getOperatorIdentifier());
+                return backend;
             } catch (Throwable t) {
                 // Best-effort tear-down on restore failure: the arena owns the linker; closing
                 // it releases every FFM resource the partial restore may have allocated.
@@ -140,15 +148,20 @@ public class ForStRsStateBackend implements StateBackend {
         try {
             db = linker.dbOpen(arena, localDbPath.toString());
             cf = linker.dbDefaultCf(db, arena);
-            return new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
-                    arena,
-                    linker,
-                    db,
-                    cf,
-                    parameters.getKeySerializer(),
-                    parameters.getKeyGroupRange(),
-                    parameters.getNumberOfKeyGroups(),
-                    true);
+            org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<K> backend =
+                    new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
+                            arena,
+                            linker,
+                            db,
+                            cf,
+                            parameters.getKeySerializer(),
+                            parameters.getKeyGroupRange(),
+                            parameters.getNumberOfKeyGroups(),
+                            true);
+            // E8-H4: wire path identity so dispose can release the invariant slot.
+            backend.setBackendPathIdentity(
+                    parameters.getJobID(), parameters.getOperatorIdentifier());
+            return backend;
         } catch (Throwable t) {
             if (cf != null) {
                 try {
@@ -177,10 +190,13 @@ public class ForStRsStateBackend implements StateBackend {
     @Override
     public <K> CheckpointableKeyedStateBackend<K> createKeyedStateBackend(
             StateBackend.KeyedStateBackendParameters<K> parameters) throws Exception {
-        // E7-H3: assert only one keyed-backend path (V1-sync or async) per operator id. Each
-        // backend has its own private StateSerializerRegistry — cross-path use would silently
-        // bypass schema-drift detection. Fail loudly here at construction time.
+        // E7-H3 / E8-H4: assert only one keyed-backend path (V1-sync or async) per operator id
+        // WITHIN A SINGLE JOB. Each backend has its own private StateSerializerRegistry —
+        // cross-path use would silently bypass schema-drift detection. Fail loudly at
+        // construction time. Keying by (JobID, operatorIdentifier) prevents false-positive
+        // cross-job blocks; backend dispose removes the slot so job redeploys do not block.
         org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.recordBackendPath(
+                parameters.getJobID(),
                 parameters.getOperatorIdentifier(),
                 org.apache.flink.state.forstrs.keyed.ForStRsBackendPathInvariant.Path.SYNC_V1);
 
@@ -293,6 +309,9 @@ public class ForStRsStateBackend implements StateBackend {
                             arena,
                             Map.of("default", 0L));
             backend.setSnapshotStrategy(strategy, sstRegistry);
+            // E8-H4: wire path identity so close() can release the invariant slot.
+            backend.setBackendPathIdentity(
+                    parameters.getJobID(), parameters.getOperatorIdentifier());
             // E6-HIGH-4(b): seed the per-state serializer metadata into the V1-sync registry so
             // the first {@code createOrUpdateInternalState} for each state name runs through
             // {@code verifyOrRegister} with the restored schema. {@code restored} is null on

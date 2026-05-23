@@ -22,7 +22,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,7 +47,7 @@ class ReducingAggregatingCacheTest {
 
         // Initial state: miss
         assertFalse(cache.contains(key));
-        assertEquals(Optional.empty(), cache.tryFold(key, 10));
+        assertFalse(cache.tryFold(key, 10));
 
         // After put: hit
         cache.put(key, 5);
@@ -56,10 +55,8 @@ class ReducingAggregatingCacheTest {
         assertEquals(Integer.valueOf(5), cache.peek(key));
         assertTrue(cache.isDirty(key));
 
-        // tryFold on hit: combines correctly
-        Optional<Integer> result = cache.tryFold(key, 10);
-        assertTrue(result.isPresent());
-        assertEquals(Integer.valueOf(15), result.get());
+        // B8-H1: tryFold on hit returns true; the post-fold accumulator is read via peek().
+        assertTrue(cache.tryFold(key, 10));
         assertEquals(Integer.valueOf(15), cache.peek(key));
     }
 

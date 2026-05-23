@@ -171,12 +171,29 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private static final int MAX_BUFFER_ENTRIES = 4096;
 
     /**
-     * Write-behind buffer: maps full composite ForSt keys to their latest value bytes. Shared
-     * across all ValueState instances on this backend. Reads check this buffer first (0-cost hit);
-     * writes go here instead of native. Flushed via {@link #flushWriteBuffer()} on threshold,
-     * checkpoint, or close.
+     * Write-behind buffer: maps full composite ForSt keys to packed {@code (offset << 32) | length}
+     * indices into {@link #writeValueArena}. Shared across all ValueState instances on this
+     * backend. Reads check this buffer first (0-cost hit); writes go here instead of native.
+     * Flushed via {@link #flushWriteBuffer()} on threshold, checkpoint, or close.
+     *
+     * <p>B8-H2: indices replace the previous {@code Map<…, byte[]>} so {@code putToWriteBuffer}
+     * can accept a value slice ({@code valBuf, valOff, valLen}) and copy directly into the arena.
+     * That eliminates the per-{@code update()} {@code outputBuffer.getCopyOfBuffer()} allocation
+     * on the Q11 V1-sync hot path. On a duplicate key write the new bytes are appended fresh and
+     * the index is repointed; the old arena slot leaks until the next flush (acceptable because
+     * the buffer is bounded at {@code MAX_BUFFER_ENTRIES} and flushed on threshold).
      */
-    private final Map<ByteArrayWrapper, byte[]> writeBuffer = new HashMap<>();
+    private final Map<ByteArrayWrapper, Long> writeBuffer = new HashMap<>();
+
+    /**
+     * B8-H2: contiguous arena holding the buffered value bytes for {@link #writeBuffer}. Grown by
+     * doubling on overflow. Reset (via {@link #writeArenaPos} = 0) on every flush so a steady-state
+     * Q11 workload never re-grows beyond the high-water mark.
+     */
+    private byte[] writeValueArena = new byte[16 * 1024];
+
+    /** B8-H2: write-pointer (in bytes) into {@link #writeValueArena}. */
+    private int writeArenaPos = 0;
 
     /** Running count of buffered writes since last flush. */
     private int writeBufferCount = 0;
@@ -897,7 +914,20 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (!bufferEnabled) {
             return null;
         }
-        byte[] result = writeBuffer.get(new ByteArrayWrapper(key));
+        // B8-H2: lookup returns the packed (off,len) index into the value arena; the caller
+        // (ValueState.value()) expects a freshly-owned byte[], so we materialize one here. This is
+        // the read path — cold relative to update() which is what the arena optimizes. The
+        // boxed Long is the JDK-internal cache-resident object; it is replaced under steady-state
+        // by the value-arena bytes, eliminating the per-write byte[] allocation.
+        Long packed = writeBuffer.get(new ByteArrayWrapper(key));
+        byte[] result = null;
+        if (packed != null) {
+            long p = packed;
+            int off = (int) (p >>> 32);
+            int len = (int) p;
+            result = new byte[len];
+            System.arraycopy(writeValueArena, off, result, 0, len);
+        }
         sampleTotal++;
         if (result != null) {
             sampleHits++;
@@ -918,18 +948,49 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * Buffers a write for the given composite ForSt key. The write is NOT sent to native
      * immediately — it will be flushed in batch when the threshold is reached, on checkpoint, or on
      * close. Called by {@link ForStRsValueState#update(Object)}.
+     *
+     * <p>B8-H2: slice-based PUT — the caller (ValueState.update) passes the serializer's shared
+     * buffer directly ({@code valBuf, valOff, valLen}) instead of a freshly-allocated owned
+     * {@code byte[]}. We copy into {@link #writeValueArena} so the shared buffer can be reused
+     * on the next update() call without corrupting buffered entries.
      */
-    public void putToWriteBuffer(byte[] key, byte[] value) {
+    public void putToWriteBuffer(byte[] key, byte[] valBuf, int valOff, int valLen) {
         if (!bufferEnabled) {
-            linker.put(db, defaultCf, key, value);
+            // Slice-based native put: pass the slice directly to ForStRsLinker. The single
+            // overload that accepts (key, value, valueOff, valueLen) avoids the per-update copy.
+            linker.put(db, defaultCf, key, valBuf, valOff, valLen);
             return;
         }
-        writeBuffer.put(new ByteArrayWrapper(key), value);
+        // Grow arena if needed (doubling). Steady-state Q11 hits the high-water mark once and
+        // then never re-grows because the arena is reset on every flush.
+        if (writeArenaPos + valLen > writeValueArena.length) {
+            int newLen = writeValueArena.length;
+            while (newLen < writeArenaPos + valLen) {
+                newLen <<= 1;
+            }
+            byte[] grown = new byte[newLen];
+            System.arraycopy(writeValueArena, 0, grown, 0, writeArenaPos);
+            writeValueArena = grown;
+        }
+        int off = writeArenaPos;
+        System.arraycopy(valBuf, valOff, writeValueArena, off, valLen);
+        writeArenaPos += valLen;
+        long packed = ((long) off << 32) | ((long) valLen & 0xFFFFFFFFL);
+        writeBuffer.put(new ByteArrayWrapper(key), packed);
         writeBufferCount++;
         if (writeBufferCount >= WRITE_BUFFER_FLUSH_THRESHOLD
                 || writeBuffer.size() >= MAX_BUFFER_ENTRIES) {
             flushWriteBuffer();
         }
+    }
+
+    /**
+     * B8-H2 legacy-compatibility shim: kept so existing call sites (none on the hot path) that
+     * still pass an owned byte[] continue to compile. Forwards to the slice overload with
+     * {@code (value, 0, value.length)}.
+     */
+    public void putToWriteBuffer(byte[] key, byte[] value) {
+        putToWriteBuffer(key, value, 0, value.length);
     }
 
     /**
@@ -959,16 +1020,22 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         int count = writeBuffer.size();
         try (Arena payloadArena = Arena.ofConfined()) {
             int i = 0;
-            for (Map.Entry<ByteArrayWrapper, byte[]> entry : writeBuffer.entrySet()) {
+            for (Map.Entry<ByteArrayWrapper, Long> entry : writeBuffer.entrySet()) {
                 byte[] k = entry.getKey().bytes;
-                byte[] v = entry.getValue();
+                long p = entry.getValue();
+                int vOff = (int) (p >>> 32);
+                int vLen = (int) p;
                 MemorySegment ks = payloadArena.allocate(k.length == 0 ? 1 : k.length);
-                MemorySegment vs = payloadArena.allocate(v.length == 0 ? 1 : v.length);
+                MemorySegment vs = payloadArena.allocate(vLen == 0 ? 1 : vLen);
                 if (k.length > 0) {
                     MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
                 }
-                if (v.length > 0) {
-                    MemorySegment.copy(v, 0, vs, ValueLayout.JAVA_BYTE, 0, v.length);
+                if (vLen > 0) {
+                    // B8-H2: copy from the value arena slice rather than from a separately-owned
+                    // byte[]. The arena slice was populated by putToWriteBuffer directly from
+                    // the serializer's shared buffer — one copy total (vs two in the legacy
+                    // owned-byte[] path: serializer→getCopyOfBuffer→arena).
+                    MemorySegment.copy(writeValueArena, vOff, vs, ValueLayout.JAVA_BYTE, 0, vLen);
                 }
                 flushKeyPtrs.set(
                         ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), ks);
@@ -981,7 +1048,7 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 flushValueLens.set(
                         ValueLayout.JAVA_LONG,
                         (long) i * ValueLayout.JAVA_LONG.byteSize(),
-                        (long) v.length);
+                        (long) vLen);
                 i++;
             }
             linker.batchPut(
@@ -994,6 +1061,9 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                     count);
         }
         writeBuffer.clear();
+        // B8-H2: reset the value arena to position 0 so steady-state Q11 reuses the same backing
+        // storage indefinitely (zero allocation per flush after the initial high-water mark).
+        writeArenaPos = 0;
         writeBufferCount = 0;
     }
 
