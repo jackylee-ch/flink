@@ -369,6 +369,102 @@ class V1SyncSchemaDriftTest {
     }
 
     /**
+     * R36-M3: V1-sync ListState variant of the schema-drift write-path coverage. Confirms the
+     * {@code createOrUpdateInternalState} call for a {@code ListStateDescriptor} flows through
+     * {@code verifyOrRegister} (writing the schema into the registry's live buffer for
+     * subsequent snapshot emission) and that the LIST kind ordinal is persisted so a restore
+     * with a kind mismatch will be detected.
+     */
+    @Test
+    void v1SyncListStateRegistersSerializerInRegistry(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            assertEquals(
+                    0,
+                    reg.metadataBuffer().size(),
+                    "fresh backend has no registered states");
+
+            org.apache.flink.api.common.state.ListStateDescriptor<String> lsd =
+                    new org.apache.flink.api.common.state.ListStateDescriptor<>(
+                            "evolvedList", StringSerializer.INSTANCE);
+            lsd.initializeSerializerUnlessSet(new ExecutionConfig());
+
+            pair.backend.createOrUpdateInternalState(
+                    org.apache.flink.api.common.typeutils.base.VoidSerializer.INSTANCE,
+                    (org.apache.flink.api.common.state.StateDescriptor) lsd,
+                    org.apache.flink.runtime.state.StateSnapshotTransformer
+                            .StateSnapshotTransformFactory.noTransform());
+
+            // R36-M3: the ListStateDescriptor's registration landed in the registry, with the
+            // LIST kind ordinal persisted so a subsequent restore that supplies the same name
+            // with a different kind would surface as StateMigrationException.
+            StateSerializerMetadata md = reg.get("evolvedList");
+            assertNotNull(md, "ListState creation MUST register schema in the registry");
+            int listOrdinal =
+                    org.apache.flink.api.common.state.StateDescriptor.Type.LIST.ordinal();
+            assertEquals(
+                    listOrdinal,
+                    md.stateKindOrdinal(),
+                    "R36-M3: registered kind ordinal for ListState must equal Type.LIST.ordinal()");
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
+     * R36-M3: V1-sync MapState variant of the schema-drift write-path coverage. Confirms the
+     * {@code createOrUpdateInternalState} call for a {@code MapStateDescriptor} flows through
+     * {@code verifyOrRegister}. Note: the V1-sync MAP path validates the MapSerializer composite
+     * (containing both UK and UV) as a SINGLE registry entry, so the UK schema drift is caught
+     * by composite snapshot resolution — distinct from the V2 path's R36-M1 fix which uses a
+     * separate {@code <stateName>$UK} entry.
+     */
+    @Test
+    void v1SyncMapStateRegistersCompositeSerializerInRegistry(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            assertEquals(
+                    0,
+                    reg.metadataBuffer().size(),
+                    "fresh backend has no registered states");
+
+            org.apache.flink.api.common.state.MapStateDescriptor<String, Long> msd =
+                    new org.apache.flink.api.common.state.MapStateDescriptor<>(
+                            "evolvedMap", StringSerializer.INSTANCE, LongSerializer.INSTANCE);
+            msd.initializeSerializerUnlessSet(new ExecutionConfig());
+
+            pair.backend.createOrUpdateInternalState(
+                    org.apache.flink.api.common.typeutils.base.VoidSerializer.INSTANCE,
+                    (org.apache.flink.api.common.state.StateDescriptor) msd,
+                    org.apache.flink.runtime.state.StateSnapshotTransformer
+                            .StateSnapshotTransformFactory.noTransform());
+
+            StateSerializerMetadata md = reg.get("evolvedMap");
+            assertNotNull(md, "MapState creation MUST register schema in the registry");
+            int mapOrdinal =
+                    org.apache.flink.api.common.state.StateDescriptor.Type.MAP.ordinal();
+            assertEquals(
+                    mapOrdinal,
+                    md.stateKindOrdinal(),
+                    "R36-M3: registered kind ordinal for MapState must equal Type.MAP.ordinal()");
+            // R36-M3: V1-sync uses a single registry entry for the WHOLE MapSerializer composite,
+            // so the second registry entry that R36-M1 introduces for V2 ($UK suffix) MUST NOT
+            // exist on the V1-sync path. This is a deliberate contract: V1-sync composite snapshot
+            // resolution catches UK drift through MapSerializer.resolveSchemaCompatibility's
+            // composite delegation — no separate entry needed.
+            assertEquals(
+                    null,
+                    reg.get("evolvedMap" + StateSerializerRegistry.USER_KEY_SUFFIX),
+                    "R36-M3: V1-sync MapState must NOT create a separate $UK registry entry"
+                            + " (only V2's R36-M1 path uses the suffix)");
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
      * Test-only {@code TypeSerializer<String>} whose {@code snapshotConfiguration()} returns a
      * snapshot that ALWAYS resolves to {@link
      * org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility#compatibleWithReconfiguredSerializer}

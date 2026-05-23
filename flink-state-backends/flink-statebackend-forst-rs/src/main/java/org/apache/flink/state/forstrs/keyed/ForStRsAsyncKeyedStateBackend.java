@@ -872,12 +872,25 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     public <N, S extends InternalKeyedState, SV> S createStateInternal(
             @Nonnull N ns, @Nonnull TypeSerializer<N> nsSer, @Nonnull StateDescriptor<SV> desc)
             throws Exception {
-        // R35-H1: interface entrypoint (called via {@link AsyncKeyedStateBackend} dispatch
-        // paths that bypass {@code getOrCreateKeyedState}, e.g. internal Flink TTL plumbing).
-        // The pre-R35-H1 single-path implementation read {@code desc.getSerializer()} directly;
-        // the registry-aware path in {@code getOrCreateKeyedState} now calls the overload below
-        // with the (possibly reconfigured) active serializer.
-        return createStateInternal(ns, nsSer, desc, desc.getSerializer());
+        // R36-L1: fail-loud. The 3-arg overload would silently bypass
+        // {@link StateSerializerRegistry#verifyOrRegister} — pre-fix it delegated to the 4-arg
+        // overload with {@code desc.getSerializer()}, so any caller that reached this entry
+        // point (Flink-internal TTL plumbing, runtime adapters, or a future refactor of
+        // {@code getOrCreateKeyedState}) would create state through the OLD serializer schema
+        // after a schema-evolution restore. Schema drift would surface only as silently wrong
+        // payloads at the first read. Throwing here makes the design constraint explicit:
+        // every state creation MUST first run through the registry to obtain the active
+        // serializer; callers must use {@link #getOrCreateKeyedState} (which does the
+        // verification + TTL gating + caching) or the private 4-arg overload from within this
+        // class.
+        throw new IllegalStateException(
+                "createStateInternal(ns, nsSer, desc) must not be called directly — it would"
+                        + " bypass StateSerializerRegistry#verifyOrRegister and silently use the"
+                        + " un-validated descriptor serializer. Route through getOrCreateKeyedState"
+                        + " so schema-drift detection runs first. State name: "
+                        + desc.getStateId()
+                        + ", kind: "
+                        + desc.getType());
     }
 
     /**
@@ -925,9 +938,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 // R35-H1: V2 {@link MapStateDescriptor} extends {@code StateDescriptor<UV>}, so
                 // {@code desc.getSerializer()} is the user-VALUE serializer (NOT a composite),
                 // and {@code activeSerializer} carries the (possibly reconfigured) value schema.
-                // The user-key serializer is held separately and is not currently subject to
-                // schema-evolution wiring through the registry (registry verifies one serializer
-                // per state-id) — we pass {@code mapDesc.getUserKeySerializer()} through as-is.
+                //
+                // R36-M1: validate the user-key serializer through the same registry as the
+                // value serializer, using the synthetic registry key {@code "<stateName>$UK"}
+                // and the synthetic kind {@link StateSerializerRegistry#KIND_USER_KEY}. Pre-fix
+                // the UK serializer was passed through {@code as-is} — a schema-evolution of
+                // the user-key type would resolve as compatible-but-different on disk and the
+                // restored MapState would silently read garbage on every lookup. The UK runs
+                // through the same {@code verifyOrRegister} contract as any other serializer:
+                // (a) fresh-state → register so the next snapshot persists the UK schema;
+                // (b) restored-state → resolveSchemaCompatibility comparison fires, with
+                //     RECONFIGURED variants threaded into the state constructor and
+                //     INCOMPATIBLE surfaced as StateMigrationException matching Flink's contract.
+                // We don't TTL-tag the UK entry: MapState TTL prefixes the VALUE (R26-M1
+                // refuses TTL on MapState anyway in the current code), so the UK serializer
+                // does not change shape under TTL toggle.
+                @SuppressWarnings("unchecked")
+                TypeSerializer<Object> userKeySerializerRaw =
+                        (TypeSerializer<Object>) mapDesc.getUserKeySerializer();
+                TypeSerializer<Object> activeUserKeySerializer =
+                        stateSerializerRegistry.verifyOrRegister(
+                                name + StateSerializerRegistry.USER_KEY_SUFFIX,
+                                StateSerializerRegistry.KIND_USER_KEY,
+                                userKeySerializerRaw,
+                                /* ttlEnabled= */ false,
+                                /* ttlMillis= */ 0L);
                 // PR-C1: hand linker/db/cf to the MapStateV2 so it can stage writes in its
                 // off-heap MapStateArrowBuffer and drain via linker.batchPut on flush. Register
                 // the instance so the snapshot pre-hook drains every live MapState V2.
@@ -937,7 +972,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 name,
                                 keySerializer,
                                 nsSer,
-                                mapDesc.getUserKeySerializer(),
+                                activeUserKeySerializer,
                                 activeSerializer,
                                 linker,
                                 db,

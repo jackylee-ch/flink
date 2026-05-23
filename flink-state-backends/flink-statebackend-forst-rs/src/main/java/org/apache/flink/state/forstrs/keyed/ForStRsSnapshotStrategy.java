@@ -51,6 +51,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
  * ForSt-RS snapshot strategy (B-Prod-P3 Tasks 3.4 + 3.5).
@@ -98,7 +99,15 @@ public class ForStRsSnapshotStrategy
     private final ForStRsSstRegistry sstRegistry;
     private final ForStRsSstUploader uploader;
     private final Arena nativeArena;
-    private final Map<String, Long> cfMap;
+    /**
+     * R36-L2: supplier (re-)read on every {@link #doAsyncSnapshot} entry. Pre-fix we held a
+     * defensive copy of the cfMap snapshot taken at strategy-construction time — any CF added
+     * after the strategy was wired (e.g. a state created post-restore) would be invisible to
+     * later checkpoints, silently emitting a stale cfMap on the handle. Switching to a
+     * {@link Supplier} re-snapshots on each invocation, so we always reflect the backend's
+     * current CF universe at the moment the checkpoint runs.
+     */
+    private final Supplier<Map<String, Long>> cfMapSupplier;
 
     /**
      * E5-HIGH-2: hook that returns the current registry blob bytes at snapshot time. The blob is
@@ -177,6 +186,12 @@ public class ForStRsSnapshotStrategy
     private final java.util.concurrent.ConcurrentHashMap<Long, Boolean> abortedCheckpoints =
             new java.util.concurrent.ConcurrentHashMap<>();
 
+    /**
+     * Back-compat constructor: a static {@link Map} is wrapped in a {@link Supplier} that
+     * returns a defensive copy on each call so the caller-supplied map cannot be mutated by
+     * later writes. Prefer the supplier overload for new call sites — it lets the backend
+     * surface CFs added after strategy construction.
+     */
     public ForStRsSnapshotStrategy(
             ForStRsLinker linker,
             FrsDb db,
@@ -186,6 +201,31 @@ public class ForStRsSnapshotStrategy
             ForStRsSstUploader uploader,
             Arena nativeArena,
             Map<String, Long> cfMap) {
+        this(
+                linker,
+                db,
+                backendIdentifier,
+                keyGroupRange,
+                sstRegistry,
+                uploader,
+                nativeArena,
+                staticCfMapSupplier(cfMap));
+    }
+
+    /**
+     * R36-L2 primary constructor: caller passes a {@link Supplier} that is re-invoked on every
+     * {@link #doAsyncSnapshot} call so the emitted handle reflects the live CF universe at the
+     * moment of the checkpoint, not the universe at strategy-construction time.
+     */
+    public ForStRsSnapshotStrategy(
+            ForStRsLinker linker,
+            FrsDb db,
+            UUID backendIdentifier,
+            KeyGroupRange keyGroupRange,
+            ForStRsSstRegistry sstRegistry,
+            ForStRsSstUploader uploader,
+            Arena nativeArena,
+            Supplier<Map<String, Long>> cfMapSupplier) {
         this.linker = linker;
         this.db = db;
         this.backendIdentifier = backendIdentifier;
@@ -193,7 +233,14 @@ public class ForStRsSnapshotStrategy
         this.sstRegistry = sstRegistry;
         this.uploader = uploader;
         this.nativeArena = nativeArena;
-        this.cfMap = new LinkedHashMap<>(cfMap);
+        this.cfMapSupplier = cfMapSupplier;
+    }
+
+    private static Supplier<Map<String, Long>> staticCfMapSupplier(Map<String, Long> cfMap) {
+        // Snapshot the input once so the supplier is stable under caller-side mutation; copy on
+        // each call so the strategy itself cannot observe surprising in-place edits.
+        Map<String, Long> frozen = new LinkedHashMap<>(cfMap);
+        return () -> new LinkedHashMap<>(frozen);
     }
 
     /**
@@ -520,6 +567,24 @@ public class ForStRsSnapshotStrategy
         List<Path> newSstFiles = readSstList(result, PTR);
         List<Path> sharedSstFiles = readSstList(result, 2 * PTR);
 
+        // ---- R36-M2: hoist the no-prior-dependence invariant check BEFORE any side-effects.
+        // Pre-fix the check ran AFTER uploader.upload was queued for the manifest + new SSTs
+        // AND after the pendingRegistrations.merge installed a rollback list. On an engine bug
+        // (sharedSstFiles non-empty under effectiveBaseCheckpointId=0) we threw IllegalStateException
+        // from the middle of the method, leaving orphan upload futures running into S3 and an
+        // orphan rollback list in pendingRegistrations that no abort handler would ever drain.
+        // Asserting immediately after createIncrementalCheckpointAt + readSstList lets us bail
+        // out before either side-effect, leaving the state machine clean.
+        if (noPriorDependence && !sharedSstFiles.isEmpty()) {
+            throw new IllegalStateException(
+                    "R35-H2 invariant violated: full snapshot (strategy="
+                            + strategy
+                            + ") requested with effectiveBaseCheckpointId=0, but engine reported "
+                            + sharedSstFiles.size()
+                            + " shared SST(s). All SSTs must be emitted as NEW; "
+                            + "FULL_CHECKPOINT must not reference prior incremental SSTs.");
+        }
+
         // Free the result struct now that we've marshalled the data into Java objects.
         //
         // R31-L1: {@code frs_incremental_checkpoint_result_free} is documented as idempotent on
@@ -613,21 +678,10 @@ public class ForStRsSnapshotStrategy
         }
 
         // ---- Resolve shared SSTs from the registry (already uploaded by a prior ckpt). ----
-        // R35-H2: with {@code effectiveBaseCheckpointId == 0} (FULL_CHECKPOINT or CANONICAL
-        // savepoint), the engine has no prior checkpoint to reference against, so
-        // {@code sharedSstFiles} MUST be empty — every reachable SST should land in
-        // {@code newSstFiles}. We assert this defensively; a non-empty list under
-        // no-prior-dependence would mean the engine ignored the base id and produced a
-        // self-inconsistent "full" handle that still depended on the registry.
-        if (noPriorDependence && !sharedSstFiles.isEmpty()) {
-            throw new IllegalStateException(
-                    "R35-H2 invariant violated: full snapshot (strategy="
-                            + strategy
-                            + ") requested with effectiveBaseCheckpointId=0, but engine reported "
-                            + sharedSstFiles.size()
-                            + " shared SST(s). All SSTs must be emitted as NEW; "
-                            + "FULL_CHECKPOINT must not reference prior incremental SSTs.");
-        }
+        // R35-H2: the no-prior-dependence sharedSstFiles invariant was already asserted above
+        // (R36-M2) immediately after createIncrementalCheckpointAt returned — well before any
+        // uploader.upload or pendingRegistrations.merge side-effect, so a violating engine state
+        // throws without leaving orphan S3 uploads or orphan rollback lists behind.
         List<HandleAndLocalPath> sharedHandles = new ArrayList<>();
         for (Path p : sharedSstFiles) {
             String localPath = p.getFileName().toString();
@@ -650,12 +704,38 @@ public class ForStRsSnapshotStrategy
         }
 
         // ---- Wait for all uploads. ----
+        // R36-H1: under NO_SHARING (fullCheckpoint=true) SSTs were already uploaded under
+        // EXCLUSIVE scope by R35-H2, AND the handle MUST be self-contained — the SSTs cannot
+        // participate in cross-checkpoint sharing because the snapshot's whole point is to be
+        // independent of any other checkpoint. Pre-R36-H1 we placed them in sharedHandles,
+        // which made AbstractIncrementalStateHandle.registerSharedStates() register every
+        // localPath via SharedStateRegistryKey on JM-side registration; a future incremental
+        // ckpt that re-emits the same localPath would then collide on the registry key
+        // (legitimate sharing turning into an unintended adoption of the prior NO_SHARING
+        // upload). Route them through privateState instead — registerSharedStates iterates
+        // sharedState only, so no registration fires; discardState drops them per-checkpoint
+        // along with the manifest + registry blob.
+        //
+        // Additionally, the local sstRegistry / pendingRegistrations.appendAndRegister bumps
+        // are skipped for NO_SHARING SSTs: those entries exist to track cross-checkpoint
+        // reuse via takePendingRegistrations on abort, but a NO_SHARING SST has no reuse
+        // path — keeping it in the local registry would either leak ref-counts forever or
+        // confuse a sibling incremental that happens to emit the same localPath later.
+        //
+        // For all OTHER strategies (FORWARD / FORWARD_BACKWARD) SSTs were uploaded SHARED
+        // and the original sharedHandles + appendAndRegister flow is preserved.
         StreamStateHandle metaHandle = manifestFut.get();
+        List<HandleAndLocalPath> noSharingPrivateSsts =
+                fullCheckpoint ? new ArrayList<>(newSstFuts.size()) : null;
         for (CompletableFuture<HandleAndLocalPath> f : newSstFuts) {
             HandleAndLocalPath hlp = f.get();
-            sharedHandles.add(hlp);
-            StateHandleID id = new StateHandleID(hlp.getLocalPath());
-            appendAndRegister(installedList, registeredIds, checkpointId, id, hlp.getHandle());
+            if (fullCheckpoint) {
+                noSharingPrivateSsts.add(hlp);
+            } else {
+                sharedHandles.add(hlp);
+                StateHandleID id = new StateHandleID(hlp.getLocalPath());
+                appendAndRegister(installedList, registeredIds, checkpointId, id, hlp.getHandle());
+            }
         }
         // Manifest is private — kept off the shared list. (Carried as the metaStateHandle below.)
 
@@ -674,12 +754,22 @@ public class ForStRsSnapshotStrategy
         // construction) or the registry was empty the entry is skipped — older checkpoints
         // that don't carry the blob remain readable by the restore-side guard, which treats
         // absence as "no metadata seeded" (matches pre-fix behavior).
-        List<HandleAndLocalPath> privateStateEntries = List.of();
+        // R36-H1: privateStateEntries collects (a) the optional registry-metadata blob and
+        // (b) any NO_SHARING SSTs we diverted off sharedHandles above. Order: SSTs first,
+        // then the registry blob (deterministic for the restore-side scan that splits on the
+        // well-known {@link #SERIALIZER_REGISTRY_LOCAL_PATH} name).
+        List<HandleAndLocalPath> privateStateEntries;
+        if (noSharingPrivateSsts != null && !noSharingPrivateSsts.isEmpty()) {
+            privateStateEntries = new ArrayList<>(noSharingPrivateSsts.size() + 1);
+            privateStateEntries.addAll(noSharingPrivateSsts);
+        } else {
+            privateStateEntries = new ArrayList<>(1);
+        }
         byte[] registryBlob = resources.getRegistryBlob();
         if (registryBlob != null && registryBlob.length > 0) {
             StreamStateHandle registryHandle = uploadRegistryBlob(registryBlob, streamFactory);
-            privateStateEntries =
-                    List.of(HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
+            privateStateEntries.add(
+                    HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
         }
 
         // ---- Build the keyed state handle. ----
@@ -691,6 +781,10 @@ public class ForStRsSnapshotStrategy
         // FULL_CHECKPOINT) so any handle consumer (restore, SharedStateRegistry registration,
         // retention bookkeeping) sees a self-consistent "full snapshot" rather than a "depends
         // on prior checkpoint" descriptor.
+        // R36-L2: re-snapshot the CF map at handle-build time so any CF added after strategy
+        // construction is captured. The supplier copies on each call, so the resulting handle
+        // owns an immutable snapshot.
+        Map<String, Long> cfMapSnapshot = cfMapSupplier.get();
         ForStRsIncrementalKeyedStateHandle handle =
                 new ForStRsIncrementalKeyedStateHandle(
                         backendIdentifier,
@@ -700,7 +794,7 @@ public class ForStRsSnapshotStrategy
                         /* sharedState= */ sharedHandles,
                         /* privateState= */ privateStateEntries,
                         metaHandle,
-                        cfMap);
+                        cfMapSnapshot);
         return SnapshotResult.of(handle);
     }
 

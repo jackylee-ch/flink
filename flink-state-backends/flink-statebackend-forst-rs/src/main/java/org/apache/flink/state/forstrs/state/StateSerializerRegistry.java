@@ -481,12 +481,16 @@ public final class StateSerializerRegistry {
             }
             // R16-M3: bound the state-kind ordinal to the known enum range. Flink's
             // StateDescriptor.Type has 5 values (VALUE=0, LIST=1, REDUCING=2,
-            // AGGREGATING=3, MAP=4); anything outside [0..4] is corruption or hostile data
-            // and must be rejected before being used as an index downstream.
-            if (kindOrd < 0 || kindOrd > 4) {
+            // AGGREGATING=3, MAP=4). R36-M1 adds a synthetic kind USER_KEY=5 used internally
+            // by the backend to register the MapState user-key serializer under the well-known
+            // name "<stateName>$UK" so its snapshot can also be schema-drift-validated. Anything
+            // outside [0..5] is corruption or hostile data and must be rejected before being
+            // used as an index downstream.
+            if (kindOrd < 0 || kindOrd > KIND_USER_KEY) {
                 throw new IOException(
                         "StateSerializerRegistry blob malformed: kindOrd=" + kindOrd
-                                + " for state '" + name + "' (expected 0..4)");
+                                + " for state '" + name + "' (expected 0.."
+                                + KIND_USER_KEY + ")");
             }
             // R24-H2: read the TTL fields when the per-entry envelope is v2; v1 entries
             // default to ttlEnabled=false, ttlMillis=0 (no TTL info was persisted).
@@ -582,8 +586,30 @@ public final class StateSerializerRegistry {
                 return "AGGREGATING";
             case 4:
                 return "MAP";
+            case KIND_USER_KEY:
+                return "USER_KEY";
             default:
                 return "UNKNOWN(" + ordinal + ")";
         }
     }
+
+    /**
+     * R36-M1: synthetic state-kind ordinal used to register MapState user-key serializers under
+     * the well-known suffix {@link #USER_KEY_SUFFIX}. Not exposed via Flink's
+     * {@code StateDescriptor.Type} enum (whose ordinals 0..4 cover VALUE / LIST / REDUCING /
+     * AGGREGATING / MAP) — chosen as 5 to extend the existing bound check without colliding.
+     * Persisted in the registry blob exactly like any other entry so restore-side schema-drift
+     * detection runs against the user-key snapshot too.
+     */
+    public static final int KIND_USER_KEY = 5;
+
+    /**
+     * R36-M1: suffix appended to a MAP state name when registering its user-key serializer as a
+     * separate registry entry. The combined registry key is {@code "<stateName>$UK"} — a single
+     * map descriptor therefore produces two registry entries (one with kind=MAP for the value
+     * serializer, one with kind=USER_KEY for the user-key serializer). The suffix is reserved:
+     * user-facing state names must not contain {@code "$UK"} (Flink already disallows {@code "$"}
+     * in state IDs through its operator-name validation, so the reservation is defensive).
+     */
+    public static final String USER_KEY_SUFFIX = "$UK";
 }

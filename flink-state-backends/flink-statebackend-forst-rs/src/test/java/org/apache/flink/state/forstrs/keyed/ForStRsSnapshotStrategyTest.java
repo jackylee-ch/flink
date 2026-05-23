@@ -418,6 +418,126 @@ class ForStRsSnapshotStrategyTest {
                                 + " of "
                                 + h2.getSharedState().size()
                                 + " entries were prior-checkpoint references.");
+
+                // ---- R36-H1: FULL_CHECKPOINT (FORWARD) is NOT the NO_SHARING case. SSTs are
+                // uploaded SHARED and must remain on sharedState — R36-H1 only diverts SSTs to
+                // privateState under NO_SHARING (CANONICAL savepoint). Verify the FORWARD
+                // contract is unchanged: sharedState is non-empty, privateState only carries
+                // the registry blob (or is empty if none was wired).
+                assertTrue(
+                        h2.getSharedState().size() > 0,
+                        "R36-H1: FORWARD (FULL_CHECKPOINT) keeps SSTs on sharedState"
+                                + " — R36-H1's privateState routing only applies to NO_SHARING."
+                                + " sharedState.size() = "
+                                + h2.getSharedState().size());
+                int privateSstCount = 0;
+                for (HandleAndLocalPath p : h2.getPrivateState()) {
+                    if (!ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH
+                            .equals(p.getLocalPath())) {
+                        privateSstCount++;
+                    }
+                }
+                assertEquals(
+                        0,
+                        privateSstCount,
+                        "R36-H1: FORWARD (FULL_CHECKPOINT) must NOT divert SSTs to privateState"
+                                + " (sharing forward IS allowed). Got "
+                                + privateSstCount
+                                + " non-registry-blob entries in privateState.");
+            }
+        }
+    }
+
+    /**
+     * R36-H1 regression: when Flink requests a CANONICAL savepoint
+     * ({@link org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy#NO_SHARING}),
+     * the produced handle MUST place its uploaded SSTs in {@code privateState}, NOT
+     * {@code sharedState}. Pre-R36-H1 the SSTs were uploaded under EXCLUSIVE scope (R35-H2)
+     * but still landed in {@code sharedState}, which made {@code registerSharedStates()} bump
+     * a SharedStateRegistry ref for each {@code localPath} — a subsequent incremental
+     * checkpoint that emits the same localPath could collide on the registry key.
+     *
+     * <p>Asserts: (a) baseCheckpointId == 0; (b) sharedState is empty; (c) every uploaded SST
+     * appears in privateState alongside the registry blob.
+     */
+    @Test
+    void canonicalSavepointDivertsSstsToPrivateState(@TempDir Path tmp) throws Exception {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpen(arena, tmp.resolve("db").toString());
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                for (int i = 0; i < 8; i++) {
+                    linker.put(db, cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+                }
+
+                ForStRsSstRegistry sstReg = new ForStRsSstRegistry();
+                ForStRsSstUploader uploader = new ForStRsSstUploader();
+                ForStRsSnapshotStrategy strategy =
+                        new ForStRsSnapshotStrategy(
+                                linker,
+                                db,
+                                UUID.randomUUID(),
+                                new KeyGroupRange(0, 0),
+                                sstReg,
+                                uploader,
+                                arena,
+                                Map.of("default", 0L));
+                MemCheckpointStreamFactory factory =
+                        new MemCheckpointStreamFactory(64 * 1024 * 1024);
+
+                org.apache.flink.runtime.checkpoint.SavepointType canonical =
+                        org.apache.flink.runtime.checkpoint.SavepointType.savepoint(
+                                org.apache.flink.core.execution.SavepointFormatType.CANONICAL);
+                assertEquals(
+                        org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy
+                                .NO_SHARING,
+                        canonical.getSharingFilesStrategy(),
+                        "test precondition: CANONICAL savepoint must be NO_SHARING");
+                org.apache.flink.runtime.checkpoint.CheckpointOptions canonicalOpts =
+                        org.apache.flink.runtime.checkpoint.CheckpointOptions.alignedNoTimeout(
+                                canonical,
+                                org.apache.flink.runtime.state.CheckpointStorageLocationReference
+                                        .getDefault());
+
+                ForStRsSnapshotResources res =
+                        strategy.syncPrepareResources(1L);
+                SnapshotResult<?> result =
+                        strategy.asyncSnapshot(res, 1L, 0L, factory, canonicalOpts)
+                                .get(new CloseableRegistry());
+                ForStRsIncrementalKeyedStateHandle h =
+                        (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+
+                assertEquals(
+                        0L,
+                        h.getBaseCheckpointId(),
+                        "R36-H1: NO_SHARING handle reports baseCheckpointId=0");
+                assertEquals(
+                        0,
+                        h.getSharedState().size(),
+                        "R36-H1: NO_SHARING handle MUST have empty sharedState"
+                                + " (was uploaded EXCLUSIVE by R35-H2, but pre-R36-H1 still"
+                                + " sat on sharedState and tripped registerSharedStates). Got"
+                                + " sharedState.size() = "
+                                + h.getSharedState().size());
+
+                // Every uploaded SST should be in privateState (along with the registry blob
+                // if present). Count non-registry-blob entries — at least one SST must exist
+                // because we seeded keys above.
+                int privateSstCount = 0;
+                for (HandleAndLocalPath p : h.getPrivateState()) {
+                    if (!ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH
+                            .equals(p.getLocalPath())) {
+                        privateSstCount++;
+                    }
+                }
+                assertTrue(
+                        privateSstCount > 0,
+                        "R36-H1: NO_SHARING handle must carry uploaded SSTs in privateState;"
+                                + " got privateState.size() = "
+                                + h.getPrivateState().size()
+                                + " with "
+                                + privateSstCount
+                                + " non-registry entries");
             }
         }
     }
