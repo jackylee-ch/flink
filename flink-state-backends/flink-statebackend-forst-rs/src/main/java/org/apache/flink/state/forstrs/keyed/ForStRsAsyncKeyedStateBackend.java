@@ -1168,18 +1168,64 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // complete.
             managedExecutors.forEach(VectorizedExecutor::flushDirty);
 
+            // R28-H2: every drain loop wraps the per-state flush in try/Throwable so a throw
+            // from one state instance cannot strand the remaining states' buffers in the
+            // pre-snapshot arena. The MapStateV2 dispose() loop (line ~1531) already uses this
+            // pattern (D5-H2 + R25-M2); the snapshot drain MUST too because a partial drain
+            // produces a silently truncated checkpoint:
+            //   * MapStateV2 off-heap buffer = the user's pending mutations
+            //   * ListStateV2 accumulator   = appended values not yet folded
+            //   * Reducing/Aggregating cache = pending RMW results
+            //   * timer queues               = scheduled-but-not-yet-engine-side timers
+            // Losing any of these silently breaks at-least-once / exactly-once guarantees on
+            // restore. The first failure is captured and rethrown after every state has been
+            // attempted; subsequent failures become suppressed exceptions so the operator sees
+            // the full failure surface in the first task-fail report.
+            //
+            // Best-effort drain pattern (R25-M2): warn-log each failure with the state name,
+            // remember the first failure as the root cause, and addSuppressed for the rest.
+            // RuntimeException is rethrown at the end so the snapshot strategy still sees a
+            // failed pre-flush.
+            Throwable drainFail = null;
+
             // PHASE 1.b: PR-C1 — drain each MapStateV2's off-heap staging buffer to the engine
             // via batchPut + tombstone deletes BEFORE the engine snapshot reads. Mirrors the
             // V1-sync statebuf flush hook (commit b3b9d7f2a6c).
             for (ForStRsMapStateV2<?, ?, ?, ?> ms : registeredMapStatesV2) {
-                ms.flushOffHeapBuffer();
+                try {
+                    ms.flushOffHeapBuffer();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.b drain failed for MapStateV2 instance #{}: continuing with"
+                                    + " remaining states (first failure recorded as root cause)",
+                            System.identityHashCode(ms),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
             // PHASE 1.c: PR-C2 — drain ListStateV2 off-heap accumulator via a single {@code
             // frs_vec_merge_append_batch} FFI. Without this hook, accumulated single-element
             // {@code asyncAdd} chunks would still be in the off-heap arena at snapshot time and
             // would be lost on restore.
             for (ForStRsAsyncListStateV2<?, ?, ?> ls : registeredListStatesV2) {
-                ls.flushPreSnapshot();
+                try {
+                    ls.flushPreSnapshot();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.c drain failed for ListStateV2 '{}': continuing with"
+                                    + " remaining states",
+                            ls.getStateName(),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
 
             // PHASE 1.d: drain RMW caches (Reducing/Aggregating V1 + V2). Each {@code
@@ -1187,17 +1233,68 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // requests to the classifier — those PUTs are picked up by PHASE 2's flushDirty
             // pass.
             for (ForStRsReducingStateV2<?> s : registeredReducingStates) {
-                s.flushOnBarrier();
+                try {
+                    s.flushOnBarrier();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.d drain failed for ReducingStateV2 instance #{}: continuing",
+                            System.identityHashCode(s),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
             for (ForStRsAggregatingStateV2<?, ?, ?> s : registeredAggregatingStates) {
-                s.flushOnBarrier();
+                try {
+                    s.flushOnBarrier();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.d drain failed for AggregatingStateV2 instance #{}:"
+                                    + " continuing",
+                            System.identityHashCode(s),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
             for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
-                s.flushOnBarrier();
+                try {
+                    s.flushOnBarrier();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.d drain failed for AsyncReducingStateV2 instance #{}:"
+                                    + " continuing",
+                            System.identityHashCode(s),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
             for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s :
                     registeredAsyncAggregatingStates) {
-                s.flushOnBarrier();
+                try {
+                    s.flushOnBarrier();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.d drain failed for AsyncAggregatingStateV2 instance #{}:"
+                                    + " continuing",
+                            System.identityHashCode(s),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
             }
 
             // PHASE 1.e: PR-A1 — drain each engine-backed timer queue's pending-buffer to the
@@ -1206,7 +1303,28 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // batched-timer design). HEAP timer-factory mode registers no queues and this loop
             // is a no-op.
             for (ForStRsKeyGroupedInternalPriorityQueue<?> q : registeredTimerQueues) {
-                q.flushPendingToEngine();
+                try {
+                    q.flushPendingToEngine();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.e drain failed for timer queue instance #{}: continuing",
+                            System.identityHashCode(q),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
+            }
+
+            // R28-H2: rethrow the aggregated drain failure after every state has been given a
+            // chance to flush. The snapshot strategy never sees a half-drained state.
+            if (drainFail != null) {
+                throw new RuntimeException(
+                        "Snapshot pre-drain failed (first failure shown; later failures"
+                                + " attached as suppressed)",
+                        drainFail);
             }
 
             // ============================================================
@@ -1537,6 +1655,41 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 }
             }
             registeredMapStatesV2.clear();
+
+            // R28-M4: symmetric best-effort close loop for the other five registered* lists.
+            // Pre-fix, dispose() only closed MapStateV2 — every other state-flavor list kept
+            // strong refs to State instances which transitively pinned their slot-arena memory
+            // segments (Reducing/Aggregating accumulator buffers) and timer-queue engine
+            // handles. Only MapStateV2 and the timer queue expose a {@code close()} entry
+            // point today; the Reducing/Aggregating variants rely on the slot-arena teardown
+            // below for native release, so we just clear the list refs so the GC can reclaim
+            // the Java-side wrapper objects.
+            //
+            // Timer queues hold engine-side merge buffers and an off-heap dispatch arena that
+            // are NOT freed by slotArenaScope.closeSlot() — they own their own resources tied
+            // to the engine handle. Closing them here is required to free those resources;
+            // missing the close was the original leak the directive flags.
+            for (ForStRsKeyGroupedInternalPriorityQueue<?> q : registeredTimerQueues) {
+                try {
+                    q.close();
+                } catch (Throwable ignored) {
+                    // best-effort: subsequent tear-down (engine close, native release) must
+                    // still run regardless of per-queue close failures.
+                }
+            }
+            registeredTimerQueues.clear();
+
+            // Reducing/Aggregating + Async{Reducing,Aggregating}/ListStateV2 do not expose a
+            // per-instance close hook — their accumulator memory lives in the slot arena
+            // which is released by slotArenaScope.closeSlot() below. We still clear the
+            // registry refs so the wrapper objects become eligible for GC and don't pin the
+            // backend instance past dispose().
+            registeredListStatesV2.clear();
+            registeredReducingStates.clear();
+            registeredAggregatingStates.clear();
+            registeredAsyncReducingStates.clear();
+            registeredAsyncAggregatingStates.clear();
+
             stateCache.clear();
         } catch (Throwable t) {
             disposeError = t;

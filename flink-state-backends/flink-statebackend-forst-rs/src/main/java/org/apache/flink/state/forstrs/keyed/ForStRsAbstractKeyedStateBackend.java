@@ -534,10 +534,36 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * calls return the same adapter (matching the AbstractKeyedStateBackend.keyValueStatesByName
      * contract). The adapters re-fetch the underlying L5 ForStRs* state on every method call so
      * they automatically pick up the post-setCurrentKey rebind via the delegate's cache.
+     *
+     * <p>R28-L2: thread-safety contract — this map is a plain {@link java.util.HashMap} (no
+     * synchronization) because every {@link AbstractKeyedStateBackend} mutator runs on the task
+     * mailbox thread. The {@link AbstractKeyedStateBackend#getOrCreateKeyedState} and
+     * {@link AbstractKeyedStateBackend#getOrCreateKeyedStateOnRestoredKey} entry points are both
+     * invoked from the mailbox executor, so a single-threaded write protocol holds even though
+     * the map is unsynchronized. {@code createOrUpdateInternalState} captures the calling thread
+     * on first invocation in {@link #internalStatesByNameOwnerThread} (debug builds only) and
+     * subsequent calls assert against the captured thread — a mismatch surfaces as an
+     * {@link AssertionError} when {@code -ea} is enabled, catching accidental concurrent
+     * registration paths (e.g. a fast checkpoint thread racing the task thread on rescale) at
+     * dev/CI time without imposing any prod overhead.
+     *
+     * <p>Guarded-by: the task mailbox thread. Concurrent reads from other threads (e.g.
+     * snapshot-strategy threads reading existing entries) are safe ONLY if no concurrent write
+     * is in flight; the map is published via final-field semantics so existing entries are
+     * visible without further synchronization.
      */
+    // @GuardedBy("task mailbox thread") — javax.annotation.concurrent.GuardedBy is not on the
+    // backend's classpath; comment-only marker matches the rest of the codebase.
     private final java.util.Map<
                     String, org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?>>
             internalStatesByName = new java.util.HashMap<>();
+
+    /**
+     * R28-L2: owner thread captured on first {@link #createOrUpdateInternalState} invocation.
+     * Debug-builds only — assertion checks against this in subsequent calls. {@code null}
+     * until first call, so the first writer wins and stamps the field.
+     */
+    private Thread internalStatesByNameOwnerThread = null;
 
     @Override
     @SuppressWarnings("unchecked")
@@ -546,6 +572,16 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             StateDescriptor<S, SV> stateDesc,
             StateSnapshotTransformFactory<SEV> snapshotTransformFactory)
             throws Exception {
+        // R28-L2: owner-thread invariant — capture-on-first-call, assert-on-subsequent.
+        // {@code assert} is a no-op when assertions are disabled (production), so the
+        // check costs nothing in normal runs while catching accidental cross-thread
+        // registration paths under {@code -ea} test runs and CI.
+        assert checkInternalStatesByNameOwnerThread()
+                : "internalStatesByName must only be mutated from a single thread (typically"
+                        + " the task mailbox thread); first writer was "
+                        + internalStatesByNameOwnerThread
+                        + ", current = "
+                        + Thread.currentThread();
         // Idempotent: cached adapter wins, matching the parent's contract that successive
         // getOrCreateKeyedState calls return the same kvState instance.
         org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> existing =
@@ -668,6 +704,24 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         }
         internalStatesByName.put(stateDesc.getName(), created);
         return (IS) created;
+    }
+
+    /**
+     * R28-L2: returns {@code true} when the current thread is the owner of
+     * {@link #internalStatesByName} (either the first writer ever, or the same thread that
+     * stamped the field on the first call). Side-effect: stamps the owner on first call so
+     * subsequent calls have a baseline to compare against.
+     *
+     * <p>Only called from an {@code assert} expression so the side-effect runs only under
+     * {@code -ea} — production builds skip both the comparison and the stamp.
+     */
+    private boolean checkInternalStatesByNameOwnerThread() {
+        Thread current = Thread.currentThread();
+        if (internalStatesByNameOwnerThread == null) {
+            internalStatesByNameOwnerThread = current;
+            return true;
+        }
+        return internalStatesByNameOwnerThread == current;
     }
 
     @Override

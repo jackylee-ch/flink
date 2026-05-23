@@ -30,6 +30,7 @@ import java.lang.foreign.Arena;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Internal
 public class ForStRsStateExecutor implements StateExecutor {
@@ -38,6 +39,27 @@ public class ForStRsStateExecutor implements StateExecutor {
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final Arena arena;
+
+    /**
+     * R28-M2: post-shutdown gate. {@link #shutdown()} was previously a no-op so a backend
+     * dispose chain that called {@code executor.shutdown()} BEFORE the in-flight
+     * AsyncExecutionController had finished handing requests off could still see the
+     * StateExecutor accept fresh batches AFTER teardown began — those batches would then
+     * touch the soon-to-be-closed slot {@link Arena} (UAF window). Flipping the flag in
+     * {@link #shutdown()} and checking it at {@link #executeBatchRequests} /
+     * {@link #executeRequestSync} entry rejects new work by completing tail futures
+     * exceptionally with {@link IllegalStateException} — the AsyncExecutionController's
+     * exception handler observes the failure and propagates it as a task fail instead of
+     * silently corrupting state via a UAF.
+     *
+     * <p>Volatility: an {@code AtomicBoolean} is overkill on the write path (only set once,
+     * from a single thread under the backend close lock) but the read path runs from any
+     * managed-executor virtual thread and we need the happens-before guarantee that any
+     * write performed before {@code shutdown()} is visible to the post-shutdown rejection
+     * check (otherwise a racing virtual thread could observe stale {@code shutdown=false}
+     * and proceed). The flag's volatile read cost is negligible vs the per-batch FFI work.
+     */
+    private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
     public ForStRsStateExecutor(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         this.linker = linker;
@@ -55,6 +77,29 @@ public class ForStRsStateExecutor implements StateExecutor {
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
         ForStRsStateRequestClassifier classifier = (ForStRsStateRequestClassifier) container;
+        // R28-M2: reject post-shutdown batches by completing every request's tail future
+        // exceptionally. Returning a failedFuture matches the existing error-path contract
+        // (see catch block below) and the AsyncExecutionController treats it as a task fail
+        // rather than a silent drop. Drain order mirrors drainTailExceptionally so the
+        // classifier's get/put/iter completed-count stays 0 (no double-complete risk).
+        if (shutdown.get()) {
+            IllegalStateException rej =
+                    new IllegalStateException(
+                            "ForStRsStateExecutor shutdown: rejecting batch of "
+                                    + (classifier.getGetRequests().size()
+                                            + classifier.getPutRequests().size()
+                                            + classifier.getIterRequests().size())
+                                    + " requests (backend dispose() is in progress)");
+            drainTailExceptionally(
+                    classifier.getGetRequests(),
+                    0,
+                    classifier.getPutRequests(),
+                    0,
+                    classifier.getIterRequests(),
+                    0,
+                    rej);
+            return CompletableFuture.failedFuture(rej);
+        }
         // E8-H3 / E9-H1: track which phase failed and how many requests inside that phase
         // already completed successfully BEFORE the throw, so the drain only completes tails
         // that were left dangling. Calling completeExceptionally on an already-completed
@@ -97,6 +142,23 @@ public class ForStRsStateExecutor implements StateExecutor {
 
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
+        // R28-M2: same post-shutdown gate as executeBatchRequests. The sync path is the
+        // entry point used by the SYNC_SAVEPOINT snapshot codepath and unit tests; if the
+        // executor was torn down mid-snapshot we must refuse new work instead of running
+        // through invalidated Arena memory.
+        if (shutdown.get()) {
+            IllegalStateException rej =
+                    new IllegalStateException(
+                            "ForStRsStateExecutor shutdown: rejecting sync request"
+                                    + " (backend dispose() is in progress)");
+            try {
+                request.getFuture().completeExceptionally(rej.getMessage(), rej);
+            } catch (RuntimeException ignored) {
+                // exceptionHandler may itself throw; propagate the original rejection
+                // through the regular exception channel below.
+            }
+            throw rej;
+        }
         ForStRsStateRequestClassifier single = new ForStRsStateRequestClassifier();
         single.offer(request);
         // executeRequestSync has only one request in each phase and propagates exceptions
@@ -113,7 +175,14 @@ public class ForStRsStateExecutor implements StateExecutor {
     }
 
     @Override
-    public void shutdown() {}
+    public void shutdown() {
+        // R28-M2: idempotent set; subsequent executeBatchRequests / executeRequestSync calls
+        // reject new work. Best-effort — no underlying resource is owned by the executor
+        // (the FrsDb / FrsCfHandle / Arena are owned by the backend and released through
+        // its dispose() chain), so shutdown's only job is to gate the inbound request
+        // queue.
+        shutdown.set(true);
+    }
 
     public void flushDirty() {}
 

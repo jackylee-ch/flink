@@ -519,6 +519,31 @@ public final class StateSerializerRegistry {
             out.put(name, new StateSerializerMetadata(
                     name, kindOrd, fmtVer, bytes, ttlEnabled, ttlMillis));
         }
+        // R28-M3: reject blobs with trailing bytes after the entry loop. A residue here
+        // signals one of three pathologies, each of which silently corrupts the restored
+        // registry view if we let it through:
+        //   1. Wire-format drift — a future writer appended a new trailer section that this
+        //      reader doesn't understand. Without the residue check the new trailer is
+        //      silently dropped and the registry deserializes as if it were the older
+        //      format, losing data on the next snapshot round-trip.
+        //   2. Tampering / hostile blob — an attacker padded the blob to hide payload
+        //      inside the trailing bytes. The malicious data is invisible to the entry
+        //      loop and could later be reflected via a side-channel.
+        //   3. Per-entry length-field mismatch — a corrupt count + bytesLen combo that
+        //      happens to land inside the buffer leaves leftover bytes; without this
+        //      check we accept the corrupted entries silently.
+        // Reading the residue length via {@link DataInputDeserializer#available()} is
+        // cheap (a single field access) and the throw shape mirrors the other malformed-
+        // blob checks above.
+        int residue = in.available();
+        if (residue != 0) {
+            throw new IOException(
+                    "StateSerializerRegistry blob malformed: "
+                            + residue
+                            + " trailing byte(s) remain after deserializing "
+                            + count
+                            + " entries (expected to be at end-of-blob)");
+        }
         return out;
     }
 

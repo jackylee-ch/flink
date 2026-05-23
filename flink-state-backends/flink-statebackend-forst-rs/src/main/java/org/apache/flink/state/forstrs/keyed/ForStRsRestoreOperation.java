@@ -191,11 +191,22 @@ public class ForStRsRestoreOperation {
         List<ForStRsIncrementalKeyedStateHandle> incHandles = new ArrayList<>(handles.size());
         for (KeyedStateHandle h : handles) {
             if (!(h instanceof ForStRsIncrementalKeyedStateHandle)) {
+                // R28-L1: surface the EXPECTED handle type alongside the actual one so an
+                // operator triaging a savepoint-restore failure sees the mismatch at a
+                // glance and can decide whether to (a) re-checkpoint from the source
+                // backend or (b) wire a state-handle conversion layer. Pre-fix the message
+                // only reported the actual class name — the operator had to grep the
+                // source tree to learn what the ForStRs backend wanted.
                 throw new ForStRsCheckpointRestoreException(
                         null,
                         -1L,
                         "Unsupported keyed-state handle type for ForStRs restore: "
-                                + (h == null ? "null" : h.getClass().getName()));
+                                + (h == null ? "null" : h.getClass().getName())
+                                + " (expected "
+                                + ForStRsIncrementalKeyedStateHandle.class.getName()
+                                + "; cross-backend handle types are not yet supported —"
+                                + " re-checkpoint from a ForStRs-backed job or convert the"
+                                + " handle before restore)");
             }
             incHandles.add((ForStRsIncrementalKeyedStateHandle) h);
         }
