@@ -43,6 +43,7 @@ import java.util.ArrayDeque;
 import java.util.Collection;
 import java.util.LinkedHashSet;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.LongFunction;
 import java.util.function.ToLongFunction;
 
@@ -179,6 +180,19 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     private static final int REFILL_BATCH = 128;
     private final ArrayDeque<Entry> pollCache = new ArrayDeque<>();
     private int cachedKg = -1; // -1 = cache invalid / empty
+
+    /**
+     * R29-M3: idempotency gate for {@link #close()}. PHASE 1.e of the backend's
+     * dispose chain calls {@link #flushPendingToEngine()} via {@code
+     * ForStRsAsyncKeyedStateBackend#snapshot} pre-snapshot drain, then dispose's
+     * symmetric registry loop calls {@link #close()} again — which would re-drain
+     * the (likely already-empty) pending buffer at the cost of another engine FFI
+     * crossing AND potentially mask a prior exception by throwing on the second
+     * drain. Mirror the {@code MemoryWritableFile} pattern: flip on first close,
+     * skip the drain on subsequent calls; arena/buffer releases are still
+     * idempotent at the {@link Arena#close()} level so re-running them is a no-op.
+     */
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /**
      * Legacy IntSupplier ctor — kept for backward compatibility with existing tests.
@@ -968,8 +982,18 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public void close() {
+        // R29-M3: idempotent close. PHASE 1.e of dispose already drained the
+        // pending buffer via {@link #flushPendingToEngine()}; the symmetric
+        // registry close() loop must NOT re-drain (extra FFI call) and must NOT
+        // throw on the second invocation (which would mask the real dispose
+        // cause). On second+ entry we skip the drain and proceed directly to
+        // arena/buffer release (those releases are themselves idempotent at the
+        // {@link Arena#close()} layer).
+        boolean firstClose = closed.compareAndSet(false, true);
         try {
-            flushPendingToEngine();
+            if (firstClose) {
+                flushPendingToEngine();
+            }
         } finally {
             try {
                 pendingBuffer.close();

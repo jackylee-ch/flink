@@ -40,6 +40,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -85,6 +86,19 @@ public class VectorizedExecutor implements StateExecutor {
     // Set via setSlotScope() before any submitVectorized(IterPrefixRequest) calls.
     private SlotArenaScope slotScope;
     private final AtomicLong nextIterHandleId = new AtomicLong(0);
+
+    /**
+     * R29-M2: post-shutdown gate (mirrors {@link ForStRsStateExecutor}'s R28-M2 design).
+     * {@link #shutdown()} previously was a no-op so the dispose chain that calls
+     * {@code managedExecutors.forEach(VectorizedExecutor::shutdown)} did not actually
+     * prevent in-flight {@link #executeBatchRequests}/{@link #executeRequestSync} calls
+     * from touching the soon-to-be-closed slot {@link Arena}. Flip this flag in
+     * {@link #shutdown()} and check at the entry points so racing virtual threads
+     * (the async-state controller's batch dispatch + sync-savepoint sync path)
+     * fail-fast with {@link IllegalStateException} instead of reading torn-down
+     * memory.
+     */
+    private final AtomicBoolean shutdown = new AtomicBoolean(false);
 
     // Long-lived classifier-side buffers (reused across batches via reset()).
     private final ColumnarBatchBuffer getKeys;
@@ -323,6 +337,17 @@ public class VectorizedExecutor implements StateExecutor {
     @Override
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
+        // R29-M2: refuse new work after shutdown so the dispose chain can safely
+        // proceed to {@code arena.close()} without racing in-flight FFI calls.
+        // Mirrors {@code ForStRsStateExecutor}'s R28-M2 gate (the unwired one
+        // R29-M2 closes); failing the container future is the same shape the
+        // AsyncExecutionController already handles for batch-dispatch failures.
+        if (shutdown.get()) {
+            return CompletableFuture.failedFuture(
+                    new IllegalStateException(
+                            "VectorizedExecutor shutdown: rejecting batch request"
+                                    + " (backend dispose() is in progress)"));
+        }
         VectorizedClassifier classifier = (VectorizedClassifier) container;
         if (metrics != null) {
             metrics.recordBatchStart();
@@ -443,6 +468,22 @@ public class VectorizedExecutor implements StateExecutor {
 
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
+        // R29-M2: same post-shutdown gate as {@link #executeBatchRequests}. The sync
+        // path is used by SYNC_SAVEPOINT and tests; refusing new work post-shutdown
+        // prevents UAF on the slot {@link Arena} that dispose() is about to close.
+        if (shutdown.get()) {
+            IllegalStateException rej =
+                    new IllegalStateException(
+                            "VectorizedExecutor shutdown: rejecting sync request"
+                                    + " (backend dispose() is in progress)");
+            try {
+                request.getFuture().completeExceptionally(rej.getMessage(), rej);
+            } catch (RuntimeException ignored) {
+                // exceptionHandler may itself throw; the throw below still surfaces
+                // the rejection through the regular exception channel.
+            }
+            throw rej;
+        }
         VectorizedClassifier single =
                 new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
         // R18-H2: widen the try/catch to cover registerListState / initNewKindBuffers /
@@ -556,7 +597,21 @@ public class VectorizedExecutor implements StateExecutor {
     }
 
     @Override
-    public void shutdown() {}
+    public void shutdown() {
+        // R29-M2: idempotent set so the close()/dispose() chain in
+        // {@link
+        // org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend#dispose}
+        // — which calls {@code managedExecutors.forEach(VectorizedExecutor::shutdown)}
+        // BEFORE {@code arena.close} via {@link
+        // org.apache.flink.state.forstrs.exec.SlotArenaScope#closeSlot} — actually
+        // gates concurrent {@link #executeBatchRequests}/{@link #executeRequestSync}
+        // calls from in-flight async-state controller batches. Best-effort: the
+        // executor does NOT own the {@link Arena} / {@link FrsDb} / {@link FrsCfHandle}
+        // (those are released by {@link
+        // org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend#releaseNativeResources});
+        // shutdown's only job is to flip the rejection gate.
+        shutdown.set(true);
+    }
 
     /**
      * Pre-snapshot drain hook (PR-A1 wiring).

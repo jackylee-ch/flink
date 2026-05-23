@@ -28,7 +28,6 @@ import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
-import org.apache.flink.state.forstrs.state.ForStRsAggregatingStateV2;
 import org.apache.flink.state.forstrs.state.ForStRsReducingStateV2;
 
 import org.junit.jupiter.api.Test;
