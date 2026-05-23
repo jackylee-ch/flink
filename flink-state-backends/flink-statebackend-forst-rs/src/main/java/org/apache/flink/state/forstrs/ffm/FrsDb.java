@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.ffm;
 
 import java.lang.foreign.MemorySegment;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Opaque ForSt-RS database handle. Wraps a {@code FrsDb} pointer (raw {@code *mut c_void} from the
@@ -27,8 +28,13 @@ import java.lang.foreign.MemorySegment;
 public final class FrsDb implements AutoCloseable {
 
     private final ForStRsLinker linker;
-    private MemorySegment handle;
-    private boolean closed = false;
+    private volatile MemorySegment handle;
+    // R22-L1: AtomicBoolean + CAS protects against concurrent close() races. Pre-fix, two threads
+    // observing closed=false could both call linker.dbClose(handle) and double-free the native
+    // handle. The dispose()/close() lifecycle ordering in the backend normally serializes these,
+    // but defense-in-depth: any future caller racing through close() is now guaranteed exactly-one
+    // dbClose by the CAS — the loser observes closed=true and skips the native call.
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     FrsDb(ForStRsLinker linker, MemorySegment handle) {
         this.linker = linker;
@@ -36,10 +42,15 @@ public final class FrsDb implements AutoCloseable {
     }
 
     public MemorySegment handle() {
-        if (closed) {
+        if (closed.get()) {
             throw new IllegalStateException("FrsDb already closed");
         }
         return handle;
+    }
+
+    /** R22-H1 regression-test hook: query the closed flag without throwing. */
+    public boolean isClosed() {
+        return closed.get();
     }
 
     /**
@@ -54,9 +65,11 @@ public final class FrsDb implements AutoCloseable {
 
     @Override
     public void close() {
-        if (!closed) {
+        // R22-L1: compareAndSet — only the thread that flips false→true performs the native
+        // dbClose call; concurrent callers observe the post-set value and return without
+        // touching the native handle. Skips the native call entirely on the loser path.
+        if (closed.compareAndSet(false, true)) {
             linker.dbClose(handle);
-            closed = true;
             handle = MemorySegment.NULL;
         }
     }

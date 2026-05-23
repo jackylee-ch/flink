@@ -269,6 +269,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private boolean disposed = false;
 
     /**
+     * R22-H1: guards {@link #releaseNativeResources()} so the close()→dispose() chain (close()
+     * calls dispose() before doing its own native-release block, and dispose() now also calls
+     * releaseNativeResources()) does not double-close db / defaultCf / arena. The first caller
+     * that flips false→true performs the native frees; subsequent callers no-op.
+     */
+    private final java.util.concurrent.atomic.AtomicBoolean nativeReleased =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    /**
      * R15-H1: set once {@link #close()} begins so {@link #snapshot} can short-circuit any racing
      * checkpoint request rather than registering a fresh future against an arena that is about
      * to close. Pure best-effort — the contractually correct race is for the coordinator to
@@ -1492,6 +1501,43 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             backendPathOperatorId = null;
             backendPathJobId = null;
         }
+        // R22-H1: release native db / defaultCf / arena from dispose() too. Pre-fix, only close()
+        // performed this release — a direct dispose() call (AbstractStreamOperator#dispose on
+        // task cancellation that did not go through close()) leaked the FrsDb, FrsCfHandle, and
+        // backing Arena to process exit. Idempotent via {@link #nativeReleased} so the
+        // close()→dispose() chain doesn't double-close.
+        releaseNativeResources();
+    }
+
+    /**
+     * R22-H1: shared native-resource release for {@link #close()} and {@link #dispose()}. Gated on
+     * {@link #ownsResources} (an external-handle backend never frees its caller's resources) and
+     * on the {@link #nativeReleased} CAS guard so the close()→dispose() lifecycle chain (close()
+     * calls dispose() first, then both code paths reach this helper) frees exactly once.
+     *
+     * <p>Each individual close call is wrapped in its own try-catch — a failure on defaultCf must
+     * not skip db.close(), and a failure on db must not skip arena.close(). The native handles
+     * themselves are CAS-guarded against double-free too (R22-L1).
+     */
+    private void releaseNativeResources() {
+        if (!ownsResources) {
+            return;
+        }
+        if (!nativeReleased.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            defaultCf.close();
+        } catch (Exception ignored) {
+        }
+        try {
+            db.close();
+        } catch (Exception ignored) {
+        }
+        try {
+            arena.close();
+        } catch (Exception ignored) {
+        }
     }
 
     @Override
@@ -1510,21 +1556,10 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // the cancel-stream registry) and BEFORE arena.close() (which would UAF on any in-flight
         // worker's FrsSnapshot close).
         awaitOutstandingSnapshots();
+        // R22-H1: dispose() now itself invokes {@link #releaseNativeResources()}. The shared
+        // helper is idempotent via the {@code nativeReleased} CAS, so this call sequence frees
+        // db/defaultCf/arena exactly once whether the caller arrived via close() or dispose().
         dispose();
-        if (ownsResources) {
-            try {
-                defaultCf.close();
-            } catch (Exception ignored) {
-            }
-            try {
-                db.close();
-            } catch (Exception ignored) {
-            }
-            try {
-                arena.close();
-            } catch (Exception ignored) {
-            }
-        }
     }
 
     /**

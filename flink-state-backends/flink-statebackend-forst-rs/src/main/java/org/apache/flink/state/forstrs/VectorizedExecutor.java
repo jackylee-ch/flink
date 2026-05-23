@@ -398,6 +398,13 @@ public class VectorizedExecutor implements StateExecutor {
                         } catch (Throwable t) {
                             cause = t.getCause() != null ? t.getCause() : t;
                         }
+                        // R22-L2: mark BEFORE per-row completion for pattern consistency with the
+                        // single-request path at line ~533. The current batched outer catch does
+                        // NOT re-complete these rows, so this is defense-in-depth — a future
+                        // refactor that adds a re-completion fallback would see the marker and
+                        // skip the duplicate. Matches the R21-H1 contract: outer catches always
+                        // observe a marker before they can race a per-row failPath.
+                        classifier.markCompletedExceptionally(amReqs[i]);
                         completePutExceptionally(amReqs[i], cause);
                         if (firstRowFailure == null) {
                             firstRowFailure = cause;
@@ -777,8 +784,32 @@ public class VectorizedExecutor implements StateExecutor {
         if (c.iterRequests().isEmpty()) {
             return;
         }
+        // R22-M2: per-op try/catch establishes the R21-H1 invariant for iter requests too. Pre-fix,
+        // an iter.process(...) throw fell through to the outer catch in {@link
+        // #executeRequestSync}, which labels failure as PUT — and because the iter's StateRequest
+        // is not in the marker set (no markCompletedExceptionally call here), the outer catch did
+        // NOT skip re-completion, so the iter row's future could be completed twice or routed
+        // through the PUT failure path. Marking + completing-exceptionally on the iter request
+        // before rethrowing matches the executePuts / executeGets contract.
         for (ForStRsDBIterRequest<?, ?, ?, ?> iter : c.iterRequests()) {
-            iter.process(linker, db, cf, arena);
+            try {
+                iter.process(linker, db, cf, arena);
+            } catch (Throwable t) {
+                StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
+                if (sr != null) {
+                    try {
+                        c.markCompletedExceptionally(sr);
+                    } catch (Throwable ignore) {
+                        // Best-effort marker placement — never swallow the original failure.
+                    }
+                }
+                try {
+                    iter.completeExceptionally(t);
+                } catch (Throwable ignore) {
+                    // Best-effort per-row completion — never swallow the original failure.
+                }
+                throw t;
+            }
         }
     }
 

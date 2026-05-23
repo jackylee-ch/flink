@@ -300,6 +300,42 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private void drainClassifiedRowsExceptionally(Throwable cause) {
         String prefix = "ForSt-RS onClear flush failed (batched-row drain): ";
         String msg = prefix + cause.getClass().getSimpleName();
+        // R22-M1: discard off-heap-buffered rows BEFORE failing the per-row Flink futures.
+        // Pre-fix, per-row futures for appendMergeRequests were failed first, which meant a
+        // whenComplete callback on a poisoned future could observe the off-heap buffer still
+        // populated with the rows the callback was being notified about. Reversing the order
+        // guarantees: once a row's Flink-side future is failed, its off-heap buffer entry has
+        // already been discarded, so any downstream observer sees an empty buffer.
+        //
+        // R21-H2 (original): discard off-heap-buffered rows for every list-state-instance that
+        // the poisoned batch wrote into. Without this, the per-state {@link
+        // ListStateArrowBuffer} retains the buffered rows and the NEXT batch's
+        // {@code flushIfDirty} writes them (along with new rows) to the engine — silently
+        // breaking exactly-once because the owning StateRequests were already reported as
+        // failed above. The design constraint is "off-heap buffered rows for failed
+        // StateRequests must NOT be flushed to the engine" across ALL exception paths.
+        //
+        // Implementation: walk the parallel {@code offHeapAppendMergeStates} array (one slot
+        // per APPEND_MERGE row that took the off-heap fast path). De-dup is automatic because
+        // {@link ForStRsAsyncListStateV2#discardBufferedRows} clears the buffer on the first
+        // call and {@link ListStateArrowBuffer#discardWithCause} short-circuits on an empty
+        // buffer for subsequent rows pointing to the same state.
+        if (offHeapAppendMergeStates != null) {
+            for (int i = 0; i < appendMergeCount; i++) {
+                org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
+                        offHeapAppendMergeStates[i];
+                if (s != null) {
+                    try {
+                        s.discardBufferedRows(cause);
+                    } catch (Throwable ignore) {
+                        // Best-effort: keep draining remaining states even if one buffer
+                        // discard throws. The amDirty bit is cleared inside the discard path
+                        // even on the empty-buffer short-circuit, so subsequent batches won't
+                        // re-walk this state.
+                    }
+                }
+            }
+        }
         for (int i = 0; i < getCount; i++) {
             failPerRowFuture(getRequests[i], msg, cause);
         }
@@ -322,35 +358,6 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
             StateRequest<?, ?, ?, ?> sr = ir.getStateRequest();
             if (sr != null) {
                 failPerRowFuture(sr, msg, cause);
-            }
-        }
-        // R21-H2: discard off-heap-buffered rows for every list-state-instance that the
-        // poisoned batch wrote into. Without this, the per-state {@link ListStateArrowBuffer}
-        // retains the buffered rows and the NEXT batch's {@code flushIfDirty} writes them
-        // (along with new rows) to the engine — silently breaking exactly-once because the
-        // owning StateRequests were already reported as failed above. The design constraint is
-        // "off-heap buffered rows for failed StateRequests must NOT be flushed to the engine"
-        // across ALL exception paths.
-        //
-        // Implementation: walk the parallel {@code offHeapAppendMergeStates} array (one slot
-        // per APPEND_MERGE row that took the off-heap fast path). De-dup is automatic because
-        // {@link ForStRsAsyncListStateV2#discardBufferedRows} clears the buffer on the first
-        // call and {@link ListStateArrowBuffer#discardWithCause} short-circuits on an empty
-        // buffer for subsequent rows pointing to the same state.
-        if (offHeapAppendMergeStates != null) {
-            for (int i = 0; i < appendMergeCount; i++) {
-                org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
-                        offHeapAppendMergeStates[i];
-                if (s != null) {
-                    try {
-                        s.discardBufferedRows(cause);
-                    } catch (Throwable ignore) {
-                        // Best-effort: keep draining remaining states even if one buffer
-                        // discard throws. The amDirty bit is cleared inside the discard path
-                        // even on the empty-buffer short-circuit, so subsequent batches won't
-                        // re-walk this state.
-                    }
-                }
             }
         }
     }
