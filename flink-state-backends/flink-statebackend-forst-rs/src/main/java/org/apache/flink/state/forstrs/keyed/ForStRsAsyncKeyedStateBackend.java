@@ -1600,7 +1600,13 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         if (s != null) {
             s.recordCompletedCheckpoint(id);
         }
-        managedExecutors.forEach(VectorizedExecutor::flushDirty);
+        // R38-M2: do NOT call {@code managedExecutors.forEach(flushDirty)} here.
+        // A flushDirty AFTER the snapshot manifest is already on durable
+        // storage produces SSTs that are orphaned w.r.t. the just-completed
+        // manifest — they can only be picked up by the next checkpoint, and
+        // until then sit on disk inflating local-disk usage with no caller
+        // benefit. flushDirty is exclusively a snapshot-pre-hook (driven
+        // from {@link ForStRsSnapshotStrategy} during `syncPrepareResources`).
     }
 
     @Override

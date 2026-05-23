@@ -42,6 +42,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -370,5 +371,31 @@ class ForStRsKeyGroupedInternalPriorityQueueBatchedTest {
             assertTrue(q.remove(e));
             assertTrue(q.isEmpty());
         }
+    }
+
+    /**
+     * R38-H2 regression: after {@link ForStRsKeyGroupedInternalPriorityQueue#close()} every
+     * mutating/reading method must surface the lifecycle violation as {@link
+     * IllegalStateException} rather than crash deep inside FFM with an opaque arena-closed
+     * error.
+     */
+    @Test
+    void closedQueueRejectsMutations() {
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q =
+                newQueue("closed", 0, new KeyGroupRange(0, 0));
+        // Seed with one entry so peek / poll have something to look at pre-close.
+        q.add(new TestElement(42L, 1));
+        // Now close — flushArena + scratchArena are released.
+        q.close();
+        // Every subsequent call must throw IllegalStateException.
+        TestElement late = new TestElement(99L, 2);
+        assertThrows(IllegalStateException.class, () -> q.add(late));
+        assertThrows(IllegalStateException.class, () -> q.remove(late));
+        assertThrows(IllegalStateException.class, q::poll);
+        assertThrows(IllegalStateException.class, q::peek);
+        assertThrows(IllegalStateException.class, q::isEmpty);
+        assertThrows(IllegalStateException.class, () -> q.advance(1000L, e -> {}));
+        // close() itself is still idempotent (no exception on second invocation).
+        q.close();
     }
 }

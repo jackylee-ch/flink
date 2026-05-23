@@ -472,6 +472,15 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      */
     @Override
     public boolean add(T element) {
+        // R38-H2: reject mutations on a closed queue. Without this gate a
+        // late timer callback could call encodeIntoScratch (which writes via
+        // MemorySegment.copy on the scratch arena) AFTER {@link #close()}
+        // closed the arena, triggering an FFM IllegalStateException deep
+        // inside the runtime. Fail loud here so the lifecycle bug surfaces
+        // at the actual call site.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         int kg = currentKeyGroupSupplier.getAsInt();
         long ts = timestampExtractor.applyAsLong(element);
         int keyLen = encodeIntoScratch(kg, element);
@@ -510,6 +519,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      */
     @Override
     public boolean remove(T element) {
+        // R38-H2: see add() — reject mutations after close().
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         int kg = currentKeyGroupSupplier.getAsInt();
         long ts = timestampExtractor.applyAsLong(element);
         int keyLen = encodeIntoScratch(kg, element);
@@ -540,6 +553,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public T poll() {
+        // R38-H2: reject post-close access. poll() triggers a flush which
+        // calls into FFM via the closed flushArena; surface the lifecycle
+        // bug loudly instead.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         // Flush pending mutations so the engine view reflects all add/remove decisions.
         flushPendingToEngine();
         int kg = currentKeyGroupSupplier.getAsInt();
@@ -563,6 +582,13 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      */
     @Override
     public T peek() {
+        // R38-H2: reject post-close access. peek() walks pendingBuffer
+        // (off-heap memory owned by the about-to-be-closed flushArena) and
+        // would otherwise raise an opaque IllegalStateException from FFM
+        // deep inside `pendingBuffer.size()` / `MemorySegment.get`.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         int kg = currentKeyGroupSupplier.getAsInt();
 
         // 1. Best ADD in buffer for this key group — happy path is heap[0] (min-ts root), which
@@ -708,6 +734,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public boolean isEmpty() {
+        // R38-H2: reject post-close access. isEmpty() touches pendingBuffer
+        // / cachedHeadEntry and triggers flushPendingToEngine — every one of
+        // those paths fails opaquely against the closed arena.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         if (pendingBuffer.size() > 0) {
             // Fast path: any ADD anywhere makes us non-empty (after cancellations).
             int n = pendingBuffer.size();
@@ -816,6 +848,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * invariant #3.
      */
     public int advance(long maxTimestamp, java.util.function.Consumer<T> visitor) {
+        // R38-H2: reject post-close access. advance() flushes then opens a
+        // prefix iterator on the engine — every step requires the arena to
+        // still be alive.
+        if (closed.get()) {
+            throw new IllegalStateException("timer queue closed");
+        }
         // STEP 1 — flush pending mutations so the engine view is consistent.
         flushPendingToEngine();
         int kg = currentKeyGroupSupplier.getAsInt();
@@ -877,28 +915,28 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             ensureFlushDelDataCapacity(totalDelBytes);
         }
 
-        // Pass A — collect ADDs into batchPut staging.
-        if (addCount > 0) {
-            byte[][] keys = new byte[addCount][];
-            byte[][] vals = new byte[addCount][];
-            int outIdx = 0;
-            MemorySegment keyDataSeg = pendingBuffer.keyDataSegment();
-            for (int i = 0; i < n; i++) {
-                if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
-                    continue;
-                }
-                int kOff = pendingBuffer.keyOffsetAt(i);
-                int kLen = pendingBuffer.keyLenAt(i);
-                byte[] k = new byte[kLen];
-                MemorySegment.copy(keyDataSeg, ValueLayout.JAVA_BYTE, kOff, k, 0, kLen);
-                keys[outIdx] = k;
-                vals[outIdx] = EMPTY_VAL_BYTES;
-                outIdx++;
-            }
-            linker.batchPut(db, cf, keys, vals);
-        }
+        // R38-H3: apply REMOVEs BEFORE ADDs so a mid-flush failure leaves
+        // engine state ⊆ logical state (recoverable on retry — the
+        // surviving ADDs are still pending in the buffer, so the next
+        // flush re-applies them; in-buffer ADD/REMOVE cancellation in
+        // {@link #add}/{@link #remove} ensures the buffer never carries a
+        // contradictory pair so this ordering is safe).
+        //
+        // The original order (ADDs then DELETEs) allowed a DELETE-throw
+        // mid-flush to leave engine ADDs orphaned while {@link
+        // #pendingBuffer#clear} below was skipped, so the next retry
+        // re-applied the ADDs but the originally-paired DELETEs were lost
+        // from logical view. A pre-snapshot drain on that failure path
+        // would have snapshotted ADDs the user logically removed.
+        //
+        // Order swap (DELETE first) is preferred over a single
+        // all-or-nothing batch because the latter requires a new FFI
+        // shape; the swap is functionally equivalent and ships today.
+        // It does NOT break the timer-ordering invariant: timers are
+        // ordered by ts on the engine side, not by the order in which
+        // flush operations are issued.
 
-        // Pass B — collect REMOVEs into Arrow-offset staging then issue one vectorized delete.
+        // Pass A — REMOVEs first (R38-H3).
         if (delCount > 0) {
             ensureFlushDelDataCapacity(totalDelBytes);
             int outIdx = 0;
@@ -922,6 +960,27 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                         ValueLayout.JAVA_INT, (long) outIdx * Integer.BYTES, (int) pos);
             }
             linker.vectorizedBatchDelete(db, cf, flushDelOffsets, flushDelData, outIdx);
+        }
+
+        // Pass B — ADDs after REMOVEs have succeeded.
+        if (addCount > 0) {
+            byte[][] keys = new byte[addCount][];
+            byte[][] vals = new byte[addCount][];
+            int outIdx = 0;
+            MemorySegment keyDataSeg = pendingBuffer.keyDataSegment();
+            for (int i = 0; i < n; i++) {
+                if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
+                    continue;
+                }
+                int kOff = pendingBuffer.keyOffsetAt(i);
+                int kLen = pendingBuffer.keyLenAt(i);
+                byte[] k = new byte[kLen];
+                MemorySegment.copy(keyDataSeg, ValueLayout.JAVA_BYTE, kOff, k, 0, kLen);
+                keys[outIdx] = k;
+                vals[outIdx] = EMPTY_VAL_BYTES;
+                outIdx++;
+            }
+            linker.batchPut(db, cf, keys, vals);
         }
         pendingBuffer.clear();
         invalidateCache();

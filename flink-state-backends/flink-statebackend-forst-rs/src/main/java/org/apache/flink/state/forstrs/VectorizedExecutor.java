@@ -630,8 +630,14 @@ public class VectorizedExecutor implements StateExecutor {
      * {@link ForStRsLinker#flush} forces a synchronous memtable → L0 conversion so the snapshot's
      * file enumeration is complete.
      *
-     * <p>Called from {@code ForStRsAsyncKeyedStateBackend.snapshot()} (PR-A1) and {@code
-     * notifyCheckpointComplete}.
+     * <p>Called from {@code ForStRsAsyncKeyedStateBackend.snapshot()} (PR-A1) ONLY.
+     *
+     * <p>R38-M2: this method is a snapshot-pre-hook. Do NOT call it after
+     * {@code notifyCheckpointComplete} — by then the manifest is already on
+     * durable storage and any new L0 SSTs produced here are orphaned w.r.t.
+     * the just-completed checkpoint (they can only be referenced by the
+     * next snapshot, and until then inflate local-disk footprint with no
+     * caller benefit).
      */
     public void flushDirty() {
         // FFI flush: synchronously fold memtable → L0 SST. Idempotent; engine returns OK if the
@@ -768,6 +774,15 @@ public class VectorizedExecutor implements StateExecutor {
         }
         StateRequest<?, ?, ?, ?>[] reqs = c.getRequests();
         ForStRsInnerTable<?, ?, ?>[] tables = c.getTables();
+        // R38-M3: per-GET confined arena for the oversize-retry path. The
+        // steady-state buffer ({@link #outData} at {@link #INITIAL_OUT_DATA_CAP})
+        // is preserved across calls; only the oversize growth lives in this
+        // arena and is released at the end of the GET. Eliminates monotonic
+        // executor-arena growth when a periodic single-large value triggers
+        // BUFFER_TOO_SMALL.
+        Arena perGetArena = null;
+        MemorySegment savedOutData = outData;
+        long savedOutDataCap = outDataCap;
         try {
             ensureOutCapacity(n);
 
@@ -795,7 +810,13 @@ public class VectorizedExecutor implements StateExecutor {
                 if (rc == FRS_STATUS_BUFFER_TOO_SMALL) {
                     long needed = outDataLenSeg.get(ValueLayout.JAVA_LONG, 0L);
                     long newCap = Math.max(outDataCap * 2L, needed);
-                    outData = arena.allocate(newCap);
+                    // R38-M3: allocate in a per-GET confined arena that is
+                    // closed in finally — the executor arena no longer
+                    // grows on a periodic large value.
+                    if (perGetArena == null) {
+                        perGetArena = Arena.ofConfined();
+                    }
+                    outData = perGetArena.allocate(newCap);
                     outDataCap = newCap;
                     continue;
                 }
@@ -853,6 +874,24 @@ public class VectorizedExecutor implements StateExecutor {
                 }
             }
             throw t;
+        } finally {
+            // R38-M3: release the per-GET oversize buffer and restore the
+            // executor's steady-state outData segment so the next call
+            // starts from {@link #INITIAL_OUT_DATA_CAP} again. This runs
+            // for both the OK path and the error path; the field swap is
+            // safe because completeGet has already consumed outData by
+            // here (it was the same segment that perGetArena allocated).
+            if (perGetArena != null) {
+                outData = savedOutData;
+                outDataCap = savedOutDataCap;
+                try {
+                    perGetArena.close();
+                } catch (Throwable ignored) {
+                    // Best-effort cleanup; arena.close() can only fail if
+                    // a borrowed segment is still in use, which would be a
+                    // production-side use-after-free we want to surface.
+                }
+            }
         }
     }
 

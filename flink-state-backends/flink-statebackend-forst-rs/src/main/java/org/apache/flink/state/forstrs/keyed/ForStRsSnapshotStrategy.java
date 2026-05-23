@@ -832,6 +832,16 @@ public class ForStRsSnapshotStrategy
      * Reads a {@code FrsLiveFileList*} stored at {@code resultStruct[off]} and walks its inner
      * {@code files} array, extracting each file's {@code path}. Other fields (size/seq/level/cf)
      * are ignored for now — we only need the absolute path for upload.
+     *
+     * <p><b>R38-L1 — NUL-terminator FFI contract:</b> the inner {@code pathPtr} is reinterpreted as
+     * an unbounded segment so {@code getString(0L)} can walk to the first NUL byte. This
+     * <em>trusts</em> the Rust side ({@code FrsLiveFile.path}) to NUL-terminate every UTF-8 path
+     * it emits — a missing NUL would read past the allocation and either crash the JVM or leak
+     * arbitrary native bytes into the returned path. The proper fix is to extend the FFI
+     * struct to carry an explicit length and switch to {@code reinterpret(len).asByteBuffer()};
+     * deferred because the change is invasive (cbindgen + every consumer). DO NOT remove the
+     * NUL-termination guarantee on the Rust side without first landing the length-prefixed
+     * variant of the struct.
      */
     private static List<Path> readSstList(MemorySegment resultStruct, long off) {
         MemorySegment listPtr = resultStruct.get(ValueLayout.ADDRESS, off);
