@@ -33,7 +33,11 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
  * PR-A7 (S1-12) regression: {@link TtlSerializer} round-trips {@code [long expiry][value bytes]}
- * losslessly and {@link TtlValue#isExpired(long)} compares strictly {@code >=}.
+ * losslessly.
+ *
+ * <p>R21-L2: {@link TtlValue#isExpired(long)} compares strictly {@code >} (not {@code >=}) so a
+ * {@link Long#MAX_VALUE} never-expire sentinel stays live even when the wall clock reads
+ * {@link Long#MAX_VALUE}.
  */
 class TtlSerializerTest {
 
@@ -55,11 +59,27 @@ class TtlSerializerTest {
     }
 
     @Test
-    void expiryComparisonIsHalfOpen() {
+    void expiryComparisonIsStrictlyAfter() {
+        // R21-L2: isExpired is now strictly greater-than (was >=). At expiry instant the value
+        // is still live; only strictly AFTER the expiry instant does it become invisible. This
+        // preserves the Long.MAX_VALUE never-expire sentinel against a Long.MAX_VALUE clock
+        // reading and matches Flink's documented half-open [now, expiry] visibility window.
         TtlValue<String> v = new TtlValue<>(100L, "x");
         assertFalse(v.isExpired(99L), "before expiry must be fresh");
-        assertTrue(v.isExpired(100L), "at expiry must be expired (>=)");
+        assertFalse(v.isExpired(100L), "AT expiry must still be live (strict >)");
         assertTrue(v.isExpired(101L), "past expiry must be expired");
+    }
+
+    @Test
+    void maxValueExpiryNeverExpiresEvenAtMaxClock() {
+        // R21-L2: regression — Long.MAX_VALUE is used as a "never expire" sentinel by the TTL
+        // compaction filter / disabled-TTL fast path. The OLD >= comparison would mark such a
+        // row as expired the moment the clock reaches Long.MAX_VALUE (or wraps in some test
+        // scenarios). The new strict-> semantics keep the sentinel live.
+        TtlValue<String> v = new TtlValue<>(Long.MAX_VALUE, "sentinel");
+        assertFalse(
+                v.isExpired(Long.MAX_VALUE),
+                "Long.MAX_VALUE expiry must remain live even at clock=Long.MAX_VALUE");
     }
 
     @Test

@@ -54,9 +54,25 @@ public final class TtlValue<V> {
         return value;
     }
 
-    /** {@code true} iff {@code currentTime >= expiryTimestamp}. */
+    /**
+     * Returns {@code true} iff {@code currentTime > expiryTimestamp}.
+     *
+     * <p>R21-L2 boundary semantics: the predicate uses strict greater-than (not {@code >=}) so
+     * the {@link Long#MAX_VALUE} sentinel — used internally to mark a value that should NEVER
+     * expire (e.g. {@code TtlConfig.disabled()} reads or sentinel rows produced by the TTL
+     * compaction filter) — does not falsely expire when the wall clock is read at
+     * {@code Long.MAX_VALUE}. With {@code >=}, both sides being {@code Long.MAX_VALUE} would
+     * make a never-expire sentinel decode as "expired", causing reads to silently drop the row.
+     * With {@code >}, equality with the sentinel returns {@code false} (live), preserving the
+     * documented "never-expire" contract.
+     *
+     * <p>Normal expiry semantics: for any non-sentinel timestamp, the predicate is "the value
+     * has been observable for at least one tick of the clock beyond its expiry instant" —
+     * matching Flink's standard TTL semantics where a value with {@code expiry = t} is still
+     * readable AT {@code t} and only invisible STRICTLY AFTER {@code t}.
+     */
     public boolean isExpired(long currentTime) {
-        return currentTime >= expiryTimestamp;
+        return currentTime > expiryTimestamp;
     }
 
     @Override

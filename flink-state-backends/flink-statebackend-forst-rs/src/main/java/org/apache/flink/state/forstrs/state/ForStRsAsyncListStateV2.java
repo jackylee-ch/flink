@@ -293,6 +293,35 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         amDirty = false;
     }
 
+    /**
+     * R21-H2: discard all rows buffered in the off-heap {@link ListStateArrowBuffer} WITHOUT
+     * dispatching them to the engine, and complete the pending per-row futures exceptionally with
+     * the given {@code cause}. Called from {@link
+     * org.apache.flink.state.forstrs.VectorizedClassifier#drainClassifiedRowsExceptionally} when a
+     * batch is poisoned (typically by an {@code onClear} FFI throw on a sibling row): rows already
+     * appended to this state's off-heap buffer must NOT survive into the next batch's flush,
+     * because the design-correctness invariant is "off-heap buffered rows for failed StateRequests
+     * are NOT flushed to the engine" (exactly-once across all exception paths).
+     *
+     * <p>Implementation: completes every pending buffer-row future exceptionally so callers
+     * observing those futures see the failure (matching the Flink-side StateRequest future drain
+     * that the classifier orchestrates), then resets the buffer's offset/data counters and the
+     * {@link #amDirty} bit so a subsequent {@link #flushIfDirty} on the next batch is a no-op.
+     *
+     * <p>Idempotent / null-safe: no-op when the buffer is not configured or empty.
+     */
+    public void discardBufferedRows(Throwable cause) {
+        if (buffer == null || buffer.isEmpty()) {
+            // Still clear the bit defensively — the classifier may have flipped it before a
+            // recordAppendMergeOffHeap call short-circuited; clearing keeps the next batch's
+            // dirty-walk a clean no-op for this state.
+            amDirty = false;
+            return;
+        }
+        buffer.discardWithCause(cause);
+        amDirty = false;
+    }
+
     // ---------------------------------------------------------------
     // ForStRsInnerTable — key serialization + state-name lookup (V20.2)
     // ---------------------------------------------------------------

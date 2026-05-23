@@ -160,6 +160,59 @@ class ListStateArrowBufferTest {
     }
 
     @Test
+    void discardWithCauseDropsRowsAndFailsPendingFutures() {
+        // R21-H2 regression: rows buffered for a StateRequest whose Flink-side future was
+        // completed exceptionally on an onClear-throw sibling row must be DROPPED — never flushed
+        // to the engine on the next batch. discardWithCause:
+        //   (a) completes every pending per-row future exceptionally with the supplied cause, and
+        //   (b) resets the buffer so a subsequent flushTo / flushIfDirty is a no-op.
+        try (ListStateArrowBuffer buf = new ListStateArrowBuffer()) {
+            CompletableFuture<Void> f1 = buf.append("k1".getBytes(), new byte[] {0, 0, 0, 1, 1});
+            CompletableFuture<Void> f2 = buf.append("k2".getBytes(), new byte[] {0, 0, 0, 1, 2});
+            CompletableFuture<Void> f3 = buf.append("k3".getBytes(), new byte[] {0, 0, 0, 1, 3});
+            assertEquals(3, buf.rowCount());
+
+            RuntimeException cause = new RuntimeException("simulated batch poison");
+            buf.discardWithCause(cause);
+
+            assertTrue(buf.isEmpty(), "discardWithCause must reset the buffer");
+            assertEquals(0, buf.rowCount(), "rowCount=0 after discard");
+            assertEquals(0L, buf.bytesUsed(), "bytesUsed=0 after discard");
+            assertTrue(f1.isCompletedExceptionally(), "row-1 future must be failed");
+            assertTrue(f2.isCompletedExceptionally(), "row-2 future must be failed");
+            assertTrue(f3.isCompletedExceptionally(), "row-3 future must be failed");
+
+            // Verify the cause was propagated.
+            try {
+                f2.getNow(null);
+            } catch (Throwable t) {
+                assertEquals(
+                        cause,
+                        t.getCause(),
+                        "discardWithCause must propagate the original poison cause");
+            }
+
+            // Post-discard: a fresh append starts over at row=0 (buffer is reusable).
+            CompletableFuture<Void> f4 = buf.append("k4".getBytes(), new byte[] {0, 0, 0, 1, 4});
+            assertEquals(1, buf.rowCount(), "post-discard append starts at row=0");
+            assertFalse(f4.isDone(), "post-discard future is still pending");
+        }
+    }
+
+    @Test
+    void discardWithCauseOnEmptyBufferIsNoOp() {
+        // Idempotence: discardWithCause on an empty buffer must not throw and must not leave the
+        // buffer in a broken state.
+        try (ListStateArrowBuffer buf = new ListStateArrowBuffer()) {
+            buf.discardWithCause(new RuntimeException("not used"));
+            assertTrue(buf.isEmpty());
+            // Buffer remains usable for normal appends afterwards.
+            buf.append("k".getBytes(), new byte[] {0, 0, 0, 1, 9});
+            assertEquals(1, buf.rowCount());
+        }
+    }
+
+    @Test
     void appendGrowsCapacityBeyondInitial() {
         // Default initial row capacity is 64; verify we can grow well past it.
         try (ListStateArrowBuffer buf = new ListStateArrowBuffer(2048, 1L << 24)) {

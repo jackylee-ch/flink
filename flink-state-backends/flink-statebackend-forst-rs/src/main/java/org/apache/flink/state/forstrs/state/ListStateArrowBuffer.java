@@ -219,6 +219,34 @@ public final class ListStateArrowBuffer implements AutoCloseable {
         futures.clear();
     }
 
+    /**
+     * R21-H2: discard every accumulated row WITHOUT dispatching them to the engine. Completes
+     * each pending per-row future exceptionally with {@code cause} so observers see the failure,
+     * then resets the buffer. Called from
+     * {@link ForStRsAsyncListStateV2#discardBufferedRows(Throwable)} when a sibling row in the
+     * same batch poisons the dispatch (e.g. an {@code onClear} FFI throw on a different state
+     * instance).
+     *
+     * <p>Design invariant: off-heap rows buffered for a StateRequest whose future was completed
+     * exceptionally must NOT be written to the engine on the next batch's flush. Without this
+     * method the {@link #flushTo} path would re-dispatch them indistinguishably from clean rows,
+     * silently breaking exactly-once semantics for the poisoned StateRequests.
+     */
+    public void discardWithCause(Throwable cause) {
+        if (rowCount == 0) {
+            return;
+        }
+        // Copy futures BEFORE reset so a continuation that re-enters asyncAdd inside an
+        // exceptionally-callback can't race the completion.
+        List<CompletableFuture<Void>> toFail = new ArrayList<>(futures);
+        reset();
+        for (CompletableFuture<Void> f : toFail) {
+            if (f != null && !f.isDone()) {
+                f.completeExceptionally(cause);
+            }
+        }
+    }
+
     @Override
     public void close() {
         if (arena != null) {

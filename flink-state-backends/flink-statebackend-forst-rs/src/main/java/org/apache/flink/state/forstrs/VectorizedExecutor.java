@@ -118,12 +118,24 @@ public class VectorizedExecutor implements StateExecutor {
     @SuppressWarnings("unchecked")
     private CompletableFuture<Void>[] scratchHeapFutures = (CompletableFuture<Void>[]) new CompletableFuture<?>[0];
 
+    // R21-M2: largest valid prefix written into {@link #scratchHeapFutures} across batches.
+    // Used by {@link #flattenHeapFutures} to null out trailing slots from a prior larger
+    // dispatch so the JVM does not retain references to stale {@link CompletableFuture}s
+    // (and the StateRequests they transitively pin). Reset to {@code n} on each call.
+    private int scratchHeapFuturesPrevSize = 0;
+
     // B6-H4: scratch flat array of per-row first-operand MemorySegment for APPEND_MERGE batch
     // dispatch. For B6-H1 heap-path rows the slice is `null` (value lives in
     // {@link AppendMergeBatchBuffer#valueBuffer()} at the same index); otherwise the slice
     // came from a pre-built {@link AppendMergeRequest}. Lifted out of the per-row body so the
     // dispatchAppendMergeBatch INNER loop avoids two List.get(row) interface dispatches per row.
     private MemorySegment[] scratchValueSlices = new MemorySegment[0];
+
+    // R21-M2: mirror of {@link #scratchHeapFuturesPrevSize} for {@link #scratchValueSlices}.
+    // Trailing slots can pin {@link MemorySegment} views over native arena memory; clearing them
+    // is needed to release those views for GC even though the underlying executor arena
+    // outlives them.
+    private int scratchValueSlicesPrevSize = 0;
 
     // A6-H3 / B6-H2 / D6-H1: persistent executor-arena scratch for dispatchIterRange.
     // The open call needs 8+4+4=16 bytes of out-params and the FrsIterHandle borrows
@@ -514,6 +526,11 @@ public class VectorizedExecutor implements StateExecutor {
                     } catch (Throwable t) {
                         cause = t.getCause() != null ? t.getCause() : t;
                     }
+                    // R21-H1: mark BEFORE completion so that if a later step in
+                    // executeRequestSyncInner throws (e.g. dispatchIterPrefix below),
+                    // the outer catch in {@link #executeRequestSync} skips the duplicate
+                    // completion attempt for this same single request.
+                    single.markCompletedExceptionally(amReqs[i]);
                     completePutExceptionally(amReqs[i], cause);
                 } else {
                     completePut(amReqs[i]);
@@ -609,8 +626,19 @@ public class VectorizedExecutor implements StateExecutor {
             // runtime would still wait on each row's future forever. Drain them
             // first so the async-state runtime sees them all resolve, then
             // re-throw so the outer catch can return a failed container future.
+            //
+            // R21-H1: BEFORE per-row exceptional completion, populate
+            // {@code classifierCompletedExceptionally} so that {@link
+            // #executeRequestSync}'s outer catch sees the marker via {@link
+            // VectorizedClassifier#takeClassifierCompletedExceptionally} and
+            // skips its own (duplicate) {@code completePutExceptionally} call.
+            // Without this, on the sync path the framework
+            // {@code AsyncFrameworkExceptionHandler.handleException} fires
+            // twice (once per per-op catch row, once from outer catch) and
+            // produces a double task-failure log.
             for (int i = 0; i < n; i++) {
                 try {
+                    c.markCompletedExceptionally(reqs[i]);
                     completePutExceptionally(reqs[i], t);
                 } catch (Throwable ignore) {
                     // continue draining the rest
@@ -635,8 +663,12 @@ public class VectorizedExecutor implements StateExecutor {
         } catch (Throwable t) {
             // PR-A10 / S1-9: drain per-row futures so the runtime does not hang
             // on the failing batch's individual StateRequest futures.
+            // R21-H1: populate the classifier marker set BEFORE per-row
+            // completion so {@link #executeRequestSync}'s outer catch skips
+            // a duplicate completion (see executePuts catch for rationale).
             for (int i = 0; i < n; i++) {
                 try {
+                    c.markCompletedExceptionally(reqs[i]);
                     completeDeleteExceptionally(reqs[i], t);
                 } catch (Throwable ignore) {
                     // continue draining the rest
@@ -726,8 +758,12 @@ public class VectorizedExecutor implements StateExecutor {
             // returns a failed container future but the per-row StateRequest
             // futures stay unresolved — the operator hangs on the first
             // transient engine error in the GET path.
+            // R21-H1: populate the classifier marker set BEFORE per-row
+            // completion so {@link #executeRequestSync}'s outer catch skips
+            // a duplicate completion (see executePuts catch for rationale).
             for (int i = 0; i < n; i++) {
                 try {
+                    c.markCompletedExceptionally(reqs[i]);
                     completeGetExceptionally(reqs[i], tables[i], t);
                 } catch (Throwable ignore) {
                     // continue draining the rest
@@ -1579,10 +1615,20 @@ public class VectorizedExecutor implements StateExecutor {
             CompletableFuture<Void>[] grown =
                     (CompletableFuture<Void>[]) new CompletableFuture<?>[newCap];
             scratchHeapFutures = grown;
+            // R21-M2: grown array starts entirely null — no stale refs to clear.
+            scratchHeapFuturesPrevSize = 0;
         }
         for (int i = 0; i < n; i++) {
             scratchHeapFutures[i] = heapFutures.get(i);
         }
+        // R21-M2: null out trailing slots from a prior LARGER dispatch so the JVM doesn't
+        // pin CompletableFuture (and the chained StateRequest / payload they reference)
+        // beyond their useful lifetime. Bound the fill to {@code [n, prevSize)} so we
+        // don't redundantly walk slots that were never written.
+        if (scratchHeapFuturesPrevSize > n) {
+            java.util.Arrays.fill(scratchHeapFutures, n, scratchHeapFuturesPrevSize, null);
+        }
+        scratchHeapFuturesPrevSize = n;
         return scratchHeapFutures;
     }
 
@@ -1604,6 +1650,8 @@ public class VectorizedExecutor implements StateExecutor {
                 newCap <<= 1;
             }
             scratchValueSlices = new MemorySegment[newCap];
+            // R21-M2: grown array starts entirely null — no stale refs to clear.
+            scratchValueSlicesPrevSize = 0;
         }
         for (int i = 0; i < n; i++) {
             MemorySegment[] vs = valueSliceLists.get(i);
@@ -1611,6 +1659,12 @@ public class VectorizedExecutor implements StateExecutor {
             // requests are routed to dispatchAppendMergePerRow upstream by dispatchAppendMerge.
             scratchValueSlices[i] = vs == null ? null : vs[0];
         }
+        // R21-M2: null out trailing slots from a prior LARGER dispatch so MemorySegment views
+        // over executor-arena memory don't linger as GC roots past their useful lifetime.
+        if (scratchValueSlicesPrevSize > n) {
+            java.util.Arrays.fill(scratchValueSlices, n, scratchValueSlicesPrevSize, null);
+        }
+        scratchValueSlicesPrevSize = n;
         return scratchValueSlices;
     }
 

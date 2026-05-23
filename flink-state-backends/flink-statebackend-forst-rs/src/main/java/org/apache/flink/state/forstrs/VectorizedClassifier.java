@@ -246,6 +246,27 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     }
 
     /**
+     * R21-H1: record that {@code request}'s future is about to be (or has just been) completed
+     * exceptionally on an executor-side per-op catch path (executePuts / executeDeletes /
+     * executeGets / dispatchAppendMerge*). Must be called BEFORE the per-op
+     * {@code completePutExceptionally} / {@code completeDeleteExceptionally} /
+     * {@code completeGetExceptionally} call so that {@link VectorizedExecutor#executeRequestSync}'s
+     * outer catch can consult {@link #takeClassifierCompletedExceptionally} and skip the second
+     * completion attempt (otherwise the framework {@code AsyncFrameworkExceptionHandler} sees the
+     * failure TWICE: once from the per-op catch and once from the outer catch, producing a double
+     * task-failure log).
+     *
+     * <p>Idempotent: re-adding an already-present request is a no-op. Membership is cleared by
+     * {@link #reset()}; lookup via {@link #takeClassifierCompletedExceptionally} removes the entry
+     * so the set stays bounded by in-flight concurrent failures (= batch size).
+     */
+    public void markCompletedExceptionally(StateRequest<?, ?, ?, ?> request) {
+        if (request != null) {
+            classifierCompletedExceptionally.add(request);
+        }
+    }
+
+    /**
      * A6-H4: returns the throwable that poisoned this batch (or {@code null} if the batch is
      * clean). Set when an {@code onClear} drain throws inside {@link #recordDelete}; cleared by
      * {@link #reset()}. The {@link
@@ -291,11 +312,45 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         for (int i = 0; i < appendMergeCount; i++) {
             failPerRowFuture(appendMergeRequests[i], msg, cause);
         }
+        // R21-M1: per-iter row may be null (defensive — see R21 review). Skip null entries so
+        // we don't NPE on {@code ir.getStateRequest()}.
         for (int i = 0; i < iterRequests.size(); i++) {
             ForStRsDBIterRequest<?, ?, ?, ?> ir = iterRequests.get(i);
+            if (ir == null) {
+                continue;
+            }
             StateRequest<?, ?, ?, ?> sr = ir.getStateRequest();
             if (sr != null) {
                 failPerRowFuture(sr, msg, cause);
+            }
+        }
+        // R21-H2: discard off-heap-buffered rows for every list-state-instance that the
+        // poisoned batch wrote into. Without this, the per-state {@link ListStateArrowBuffer}
+        // retains the buffered rows and the NEXT batch's {@code flushIfDirty} writes them
+        // (along with new rows) to the engine — silently breaking exactly-once because the
+        // owning StateRequests were already reported as failed above. The design constraint is
+        // "off-heap buffered rows for failed StateRequests must NOT be flushed to the engine"
+        // across ALL exception paths.
+        //
+        // Implementation: walk the parallel {@code offHeapAppendMergeStates} array (one slot
+        // per APPEND_MERGE row that took the off-heap fast path). De-dup is automatic because
+        // {@link ForStRsAsyncListStateV2#discardBufferedRows} clears the buffer on the first
+        // call and {@link ListStateArrowBuffer#discardWithCause} short-circuits on an empty
+        // buffer for subsequent rows pointing to the same state.
+        if (offHeapAppendMergeStates != null) {
+            for (int i = 0; i < appendMergeCount; i++) {
+                org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
+                        offHeapAppendMergeStates[i];
+                if (s != null) {
+                    try {
+                        s.discardBufferedRows(cause);
+                    } catch (Throwable ignore) {
+                        // Best-effort: keep draining remaining states even if one buffer
+                        // discard throws. The amDirty bit is cleared inside the discard path
+                        // even on the empty-buffer short-circuit, so subsequent batches won't
+                        // re-walk this state.
+                    }
+                }
             }
         }
     }

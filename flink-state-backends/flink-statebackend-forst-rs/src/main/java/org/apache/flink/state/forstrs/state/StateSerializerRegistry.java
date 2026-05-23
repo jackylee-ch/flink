@@ -132,7 +132,25 @@ public final class StateSerializerRegistry {
      */
     public <T> void register(String stateName, int stateKindOrdinal, TypeSerializer<T> serializer)
             throws IOException {
-        if (live.containsKey(stateName)) {
+        StateSerializerMetadata existing = live.get(stateName);
+        if (existing != null) {
+            // R21-L1: duplicate registration must agree on state-kind. The previous behavior
+            // silently no-op'd on any duplicate name, which masked the genuine corruption case
+            // where two different state primitives (e.g. ValueState and ListState) share a
+            // name across operator builds. Their on-disk layouts diverge (ValueState stores
+            // a single serialized value; ListState stores {@code [count:int][elem...]}), so a
+            // subsequent read through the wrong kind decodes garbage. The kind-match check
+            // here makes the conflict loud at registration time rather than at first read.
+            if (existing.stateKindOrdinal() != stateKindOrdinal) {
+                throw new IllegalStateException(
+                        "Duplicate state registration with different kind: " + stateName
+                                + " (previously " + stateKindName(existing.stateKindOrdinal())
+                                + " [ordinal=" + existing.stateKindOrdinal() + "], now "
+                                + stateKindName(stateKindOrdinal)
+                                + " [ordinal=" + stateKindOrdinal + "]). On-disk layouts differ;"
+                                + " reading through the wrong kind decodes garbage. Choose a"
+                                + " different state name.");
+            }
             return;
         }
         TypeSerializerSnapshot<T> snap = serializer.snapshotConfiguration();
