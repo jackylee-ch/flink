@@ -480,6 +480,17 @@ public class ForStRsSnapshotStrategy
         List<Path> sharedSstFiles = readSstList(result, 2 * PTR);
 
         // Free the result struct now that we've marshalled the data into Java objects.
+        //
+        // R31-L1: {@code frs_incremental_checkpoint_result_free} is documented as idempotent on
+        // the Rust side — it CAS-flips a "freed" flag inside the boxed result and short-circuits
+        // when re-invoked. Catching {@link RuntimeException} is belt-and-braces for two cases:
+        // (a) a future ABI change that introduces a fallible variant we don't know about yet,
+        // and (b) a JVM-side wrapper exception thrown during the FFI bind. Either way, swallowing
+        // is safe because the worst-case (failed free) is a leak of the result struct (which is
+        // bounded — one per checkpoint) and never a use-after-free of the manifest path /
+        // sstFiles lists we already marshalled into Java arrays above. An integration test that
+        // double-invokes free() is intentionally deferred — the native idempotency is covered by
+        // the Rust-side unit test in {@code checkpoint::tests::result_free_idempotent}.
         try {
             linker.dbIncrementalCheckpointResultFree(result);
         } catch (RuntimeException ignored) {

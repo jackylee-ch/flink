@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.ffm;
 
 import java.lang.foreign.MemorySegment;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Java handle wrapping a native {@code FrsSnapshot} pointer obtained from {@code frs_db_snapshot}.
@@ -44,7 +45,15 @@ public final class FrsSnapshot implements AutoCloseable {
 
     private final ForStRsLinker linker;
     private final FrsDb db;
-    private MemorySegment handle;
+    // R31-H2: volatile for safe publication of the handle reference across the
+    // check-on-handle() reads that race with close().
+    private volatile MemorySegment handle;
+    // R31-H2: AtomicBoolean + CAS — mirrors FrsDb / FrsCfHandle. Without this,
+    // the prior `if (handle != null) { release; handle = null; }` was a classic
+    // check-then-act race: two concurrent close() callers both observe a
+    // non-null handle, both invoke linker.dbReleaseSnapshot, and the Rust side
+    // is double-freed. The CAS guarantees exactly-one release.
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     FrsSnapshot(ForStRsLinker linker, FrsDb db, MemorySegment handle) {
         this.linker = linker;
@@ -57,7 +66,7 @@ public final class FrsSnapshot implements AutoCloseable {
      * already been closed (use-after-close on the Java side, before any native call).
      */
     public MemorySegment handle() {
-        if (handle == null) {
+        if (closed.get()) {
             throw new IllegalStateException("FrsSnapshot already closed");
         }
         return handle;
@@ -65,19 +74,23 @@ public final class FrsSnapshot implements AutoCloseable {
 
     /** Returns {@code true} once {@link #close()} has been invoked at least once. */
     public boolean isClosed() {
-        return handle == null;
+        return closed.get();
     }
 
     /**
      * Releases the snapshot back to the engine. Idempotent: calling more than once is a no-op (does
      * not double-release). Per spec §10.0 the underlying release call cannot fail with {@code
      * INVALID_ARGUMENT} as long as the snapshot was originally obtained from {@code db}.
+     *
+     * <p>R31-H2: CAS-guarded — only the thread that flips {@code closed} from {@code false} to
+     * {@code true} invokes the native release. Concurrent callers observing {@code closed=true}
+     * skip the call.
      */
     @Override
     public void close() {
-        if (handle != null) {
+        if (closed.compareAndSet(false, true)) {
             linker.dbReleaseSnapshot(db, this);
-            handle = null;
+            handle = MemorySegment.NULL;
         }
     }
 }

@@ -86,6 +86,21 @@ public final class FrsIterHandle implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     /**
+     * R31-H3: {@code true} while the operator thread is inside a native {@link #next} call. The
+     * watchdog reads this flag in its sweep and SKIPS any handle currently executing, eliminating
+     * the false-positive idle-timeout firing on a slow but in-flight native call.
+     *
+     * <p>Pre-fix: {@code idle = nowNs - lastNextNs}, where {@code lastNextNs} is updated only AFTER
+     * the native call returns. A {@code next()} that takes longer than {@link
+     * IterLifetimeWatchdog#DEFAULT_IDLE_TIMEOUT_MS} (default 30 s — e.g. a large prefix scan over
+     * remote storage with retries) would trip the watchdog mid-call: the watchdog calls {@link
+     * #requestClose()}, the operator's pending {@code next()} eventually returns, the operator
+     * sees {@code closeRequested=true} on its NEXT invocation, and bails out — even though the
+     * handle was making progress the entire time.
+     */
+    private final AtomicBoolean inCall = new AtomicBoolean(false);
+
+    /**
      * R14-M1 / R15-M4: pre-allocated scratch out-parameter segments for {@link #next}. Allocated
      * ONCE at construction and reused across every {@code next()} call so the per-call cost is a
      * pure FFI invocation — no bump-allocation. Pre-fix, {@code perIterArena.allocate(JAVA_INT) × 2}
@@ -164,6 +179,15 @@ public final class FrsIterHandle implements AutoCloseable {
     }
 
     /**
+     * R31-H3: returns {@code true} while the operator thread is inside a native {@link #next} call.
+     * The {@link IterLifetimeWatchdog} sweep reads this and skips the handle so a long-but-active
+     * native call doesn't trip the idle-timeout fault.
+     */
+    public boolean isInCall() {
+        return inCall.get();
+    }
+
+    /**
      * Pulls the next chunk of rows into a caller-owned buffer.
      *
      * <p>If the watchdog has set {@link #closeRequested}, this method closes the handle and throws
@@ -190,13 +214,25 @@ public final class FrsIterHandle implements AutoCloseable {
         // {@code ownsArena=false} the per-iter Arena is the executor's long-lived one, so the
         // previous {@code perIterArena.allocate(JAVA_INT) × 2} per next() call accumulated
         // 8 bytes/call indefinitely.
-        int rc =
-                linker.frsVecIterPrefixNext(
-                        nativeHandleId,
-                        chunkBuf,
-                        (int) chunkBuf.byteSize(),
-                        scratchOutRc,
-                        scratchOutBu);
+        //
+        // R31-H3: flip {@link #inCall} BEFORE the native call so the watchdog sees the handle is
+        // active for the entire duration; cleared in {@code finally} so an FFI throw still un-sets
+        // the flag. The watchdog's sweep skips handles whose {@code inCall} is true — without
+        // this, a single long {@code frsVecIterPrefixNext} (remote-storage prefetch with retries,
+        // etc.) longer than the idle threshold would falsely trip the watchdog mid-call.
+        int rc;
+        inCall.set(true);
+        try {
+            rc =
+                    linker.frsVecIterPrefixNext(
+                            nativeHandleId,
+                            chunkBuf,
+                            (int) chunkBuf.byteSize(),
+                            scratchOutRc,
+                            scratchOutBu);
+        } finally {
+            inCall.set(false);
+        }
         lastNextNs.set(System.nanoTime());
         if (rc != FrsErrorCode.OK.code()) {
             FrsErrorCode code = FrsErrorCode.fromU32(rc);

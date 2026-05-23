@@ -177,24 +177,30 @@ class RestoreBatchedCopyKeyGroupTest {
 
     @Test
     void copyKeyGroupSeamInvokedDuringRescale(@TempDir Path tmp) throws Exception {
-        // End-to-end proof: take a snapshot whose source range = [0,0], restore into a target
-        // range = [0,0] but with rescaling logic triggered (we force the rescale branch by
-        // claiming the source is multi-handle). Verify the protected
-        // flushCopyKeyGroupBatch seam fires — that means production copyKeyGroup ran the
-        // batched path, NOT the legacy per-record linker.put loop.
+        // End-to-end proof: take a snapshot whose source range = [0,0] and restore into a target
+        // range = [0,1] — the size==1 + range-mismatch combination forces the rescaling branch
+        // without needing duplicate-handle overlap.
+        //
+        // R31-M1 follow-up: the previous incarnation of this test passed (h1, h1) — two handles
+        // with the same KeyGroupRange — to force rescaling, but that's exactly the corruption
+        // scenario R31-M1's overlap-detection guards against. The handles-size != 1 OR range !=
+        // targetRange gate at restore() entry already triggers rescaling for our case (size==1
+        // with range != targetRange), so we no longer need duplicate handles.
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
             ForStRsIncrementalKeyedStateHandle h1 =
                     ForStRsRestoreOperationTest.takeSnapshot(linker, arena, tmp.resolve("src1"), 16);
 
-            // Build the restore op with a flushCopyKeyGroupBatch counter.
+            // Build the restore op with a flushCopyKeyGroupBatch counter. Target range = [0,1]
+            // is a strict superset of the source range [0,0] (returned by takeSnapshot), so the
+            // restore() entry hits the rescaling branch (range != targetRange).
             int[] flushCalls = new int[1];
             ForStRsRestoreOperation op =
                     new ForStRsRestoreOperation(
                             linker,
                             arena,
                             tmp.resolve("restored"),
-                            new org.apache.flink.runtime.state.KeyGroupRange(0, 0),
+                            new org.apache.flink.runtime.state.KeyGroupRange(0, 1),
                             new org.apache.flink.state.forstrs.keyed.sst.ForStRsSstRegistry()) {
                         @Override
                         protected void flushCopyKeyGroupBatch(
@@ -205,8 +211,7 @@ class RestoreBatchedCopyKeyGroupTest {
                             super.flushCopyKeyGroupBatch(batch, targetDb, targetCf);
                         }
                     };
-            // Two handles with the same range force the rescaling branch.
-            op.restore(java.util.List.of(h1, h1));
+            op.restore(java.util.List.of(h1));
             // The seam must have been invoked at least once — proving the batched path ran.
             // (Equality with 0 would mean copyKeyGroup never reached a flush, i.e. either no
             // keys had the expected kg-prefix or — the regression we're guarding against — a

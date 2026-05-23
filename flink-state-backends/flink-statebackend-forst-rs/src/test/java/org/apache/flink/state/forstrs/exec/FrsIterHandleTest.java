@@ -80,4 +80,13 @@ class FrsIterHandleTest {
         assertEquals(long.class, FrsIterHandle.class.getMethod("lastNextNs").getReturnType());
         assertEquals(long.class, FrsIterHandle.class.getMethod("openedAtMs").getReturnType());
     }
+
+    /**
+     * R31-H3: verify {@code isInCall()} is exposed with the expected return type. The watchdog
+     * reads this flag to skip handles currently executing a native {@code next()} call.
+     */
+    @Test
+    void isInCallSurfaceExists() throws Exception {
+        assertEquals(boolean.class, FrsIterHandle.class.getMethod("isInCall").getReturnType());
+    }
 }

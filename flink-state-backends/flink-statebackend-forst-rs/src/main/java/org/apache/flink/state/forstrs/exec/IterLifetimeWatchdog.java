@@ -122,6 +122,17 @@ public final class IterLifetimeWatchdog {
                 if (h.closeRequested()) {
                     continue; // already flagged — operator thread will observe
                 }
+                // R31-H3: skip handles currently executing a native next() call. The idle
+                // timer measures time since {@code lastNextNs}, which is updated only AFTER
+                // the FFI call returns — so a slow but in-flight call (large remote-storage
+                // prefix scan, GC pause inside the native side) would otherwise trip
+                // {@code idleMs > idleTimeoutMs} mid-call and request close on a healthy
+                // handle. {@link FrsIterHandle#isInCall()} flips true around the native call
+                // (set before, cleared in finally), so any sweep observing inCall=true
+                // defers eviction to the next sweep after the call completes.
+                if (h.isInCall()) {
+                    continue;
+                }
                 long idleMs = TimeUnit.NANOSECONDS.toMillis(nowNs - h.lastNextNs());
                 if (idleMs > idleTimeoutMs) {
                     idleTimeouts.incrementAndGet();

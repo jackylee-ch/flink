@@ -34,6 +34,9 @@ import org.apache.flink.state.forstrs.keyed.sst.SstRetryStrategy;
 import org.apache.flink.state.forstrs.state.StateSerializerMetadata;
 import org.apache.flink.state.forstrs.state.StateSerializerRegistry;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
@@ -88,6 +91,8 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @Internal
 public class ForStRsRestoreOperation {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ForStRsRestoreOperation.class);
 
     private final ForStRsLinker linker;
     private final Arena arena;
@@ -602,6 +607,45 @@ public class ForStRsRestoreOperation {
                 sources.add(s);
             }
         }
+
+        // R31-M1: pre-flight overlap detection. {@link #findSourceFor} returns the FIRST source
+        // whose KeyGroupRange covers a given kg, so two sources that both claim the same kg would
+        // silently lose half the data on restore (the second source's contents for the shared kgs
+        // would never be copied because the first source already matched). The earlier check at
+        // checkpoint time SHOULD have produced disjoint ranges, but operator bugs or hand-edited
+        // metadata can produce overlaps; failing loudly here prevents corrupt restores.
+        for (int i = 0; i < sources.size(); i++) {
+            KeyGroupRange a = sources.get(i).range;
+            for (int j = i + 1; j < sources.size(); j++) {
+                KeyGroupRange b = sources.get(j).range;
+                int overlapStart = Math.max(a.getStartKeyGroup(), b.getStartKeyGroup());
+                int overlapEnd = Math.min(a.getEndKeyGroup(), b.getEndKeyGroup());
+                if (overlapStart <= overlapEnd) {
+                    String msg =
+                            "Overlapping source ranges: indices "
+                                    + i
+                                    + " ("
+                                    + a
+                                    + ") and "
+                                    + j
+                                    + " ("
+                                    + b
+                                    + ") both claim kg "
+                                    + overlapStart;
+                    // Close any opened sources before throwing — they own native handles.
+                    for (OpenSourceDb s : sources) {
+                        try {
+                            s.close();
+                        } catch (Throwable ignored) {
+                            // best-effort during cleanup
+                        }
+                    }
+                    throw new ForStRsCheckpointRestoreException(
+                            targetDir.toString(), maxRestoredCkpt, msg);
+                }
+            }
+        }
+
         try {
 
             // 2. Open an empty target DB.
@@ -934,6 +978,13 @@ public class ForStRsRestoreOperation {
         if (!Files.exists(p)) {
             return;
         }
+        // R31-L2: collect per-entry failures into a suppressed list and log at WARN. Pre-fix the
+        // catch was a silent {@code ignored}, so a partially-cleaned restore directory would
+        // surface as a confusing engine error later (e.g. "engine refused to open: stale MANIFEST
+        // present"). Logging WARN lets operators correlate the engine failure with the cleanup
+        // problem; surfacing the first suppressed cause via the outer IOException's
+        // {@link Throwable#addSuppressed(Throwable)} chain keeps the API contract unchanged.
+        java.util.List<IOException> suppressed = new java.util.ArrayList<>();
         try (var stream = Files.walk(p)) {
             // Reverse-order so directories come last.
             stream.sorted((a, b) -> b.getNameCount() - a.getNameCount())
@@ -941,11 +992,24 @@ public class ForStRsRestoreOperation {
                             child -> {
                                 try {
                                     Files.deleteIfExists(child);
-                                } catch (IOException ignored) {
-                                    // Best-effort cleanup; the engine will surface a hard error
-                                    // if a leftover file truly blocks the restore.
+                                } catch (IOException e) {
+                                    LOG.warn(
+                                            "deleteRecursively: failed to delete '{}'; continuing",
+                                            child,
+                                            e);
+                                    suppressed.add(e);
                                 }
                             });
+        }
+        if (!suppressed.isEmpty()) {
+            // Surface a single IOException carrying the rest as suppressed so callers that DO
+            // care (e.g. unit tests) can introspect; the engine's open() will still fail loudly
+            // if a leftover file truly blocks the restore.
+            IOException head = suppressed.get(0);
+            for (int i = 1; i < suppressed.size(); i++) {
+                head.addSuppressed(suppressed.get(i));
+            }
+            throw head;
         }
     }
 
