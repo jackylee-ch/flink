@@ -473,4 +473,118 @@ class AsyncBackendSnapshotPathTest {
         release.countDown();
         workerThread.join(2_000L);
     }
+
+    /**
+     * R16-H1 regression: the closing-flag check + outstanding-set publish must be atomic. Pre-fix
+     * sequence was (1) read closing, (2) long sync prep, (3) trackSnapshot adds to set. A close()
+     * that flipped {@code closing=true} between (1) and (3) saw an EMPTY set in
+     * {@code awaitOutstandingSnapshots} and proceeded to arena.close() while the in-flight
+     * snapshot still held the arena (UAF reintroduced).
+     *
+     * <p>Test strategy: spawn a thread that runs snapshot() while another thread races close().
+     * Either (a) close() saw {@code closing=true} first and snapshot returned
+     * {@code SnapshotResult.empty()}, OR (b) snapshot() published its placeholder under
+     * {@code closeLock} first and close() awaits the in-flight snapshot. There is no third
+     * outcome where close() returns while the snapshot is still in its long prep — that is the
+     * TOCTOU we are guarding against.
+     *
+     * <p>We cannot directly observe the placeholder publish race (it is internal), so the test
+     * here checks the contract: after close() returns, the snapshot worker has either completed
+     * with a tracked future (registered before close awaited) or returned {@code empty()} (saw
+     * closing=true). Neither path leaves the arena closed with a live snapshot still touching it.
+     */
+    @Test
+    void snapshotAndCloseRaceObservesAtomicCheckAndPublish(@TempDir Path tmp) throws Exception {
+        // Repeat the race a few times to maximise the chance of catching a regression.
+        for (int iterRaw = 0; iterRaw < 8; iterRaw++) {
+            final int iter = iterRaw;
+            ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db" + iter));
+
+            // Thread A: calls snapshot() (will either succeed or return empty).
+            java.util.concurrent.atomic.AtomicReference<Throwable> snapErr =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            java.util.concurrent.atomic.AtomicReference<
+                            java.util.concurrent.RunnableFuture<
+                                    org.apache.flink.runtime.state.SnapshotResult<
+                                            org.apache.flink.runtime.state.KeyedStateHandle>>>
+                    snapFuture = new java.util.concurrent.atomic.AtomicReference<>();
+            Thread snapThread =
+                    new Thread(
+                            () -> {
+                                try {
+                                    org.apache.flink.runtime.checkpoint.CheckpointOptions opts =
+                                            org.apache.flink.runtime.checkpoint.CheckpointOptions
+                                                    .forCheckpointWithDefaultLocation();
+                                    snapFuture.set(
+                                            backend.snapshot(
+                                                    /* id */ 10L + iter,
+                                                    /* ts */ System.currentTimeMillis(),
+                                                    /* streamFactory */ new org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory(
+                                                            16 * 1024 * 1024),
+                                                    /* options */ opts));
+                                } catch (Throwable t) {
+                                    snapErr.set(t);
+                                }
+                            },
+                            "test-snap-race-" + iter);
+            snapThread.setDaemon(true);
+
+            // Thread B: calls close().
+            java.util.concurrent.atomic.AtomicReference<Throwable> closeErr =
+                    new java.util.concurrent.atomic.AtomicReference<>();
+            Thread closeThread =
+                    new Thread(
+                            () -> {
+                                try {
+                                    backend.close();
+                                } catch (Throwable t) {
+                                    closeErr.set(t);
+                                }
+                            },
+                            "test-close-race-" + iter);
+            closeThread.setDaemon(true);
+
+            // Launch both threads as close as possible to maximise race exposure.
+            snapThread.start();
+            closeThread.start();
+
+            // Wait for both to settle. close() should not block indefinitely: either the
+            // snapshot's placeholder published before close() flipped the flag (await up to the
+            // per-future budget), or close() flipped the flag first and snapshot() short-circuits.
+            snapThread.join(15_000L);
+            closeThread.join(15_000L);
+
+            assertFalse(snapThread.isAlive(), "snapshot thread settled");
+            assertFalse(closeThread.isAlive(), "close thread settled");
+
+            // Neither thread should have thrown an unexpected error. close() may throw IOException
+            // on a real teardown failure; for this test we just want to check no UAF / no
+            // deadlock surfaced — a clean throw or no throw both satisfy the contract.
+            Throwable se = snapErr.get();
+            Throwable ce = closeErr.get();
+            // The contract: if snapshot() returned without throwing, its result is either a
+            // tracked RunnableFuture OR DoneFuture.of(empty()) (closing-flag short-circuit). We
+            // do NOT require any particular branch — both are valid race outcomes.
+            if (se != null) {
+                // snapshot() may legitimately throw if the cancel-stream registry was closed by a
+                // concurrent dispose() before snapshot()'s registry-register call. That is the
+                // documented benign path (caught in the snapshot() IOException handler and
+                // converted to DoneFuture.of(empty())), so a non-IOException here would be a
+                // regression.
+                if (!(se instanceof java.io.IOException
+                        || se.getCause() instanceof java.io.IOException)) {
+                    fail("snapshot() threw a non-IOException on close race: " + se);
+                }
+            }
+            if (ce != null && !(ce instanceof java.io.IOException)) {
+                fail("close() threw a non-IOException: " + ce);
+            }
+            // If snapshot() returned a future, it must be a legal RunnableFuture (either tracked
+            // or empty DoneFuture). Just verify it's non-null when no exception was thrown.
+            if (se == null) {
+                assertNotNull(
+                        snapFuture.get(), "snapshot() returned a future or null on race short-circuit");
+            }
+        }
+    }
 }

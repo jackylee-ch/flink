@@ -120,7 +120,11 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         // is a power of two. A non-pow2 capacity would skip slots and silently drop
         // entries on insert. Mirrors the FlatStateCache:60 rounding pattern.
         this.capacity = nextPow2(Math.max(initialCapacity, 16));
-        this.maxCapacity = Math.max(maxCapacity, this.capacity);
+        // R16-M1: round maxCapacity up to the next power of two too. The resize path
+        // {@code Math.min(capacity * 2, maxCapacity)} would otherwise produce a non-pow2 if
+        // maxCapacity itself was non-pow2, breaking the hash-index linear-probe mask
+        // invariant. Rounding here keeps every observable {@code capacity} value pow2.
+        this.maxCapacity = nextPow2(Math.max(maxCapacity, this.capacity));
         this.arena = Arena.ofShared();
         allocate(this.capacity, 64 /* avg key bytes */);
     }

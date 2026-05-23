@@ -93,6 +93,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
@@ -303,6 +304,24 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     /** R15-H1: per-future await budget on {@link #close()}. 5s matches the spec. */
     private static final long CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS = 5_000L;
+
+    /**
+     * R16-H1: lock that gates the publish of new {@link #outstandingSnapshots} entries against the
+     * {@link #closing} flag flip. The previous (R15-H1) sequence — read {@code closing}, run a long
+     * sync prep, then add to {@code outstandingSnapshots} — was a TOCTOU: a concurrent {@link
+     * #close()} could flip {@code closing=true} between the check and the add, observe an EMPTY
+     * outstanding set, and proceed to {@code arena.close()} while the in-flight snapshot's
+     * {@link org.apache.flink.state.forstrs.ffm.FrsSnapshot} still referenced the arena (UAF
+     * reintroduced).
+     *
+     * <p>Fix: register a {@code CompletableFuture} placeholder under this lock BEFORE running the
+     * long sync prep, also under the same lock check that {@code closing == false}. {@link
+     * #close()} takes the same lock to flip {@code closing}, so it is mutually exclusive with the
+     * snapshot-register window. After release, the long sync prep runs unsynchronized; if
+     * {@link #close()} then runs concurrently it observes the placeholder in the outstanding set
+     * and awaits it before {@code arena.close()}.
+     */
+    private final Object closeLock = new Object();
 
     /**
      * E8-H4: identity of the (JobID, operatorIdentifier) slot this backend occupies in
@@ -1114,13 +1133,28 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // ("default" → 0) because the async-V2 path keeps every state in the default column
         // family; multi-CF wiring is a follow-on PR (V20).
         ForStRsSnapshotStrategy strategy = ensureSnapshotStrategy();
-        try {
-            // R15-H1: if {@link #close()} is in progress, refuse to enqueue new snapshot work
-            // — the arena that backs every FrsSnapshot is about to close, and any future we
-            // register here would race the arena teardown.
+        // R16-H1: eager-register a placeholder BEFORE running the long sync prep, under
+        // {@link #closeLock} so the closing-flag check and the outstanding-set publish are
+        // atomic with respect to {@link #close()}. Pre-fix, the closing-flag check ran ~tens of
+        // ms before the {@code outstandingSnapshots.add} that {@link #trackSnapshot} performed
+        // — close() racing in that window saw an empty set and freed the arena while the
+        // in-flight snapshot still referenced it.
+        //
+        // Pattern: the placeholder is itself a RunnableFuture (a no-op DoneFuture wrapper)
+        // registered eagerly; later we register the actual future via trackSnapshot and remove
+        // the placeholder. Until the actual future is registered, close()'s await sees the
+        // placeholder and either completes immediately (done) or waits — but the wait is
+        // unimportant because the placeholder protects the publish window, not real work.
+        CompletableFuture<Void> placeholder = new CompletableFuture<>();
+        RunnableFuture<SnapshotResult<KeyedStateHandle>> placeholderFuture =
+                new PlaceholderRunnableFuture(placeholder);
+        synchronized (closeLock) {
             if (closing) {
                 return DoneFuture.of(SnapshotResult.empty());
             }
+            outstandingSnapshots.add(placeholderFuture);
+        }
+        try {
             // PR-A8: SYNC_SAVEPOINT semantics. Synchronous execution blocks until the future is
             // pre-run, so by the time this method returns every state mutation up to the barrier
             // is durable on S3. For periodic checkpoints we use ASYNCHRONOUS so the mailbox
@@ -1137,15 +1171,26 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                     cancelStreamRegistry,
                                     execType)
                             .snapshot(id, ts, f, o);
-            // R15-H1: register the future so {@link #close()} can await its completion before
-            // closing the native arena. For SYNCHRONOUS savepoints the future is already done
-            // by the time {@code .snapshot()} returns (SnapshotStrategyRunner pre-runs the
+            // R15-H1 + R16-H1: register the future so {@link #close()} can await its completion
+            // before closing the native arena. For SYNCHRONOUS savepoints the future is already
+            // done by the time {@code .snapshot()} returns (SnapshotStrategyRunner pre-runs the
             // FutureTask), so tracking is harmless (close() sees done=true and skips the
             // await). For ASYNCHRONOUS checkpoints the worker thread runs concurrently with
-            // the mailbox and MUST be awaited at close() to prevent the
-            // R15-H1 use-after-free on the nativeArena.
-            return trackSnapshot(future);
+            // the mailbox and MUST be awaited at close() to prevent the R15-H1 use-after-free
+            // on the nativeArena. The placeholder is removed only AFTER the actual future is
+            // installed in the set, so close() never sees an empty outstanding set between
+            // the two operations.
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> tracked = trackSnapshot(future);
+            // Publish-then-retire ordering: actual future is now in outstandingSnapshots (or
+            // already done and removed), so it is safe to drop the placeholder.
+            outstandingSnapshots.remove(placeholderFuture);
+            placeholder.complete(null);
+            return tracked;
         } catch (IOException e) {
+            // R16-H1: release the placeholder on any throw path so close()'s await does not
+            // block on a dead snapshot attempt.
+            outstandingSnapshots.remove(placeholderFuture);
+            placeholder.complete(null);
             // The cancelStreamRegistry may already be closed if a prior checkpoint's async phase
             // failed or the task is being cancelled. In that case the SnapshotStrategyRunner
             // cannot register its cancellation hook and throws "Cannot register Closeable,
@@ -1168,6 +1213,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 return DoneFuture.of(SnapshotResult.empty());
             }
             throw e;
+        } catch (Throwable t) {
+            // R16-H1: any non-IOException throw (RuntimeException, FFI panics, Errors) must also
+            // release the placeholder so close()'s await does not block on a dead attempt. The
+            // throw still propagates so the coordinator's tolerable-failed-checkpoints accounting
+            // observes the real failure (A4-H3 contract preserved).
+            outstandingSnapshots.remove(placeholderFuture);
+            placeholder.complete(null);
+            throw t;
         }
         // Other Exception subtypes (RuntimeException / FFI panics surfaced as Exception via
         // FrsBackendException) propagate without catch: they signal real backend failure and
@@ -1409,10 +1462,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     @Override
     public void close() throws IOException {
-        // R15-H1: mark closing BEFORE dispose() / arena.close() so any in-flight
-        // {@link #snapshot} request observes the flag and returns an empty future instead of
-        // enqueuing work against the arena that is about to close.
-        closing = true;
+        // R15-H1 + R16-H1: flip the closing flag under {@link #closeLock} so it is mutually
+        // exclusive with the snapshot()-side placeholder publish. After this synchronized block
+        // exits, any subsequent snapshot() call observes {@code closing=true} BEFORE attempting
+        // the outstanding-set add and returns SnapshotResult.empty() — and any snapshot() that
+        // was already inside its own synchronized(closeLock) block has either (a) bailed because
+        // it saw closing=true, or (b) successfully published its placeholder which we now
+        // observe in the outstanding set below.
+        synchronized (closeLock) {
+            closing = true;
+        }
         // R15-H1: await every outstanding async-snapshot future BEFORE dispose() (which closes
         // the cancel-stream registry) and BEFORE arena.close() (which would UAF on any in-flight
         // worker's FrsSnapshot close).
@@ -1505,6 +1564,62 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 }
             }
         };
+    }
+
+    /**
+     * R16-H1: thin {@link RunnableFuture} wrapper around a {@link CompletableFuture<Void>} used as
+     * an eager placeholder in {@link #outstandingSnapshots}. The placeholder is added under
+     * {@link #closeLock} BEFORE the long sync prep (SnapshotStrategyRunner.snapshot) runs, so
+     * any concurrent {@link #close()} observes the placeholder in the set and awaits it. The
+     * placeholder is removed once the real future is installed by {@link #trackSnapshot}, and
+     * the wrapped {@link CompletableFuture} is completed so any racing await returns immediately.
+     *
+     * <p>This wrapper does NOT do real work — {@link #run()} is a no-op. Its only role is to
+     * occupy a slot in the set during the publish window.
+     */
+    private static final class PlaceholderRunnableFuture
+            implements RunnableFuture<SnapshotResult<KeyedStateHandle>> {
+        private final CompletableFuture<Void> delegate;
+
+        PlaceholderRunnableFuture(CompletableFuture<Void> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public void run() {
+            // No-op: the placeholder represents the pre-run publish window, not real snapshot
+            // work. The snapshot() method completes the delegate after trackSnapshot installs
+            // the real future.
+        }
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            return delegate.cancel(mayInterruptIfRunning);
+        }
+
+        @Override
+        public boolean isCancelled() {
+            return delegate.isCancelled();
+        }
+
+        @Override
+        public boolean isDone() {
+            return delegate.isDone();
+        }
+
+        @Override
+        public SnapshotResult<KeyedStateHandle> get()
+                throws InterruptedException, ExecutionException {
+            delegate.get();
+            return SnapshotResult.empty();
+        }
+
+        @Override
+        public SnapshotResult<KeyedStateHandle> get(long timeout, @Nonnull TimeUnit unit)
+                throws InterruptedException, ExecutionException, TimeoutException {
+            delegate.get(timeout, unit);
+            return SnapshotResult.empty();
+        }
     }
 
     /**

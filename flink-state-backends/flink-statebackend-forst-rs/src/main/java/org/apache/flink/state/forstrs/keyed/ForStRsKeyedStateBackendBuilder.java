@@ -101,7 +101,26 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
                             256L * 1024 * 1024, // block_cache_capacity_bytes
                             options.writeBufferManagerCapacityBytes());
         }
-        FrsCfHandle cf = linker.dbDefaultCf(opened, arena);
+        // R16-M4: wrap dbDefaultCf in try/catch so a failure between dbOpen and CF
+        // attachment doesn't leak the opened DB. Pre-fix, if dbDefaultCf threw the engine
+        // handle from {@code linker.dbOpen} (or {@code linker.dbOpenRemote}) would be
+        // dropped on the floor — the native FrsDb stays alive until process exit because
+        // its close path is only driven by {@link FrsDb#close()} which never gets called.
+        FrsCfHandle cf;
+        try {
+            cf = linker.dbDefaultCf(opened, arena);
+        } catch (Throwable t) {
+            try {
+                opened.close();
+            } catch (Throwable closeErr) {
+                // Best-effort cleanup on partial-failure path. Suppress the close error
+                // so the primary failure (dbDefaultCf) reaches the caller intact —
+                // diagnosis of why the CF could not be attached is more useful than the
+                // secondary cleanup failure.
+                t.addSuppressed(closeErr);
+            }
+            throw t;
+        }
         return withDb(opened, cf);
     }
 

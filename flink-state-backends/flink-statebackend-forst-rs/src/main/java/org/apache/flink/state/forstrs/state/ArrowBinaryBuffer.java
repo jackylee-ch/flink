@@ -110,7 +110,12 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         // is a power of two. A non-pow2 capacity would skip slots and silently drop
         // entries on insert. Mirrors the FlatStateCache:60 rounding pattern.
         this.capacity = nextPow2(Math.max(initialCapacity, 8));
-        this.maxCapacity = maxCapacity;
+        // R16-M1: round maxCapacity up to the next power of two too. Pre-fix, the resize path
+        // {@code Math.min(capacity * 2, maxCapacity)} could land on a non-pow2 if maxCapacity
+        // itself was non-pow2 (e.g. user passed 1000 — resize would clamp to 1000, breaking the
+        // hash-index mask invariant). Rounding here keeps every observable {@code capacity}
+        // value a power of two for the buffer's lifetime.
+        this.maxCapacity = nextPow2(Math.max(maxCapacity, this.capacity));
         this.arena = Arena.ofShared();
         this.tuner = tuner;
         allocate(this.capacity, 64 /* avg key bytes */, 64 /* avg value bytes */);

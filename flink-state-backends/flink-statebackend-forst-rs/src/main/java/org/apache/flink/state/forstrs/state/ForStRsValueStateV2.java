@@ -36,6 +36,7 @@ import org.apache.flink.state.forstrs.ForStRsInnerTable;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -294,9 +295,15 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
             return dest.appendEmpty();
         }
         Object payload = request.getPayload();
-        if (payload == null) {
-            return dest.appendEmpty();
-        }
+        // R16-L3: symmetry guard with the V1 sync update() path (ForStRsValueState.update()
+        // calls Objects.requireNonNull on its newValue argument). Pre-fix, the V2 vectorized
+        // path silently treated a null update payload as a delete-via-empty-bytes encoding
+        // (appendEmpty), which is a different semantic than the V1 path's clear NullPointer-
+        // Exception. Callers using {@link ValueState#asyncUpdate(Object)} with null should
+        // route through {@link ValueState#asyncClear()} instead — making this explicit at the
+        // backend boundary prevents accidental "update(null) ≡ clear()" code patterns from
+        // silently working on V2 while throwing on V1.
+        Objects.requireNonNull(payload, "VALUE_UPDATE payload must not be null; use clear() instead");
         try {
             valueOut.clear();
             valueSerializer.serialize((V) payload, valueOut);

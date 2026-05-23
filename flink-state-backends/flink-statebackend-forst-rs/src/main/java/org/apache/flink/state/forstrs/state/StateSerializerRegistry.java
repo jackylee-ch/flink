@@ -354,6 +354,26 @@ public final class StateSerializerRegistry {
             int fmtVer = in.readInt();
             int kindOrd = in.readInt();
             int bytesLen = in.readInt();
+            // R16-M3: bound the per-entry envelope-version BEFORE allocating any further
+            // state. v1 is the only known per-entry format; a malformed/hostile blob may
+            // embed a non-{1} value to confuse downstream decode logic, so reject it at
+            // the boundary with a clear error message rather than letting an arbitrary
+            // integer propagate into the consumer.
+            if (fmtVer != REGISTRY_BLOB_FORMAT_V1) {
+                throw new IOException(
+                        "StateSerializerRegistry blob malformed: fmtVer=" + fmtVer
+                                + " for state '" + name + "' (expected "
+                                + REGISTRY_BLOB_FORMAT_V1 + ")");
+            }
+            // R16-M3: bound the state-kind ordinal to the known enum range. Flink's
+            // StateDescriptor.Type has 5 values (VALUE=0, LIST=1, REDUCING=2,
+            // AGGREGATING=3, MAP=4); anything outside [0..4] is corruption or hostile data
+            // and must be rejected before being used as an index downstream.
+            if (kindOrd < 0 || kindOrd > 4) {
+                throw new IOException(
+                        "StateSerializerRegistry blob malformed: kindOrd=" + kindOrd
+                                + " for state '" + name + "' (expected 0..4)");
+            }
             // R15-M1: bound the per-entry snapshot size BEFORE allocating the byte[]. The
             // upper cap matches the largest plausible TypeSerializerSnapshot envelope (a few MB
             // for pathological POJO graphs); anything larger is corruption, not legitimate

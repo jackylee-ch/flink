@@ -450,11 +450,11 @@ public class ForStRsValueState<T> implements ValueState<T> {
      * @return the previous value, or null if the key did not exist
      */
     public T getAndUpdate(T newValue) throws IOException {
-        // R15-L3: reject null payload explicitly. The Javadoc requires {@code newValue != null}
-        // (callers must use {@link #clear()} for deletion); without this guard the call
+        // R15-L3 / R16-L1: reject null payload explicitly. The Javadoc requires {@code newValue
+        // != null} (callers must use {@link #clear()} for deletion); without this guard the call
         // dispatches into {@code serializer.serialize(null, ...)} which throws an obscure
-        // NullPointerException deep in the serializer stack instead of a clear IAE at the
-        // backend boundary.
+        // NullPointerException deep in the serializer stack instead of a clear NPE with a
+        // proper message at the backend boundary.
         Objects.requireNonNull(newValue, "newValue must not be null");
         outputBuffer.clear();
         serializer.serialize(newValue, outputBuffer);
