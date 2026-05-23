@@ -41,6 +41,9 @@ import org.apache.flink.state.forstrs.state.ForStRsMapState;
 import org.apache.flink.state.forstrs.state.ForStRsReducingState;
 import org.apache.flink.state.forstrs.state.ForStRsValueState;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Closeable;
 import java.io.IOException;
 import java.lang.foreign.Arena;
@@ -99,6 +102,8 @@ import java.util.function.Function;
  */
 @Internal
 public class ForStRsKeyedStateBackend<K> implements Closeable {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ForStRsKeyedStateBackend.class);
 
     /** Initial buffer size for currentKey serialization (grows on demand). */
     private static final int DEFAULT_KEY_BUFFER = 32;
@@ -1272,10 +1277,33 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     /**
      * Flushes all registered kg-prefixed MapState instances. Called on checkpoint and close to
      * ensure all buffered map-state writes reach the engine before snapshot.
+     *
+     * <p>R25-M2: pre-fix this method iterated without a per-state try/catch — a single
+     * {@code ms.flush()} throw aborted the loop and skipped every subsequent MapState's
+     * pending write buffer, silently dropping their data on checkpoint. The fix mirrors
+     * the best-effort pattern at {@link #flushAllOffHeapValueStateBuffers}: a per-state
+     * try/catch records the first failure (with any subsequent failures attached as
+     * {@code addSuppressed}) and continues, then surfaces the aggregate at the end so
+     * callers still observe the failure but every state has had a chance to drain.
      */
     public void flushAllMapStates() {
-        for (ForStRsMapState<?, ?> ms : mapStateRegistry.values()) {
-            ms.flush();
+        Throwable firstFailure = null;
+        for (Map.Entry<String, ForStRsMapState<?, ?>> entry : mapStateRegistry.entrySet()) {
+            try {
+                entry.getValue().flush();
+            } catch (Throwable t) {
+                LOG.warn("MapState flush failed for state '{}'", entry.getKey(), t);
+                if (firstFailure == null) {
+                    firstFailure = t;
+                } else {
+                    firstFailure.addSuppressed(t);
+                }
+            }
+        }
+        if (firstFailure != null) {
+            throw new RuntimeException(
+                    "One or more MapState flushes failed during flushAllMapStates",
+                    firstFailure);
         }
     }
 

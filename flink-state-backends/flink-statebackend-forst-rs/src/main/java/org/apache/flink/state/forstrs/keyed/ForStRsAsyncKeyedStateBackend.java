@@ -20,6 +20,7 @@ package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.v2.AggregatingStateDescriptor;
 import org.apache.flink.api.common.state.v2.ListStateDescriptor;
 import org.apache.flink.api.common.state.v2.MapStateDescriptor;
@@ -735,8 +736,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // PR-A1 wires seedFromRestore), this verify call routes COMPATIBLE_AS_IS through and
         // throws StateMigrationException on INCOMPATIBLE per Flink's standard contract.
         // For now, on a fresh session, this is equivalent to a write-only register call.
+        //
+        // R25-H1: extract TTL from the descriptor and forward to the 4-arg overload so the
+        // registry can compare {@code ttlEnabled}/{@code ttlMillis} against the persisted
+        // metadata on restore. Pre-R25-H1 the 3-arg overload defaulted ttlEnabled=false and
+        // any TTL toggle on a restored state silently decoded the 8-byte expiry header as
+        // payload bytes. The descriptor's getTtlConfig() is @Nonnull and returns
+        // {@code StateTtlConfig.DISABLED} when TTL is not configured, so the null guard
+        // below is defensive.
+        StateTtlConfig ttlConfig = desc.getTtlConfig();
+        boolean ttlEnabled = ttlConfig != null && ttlConfig.isEnabled();
+        long ttlMillis = ttlEnabled ? ttlConfig.getTimeToLive().toMillis() : 0L;
         stateSerializerRegistry.verifyOrRegister(
-                desc.getStateId(), desc.getType().ordinal(), desc.getSerializer());
+                desc.getStateId(),
+                desc.getType().ordinal(),
+                desc.getSerializer(),
+                ttlEnabled,
+                ttlMillis);
         // PR-A7 (S1-12): if the descriptor has TTL enabled, wrap the inner state in a TTL
         // decorator. Pre-A7 the TtlConfig was silently dropped on the floor and TTL never fired.
         // STORAGE FORMAT BREAK: TTL-enabled state cells now carry an 8-byte expiry prefix;

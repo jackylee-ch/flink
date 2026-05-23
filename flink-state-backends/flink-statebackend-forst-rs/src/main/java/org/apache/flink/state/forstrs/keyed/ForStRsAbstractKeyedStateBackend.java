@@ -28,6 +28,7 @@ import org.apache.flink.api.common.state.MapStateDescriptor;
 import org.apache.flink.api.common.state.ReducingStateDescriptor;
 import org.apache.flink.api.common.state.State;
 import org.apache.flink.api.common.state.StateDescriptor;
+import org.apache.flink.api.common.state.StateTtlConfig;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.java.tuple.Tuple2;
@@ -558,10 +559,19 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // schema-compatibility check against restored metadata on first encounter. We pass the
         // *value* serializer because that is the one that observes user-visible payload changes;
         // the namespace serializer is fixed by Flink's runtime.
+        //
+        // R25-H1: forward TTL config to the 4-arg overload so a TTL toggle across a snapshot/
+        // restore is surfaced as StateMigrationException by the registry. The v1 StateDescriptor
+        // returns {@code StateTtlConfig.DISABLED} (non-null) when TTL was never configured.
+        StateTtlConfig ttlConfig = stateDesc.getTtlConfig();
+        boolean ttlEnabled = ttlConfig != null && ttlConfig.isEnabled();
+        long ttlMillis = ttlEnabled ? ttlConfig.getTimeToLive().toMillis() : 0L;
         stateSerializerRegistry.verifyOrRegister(
                 stateDesc.getName(),
                 stateDesc.getType().ordinal(),
-                stateDesc.getSerializer());
+                stateDesc.getSerializer(),
+                ttlEnabled,
+                ttlMillis);
         org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> created;
         switch (stateDesc.getType()) {
             case VALUE:

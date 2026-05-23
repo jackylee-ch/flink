@@ -131,12 +131,22 @@ public final class ForStRsStateMigration {
      * Drops a column family by handle (B-Prod-followup-5, spec §6g).
      *
      * <p>After this call returns, the CF is unusable from any handle held against it (subsequent
-     * native operations fail with {@code INVALID_ARGUMENT}). The {@link FrsCfHandle} itself is NOT
-     * closed — callers are still responsible for {@code cf.close()} to release the FFM allocation.
+     * native operations fail with {@code INVALID_ARGUMENT}). R25-L2: the {@link FrsCfHandle}
+     * is now closed inside this method as the safe default so callers cannot inadvertently
+     * leak the FFM allocation on the success path. The handle's {@code close()} is idempotent
+     * (uses {@code compareAndSet}), so existing callers that still call {@code cf.close()}
+     * after this method behave correctly. Pre-R25-L2 the docstring placed the close
+     * responsibility on the caller; the redundant call from migrated callers is harmless.
      *
      * <p>Combined with {@link #createColumnFamilyFromImport}, this enables same-CF-name migration:
      * drop the old CF, then re-import under the same name. Idempotent on an already-dropped CF
      * (returns silently); rejects the default CF with {@code INVALID_ARGUMENT}.
+     *
+     * <p>Close ordering: the engine-side drop runs BEFORE the FFM-side {@code cf.close}. If
+     * the engine-side drop throws, the FFM handle is intentionally left open so the caller's
+     * exception-handling path can observe the unchanged state (consistent with the
+     * "drop+ingest" recovery pattern where a failed drop should leave the original CF
+     * fully accessible).
      *
      * @param db open ForSt-RS database (must outlive this call)
      * @param cf column-family handle to drop (any clone of the handle observes the drop)
@@ -148,6 +158,12 @@ public final class ForStRsStateMigration {
         Objects.requireNonNull(db, "db");
         Objects.requireNonNull(cf, "cf");
         db.linker().dbDropCf(db, cf);
+        // R25-L2: close the FFM handle as the safe default. The native engine has already
+        // released the CF; keeping the Java-side handle alive after that would only leak
+        // the MemorySegment with no recoverable use. cf.close() is idempotent via
+        // compareAndSet, so callers that retain the legacy "close after drop" convention
+        // observe a structural no-op on their follow-up close call.
+        cf.close();
     }
 
     /**

@@ -169,14 +169,52 @@ public final class ForStRsDBWriteBatchWrapper implements AutoCloseable {
     /**
      * Atomically commits all staged + pending entries. After this call the wrapper is closed; any
      * further put/delete/flush throws.
+     *
+     * <p>R25-M1: pre-fix the {@code handle} field was cleared and {@code disposed=true} was set
+     * BEFORE the {@code writebatchCommit} FFI call. If the commit threw, the subsequent {@code
+     * close()} short-circuited on {@code disposed=true} and the native WriteBatch was never
+     * released → memory leak on the engine side. The fix below clears Java-side state only
+     * AFTER the native call returns (success path) or after an explicit {@code writebatchClose}
+     * runs in the failure-cleanup branch. The contract assumed for {@code frs_writebatch_commit}:
+     * commit does NOT release the handle (the Rust-side stub at {@code
+     * crates/forst-rs-ffi/src/lib.rs:2701} is currently NOT_SUPPORTED with no lifecycle effect;
+     * the canonical release entry point is {@code frs_writebatch_close}). So on commit
+     * SUCCESS we still need to close; on FAILURE we also need to close. We perform the close
+     * unconditionally in the finally block when the handle is still non-zero.
      */
     public void commit() {
         ensureOpen();
         flush();
         long h = handle;
-        handle = 0L;
-        disposed = true;
-        linker.writebatchCommit(h, db);
+        Throwable thrown = null;
+        try {
+            linker.writebatchCommit(h, db);
+        } catch (Throwable t) {
+            thrown = t;
+            throw t;
+        } finally {
+            // Always release the native batch — the engine's commit does NOT free it (see
+            // contract note above). Order: native release first, then flip Java-side flags so
+            // a re-entrant close() through this same wrapper is a structural no-op.
+            try {
+                linker.writebatchClose(h);
+            } catch (Throwable closeFailure) {
+                if (thrown != null) {
+                    thrown.addSuppressed(closeFailure);
+                }
+                // If commit succeeded but close failed, surface the close failure so callers
+                // are not silently leaked. We deliberately do not swallow.
+                if (thrown == null) {
+                    handle = 0L;
+                    disposed = true;
+                    throw closeFailure instanceof RuntimeException
+                            ? (RuntimeException) closeFailure
+                            : new RuntimeException(closeFailure);
+                }
+            }
+            handle = 0L;
+            disposed = true;
+        }
     }
 
     /** Drops all staged + pending entries without committing. Idempotent. */
