@@ -1186,16 +1186,29 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                     slot++;
                     int vOff = (int) (p >>> 32);
                     int vLen = (int) p;
-                    // D10-M3: skip Arena allocation for empty key/value — store
-                    // {@link MemorySegment#NULL} in the pointer slot (len=0 in the
-                    // matching length slot). Avoids a wasted 1-byte slot per empty payload
-                    // and keeps the pointer/length pair internally consistent.
+                    // A11-H1 / D11-H2 (DATA CORRUPTION): REVERT D10-M3. The 1-byte dummy
+                    // allocation is load-bearing — it preserves PUT semantics for legitimately
+                    // empty keys / values.
+                    //
+                    // The Rust FFI {@code frs_batch_put} interprets {@code value_ptrs[i].is_null()}
+                    // as DELETE (lib.rs:1339-1348) and {@code key_ptrs[i].is_null()} as
+                    // FRS_STATUS_NULL_ARG (aborts the whole batch). If we passed
+                    // {@link MemorySegment#NULL} (C pointer 0) for an empty value, ANY state
+                    // whose serialized form is zero bytes would be silently transformed into a
+                    // tombstone at flush — silent data corruption. Storing NULL for an empty
+                    // key would abort the entire batch.
+                    //
+                    // The 1-byte sentinel guarantees the pointer is non-NULL while the matching
+                    // length slot remains 0, so the engine sees a PUT with an empty payload
+                    // ({@code slice::from_raw_parts(ptr, 0)} is a valid empty slice). Memcopy of
+                    // length 0 is a no-op so we never read the sentinel byte's contents.
+                    //
+                    // Arena cost: 1 byte × 64 entries = 64 bytes/chunk peak — negligible vs the
+                    // correctness cost of silent tombstoning.
                     MemorySegment ks =
-                            k.length == 0
-                                    ? MemorySegment.NULL
-                                    : payloadArena.allocate(k.length);
+                            payloadArena.allocate(k.length == 0 ? 1 : k.length, 1);
                     MemorySegment vs =
-                            vLen == 0 ? MemorySegment.NULL : payloadArena.allocate(vLen);
+                            payloadArena.allocate(vLen == 0 ? 1 : vLen, 1);
                     if (k.length > 0) {
                         MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
                     }

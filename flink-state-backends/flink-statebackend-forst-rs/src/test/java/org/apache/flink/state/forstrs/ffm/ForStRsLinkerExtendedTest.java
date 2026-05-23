@@ -584,4 +584,76 @@ class ForStRsLinkerExtendedTest {
             }
         }
     }
+
+    /**
+     * A11-H1 / D11-H2 regression: a value with {@code valueOut.length() == 0} (i.e. a legitimately
+     * empty serialized form) must PUT-with-empty-value through the batch path, not be silently
+     * transformed into a DELETE tombstone.
+     *
+     * <p>The Rust FFI {@code frs_batch_put} interprets a NULL value pointer as DELETE
+     * (lib.rs:1343-1348). The Java batch staging path (both the convenience overload here and the
+     * {@code ForStRsKeyedStateBackend.flushWriteBuffer} chunk loop) must therefore stage a non-NULL
+     * pointer even for empty payloads — the 1-byte sentinel allocation guarantees this while the
+     * paired length slot stays at 0, so the engine sees an empty PUT slice.
+     *
+     * <p>Witness: open a full iterator after the batchPut. If the empty-value key is present, it
+     * shows up in the iterator key set; if D10-M3's NULL-as-empty-value transformation tombstoned
+     * it, the key is absent. We use the iterator rather than {@link ForStRsLinker#get} because
+     * {@code FrsBytes::from_vec} of an empty {@code Vec} returns {@code data=NULL}, which the
+     * Java {@code getInternal} reports as a miss — so {@code get} alone cannot distinguish a
+     * present-but-empty value from a tombstone. The iterator iterates the engine's actual key
+     * set and is unambiguous.
+     */
+    @Test
+    void emptyValueRoundTripsAsPutNotDelete() {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpenMemory(arena);
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+
+                byte[] emptyKey = utf8("empty-val-key");
+                byte[] nonEmptyKey = utf8("non-empty-val-key");
+                byte[] emptyValue = new byte[0];
+                byte[] nonEmptyValue = utf8("payload");
+
+                // Batch put: one row has an empty value, the other a normal payload.
+                byte[][] keys = new byte[][] {emptyKey, nonEmptyKey};
+                byte[][] values = new byte[][] {emptyValue, nonEmptyValue};
+                linker.batchPut(db, cf, keys, values);
+
+                // Witness via iterator: BOTH keys must be present. A NULL-as-DELETE transformation
+                // would tombstone the empty-value row and the iterator would only see one key.
+                List<String> observedKeys = new ArrayList<>();
+                List<Integer> observedValueLens = new ArrayList<>();
+                try (FrsIterator iter = linker.iteratorOpen(db, cf, arena)) {
+                    IteratorEntry entry;
+                    while ((entry = linker.iteratorNext(iter)) != null) {
+                        observedKeys.add(new String(entry.key(), StandardCharsets.UTF_8));
+                        observedValueLens.add(entry.value().length);
+                    }
+                }
+
+                assertTrue(
+                        observedKeys.contains("empty-val-key"),
+                        "key with empty value must be PRESENT after batchPut (FFI null-as-DELETE"
+                                + " collision would tombstone it)");
+                assertTrue(
+                        observedKeys.contains("non-empty-val-key"),
+                        "non-empty companion in same batchPut must be present");
+
+                // The empty-value key's value length must be 0 (not absent / not corrupted).
+                int idxEmpty = observedKeys.indexOf("empty-val-key");
+                assertEquals(
+                        0,
+                        observedValueLens.get(idxEmpty).intValue(),
+                        "empty-value key must retrieve a zero-length payload");
+
+                int idxNonEmpty = observedKeys.indexOf("non-empty-val-key");
+                assertEquals(
+                        nonEmptyValue.length,
+                        observedValueLens.get(idxNonEmpty).intValue(),
+                        "non-empty companion payload length must be preserved");
+            }
+        }
+    }
 }

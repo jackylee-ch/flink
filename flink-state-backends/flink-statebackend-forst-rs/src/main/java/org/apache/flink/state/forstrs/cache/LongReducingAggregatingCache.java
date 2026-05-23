@@ -81,8 +81,38 @@ public final class LongReducingAggregatingCache {
     private final LongFlushCallback flushCallback;
     private final LinkedHashMap<BytesKey, LongEntry> entries;
     private final int maxEntries;
-    private final LinkedHashMap<BytesKey, Long> generations = new LinkedHashMap<>();
+
+    /**
+     * B11-H1: per-key invalidation-generation counter, primitive-{@code long} valued.
+     *
+     * <p>Was {@code LinkedHashMap<BytesKey, Long>}: every {@code generations.merge(owned, 1L,
+     * Long::sum)} on {@link #invalidate} allocated a fresh {@link Long} box on the {@code onClear}
+     * hot path because the counter quickly exceeds {@link Long}'s cached {@code [-128, 127]}
+     * range. Now stores a {@link MutableLong} per slot — one allocation per first-time-insert,
+     * reused on every subsequent bump via {@code .value++}. Zero {@code Long.valueOf} on steady
+     * state.
+     *
+     * <p>{@link MutableLong} is a tiny final class with a single primitive field; the read APIs
+     * ({@link #currentGen} / {@link #putIfGen}) unbox to a primitive {@code long} directly from
+     * the cell, so no {@link Long} box ever materializes.
+     */
+    private final LinkedHashMap<BytesKey, MutableLong> generations = new LinkedHashMap<>();
+
     private final Object generationsLock = new Object();
+
+    /**
+     * B11-H1: mutable primitive-{@code long} cell. Used as the value type for {@link #generations}
+     * so the invalidate-bump path can increment in place ({@code cell.value++}) without ever
+     * allocating a fresh {@link Long} box. One allocation per first-time-insert; reused forever
+     * after.
+     */
+    private static final class MutableLong {
+        long value;
+
+        MutableLong(long value) {
+            this.value = value;
+        }
+    }
 
     /** Deferred-flush slot — same E8-H1 / E9-H2 contract as {@link ReducingAggregatingCache}. */
     private BytesKey pendingFlushKey;
@@ -210,8 +240,9 @@ public final class LongReducingAggregatingCache {
     public long currentGen(byte[] buf, int off, int len) {
         synchronized (generationsLock) {
             BytesKey probe = new BytesKey().view(buf, off, len);
-            Long g = generations.get(probe);
-            return g == null ? 0L : g;
+            // B11-H1: primitive-long cell — no Long.valueOf box on read.
+            MutableLong g = generations.get(probe);
+            return g == null ? 0L : g.value;
         }
     }
 
@@ -219,8 +250,9 @@ public final class LongReducingAggregatingCache {
         boolean inserted;
         synchronized (generationsLock) {
             BytesKey probe = new BytesKey().view(compositeKey, 0, compositeKey.length);
-            Long g = generations.get(probe);
-            long current = g == null ? 0L : g;
+            // B11-H1: primitive-long cell — no Long.valueOf box on read.
+            MutableLong g = generations.get(probe);
+            long current = g == null ? 0L : g.value;
             if (current != expectedGen) {
                 return false;
             }
@@ -234,7 +266,29 @@ public final class LongReducingAggregatingCache {
         return inserted;
     }
 
+    /**
+     * Flushes all dirty entries via the flush callback. Called on checkpoint barrier (§3 Trace E).
+     * Marks entries clean after flushing.
+     *
+     * <p>A10-H1 / A11-H2: drain any in-flight {@link #pendingFlushKey}/{@link #pendingFlushValue}
+     * slot FIRST. The slot is populated by {@code removeEldestEntry} when an LRU eviction was
+     * deferred (engine-PUT FFI must not run under {@code generationsLock}). If a prior
+     * {@code drainPendingFlush} throw re-stashed an entry, {@code drainPendingFlush} placed it
+     * back into {@code entries} marked dirty and the {@code entries} iteration would have picked
+     * it up — so the re-stash path is covered without this drain. BUT the SUCCESS-but-not-yet-
+     * drained path (a deferred eviction captured into the slot that has not been drained by a
+     * subsequent {@code put} or {@code putIfGen}) needs us to materialize the slot before
+     * iterating. Failing to drain here would leave the captured (key, value) unflushed forever —
+     * {@code removeEldestEntry} already removed it from {@code entries}, marked the original
+     * Entry clean, and stashed it into the slot. The {@code entries} iteration alone cannot
+     * see it.
+     *
+     * <p>This mirrors the A10-H1 fix in {@link ReducingAggregatingCache#flushAllDirty()}. The
+     * peer class was introduced in B10-H2 without this drain; it was the silent loss of cascaded
+     * eviction's dirty accumulator on Q12 SumAgg/CountAgg checkpoints (A11-H2 / D11-H1 / E11-H1).
+     */
     public void flushAllDirty() {
+        drainPendingFlush();
         for (Map.Entry<BytesKey, LongEntry> me : entries.entrySet()) {
             LongEntry e = me.getValue();
             if (e.dirty) {
@@ -257,18 +311,31 @@ public final class LongReducingAggregatingCache {
     }
 
     public boolean invalidate(byte[] buf, int off, int len) {
-        BytesKey owned = scratch.view(buf, off, len).snapshot();
         synchronized (generationsLock) {
-            generations.merge(owned, 1L, Long::sum);
-            if (generations.size() > maxEntries) {
-                java.util.Iterator<Map.Entry<BytesKey, Long>> it =
-                        generations.entrySet().iterator();
-                int overflow = generations.size() - maxEntries;
-                while (it.hasNext() && overflow > 0) {
-                    Map.Entry<BytesKey, Long> me = it.next();
-                    if (!entries.containsKey(me.getKey())) {
-                        it.remove();
-                        overflow--;
+            // B11-H1: in-place primitive-long bump. We do TWO probes here: one with the scratch
+            // BytesKey (zero-alloc), and on miss, one allocating snapshot for first-time-insert.
+            // The steady-state hot path (key already present) takes ONLY the scratch probe — no
+            // BytesKey snapshot, no Long box, no map-restructure.
+            BytesKey probe = scratch.view(buf, off, len);
+            MutableLong cell = generations.get(probe);
+            if (cell != null) {
+                cell.value++;
+            } else {
+                // First-time bump: must own the key bytes (scratch is a view into the caller's
+                // buffer). One allocation per never-before-invalidated key — same as the legacy
+                // implementation's snapshot() call; no extra cost.
+                BytesKey owned = probe.snapshot();
+                generations.put(owned, new MutableLong(1L));
+                if (generations.size() > maxEntries) {
+                    java.util.Iterator<Map.Entry<BytesKey, MutableLong>> it =
+                            generations.entrySet().iterator();
+                    int overflow = generations.size() - maxEntries;
+                    while (it.hasNext() && overflow > 0) {
+                        Map.Entry<BytesKey, MutableLong> me = it.next();
+                        if (!entries.containsKey(me.getKey())) {
+                            it.remove();
+                            overflow--;
+                        }
                     }
                 }
             }

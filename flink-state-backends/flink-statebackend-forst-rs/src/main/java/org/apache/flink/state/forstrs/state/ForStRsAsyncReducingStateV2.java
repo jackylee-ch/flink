@@ -179,27 +179,43 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         this.usePrimitiveLongCache = isLong || isInt;
         this.accIsInteger = isInt;
         if (this.usePrimitiveLongCache) {
-            // Unwrap the user's ReduceFunction<Long|Integer> into a LongBinaryOperator. We still
-            // pay one boxed Long/Integer per combiner call (the user's reduce() signature is
-            // Object-typed, no way around it), but the WRITE-BACK box that the general cache
-            // pays on every hit is gone — the result long is written straight into the entry's
-            // primitive field. Net allocation cost on a Q12-pattern cache-hit run is halved.
+            // B11-H2: fast-path detection for well-known primitive reducers. The vast majority of
+            // Q12-pattern workloads use a SumAgg whose reduce(a, b) is `Long::sum` /
+            // `Integer::sum` / `(a, b) -> a + b`. For these we can install a pre-compiled
+            // LongBinaryOperator that does `(a, b) -> a + b` natively — ZERO boxing per cache HIT.
+            //
+            // Detection is via java.lang.invoke.SerializedLambda introspection of any
+            // LambdaMetafactory-generated lambda or method reference. If the lambda's implMethod
+            // is one of the known primitive-sum forms, we route to the native operator. Anything
+            // else (anonymous class, custom reducer, lambda body more complex than a + b) falls
+            // back to the existing boxing shim — same cost as before.
+            //
+            // Halved-alloc fallback is retained for unknown reducers; the goal of this fix is to
+            // eliminate the steady-state alloc on the SumAgg HOT path, not to require every
+            // ReduceFunction to be inspectable.
             final ReduceFunction rawReduce = reduceFunction;
             final boolean asInt = isInt;
             java.util.function.LongBinaryOperator longCombiner =
-                    (accL, inL) -> {
-                        try {
-                            Object acc = asInt ? Integer.valueOf((int) accL) : Long.valueOf(accL);
-                            Object in = asInt ? Integer.valueOf((int) inL) : Long.valueOf(inL);
-                            Object out = rawReduce.reduce(acc, in);
-                            return asInt
-                                    ? ((Integer) out).longValue()
-                                    : ((Long) out).longValue();
-                        } catch (Exception e) {
-                            throw new RuntimeException(
-                                    "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
-                        }
-                    };
+                    tryUnwrapPrimitiveSumReducer(reduceFunction);
+            if (longCombiner == null) {
+                // Fallback boxing shim (halved alloc — write-back box eliminated, input box kept).
+                longCombiner =
+                        (accL, inL) -> {
+                            try {
+                                Object acc =
+                                        asInt ? Integer.valueOf((int) accL) : Long.valueOf(accL);
+                                Object in =
+                                        asInt ? Integer.valueOf((int) inL) : Long.valueOf(inL);
+                                Object out = rawReduce.reduce(acc, in);
+                                return asInt
+                                        ? ((Integer) out).longValue()
+                                        : ((Long) out).longValue();
+                            } catch (Exception e) {
+                                throw new RuntimeException(
+                                        "ForStRsAsyncReducingStateV2: ReduceFunction threw", e);
+                            }
+                        };
+            }
             LongReducingAggregatingCache.LongFlushCallback longFlush =
                     (keyBytes, acc) -> {
                         Object boxedAcc = asInt ? Integer.valueOf((int) acc) : Long.valueOf(acc);
@@ -516,6 +532,90 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     private void flushEntry(byte[] keyBytes, V acc) {
         byte[] valBytes = acc == null ? null : serializeValueBytes(acc);
         flushHandler.accept(keyBytes, valBytes);
+    }
+
+    /**
+     * B11-H2 — detect a well-known primitive-sum {@link ReduceFunction} and return a pre-compiled
+     * native {@link java.util.function.LongBinaryOperator} that does {@code (a, b) -> a + b}
+     * directly on primitive {@code long} values.
+     *
+     * <p>Returns {@code null} if the reducer is not one of the recognized forms; the caller falls
+     * back to a boxing shim (which still eliminates the WRITE-BACK box vs the general cache, but
+     * keeps the input-box per call).
+     *
+     * <p>Recognition strategy: introspect the lambda via {@link java.io.Serializable} +
+     * {@code writeReplace -> SerializedLambda}. This is the JVM-blessed mechanism for inspecting
+     * {@code LambdaMetafactory}-generated lambdas at runtime. The user's {@link ReduceFunction}
+     * must be {@code Serializable} (Flink's API requires this anyway — operators are shipped to
+     * task managers via Java serialization) so {@code writeReplace} is always reachable.
+     *
+     * <p>Recognized forms:
+     *
+     * <ul>
+     *   <li>Method reference {@code Long::sum} → impl class {@code java/lang/Long}, method
+     *       {@code sum}, descriptor {@code (JJ)J}.
+     *   <li>Method reference {@code Integer::sum} → impl class {@code java/lang/Integer}, method
+     *       {@code sum}, descriptor {@code (II)I}.
+     *   <li>Method reference {@code Math::addExact} (long or int variants).
+     *   <li>Lambda body {@code (a, b) -> a + b} — generated as a synthetic method on the calling
+     *       class. We CANNOT inspect the bytecode portably; lambdas with synthetic implementation
+     *       methods fall through to the boxing shim. Users who care about peak performance should
+     *       use {@code Long::sum} directly.
+     * </ul>
+     *
+     * <p>If introspection itself throws (e.g. reducer is not serializable, lambda is from a
+     * non-LambdaMetafactory source, or the JVM is hardened against {@code writeReplace} access),
+     * we silently return {@code null} and fall back — correctness is unaffected.
+     */
+    @SuppressWarnings("rawtypes")
+    private static java.util.function.LongBinaryOperator tryUnwrapPrimitiveSumReducer(
+            ReduceFunction reducer) {
+        if (reducer == null) {
+            return null;
+        }
+        if (!(reducer instanceof java.io.Serializable)) {
+            return null;
+        }
+        try {
+            java.lang.reflect.Method writeReplace =
+                    reducer.getClass().getDeclaredMethod("writeReplace");
+            writeReplace.setAccessible(true);
+            Object replaced = writeReplace.invoke(reducer);
+            if (!(replaced instanceof java.lang.invoke.SerializedLambda)) {
+                return null;
+            }
+            java.lang.invoke.SerializedLambda sl = (java.lang.invoke.SerializedLambda) replaced;
+            String implClass = sl.getImplClass();
+            String implMethod = sl.getImplMethodName();
+            String implSig = sl.getImplMethodSignature();
+            // Method reference forms: Long::sum, Integer::sum, Math::addExact.
+            if ("java/lang/Long".equals(implClass)
+                    && "sum".equals(implMethod)
+                    && "(JJ)J".equals(implSig)) {
+                return Long::sum;
+            }
+            if ("java/lang/Integer".equals(implClass)
+                    && "sum".equals(implMethod)
+                    && "(II)I".equals(implSig)) {
+                // Promote to long-domain (storage uses long); no overflow on simple sums.
+                return (a, b) -> (long) ((int) a + (int) b);
+            }
+            if ("java/lang/Math".equals(implClass)
+                    && "addExact".equals(implMethod)
+                    && "(JJ)J".equals(implSig)) {
+                return Math::addExact;
+            }
+            if ("java/lang/Math".equals(implClass)
+                    && "addExact".equals(implMethod)
+                    && "(II)I".equals(implSig)) {
+                return (a, b) -> Math.addExact((int) a, (int) b);
+            }
+            return null;
+        } catch (Throwable t) {
+            // Defensive: any reflection / serialization failure falls back to the boxing shim.
+            // The fast path is an optimization, not a correctness requirement.
+            return null;
+        }
     }
 
     private byte[] serializeValueBytes(V acc) {
