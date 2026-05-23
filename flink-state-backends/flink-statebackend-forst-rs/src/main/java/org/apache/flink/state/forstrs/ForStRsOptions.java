@@ -195,6 +195,26 @@ public final class ForStRsOptions {
             throw new IllegalArgumentException(
                     "blockCacheCapacityBytes must be >= 0, got " + bytes);
         }
+        // R18-L3: upper-bound validation — the FFI layer represents the
+        // capacity as a {@code usize}, which on a 64-bit target maps to a
+        // Rust {@code u64} cast from this {@code long}. A {@code Long.MAX_VALUE}
+        // here is benign at the JVM boundary but signals operator
+        // misconfiguration (a 9 EiB block cache is never intended). R17-M2
+        // fixed the analogous overflow on {@link #cacheCapacityMb} (MiB → bytes
+        // multiplication). For these byte-valued setters we bound at a
+        // practical ceiling that still leaves room for any conceivable
+        // production deployment (1 PiB) while flagging the obvious
+        // misconfiguration cases (e.g., {@code Long.MAX_VALUE} from a
+        // misconfigured ConfigOption parse).
+        long maxBytes = 1L << 50; // 1 PiB
+        if (bytes > maxBytes) {
+            throw new IllegalArgumentException(
+                    "blockCacheCapacityBytes="
+                            + bytes
+                            + " exceeds the practical ceiling (max="
+                            + maxBytes
+                            + " bytes = 1 PiB); this is almost certainly a misconfiguration");
+        }
         this.blockCacheCapacityBytes = bytes;
         return this;
     }
@@ -212,6 +232,19 @@ public final class ForStRsOptions {
         if (bytes < 0) {
             throw new IllegalArgumentException(
                     "writeBufferManagerCapacityBytes must be >= 0, got " + bytes);
+        }
+        // R18-L3: see blockCacheCapacityBytes for rationale on the 1 PiB
+        // ceiling. The cross-CF write-buffer manager cap is similarly bounded
+        // at the FFI {@code usize} surface — a {@code Long.MAX_VALUE} value
+        // is operator-error rather than a meaningful configuration.
+        long maxBytes = 1L << 50; // 1 PiB
+        if (bytes > maxBytes) {
+            throw new IllegalArgumentException(
+                    "writeBufferManagerCapacityBytes="
+                            + bytes
+                            + " exceeds the practical ceiling (max="
+                            + maxBytes
+                            + " bytes = 1 PiB); this is almost certainly a misconfiguration");
         }
         this.writeBufferManagerCapacityBytes = bytes;
         return this;

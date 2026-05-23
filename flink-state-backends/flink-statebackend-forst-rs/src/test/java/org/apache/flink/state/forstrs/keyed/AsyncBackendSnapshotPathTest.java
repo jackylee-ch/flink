@@ -659,4 +659,98 @@ class AsyncBackendSnapshotPathTest {
             backend.close();
         }
     }
+
+    /**
+     * R18-H1 regression: {@code awaitOutstandingSnapshots} must observe a real future
+     * INSERTED into {@code outstandingSnapshots} AFTER it has begun its iteration. Pre-fix the
+     * await loop snapshotted the set once into a local list; the placeholder→real-future
+     * handoff in snapshot() — which adds the real future via {@code trackSnapshot} before
+     * removing the placeholder — produced a window where close() could iterate ONLY the
+     * placeholder and return without ever observing the real future that was concurrently
+     * installed in the set.
+     *
+     * <p>Test strategy: subclass a {@link java.util.concurrent.FutureTask} whose {@code get(...)}
+     * method synchronously installs a real (already-done) future into the registry BEFORE
+     * returning, then completes. The close() await loop's first iteration drains the
+     * placeholder; the re-poll loop must observe the just-installed real future on the second
+     * iteration and drain it too. Pre-fix the single-snapshot iteration would miss it.
+     */
+    @Test
+    void closeObservesPlaceholderToRealFutureHandoff(@TempDir Path tmp) throws Exception {
+        ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db"));
+
+        // Reflectively access the outstandingSnapshots set.
+        java.lang.reflect.Field osField =
+                ForStRsAsyncKeyedStateBackend.class.getDeclaredField("outstandingSnapshots");
+        osField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<RunnableFuture<?>> registry =
+                (java.util.Set<RunnableFuture<?>>) osField.get(backend);
+
+        // The "real" future installed by the handoff. Pre-done so close() drains it
+        // immediately.
+        java.util.concurrent.FutureTask<SnapshotResult<KeyedStateHandle>> realTask =
+                new java.util.concurrent.FutureTask<>(SnapshotResult::empty);
+        realTask.run(); // pre-complete
+        assertTrue(realTask.isDone());
+
+        // Handoff-emulating future: when close()'s await calls get() on this entry, our
+        // overridden get() installs the real future into the registry BEFORE returning. This
+        // mirrors the snapshot() ordering: outstandingSnapshots.add(real) happens before
+        // placeholder.complete(null). Pre-fix the await loop took ONE snapshot of the set,
+        // drained this entry, and returned without seeing realTask in the registry.
+        java.util.concurrent.atomic.AtomicBoolean handoffRan =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        @SuppressWarnings("serial")
+        java.util.concurrent.FutureTask<SnapshotResult<KeyedStateHandle>> handoffTask =
+                new java.util.concurrent.FutureTask<SnapshotResult<KeyedStateHandle>>(
+                        SnapshotResult::empty) {
+                    @Override
+                    public boolean cancel(boolean mayInterruptIfRunning) {
+                        // close() calls cancel(true) on non-placeholder entries before get().
+                        // Suppress so our get() override drives the handoff. The placeholder
+                        // protocol in production has the same "no cancel" property via
+                        // PlaceholderRunnableFuture, so this is faithful to the contract.
+                        return false;
+                    }
+
+                    @Override
+                    public SnapshotResult<KeyedStateHandle> get(
+                            long timeout, java.util.concurrent.TimeUnit unit)
+                            throws InterruptedException,
+                                    java.util.concurrent.ExecutionException,
+                                    java.util.concurrent.TimeoutException {
+                        // Install the real future BEFORE returning — emulates the
+                        // trackSnapshot(real) + placeholder.complete(null) ordering in
+                        // snapshot().
+                        registry.add(realTask);
+                        handoffRan.set(true);
+                        run(); // mark this handoff future done so the await's get() returns.
+                        return super.get(timeout, unit);
+                    }
+
+                    @Override
+                    public SnapshotResult<KeyedStateHandle> get()
+                            throws InterruptedException, java.util.concurrent.ExecutionException {
+                        registry.add(realTask);
+                        handoffRan.set(true);
+                        run();
+                        return super.get();
+                    }
+                };
+        registry.add(handoffTask);
+        assertTrue(registry.contains(handoffTask), "handoff entry installed");
+
+        backend.close();
+
+        // After close() returns the registry must be empty — close() must have observed BOTH
+        // the handoff (first iteration) AND the real future installed during the handoff
+        // (second iteration of the re-poll loop). Pre-fix the second iteration did not
+        // happen and realTask remained in the set.
+        assertTrue(handoffRan.get(), "handoff future's get() was invoked");
+        assertTrue(
+                registry.isEmpty(),
+                "registry drained — re-poll loop observed the handed-off real future. Pre-fix"
+                        + " the real future would still be present here.");
+    }
 }

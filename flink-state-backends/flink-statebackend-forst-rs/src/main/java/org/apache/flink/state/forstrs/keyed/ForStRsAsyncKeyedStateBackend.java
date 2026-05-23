@@ -1432,6 +1432,24 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             return;
         }
         disposed = true;
+        // R18-M2: dispose() is a legitimate Flink lifecycle entry point that closes native
+        // resources (slotArenaScope, cancelStreamRegistry, MapStateV2 arenas, watchdog).
+        // Pre-fix, only close() drained outstanding async snapshots — a direct dispose() call
+        // (e.g., from AbstractStreamOperator#dispose on task cancellation that did not go
+        // through close()) tore down the arena while in-flight snapshot workers were still
+        // touching it (R15-H1 UAF re-opened).
+        //
+        // Idempotency: close() also calls awaitOutstandingSnapshots() before invoking
+        // dispose(). The second call here observes an empty set (the first await drained it)
+        // and returns immediately — no double-await cost. Direct-dispose callers (bypassing
+        // close()) get the same UAF protection.
+        //
+        // Flip closing=true under closeLock so any racing snapshot() short-circuits — same
+        // semantics as close(). Safe to flip multiple times.
+        synchronized (closeLock) {
+            closing = true;
+        }
+        awaitOutstandingSnapshots();
         managedExecutors.forEach(VectorizedExecutor::flushDirty);
         managedExecutors.forEach(VectorizedExecutor::shutdown);
         managedExecutors.clear();
@@ -1610,7 +1628,20 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
         @Override
         public boolean cancel(boolean mayInterruptIfRunning) {
-            return delegate.cancel(mayInterruptIfRunning);
+            // R18-M1: cancellation is a no-op for the pre-PHASE-1 placeholder. Pre-fix,
+            // delegating to {@link CompletableFuture#cancel} let ANY caller (the await loop's
+            // forEach iterator, an external future-iterator consumer, generic registry
+            // bookkeeping) flip the placeholder's inner future to CANCELLED. {@link
+            // #awaitOutstandingSnapshots} then saw a "done" placeholder and proceeded to
+            // arena teardown while snapshot() was still inside PHASE 1-3 — R17-H1 UAF window
+            // reopened.
+            //
+            // Contract: the placeholder is retired ONLY by {@link
+            // ForStRsAsyncKeyedStateBackend#snapshot}'s explicit
+            // {@code placeholder.complete(null)} after the real future is installed (or any
+            // throw path's {@code outstandingSnapshots.remove(placeholderFuture)}). No
+            // external code path may cancel it.
+            return false;
         }
 
         @Override
@@ -1658,66 +1689,118 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         if (outstandingSnapshots.isEmpty()) {
             return;
         }
-        // Snapshot to a local list so concurrent removals from the worker-completion hook do
-        // not surprise us mid-iteration.
-        List<RunnableFuture<?>> pending = new ArrayList<>(outstandingSnapshots);
-        for (RunnableFuture<?> f : pending) {
-            if (f.isDone()) {
-                outstandingSnapshots.remove(f);
-                continue;
-            }
-            // R17-H2: do NOT call cancel(true) on a PlaceholderRunnableFuture. Pre-fix,
-            // cancel(true) propagated to the placeholder's inner CompletableFuture and completed
-            // it exceptionally — get() then returned immediately with CancellationException and
-            // close() proceeded to arena teardown while snapshot() was still inside PHASE 1-3
-            // (drains + FFI snapshot), reintroducing the R17-H1 UAF window the placeholder is
-            // meant to guard. The contract is: snapshot() removes the placeholder explicitly
-            // once the real future is installed (or any throw path); close() must therefore
-            // ONLY get() the placeholder and let snapshot() complete it. On timeout we
-            // force-remove the entry to avoid wedging close(), accepting the same best-effort
-            // UAF fallback as the non-placeholder branch (the snapshot worker may still touch
-            // the arena briefly — coordinator should never issue a checkpoint to a closing
-            // backend).
-            boolean isPlaceholder = f instanceof PlaceholderRunnableFuture;
-            if (!isPlaceholder) {
+        // R18-H1: re-poll loop until the set drains OR an overall deadline is exhausted.
+        //
+        // Pre-fix (R17-H2 layout) iterated a single snapshot of the set. The placeholder→real-
+        // future handoff in snapshot() is:
+        //
+        //   (a) snapshot() publishes placeholderFuture under closeLock (PHASE 0)
+        //   (b) snapshot() runs PHASE 1-3 and obtains the strategy-built RunnableFuture
+        //   (c) trackSnapshot() ADDS the real future to outstandingSnapshots (line ~1524)
+        //   (d) snapshot() REMOVES the placeholder (line ~1200)
+        //   (e) snapshot() completes the placeholder's inner CompletableFuture
+        //
+        // Between (c) and (d) the set contains BOTH placeholder and real future. The single-
+        // snapshot pre-fix above took its `pending` list at await entry — if the iteration order
+        // had close() observe the placeholder first and successfully get() it (after snapshot()
+        // ran step (e)), the iteration would proceed without ever seeing the real future, and
+        // arena.close() would race the real worker's FFI snapshot teardown — R15-H1 UAF
+        // reintroduced.
+        //
+        // Fix: after each pass, re-check whether the set still has entries. trackSnapshot's
+        // `outstandingSnapshots.add(inner)` precedes the placeholder.complete(null) in
+        // snapshot(), so any real future installed by the handoff is visible to the NEXT pass.
+        // ConcurrentHashMap.newKeySet provides the required happens-before — the .add() in
+        // trackSnapshot synchronizes-with the next .isEmpty()/iterator() here.
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+        while (!outstandingSnapshots.isEmpty()) {
+            // Snapshot to a local list so concurrent removals from the worker-completion hook do
+            // not surprise us mid-iteration.
+            List<RunnableFuture<?>> pending = new ArrayList<>(outstandingSnapshots);
+            for (RunnableFuture<?> f : pending) {
+                if (f.isDone()) {
+                    outstandingSnapshots.remove(f);
+                    continue;
+                }
+                // R17-H2: do NOT call cancel(true) on a PlaceholderRunnableFuture. Pre-fix,
+                // cancel(true) propagated to the placeholder's inner CompletableFuture and
+                // completed it exceptionally — get() then returned immediately with
+                // CancellationException and close() proceeded to arena teardown while
+                // snapshot() was still inside PHASE 1-3 (drains + FFI snapshot), reintroducing
+                // the R17-H1 UAF window the placeholder is meant to guard. The contract is:
+                // snapshot() removes the placeholder explicitly once the real future is
+                // installed (or any throw path); close() must therefore ONLY get() the
+                // placeholder and let snapshot() complete it. On timeout we force-remove the
+                // entry to avoid wedging close(), accepting the same best-effort UAF fallback
+                // as the non-placeholder branch (the snapshot worker may still touch the arena
+                // briefly — coordinator should never issue a checkpoint to a closing backend).
+                //
+                // R18-M1: PlaceholderRunnableFuture.cancel() is a no-op, so even paths that
+                // call cancel() on every entry remain safe — the placeholder ignores the
+                // cancel and is only retired by snapshot()'s explicit completion.
+                boolean isPlaceholder = f instanceof PlaceholderRunnableFuture;
+                if (!isPlaceholder) {
+                    try {
+                        f.cancel(true);
+                    } catch (Throwable ignored) {
+                        // best-effort cancel; some snapshot strategies are uninterruptible
+                    }
+                }
+                long remaining = deadline - System.nanoTime();
+                if (remaining <= 0L) {
+                    LOG.warn(
+                            "ForStRsAsyncKeyedStateBackend.close: overall await budget ({}s)"
+                                    + " exhausted with {} outstanding snapshot future(s) —"
+                                    + " proceeding to arena teardown; the worker may UAF"
+                                    + " (R18-H1 best-effort fallback)",
+                            30,
+                            outstandingSnapshots.size());
+                    return;
+                }
+                long perFutureNs =
+                        Math.min(
+                                remaining,
+                                TimeUnit.MILLISECONDS.toNanos(CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS));
                 try {
-                    f.cancel(true);
+                    f.get(perFutureNs, TimeUnit.NANOSECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    LOG.warn(
+                            "ForStRsAsyncKeyedStateBackend.close: interrupted while awaiting"
+                                    + " outstanding async-snapshot future — proceeding to arena"
+                                    + " teardown anyway",
+                            e);
+                    return;
+                } catch (TimeoutException e) {
+                    if (isPlaceholder) {
+                        LOG.warn(
+                                "ForStRsAsyncKeyedStateBackend.close: snapshot()'s pre-PHASE-1"
+                                        + " placeholder did not retire within {}ms —"
+                                        + " proceeding to arena teardown; the snapshot worker"
+                                        + " may UAF on in-flight FFI calls (R17-H1/H2"
+                                        + " best-effort fallback)",
+                                CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+                    } else {
+                        LOG.warn(
+                                "ForStRsAsyncKeyedStateBackend.close: outstanding"
+                                        + " async-snapshot did not complete within {}ms after"
+                                        + " cancel(true) — proceeding to arena teardown; the"
+                                        + " worker may UAF on its FrsSnapshot close (R15-H1"
+                                        + " best-effort fallback)",
+                                CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+                    }
                 } catch (Throwable ignored) {
-                    // best-effort cancel; some snapshot strategies are uninterruptible mid-upload
+                    // ExecutionException / cancellation surfaced via get(); benign — the worker
+                    // has terminated, which is all we needed before closing the arena.
+                } finally {
+                    outstandingSnapshots.remove(f);
                 }
             }
-            try {
-                f.get(CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                LOG.warn(
-                        "ForStRsAsyncKeyedStateBackend.close: interrupted while awaiting"
-                                + " outstanding async-snapshot future — proceeding to arena"
-                                + " teardown anyway",
-                        e);
-                break;
-            } catch (TimeoutException e) {
-                if (isPlaceholder) {
-                    LOG.warn(
-                            "ForStRsAsyncKeyedStateBackend.close: snapshot()'s pre-PHASE-1"
-                                    + " placeholder did not retire within {}ms — proceeding"
-                                    + " to arena teardown; the snapshot worker may UAF on"
-                                    + " in-flight FFI calls (R17-H1/H2 best-effort fallback)",
-                            CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
-                } else {
-                    LOG.warn(
-                            "ForStRsAsyncKeyedStateBackend.close: outstanding async-snapshot"
-                                    + " did not complete within {}ms after cancel(true) —"
-                                    + " proceeding to arena teardown; the worker may UAF on"
-                                    + " its FrsSnapshot close (R15-H1 best-effort fallback)",
-                            CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
-                }
-            } catch (Throwable ignored) {
-                // ExecutionException / cancellation surfaced via get(); benign — the worker
-                // has terminated, which is all we needed before closing the arena.
-            } finally {
-                outstandingSnapshots.remove(f);
-            }
+            // Loop again — the placeholder→real-future handoff in snapshot() may have inserted
+            // a real future between this iteration's snapshot of `pending` and the iteration
+            // end. ConcurrentHashMap.newKeySet semantics ensure that the .add() in
+            // trackSnapshot is visible to the next outstandingSnapshots.isEmpty() / iterator()
+            // call here.
         }
     }
 }

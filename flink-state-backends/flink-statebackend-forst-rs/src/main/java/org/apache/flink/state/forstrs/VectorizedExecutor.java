@@ -426,16 +426,28 @@ public class VectorizedExecutor implements StateExecutor {
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
         VectorizedClassifier single =
                 new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
-        single.reset();
-        // Lazy-init the new-kind buffers (matches createRequestContainer behavior).
-        for (String name : listStateNames) {
-            single.registerListState(name);
-        }
-        single.initNewKindBuffers(arena);
-        single.offer(request);
-        // Round-3 fix A3-H1: wrap dispatch in try/catch so an FFI/engine throw on the sync
-        // path doesn't leak the StateRequest's future (operator would hang).
+        // R18-H2: widen the try/catch to cover registerListState / initNewKindBuffers /
+        // single.offer(request). Pre-fix the try block started at executeRequestSyncInner;
+        // {@link VectorizedClassifier#recordDelete} (invoked transitively from
+        // {@link VectorizedClassifier#offer} for null-payload write paths) rethrows the FFI
+        // batchPut error when an {@code onClear} hook on a list/reducing/aggregating state
+        // fails. That throw escaped executeRequestSync without completing the StateRequest's
+        // future, leaving the operator wedged on an unresolvable CompletableFuture.
+        //
+        // Also covers initNewKindBuffers (arena allocation can OOM) and registerListState
+        // (HashMap entry init) — every operation that mutates the per-call classifier before
+        // dispatch must propagate to completePutExceptionally so the runtime observes the
+        // failure on the request's future.
         try {
+            single.reset();
+            // Lazy-init the new-kind buffers (matches createRequestContainer behavior).
+            for (String name : listStateNames) {
+                single.registerListState(name);
+            }
+            single.initNewKindBuffers(arena);
+            single.offer(request);
+            // Round-3 fix A3-H1: wrap dispatch in try/catch so an FFI/engine throw on the sync
+            // path doesn't leak the StateRequest's future (operator would hang).
             executeRequestSyncInner(single);
         } catch (Throwable t) {
             completePutExceptionally(request, t);
