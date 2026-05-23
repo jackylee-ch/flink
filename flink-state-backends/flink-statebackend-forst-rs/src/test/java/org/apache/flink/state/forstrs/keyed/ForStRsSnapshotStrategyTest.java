@@ -296,4 +296,129 @@ class ForStRsSnapshotStrategyTest {
             }
         }
     }
+
+    /**
+     * R35-H2 regression: when Flink requests a FULL_CHECKPOINT
+     * ({@link org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy#NO_SHARING}),
+     * the produced handle MUST report {@code baseCheckpointId == 0} and carry NO entries that
+     * reference a prior-checkpoint shared SST — i.e. SharedStateRegistry cleanup of a prior
+     * incremental checkpoint must not be able to delete files this "full" handle depends on.
+     *
+     * <p>Pre-R35-H2 the sync phase set {@code baseCheckpointId} to the last-completed id
+     * unconditionally; the async phase emitted SSTs from prior checkpoints in the
+     * {@code sharedState} list. The fix branches on the checkpoint type's sharing strategy and
+     * forces {@code effectiveBaseCheckpointId = 0} (so the engine emits every reachable SST as
+     * NEW) plus uploads those new SSTs under EXCLUSIVE scope so the snapshot is self-contained.
+     *
+     * <p>Test scenario: run ckpt 1 (incremental, base 0) so the engine has SSTs in the registry.
+     * Mark it complete. Then trigger ckpt 2 with a FULL_CHECKPOINT options object — assert (a)
+     * the handle's baseCheckpointId is 0 (not 1), and (b) no SST handle in sharedState came from
+     * ckpt 1 (i.e. is registered in the SstRegistry from a prior call) — every entry must be a
+     * fresh upload introduced by this checkpoint.
+     */
+    @Test
+    void fullCheckpointEmitsBaseZeroAndNoPriorSharedReferences(@TempDir Path tmp) throws Exception {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            try (FrsDb db = linker.dbOpen(arena, tmp.resolve("db").toString());
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
+                for (int i = 0; i < 8; i++) {
+                    linker.put(db, cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+                }
+
+                ForStRsSstRegistry sstReg = new ForStRsSstRegistry();
+                ForStRsSstUploader uploader = new ForStRsSstUploader();
+                ForStRsSnapshotStrategy strategy =
+                        new ForStRsSnapshotStrategy(
+                                linker,
+                                db,
+                                UUID.randomUUID(),
+                                new KeyGroupRange(0, 0),
+                                sstReg,
+                                uploader,
+                                arena,
+                                Map.of("default", 0L));
+                MemCheckpointStreamFactory factory =
+                        new MemCheckpointStreamFactory(64 * 1024 * 1024);
+
+                // ---- Ckpt 1: incremental, completes. ----
+                ForStRsSnapshotResources res1 = strategy.syncPrepareResources(1L);
+                SnapshotResult<?> result1 =
+                        strategy.asyncSnapshot(
+                                        res1,
+                                        1L,
+                                        0L,
+                                        factory,
+                                        org.apache.flink.runtime.checkpoint.CheckpointOptions
+                                                .forCheckpointWithDefaultLocation())
+                                .get(new CloseableRegistry());
+                ForStRsIncrementalKeyedStateHandle h1 =
+                        (ForStRsIncrementalKeyedStateHandle) result1.getJobManagerOwnedSnapshot();
+                assertEquals(0L, h1.getBaseCheckpointId(), "ckpt 1 base is 0 (first ckpt)");
+                strategy.recordCompletedCheckpoint(1L);
+                strategy.takePendingRegistrations(1L);
+                // Capture ckpt 1's per-local-path StreamStateHandle identity. The pre-R35-H2 bug
+                // would surface as h2 carrying the SAME StreamStateHandle OBJECT for the same
+                // local path (re-used via sstRegistry lookup); the fix re-uploads each SST so
+                // the StreamStateHandle is a fresh object even when local-path collides.
+                java.util.Map<
+                                String,
+                                org.apache.flink.runtime.state.StreamStateHandle>
+                        priorHandlesByPath = new java.util.HashMap<>();
+                for (HandleAndLocalPath hlp : h1.getSharedState()) {
+                    priorHandlesByPath.put(hlp.getLocalPath(), hlp.getHandle());
+                }
+                assertTrue(
+                        !priorHandlesByPath.isEmpty(),
+                        "ckpt 1 must have registered at least one SST so the prior-handle map is"
+                                + " meaningful");
+
+                // ---- Ckpt 2: FULL_CHECKPOINT. ----
+                // Write more data and trigger a FULL_CHECKPOINT request — the strategy MUST force
+                // baseCheckpointId=0 and emit every SST as NEW (re-uploaded, no registry lookup).
+                for (int i = 8; i < 16; i++) {
+                    linker.put(db, cf, ("k-" + i).getBytes(), ("v-" + i).getBytes());
+                }
+                ForStRsSnapshotResources res2 = strategy.syncPrepareResources(2L);
+                org.apache.flink.runtime.checkpoint.CheckpointOptions fullOpts =
+                        new org.apache.flink.runtime.checkpoint.CheckpointOptions(
+                                org.apache.flink.runtime.checkpoint.CheckpointType.FULL_CHECKPOINT,
+                                org.apache.flink.runtime.state.CheckpointStorageLocationReference
+                                        .getDefault());
+                SnapshotResult<?> result2 =
+                        strategy.asyncSnapshot(res2, 2L, 0L, factory, fullOpts)
+                                .get(new CloseableRegistry());
+                ForStRsIncrementalKeyedStateHandle h2 =
+                        (ForStRsIncrementalKeyedStateHandle) result2.getJobManagerOwnedSnapshot();
+
+                assertEquals(
+                        0L,
+                        h2.getBaseCheckpointId(),
+                        "R35-H2: FULL_CHECKPOINT handle must report baseCheckpointId=0,"
+                                + " not the last-completed ckpt id");
+
+                // Every entry in h2.getSharedState() that shares a local-path with a ckpt 1
+                // entry MUST carry a DIFFERENT StreamStateHandle object — proving the FULL
+                // checkpoint re-uploaded the file rather than pulling the prior handle from
+                // sstRegistry (which is the pre-R35-H2 incremental-handle bug).
+                int reusedHandleCount = 0;
+                for (HandleAndLocalPath hlp : h2.getSharedState()) {
+                    org.apache.flink.runtime.state.StreamStateHandle prior =
+                            priorHandlesByPath.get(hlp.getLocalPath());
+                    if (prior != null && prior == hlp.getHandle()) {
+                        reusedHandleCount++;
+                    }
+                }
+                assertEquals(
+                        0,
+                        reusedHandleCount,
+                        "R35-H2: FULL_CHECKPOINT handle must NOT reuse StreamStateHandle objects"
+                                + " from prior checkpoints (registry lookup must not fire). "
+                                + reusedHandleCount
+                                + " of "
+                                + h2.getSharedState().size()
+                                + " entries were prior-checkpoint references.");
+            }
+        }
+    }
 }

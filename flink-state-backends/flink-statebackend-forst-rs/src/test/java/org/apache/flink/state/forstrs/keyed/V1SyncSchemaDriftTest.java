@@ -301,4 +301,211 @@ class V1SyncSchemaDriftTest {
             pair.backend.close();
         }
     }
+
+    /**
+     * R35-H1 regression: when {@code StateSerializerRegistry#verifyOrRegister} returns a
+     * RECONFIGURED variant (because the new descriptor's snapshot resolves to
+     * {@link org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility#compatibleWithReconfiguredSerializer}),
+     * the V1-sync backend MUST use the reconfigured serializer when constructing the adapter —
+     * NOT the original from {@code stateDesc.getSerializer()}. Pre-R35-H1 the return value was
+     * silently discarded and the adapter held the OLD serializer, so subsequent reads/writes
+     * went through the old schema and silently produced wrong-format payloads.
+     *
+     * <p>Strategy: pre-seed the backend's registry with a metadata entry that the new
+     * descriptor's snapshot will resolve as RECONFIGURED against (the snapshot type
+     * {@code ReconfiguringSerializer.Snapshot} below always reports RECONFIGURED with a fixed
+     * sentinel reconfigured serializer). Then call {@code createOrUpdateInternalState} with the
+     * original serializer; the resulting {@code InternalValueState} adapter must report the
+     * RECONFIGURED instance via {@code getValueSerializer()}.
+     */
+    @Test
+    void reconfiguredSerializerThreadedIntoValueAdapter(@TempDir Path tmp) throws Exception {
+        V1Pair pair = openV1Pair(tmp.resolve("db"));
+        try {
+            StateSerializerRegistry reg = pair.backend.stateSerializerRegistry();
+            // Seed prior metadata so verifyOrRegister has something to resolve against — register
+            // the SAME serializer under "evolved" so the snapshot bytes are present in `restored`.
+            ReconfiguringSerializer originalSer = new ReconfiguringSerializer("v1");
+            StateSerializerRegistry seedingReg = new StateSerializerRegistry();
+            // StateDescriptor.Type.VALUE.ordinal() == 1 (0 is the deprecated UNKNOWN slot).
+            int valueOrdinal =
+                    org.apache.flink.api.common.state.StateDescriptor.Type.VALUE.ordinal();
+            seedingReg.register("evolved", valueOrdinal, originalSer);
+            Map<String, StateSerializerMetadata> restoredMap = new LinkedHashMap<>();
+            restoredMap.put("evolved", seedingReg.get("evolved"));
+            pair.backend.seedRestoredSerializerMetadata(restoredMap);
+
+            // Now construct a fresh ValueStateDescriptor with the SAME serializer — the snapshot's
+            // resolveSchemaCompatibility will return RECONFIGURED with the sentinel below.
+            org.apache.flink.api.common.state.ValueStateDescriptor<String> vsd =
+                    new org.apache.flink.api.common.state.ValueStateDescriptor<>(
+                            "evolved", originalSer);
+            vsd.initializeSerializerUnlessSet(new ExecutionConfig());
+
+            @SuppressWarnings({"unchecked", "rawtypes"})
+            org.apache.flink.runtime.state.internal.InternalValueState<Integer, Void, String>
+                    valueState =
+                            (org.apache.flink.runtime.state.internal.InternalValueState<
+                                            Integer, Void, String>)
+                                    pair.backend.createOrUpdateInternalState(
+                                            org.apache.flink.api.common.typeutils.base
+                                                    .VoidSerializer.INSTANCE,
+                                            (org.apache.flink.api.common.state.StateDescriptor) vsd,
+                                            org.apache.flink.runtime.state.StateSnapshotTransformer
+                                                    .StateSnapshotTransformFactory.noTransform());
+
+            // R35-H1 assertion: the adapter's value serializer is the RECONFIGURED instance, not
+            // the original descriptor serializer.
+            assertNotNull(valueState.getValueSerializer(), "adapter must have a value serializer");
+            assertTrue(
+                    valueState.getValueSerializer() instanceof ReconfiguringSerializer rs
+                            && "reconfigured".equals(rs.tag()),
+                    "R35-H1: adapter must hold the RECONFIGURED serializer (tag=reconfigured),"
+                            + " got: "
+                            + valueState.getValueSerializer());
+        } finally {
+            pair.backend.close();
+        }
+    }
+
+    /**
+     * Test-only {@code TypeSerializer<String>} whose {@code snapshotConfiguration()} returns a
+     * snapshot that ALWAYS resolves to {@link
+     * org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility#compatibleWithReconfiguredSerializer}
+     * with a sentinel {@code ReconfiguringSerializer("reconfigured")} as the reconfigured
+     * instance. Drives the R35-H1 fix path: the registry returns the sentinel when the snapshot
+     * is restored and compared against the original. Delegates byte-level ops to
+     * {@link org.apache.flink.api.common.typeutils.base.StringSerializer#INSTANCE}.
+     */
+    private static final class ReconfiguringSerializer
+            extends org.apache.flink.api.common.typeutils.TypeSerializer<String> {
+        private static final long serialVersionUID = 1L;
+        private final String tag;
+
+        ReconfiguringSerializer(String tag) {
+            this.tag = tag;
+        }
+
+        String tag() {
+            return tag;
+        }
+
+        @Override
+        public boolean isImmutableType() {
+            return true;
+        }
+
+        @Override
+        public org.apache.flink.api.common.typeutils.TypeSerializer<String> duplicate() {
+            return this;
+        }
+
+        @Override
+        public String createInstance() {
+            return "";
+        }
+
+        @Override
+        public String copy(String from) {
+            return from;
+        }
+
+        @Override
+        public String copy(String from, String reuse) {
+            return from;
+        }
+
+        @Override
+        public int getLength() {
+            return -1;
+        }
+
+        @Override
+        public void serialize(String s, org.apache.flink.core.memory.DataOutputView target)
+                throws java.io.IOException {
+            org.apache.flink.api.common.typeutils.base.StringSerializer.INSTANCE.serialize(
+                    s, target);
+        }
+
+        @Override
+        public String deserialize(org.apache.flink.core.memory.DataInputView source)
+                throws java.io.IOException {
+            return org.apache.flink.api.common.typeutils.base.StringSerializer.INSTANCE.deserialize(
+                    source);
+        }
+
+        @Override
+        public String deserialize(String reuse, org.apache.flink.core.memory.DataInputView source)
+                throws java.io.IOException {
+            return deserialize(source);
+        }
+
+        @Override
+        public void copy(
+                org.apache.flink.core.memory.DataInputView source,
+                org.apache.flink.core.memory.DataOutputView target)
+                throws java.io.IOException {
+            String s = deserialize(source);
+            serialize(s, target);
+        }
+
+        @Override
+        public boolean equals(Object obj) {
+            return obj instanceof ReconfiguringSerializer other && tag.equals(other.tag);
+        }
+
+        @Override
+        public int hashCode() {
+            return tag.hashCode();
+        }
+
+        @Override
+        public org.apache.flink.api.common.typeutils.TypeSerializerSnapshot<String>
+                snapshotConfiguration() {
+            return new ReconfiguringSerializerSnapshot();
+        }
+
+        @Override
+        public String toString() {
+            return "ReconfiguringSerializer(" + tag + ")";
+        }
+    }
+
+    /**
+     * Companion snapshot that always reports {@code COMPATIBLE_WITH_RECONFIGURED_SERIALIZER} with
+     * a sentinel reconfigured serializer.
+     */
+    public static final class ReconfiguringSerializerSnapshot
+            implements org.apache.flink.api.common.typeutils.TypeSerializerSnapshot<String> {
+        @Override
+        public int getCurrentVersion() {
+            return 1;
+        }
+
+        @Override
+        public void writeSnapshot(org.apache.flink.core.memory.DataOutputView out)
+                throws java.io.IOException {}
+
+        @Override
+        public void readSnapshot(
+                int readVersion,
+                org.apache.flink.core.memory.DataInputView in,
+                ClassLoader userCodeClassLoader)
+                throws java.io.IOException {}
+
+        @Override
+        public org.apache.flink.api.common.typeutils.TypeSerializer<String> restoreSerializer() {
+            return new ReconfiguringSerializer("restored-from-snapshot");
+        }
+
+        @Override
+        public org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility<String>
+                resolveSchemaCompatibility(
+                        org.apache.flink.api.common.typeutils.TypeSerializerSnapshot<String>
+                                oldSerializerSnapshot) {
+            return org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility
+                    .compatibleWithReconfiguredSerializer(
+                            new ReconfiguringSerializer("reconfigured"));
+        }
+    }
 }

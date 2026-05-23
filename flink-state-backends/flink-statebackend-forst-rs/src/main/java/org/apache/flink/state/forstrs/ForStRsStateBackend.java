@@ -402,8 +402,18 @@ public class ForStRsStateBackend implements StateBackend {
             StateBackend.OperatorStateBackendParameters parameters) throws Exception {
         // ForSt-RS does not store operator state itself — it is a key-value store. Operator state
         // is a serialized bytestream that Flink's default builder handles directly.
+        //
+        // R35-M1: source the classloader from the task environment's user-code loader, mirroring
+        // the keyed-state path at {@link #createKeyedStateBackend}. Pre-R35-M1 this used
+        // {@code Thread.currentThread().getContextClassLoader()}, which on certain Flink
+        // dispatch threads (notably the JobMaster's RPC pool) resolves to the framework
+        // classloader rather than the user-code loader. Operator-state restore that needs to
+        // deserialize user-defined classes (via {@code TypeSerializerSnapshotSerializationUtil}
+        // → {@code Class.forName(..., loader)}) would then hit ClassNotFoundException for
+        // user types that ARE on the user classpath, but invisible to the framework loader.
+        // Aligning with the keyed path closes the inconsistency.
         return new DefaultOperatorStateBackendBuilder(
-                        Thread.currentThread().getContextClassLoader(),
+                        parameters.getEnv().getUserCodeClassLoader().asClassLoader(),
                         parameters.getEnv().getExecutionConfig(),
                         /* asynchronousSnapshots= */ true,
                         parameters.getStateHandles(),

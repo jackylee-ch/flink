@@ -777,21 +777,30 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                             "Unsupported state type for TTL: " + desc.getType());
             }
         }
-        stateSerializerRegistry.verifyOrRegister(
-                desc.getStateId(),
-                desc.getType().ordinal(),
-                desc.getSerializer(),
-                ttlEnabled,
-                ttlMillis);
+        // R35-H1: capture the (possibly reconfigured) serializer returned by the registry. When
+        // the new descriptor resolves as {@code COMPATIBLE_WITH_RECONFIGURED_SERIALIZER}, the
+        // registry returns the reconfigured TypeSerializer instance; discarding it here and
+        // passing the raw {@code desc.getSerializer()} to the V2 state constructor caused all
+        // subsequent reads/writes to go through the OLD serializer schema, silently producing
+        // wrong-format payloads on the engine.
+        @SuppressWarnings("unchecked")
+        TypeSerializer<SV> activeSerializer =
+                (TypeSerializer<SV>)
+                        stateSerializerRegistry.verifyOrRegister(
+                                desc.getStateId(),
+                                desc.getType().ordinal(),
+                                desc.getSerializer(),
+                                ttlEnabled,
+                                ttlMillis);
         // PR-A7 (S1-12): if the descriptor has TTL enabled, wrap the inner state in a TTL
         // decorator. Pre-A7 the TtlConfig was silently dropped on the floor and TTL never fired.
         // STORAGE FORMAT BREAK: TTL-enabled state cells now carry an 8-byte expiry prefix;
         // enabling TTL on existing non-TTL data is not snapshot-compatible.
         S created;
         if (desc.getTtlConfig() != null && desc.getTtlConfig().isEnabled()) {
-            created = createTtlAwareStateInternal(ns, nsSer, desc);
+            created = createTtlAwareStateInternal(ns, nsSer, desc, activeSerializer);
         } else {
-            created = createStateInternal(ns, nsSer, desc);
+            created = createStateInternal(ns, nsSer, desc, activeSerializer);
         }
         stateCache.put(desc.getStateId(), (InternalKeyedState<K, ?, ?>) created);
         return created;
@@ -804,12 +813,20 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <N, S extends State, SV> S createTtlAwareStateInternal(
-            N ns, TypeSerializer<N> nsSer, StateDescriptor<SV> desc) throws Exception {
+            N ns,
+            TypeSerializer<N> nsSer,
+            StateDescriptor<SV> desc,
+            TypeSerializer<SV> activeSerializer)
+            throws Exception {
         String name = desc.getStateId();
         switch (desc.getType()) {
             case VALUE:
                 {
-                    TypeSerializer<SV> userSerializer = desc.getSerializer();
+                    // R35-H1: wrap the (possibly reconfigured) serializer returned by the
+                    // registry, not the original {@code desc.getSerializer()}. The TtlSerializer
+                    // composes around the active user serializer so reads / writes go through
+                    // the post-reconfiguration schema even after schema-evolution restore.
+                    TypeSerializer<SV> userSerializer = activeSerializer;
                     TtlSerializer<SV> ttlSerializer = new TtlSerializer<>(userSerializer);
                     // Construct the inner state with the TtlSerializer (so the engine sees
                     // [long expiry][value bytes] as the cell payload) and wrap it.
@@ -851,10 +868,40 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     }
 
     @Nonnull
-    @SuppressWarnings("unchecked")
     @Override
     public <N, S extends InternalKeyedState, SV> S createStateInternal(
             @Nonnull N ns, @Nonnull TypeSerializer<N> nsSer, @Nonnull StateDescriptor<SV> desc)
+            throws Exception {
+        // R35-H1: interface entrypoint (called via {@link AsyncKeyedStateBackend} dispatch
+        // paths that bypass {@code getOrCreateKeyedState}, e.g. internal Flink TTL plumbing).
+        // The pre-R35-H1 single-path implementation read {@code desc.getSerializer()} directly;
+        // the registry-aware path in {@code getOrCreateKeyedState} now calls the overload below
+        // with the (possibly reconfigured) active serializer.
+        return createStateInternal(ns, nsSer, desc, desc.getSerializer());
+    }
+
+    /**
+     * R35-H1 overload: build a V2 state using the supplied {@code activeSerializer} rather than
+     * reading {@code desc.getSerializer()} directly. {@code activeSerializer} is the return value
+     * of {@link StateSerializerRegistry#verifyOrRegister} — i.e. the original serializer when the
+     * descriptor was compatible-as-is or after-migration, or the RECONFIGURED variant when the
+     * registry resolved to {@link
+     * org.apache.flink.api.common.typeutils.TypeSerializerSchemaCompatibility#compatibleWithReconfiguredSerializer}.
+     * Pre-R35-H1 the registry result was discarded and the engine read/wrote through the OLD
+     * serializer schema, silently producing wrong-format payloads after a schema-evolution restore.
+     *
+     * <p>For composite descriptors (LIST, MAP) the active serializer is the FULL ListSerializer /
+     * MapSerializer composite; we extract the inner element / user-k-v components from it so the
+     * reconfigured branches propagate the new schema. For singleton-value descriptors (VALUE,
+     * REDUCING, AGGREGATING) the active serializer replaces {@code desc.getSerializer()} directly.
+     */
+    @Nonnull
+    @SuppressWarnings("unchecked")
+    private <N, S extends InternalKeyedState, SV> S createStateInternal(
+            @Nonnull N ns,
+            @Nonnull TypeSerializer<N> nsSer,
+            @Nonnull StateDescriptor<SV> desc,
+            @Nonnull TypeSerializer<SV> activeSerializer)
             throws Exception {
         String name = desc.getStateId();
         // PR-A2 (S1-4 / E2-CRIT-1): forward `nsSer` to every V2 state constructor so the
@@ -865,15 +912,22 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // See RELEASE-NOTES: "v4.0 keyed-state binary format is incompatible with v3.x".
         switch (desc.getType()) {
             case VALUE:
+                // R35-H1: use the active (possibly reconfigured) value serializer.
                 return (S)
                         new ForStRsValueStateV2<>(
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
                                 nsSer,
-                                desc.getSerializer());
+                                activeSerializer);
             case MAP:
                 var mapDesc = (MapStateDescriptor<?, ?>) desc;
+                // R35-H1: V2 {@link MapStateDescriptor} extends {@code StateDescriptor<UV>}, so
+                // {@code desc.getSerializer()} is the user-VALUE serializer (NOT a composite),
+                // and {@code activeSerializer} carries the (possibly reconfigured) value schema.
+                // The user-key serializer is held separately and is not currently subject to
+                // schema-evolution wiring through the registry (registry verifies one serializer
+                // per state-id) — we pass {@code mapDesc.getUserKeySerializer()} through as-is.
                 // PR-C1: hand linker/db/cf to the MapStateV2 so it can stage writes in its
                 // off-heap MapStateArrowBuffer and drain via linker.batchPut on flush. Register
                 // the instance so the snapshot pre-hook drains every live MapState V2.
@@ -884,19 +938,20 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 keySerializer,
                                 nsSer,
                                 mapDesc.getUserKeySerializer(),
-                                mapDesc.getSerializer(),
+                                activeSerializer,
                                 linker,
                                 db,
                                 defaultCf);
                 registeredMapStatesV2.add(mapStateV2);
                 return (S) mapStateV2;
             case LIST:
-                var listDesc = (ListStateDescriptor<?>) desc;
                 // V3.2 (V20 sub-spec §5): register the ListState name with every managed
                 // executor so the per-batch classifier routes LIST_ADD via APPEND_MERGE.
                 for (VectorizedExecutor exec : managedExecutors) {
                     exec.registerListState(name);
                 }
+                // R35-H1: registry validated the ListSerializer composite — pass it through so
+                // ForStRsAsyncListStateV2 sees the (possibly reconfigured) element schema.
                 // PR-C2: hand linker/db/cf + a fresh per-state ListStateArrowBuffer to the
                 // AsyncListStateV2 so the classifier's APPEND_MERGE routing goes through the
                 // off-heap fast path (skips the heap-byte[] AppendMergeBatchBuffer). Register
@@ -909,7 +964,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 name,
                                 keySerializer,
                                 nsSer,
-                                listDesc.getSerializer(),
+                                activeSerializer,
                                 listBuf,
                                 linker,
                                 db,
@@ -917,9 +972,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 registeredListStatesV2.add(listStateV2);
                 return (S) listStateV2;
             case REDUCING:
-                return (S) createReducingState(name, nsSer, desc);
+                return (S) createReducingState(name, nsSer, desc, activeSerializer);
             case AGGREGATING:
-                return (S) createAggregatingState(name, nsSer, desc);
+                return (S) createAggregatingState(name, nsSer, desc, activeSerializer);
             default:
                 throw new UnsupportedOperationException("Unsupported: " + desc.getType());
         }
@@ -927,15 +982,20 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <N> ForStRsAsyncReducingStateV2<K, N, ?> createReducingState(
-            String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
+            String name,
+            TypeSerializer<N> nsSer,
+            StateDescriptor<?> desc,
+            TypeSerializer<?> activeSerializer) {
         ReducingStateDescriptor reducingDesc = (ReducingStateDescriptor) desc;
+        // R35-H1: use the registry-validated active serializer rather than
+        // {@code reducingDesc.getSerializer()} so schema-reconfigured types flow through.
         ForStRsAsyncReducingStateV2<K, N, ?> state =
                 new ForStRsAsyncReducingStateV2<>(
                         stateRequestHandler,
                         name,
                         keySerializer,
                         nsSer,
-                        reducingDesc.getSerializer(),
+                        activeSerializer,
                         reducingDesc.getReduceFunction());
         // PR-C3 (V12 / B3-H1): wire the production flush handler so accumulators captured by the
         // RMW cache are actually durable on checkpoint. Closes A4-H2 — the previous default of
@@ -951,15 +1011,19 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     @SuppressWarnings({"unchecked", "rawtypes"})
     private <N> ForStRsAsyncAggregatingStateV2<K, N, ?, ?, ?> createAggregatingState(
-            String name, TypeSerializer<N> nsSer, StateDescriptor<?> desc) {
+            String name,
+            TypeSerializer<N> nsSer,
+            StateDescriptor<?> desc,
+            TypeSerializer<?> activeSerializer) {
         AggregatingStateDescriptor aggDesc = (AggregatingStateDescriptor) desc;
+        // R35-H1: thread the registry-validated active accumulator serializer through.
         ForStRsAsyncAggregatingStateV2<K, N, ?, ?, ?> state =
                 new ForStRsAsyncAggregatingStateV2<>(
                         stateRequestHandler,
                         name,
                         keySerializer,
                         nsSer,
-                        aggDesc.getSerializer(),
+                        activeSerializer,
                         aggDesc.getAggregateFunction());
         // PR-C3 (V12 / B3-H2): wire the production flush handler — see createReducingState above
         // for the A4-H2 rationale.

@@ -625,48 +625,69 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                             + " StateTtlConfig on this descriptor.");
         }
         long ttlMillis = 0L;
-        stateSerializerRegistry.verifyOrRegister(
-                stateDesc.getName(),
-                stateDesc.getType().ordinal(),
-                stateDesc.getSerializer(),
-                /* ttlEnabled= */ false,
-                ttlMillis);
+        // R35-H1: capture the (potentially reconfigured) serializer returned by the registry.
+        // When the new descriptor's snapshot resolves as
+        // {@code COMPATIBLE_WITH_RECONFIGURED_SERIALIZER}, the registry returns the
+        // reconfigured TypeSerializer instance; discarding it here and passing the original
+        // {@code stateDesc.getSerializer()} to the adapter caused all subsequent reads/writes
+        // to go through the OLD serializer schema, silently producing wrong-format payloads.
+        // Thread the returned serializer through to every state-class constructor.
+        @SuppressWarnings("unchecked")
+        TypeSerializer<SV> activeDescSerializer =
+                (TypeSerializer<SV>)
+                        stateSerializerRegistry.verifyOrRegister(
+                                stateDesc.getName(),
+                                stateDesc.getType().ordinal(),
+                                stateDesc.getSerializer(),
+                                /* ttlEnabled= */ false,
+                                ttlMillis);
         org.apache.flink.runtime.state.internal.InternalKvState<?, ?, ?> created;
         switch (stateDesc.getType()) {
             case VALUE:
                 {
-                    ValueStateDescriptor<SV> vsd = (ValueStateDescriptor<SV>) stateDesc;
+                    // R35-H1: use the active (possibly reconfigured) value serializer.
                     created =
                             new ForStRsInternalKvStateAdapters.ValueAdapter<>(
                                     getKeySerializer(),
                                     (TypeSerializer<Object>) namespaceSerializer,
-                                    vsd.getSerializer(),
+                                    activeDescSerializer,
                                     stateDesc.getName(),
                                     (ForStRsKeyedStateBackend<K>) delegate);
                     break;
                 }
             case LIST:
                 {
-                    ListStateDescriptor<Object> lsd = (ListStateDescriptor<Object>) stateDesc;
+                    // R35-H1: registry validates the ListSerializer composite; extract its
+                    // (possibly reconfigured) element serializer for the adapter.
+                    org.apache.flink.api.common.typeutils.base.ListSerializer<Object>
+                            activeListSer =
+                                    (org.apache.flink.api.common.typeutils.base.ListSerializer<
+                                                    Object>)
+                                            activeDescSerializer;
                     created =
                             new ForStRsInternalKvStateAdapters.ListAdapter<>(
                                     getKeySerializer(),
                                     (TypeSerializer<Object>) namespaceSerializer,
-                                    lsd.getElementSerializer(),
+                                    activeListSer.getElementSerializer(),
                                     stateDesc.getName(),
                                     (ForStRsKeyedStateBackend<K>) delegate);
                     break;
                 }
             case MAP:
                 {
-                    MapStateDescriptor<Object, Object> msd =
-                            (MapStateDescriptor<Object, Object>) stateDesc;
+                    // R35-H1: registry validates the MapSerializer composite; extract its
+                    // (possibly reconfigured) user-key/value serializers for the adapter.
+                    org.apache.flink.api.common.typeutils.base.MapSerializer<Object, Object>
+                            activeMapSer =
+                                    (org.apache.flink.api.common.typeutils.base.MapSerializer<
+                                                    Object, Object>)
+                                            activeDescSerializer;
                     created =
                             new ForStRsInternalKvStateAdapters.MapAdapter<>(
                                     getKeySerializer(),
                                     (TypeSerializer<Object>) namespaceSerializer,
-                                    msd.getKeySerializer(),
-                                    msd.getValueSerializer(),
+                                    activeMapSer.getKeySerializer(),
+                                    activeMapSer.getValueSerializer(),
                                     stateDesc.getName(),
                                     (ForStRsKeyedStateBackend<K>) delegate);
                     break;
@@ -674,11 +695,12 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             case REDUCING:
                 {
                     ReducingStateDescriptor<SV> rsd = (ReducingStateDescriptor<SV>) stateDesc;
+                    // R35-H1: use the active (possibly reconfigured) value serializer.
                     created =
                             new ForStRsInternalKvStateAdapters.ReducingAdapter<>(
                                     getKeySerializer(),
                                     (TypeSerializer<Object>) namespaceSerializer,
-                                    rsd.getSerializer(),
+                                    activeDescSerializer,
                                     stateDesc.getName(),
                                     rsd.getReduceFunction(),
                                     (ForStRsKeyedStateBackend<K>) delegate);
@@ -688,11 +710,12 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                 {
                     AggregatingStateDescriptor<Object, SV, Object> asd =
                             (AggregatingStateDescriptor<Object, SV, Object>) stateDesc;
+                    // R35-H1: use the active (possibly reconfigured) accumulator serializer.
                     created =
                             new ForStRsInternalKvStateAdapters.AggregatingAdapter<>(
                                     getKeySerializer(),
                                     (TypeSerializer<Object>) namespaceSerializer,
-                                    asd.getSerializer(),
+                                    activeDescSerializer,
                                     stateDesc.getName(),
                                     asd.getAggregateFunction(),
                                     (ForStRsKeyedStateBackend<K>) delegate);

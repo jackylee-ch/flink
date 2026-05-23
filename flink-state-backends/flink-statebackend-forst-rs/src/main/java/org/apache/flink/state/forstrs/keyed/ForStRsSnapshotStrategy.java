@@ -272,7 +272,7 @@ public class ForStRsSnapshotStrategy
             CheckpointOptions checkpointOptions) {
         return (CloseableRegistry registry) -> {
             try {
-                return doAsyncSnapshot(resources, streamFactory);
+                return doAsyncSnapshot(resources, streamFactory, checkpointOptions);
             } finally {
                 // Whether success or failure, release the engine snapshot + result struct now —
                 // the uploaded handles + Java IncrementalKeyedStateHandle below carry zero
@@ -457,8 +457,49 @@ public class ForStRsSnapshotStrategy
     }
 
     private SnapshotResult<KeyedStateHandle> doAsyncSnapshot(
-            ForStRsSnapshotResources resources, CheckpointStreamFactory streamFactory)
+            ForStRsSnapshotResources resources,
+            CheckpointStreamFactory streamFactory,
+            CheckpointOptions checkpointOptions)
             throws Exception {
+        // R35-H2: branch on the checkpoint type's sharing strategy. Pre-R35-H2 the sync phase
+        // set {@code baseCheckpointId = lastCompletedCheckpointId.get()} unconditionally, so a
+        // Flink-requested FULL_CHECKPOINT (FORWARD) or CANONICAL savepoint (NO_SHARING) was
+        // emitted as an INCREMENTAL handle that referenced prior-checkpoint SSTs under SHARED
+        // scope. A subsequent retention-policy cleanup of those prior incrementals could then
+        // delete the SSTs the "full" handle depended on — silently corrupting restore from the
+        // supposed self-contained snapshot.
+        //
+        // Two-tier gate driven by {@link SharingFilesStrategy}:
+        //  - FORWARD (FULL_CHECKPOINT) and NO_SHARING (CANONICAL savepoint) BOTH disallow
+        //    reusing files from older snapshots — set {@code effectiveBaseCheckpointId = 0}
+        //    so the engine emits every reachable SST as NEW (no SHARED references to prior).
+        //  - NO_SHARING additionally disallows future snapshots from sharing these files —
+        //    upload SSTs under EXCLUSIVE scope so the snapshot is fully self-contained and
+        //    SharedStateRegistry won't ref-count them as a shared resource.
+        //  - FORWARD_BACKWARD (default CHECKPOINT) keeps the pre-R35-H2 incremental contract
+        //    (base=lastCompleted, SSTs under SHARED scope).
+        //
+        // Defensive: legacy test harness call-sites pass {@code null} for {@code checkpointOptions}
+        // — treat null as "incremental" (default FORWARD_BACKWARD), matching pre-R35-H2 behaviour.
+        org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy strategy =
+                checkpointOptions == null
+                        ? org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy
+                                .FORWARD_BACKWARD
+                        : checkpointOptions.getCheckpointType().getSharingFilesStrategy();
+        boolean noPriorDependence =
+                strategy
+                                == org.apache.flink.runtime.checkpoint.SnapshotType
+                                        .SharingFilesStrategy.FORWARD
+                        || strategy
+                                == org.apache.flink.runtime.checkpoint.SnapshotType
+                                        .SharingFilesStrategy.NO_SHARING;
+        boolean fullCheckpoint =
+                strategy
+                        == org.apache.flink.runtime.checkpoint.SnapshotType.SharingFilesStrategy
+                                .NO_SHARING;
+        long effectiveBaseCheckpointId =
+                noPriorDependence ? 0L : resources.getBaseCheckpointId();
+
         // ---- Compute the incremental checkpoint (flush + SST enumeration). ----
         // This was moved out of the sync phase to avoid blocking the task thread
         // during checkpoint barriers. The snapshot pins all versions at the captured
@@ -469,7 +510,7 @@ public class ForStRsSnapshotStrategy
                     db,
                     resources.getSnapshot(),
                     resources.getCheckpointId(),
-                    resources.getBaseCheckpointId(),
+                    effectiveBaseCheckpointId,
                     result);
         } catch (RuntimeException re) {
             throw re;
@@ -501,13 +542,22 @@ public class ForStRsSnapshotStrategy
         CompletableFuture<StreamStateHandle> manifestFut =
                 uploader.upload(manifestPath, streamFactory, CheckpointedStateScope.EXCLUSIVE);
 
-        // ---- Upload each new SST under SHARED scope (eligible for cross-checkpoint sharing). ----
+        // ---- Upload each new SST. ----
+        // R35-H2: under {@link SharingFilesStrategy#NO_SHARING} (FULL_CHECKPOINT and CANONICAL
+        // savepoints) the snapshot MUST be self-contained — every SST is emitted under EXCLUSIVE
+        // scope so neither this snapshot nor a later one will adopt these files into a shared
+        // ref-counted set. Under the incremental contract (FORWARD / FORWARD_BACKWARD) the
+        // pre-R35-H2 SHARED scope is preserved so cross-checkpoint sharing continues to work.
+        CheckpointedStateScope newSstScope =
+                fullCheckpoint
+                        ? CheckpointedStateScope.EXCLUSIVE
+                        : CheckpointedStateScope.SHARED;
         List<CompletableFuture<HandleAndLocalPath>> newSstFuts =
                 new ArrayList<>(newSstFiles.size());
         for (Path p : newSstFiles) {
             String localPath = p.getFileName().toString();
             CompletableFuture<HandleAndLocalPath> f =
-                    uploader.upload(p, streamFactory, CheckpointedStateScope.SHARED)
+                    uploader.upload(p, streamFactory, newSstScope)
                             .thenApply(h -> HandleAndLocalPath.of(h, localPath));
             newSstFuts.add(f);
         }
@@ -563,6 +613,21 @@ public class ForStRsSnapshotStrategy
         }
 
         // ---- Resolve shared SSTs from the registry (already uploaded by a prior ckpt). ----
+        // R35-H2: with {@code effectiveBaseCheckpointId == 0} (FULL_CHECKPOINT or CANONICAL
+        // savepoint), the engine has no prior checkpoint to reference against, so
+        // {@code sharedSstFiles} MUST be empty — every reachable SST should land in
+        // {@code newSstFiles}. We assert this defensively; a non-empty list under
+        // no-prior-dependence would mean the engine ignored the base id and produced a
+        // self-inconsistent "full" handle that still depended on the registry.
+        if (noPriorDependence && !sharedSstFiles.isEmpty()) {
+            throw new IllegalStateException(
+                    "R35-H2 invariant violated: full snapshot (strategy="
+                            + strategy
+                            + ") requested with effectiveBaseCheckpointId=0, but engine reported "
+                            + sharedSstFiles.size()
+                            + " shared SST(s). All SSTs must be emitted as NEW; "
+                            + "FULL_CHECKPOINT must not reference prior incremental SSTs.");
+        }
         List<HandleAndLocalPath> sharedHandles = new ArrayList<>();
         for (Path p : sharedSstFiles) {
             String localPath = p.getFileName().toString();
@@ -621,12 +686,17 @@ public class ForStRsSnapshotStrategy
         // The manifest is the dedicated metaStateHandle slot per Flink's incremental contract; the
         // engine writes a single manifest file per checkpoint, distinct from the serializer
         // registry blob now carried under privateState (E5-HIGH-2).
+        //
+        // R35-H2: record the EFFECTIVE base checkpoint id on the handle (0L for NO_SHARING /
+        // FULL_CHECKPOINT) so any handle consumer (restore, SharedStateRegistry registration,
+        // retention bookkeeping) sees a self-consistent "full snapshot" rather than a "depends
+        // on prior checkpoint" descriptor.
         ForStRsIncrementalKeyedStateHandle handle =
                 new ForStRsIncrementalKeyedStateHandle(
                         backendIdentifier,
                         keyGroupRange,
                         resources.getCheckpointId(),
-                        resources.getBaseCheckpointId(),
+                        effectiveBaseCheckpointId,
                         /* sharedState= */ sharedHandles,
                         /* privateState= */ privateStateEntries,
                         metaHandle,
