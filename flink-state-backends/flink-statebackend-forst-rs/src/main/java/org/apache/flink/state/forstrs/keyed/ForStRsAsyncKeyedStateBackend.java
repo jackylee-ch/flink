@@ -93,8 +93,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.RunnableFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 @Internal
 public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<K> {
@@ -262,6 +266,43 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private SlotArenaScope slotArenaScope;
     private IterLifetimeWatchdog iterWatchdog;
     private boolean disposed = false;
+
+    /**
+     * R15-H1: set once {@link #close()} begins so {@link #snapshot} can short-circuit any racing
+     * checkpoint request rather than registering a fresh future against an arena that is about
+     * to close. Pure best-effort — the contractually correct race is for the coordinator to
+     * stop issuing checkpoints to a backend that is being torn down, but if it does we still
+     * must not enqueue work that the arena-close will then UAF.
+     */
+    private volatile boolean closing = false;
+
+    /**
+     * R15-H1: registry of in-flight async-snapshot {@link RunnableFuture}s. Populated in {@link
+     * #snapshot} when the snapshot strategy runs ASYNCHRONOUSLY (periodic checkpoint path); the
+     * future self-removes from this set when it completes (success or failure).
+     *
+     * <p>{@link #close()} iterates this set and either (a) waits up to {@link
+     * #CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS}ms per future for completion, or (b) calls
+     * {@code cancel(true)} if the future is still incomplete after the timeout. Only after every
+     * outstanding future is resolved does {@code close()} proceed to {@code arena.close()},
+     * which closes the native arena backing every {@link
+     * org.apache.flink.state.forstrs.ffm.FrsSnapshot} held by a snapshot worker.
+     *
+     * <p>Pre-fix, {@code close()} aborted the cancel-stream registry but did not await
+     * outstanding workers — a worker that had not yet executed {@code resources.release()}
+     * could call {@code snapshot.close()} on a {@code MemorySegment} whose backing
+     * {@code nativeArena} was already closed, surfacing as a UAF on the native FrsSnapshot
+     * struct (R15-H1 root cause).
+     *
+     * <p>{@link ConcurrentHashMap#newKeySet()} provides lock-free add/remove suitable for the
+     * mailbox-thread {@code snapshot()} and worker-thread completion callback to share without
+     * synchronization on the backend instance.
+     */
+    private final Set<RunnableFuture<?>> outstandingSnapshots =
+            ConcurrentHashMap.newKeySet();
+
+    /** R15-H1: per-future await budget on {@link #close()}. 5s matches the spec. */
+    private static final long CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS = 5_000L;
 
     /**
      * E8-H4: identity of the (JobID, operatorIdentifier) slot this backend occupies in
@@ -1074,6 +1115,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // family; multi-CF wiring is a follow-on PR (V20).
         ForStRsSnapshotStrategy strategy = ensureSnapshotStrategy();
         try {
+            // R15-H1: if {@link #close()} is in progress, refuse to enqueue new snapshot work
+            // — the arena that backs every FrsSnapshot is about to close, and any future we
+            // register here would race the arena teardown.
+            if (closing) {
+                return DoneFuture.of(SnapshotResult.empty());
+            }
             // PR-A8: SYNC_SAVEPOINT semantics. Synchronous execution blocks until the future is
             // pre-run, so by the time this method returns every state mutation up to the barrier
             // is durable on S3. For periodic checkpoints we use ASYNCHRONOUS so the mailbox
@@ -1081,14 +1128,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // thread.
             SnapshotExecutionType execType =
                     isSync ? SnapshotExecutionType.SYNCHRONOUS : SnapshotExecutionType.ASYNCHRONOUS;
-            return new SnapshotStrategyRunner<>(
-                            isSavepoint
-                                    ? "ForStRs-async-savepoint"
-                                    : "ForStRs-async-incremental-snapshot",
-                            strategy,
-                            cancelStreamRegistry,
-                            execType)
-                    .snapshot(id, ts, f, o);
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> future =
+                    new SnapshotStrategyRunner<>(
+                                    isSavepoint
+                                            ? "ForStRs-async-savepoint"
+                                            : "ForStRs-async-incremental-snapshot",
+                                    strategy,
+                                    cancelStreamRegistry,
+                                    execType)
+                            .snapshot(id, ts, f, o);
+            // R15-H1: register the future so {@link #close()} can await its completion before
+            // closing the native arena. For SYNCHRONOUS savepoints the future is already done
+            // by the time {@code .snapshot()} returns (SnapshotStrategyRunner pre-runs the
+            // FutureTask), so tracking is harmless (close() sees done=true and skips the
+            // await). For ASYNCHRONOUS checkpoints the worker thread runs concurrently with
+            // the mailbox and MUST be awaited at close() to prevent the
+            // R15-H1 use-after-free on the nativeArena.
+            return trackSnapshot(future);
         } catch (IOException e) {
             // The cancelStreamRegistry may already be closed if a prior checkpoint's async phase
             // failed or the task is being cancelled. In that case the SnapshotStrategyRunner
@@ -1353,6 +1409,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
 
     @Override
     public void close() throws IOException {
+        // R15-H1: mark closing BEFORE dispose() / arena.close() so any in-flight
+        // {@link #snapshot} request observes the flag and returns an empty future instead of
+        // enqueuing work against the arena that is about to close.
+        closing = true;
+        // R15-H1: await every outstanding async-snapshot future BEFORE dispose() (which closes
+        // the cancel-stream registry) and BEFORE arena.close() (which would UAF on any in-flight
+        // worker's FrsSnapshot close).
+        awaitOutstandingSnapshots();
         dispose();
         if (ownsResources) {
             try {
@@ -1366,6 +1430,138 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             try {
                 arena.close();
             } catch (Exception ignored) {
+            }
+        }
+    }
+
+    /**
+     * R15-H1: wraps a snapshot future so it self-removes from {@link #outstandingSnapshots} on
+     * completion. The wrapper is a thin {@link RunnableFuture} forwarder; the only added
+     * behaviour is the {@code finally} block on {@link RunnableFuture#run()} that removes the
+     * inner future from the registry once {@code get()} would no longer block.
+     *
+     * <p>Note: SnapshotStrategyRunner's FutureTask is pre-run inline for SYNCHRONOUS execution
+     * (savepoints), so by the time we wrap it the inner future is already done. In that case
+     * {@link #run()} on the wrapper is a no-op + remove, which is harmless.
+     */
+    private RunnableFuture<SnapshotResult<KeyedStateHandle>> trackSnapshot(
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> inner) {
+        outstandingSnapshots.add(inner);
+        // If the runner already pre-ran the inner future (SYNCHRONOUS path) it is already done
+        // and the worker-thread completion hook will never fire — remove the entry eagerly so
+        // {@link #close()}'s await does not spin on a done future.
+        if (inner.isDone()) {
+            outstandingSnapshots.remove(inner);
+            return inner;
+        }
+        return new RunnableFuture<SnapshotResult<KeyedStateHandle>>() {
+            @Override
+            public void run() {
+                try {
+                    inner.run();
+                } finally {
+                    outstandingSnapshots.remove(inner);
+                }
+            }
+
+            @Override
+            public boolean cancel(boolean mayInterruptIfRunning) {
+                try {
+                    return inner.cancel(mayInterruptIfRunning);
+                } finally {
+                    outstandingSnapshots.remove(inner);
+                }
+            }
+
+            @Override
+            public boolean isCancelled() {
+                return inner.isCancelled();
+            }
+
+            @Override
+            public boolean isDone() {
+                return inner.isDone();
+            }
+
+            @Override
+            public SnapshotResult<KeyedStateHandle> get()
+                    throws InterruptedException, ExecutionException {
+                try {
+                    return inner.get();
+                } finally {
+                    outstandingSnapshots.remove(inner);
+                }
+            }
+
+            @Override
+            public SnapshotResult<KeyedStateHandle> get(long timeout, @Nonnull TimeUnit unit)
+                    throws InterruptedException, ExecutionException, TimeoutException {
+                try {
+                    return inner.get(timeout, unit);
+                } finally {
+                    if (inner.isDone()) {
+                        outstandingSnapshots.remove(inner);
+                    }
+                }
+            }
+        };
+    }
+
+    /**
+     * R15-H1: drain {@link #outstandingSnapshots} before tearing down the native arena. For
+     * each outstanding future:
+     *
+     * <ol>
+     *   <li>If already done, remove and continue.
+     *   <li>Otherwise, attempt {@code cancel(true)} to interrupt the worker, then {@code
+     *       get(CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS, MILLISECONDS)} to block until the worker
+     *       returns. The timeout caps how long {@code close()} can block on a wedged worker;
+     *       on timeout we drop the future and proceed (the worker may still touch the arena
+     *       briefly, but the contract here is best-effort safety, not a hard guarantee — the
+     *       coordinator should never issue a checkpoint to a closing backend).
+     * </ol>
+     *
+     * <p>All exceptions are swallowed: {@code close()} must not throw on shutdown.
+     */
+    private void awaitOutstandingSnapshots() {
+        if (outstandingSnapshots.isEmpty()) {
+            return;
+        }
+        // Snapshot to a local list so concurrent removals from the worker-completion hook do
+        // not surprise us mid-iteration.
+        List<RunnableFuture<?>> pending = new ArrayList<>(outstandingSnapshots);
+        for (RunnableFuture<?> f : pending) {
+            if (f.isDone()) {
+                outstandingSnapshots.remove(f);
+                continue;
+            }
+            try {
+                f.cancel(true);
+            } catch (Throwable ignored) {
+                // best-effort cancel; some snapshot strategies are uninterruptible mid-upload
+            }
+            try {
+                f.get(CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.warn(
+                        "ForStRsAsyncKeyedStateBackend.close: interrupted while awaiting"
+                                + " outstanding async-snapshot future — proceeding to arena"
+                                + " teardown anyway",
+                        e);
+                break;
+            } catch (TimeoutException e) {
+                LOG.warn(
+                        "ForStRsAsyncKeyedStateBackend.close: outstanding async-snapshot did"
+                                + " not complete within {}ms after cancel(true) — proceeding"
+                                + " to arena teardown; the worker may UAF on its FrsSnapshot"
+                                + " close (R15-H1 best-effort fallback)",
+                        CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
+            } catch (Throwable ignored) {
+                // ExecutionException / cancellation surfaced via get(); benign — the worker
+                // has terminated, which is all we needed before closing the arena.
+            } finally {
+                outstandingSnapshots.remove(f);
             }
         }
     }

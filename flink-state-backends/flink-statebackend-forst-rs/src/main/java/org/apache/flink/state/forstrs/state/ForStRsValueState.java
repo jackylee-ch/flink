@@ -28,6 +28,7 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.io.IOException;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -449,6 +450,12 @@ public class ForStRsValueState<T> implements ValueState<T> {
      * @return the previous value, or null if the key did not exist
      */
     public T getAndUpdate(T newValue) throws IOException {
+        // R15-L3: reject null payload explicitly. The Javadoc requires {@code newValue != null}
+        // (callers must use {@link #clear()} for deletion); without this guard the call
+        // dispatches into {@code serializer.serialize(null, ...)} which throws an obscure
+        // NullPointerException deep in the serializer stack instead of a clear IAE at the
+        // backend boundary.
+        Objects.requireNonNull(newValue, "newValue must not be null");
         outputBuffer.clear();
         serializer.serialize(newValue, outputBuffer);
         // PR-B3: reuse the serializer's internal buffer; the engine consumes the value

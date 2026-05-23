@@ -105,11 +105,26 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
 
     public ArrowBinaryBuffer(
             int initialCapacity, int maxCapacity, ArrowBinaryBufferAutoTuner tuner) {
-        this.capacity = Math.max(initialCapacity, 8);
+        // R15-L1: capacity MUST be a power of two — the hash-index linear-probe mask
+        // {@code (capacity * 2) - 1} only matches all slots when {@code capacity * 2}
+        // is a power of two. A non-pow2 capacity would skip slots and silently drop
+        // entries on insert. Mirrors the FlatStateCache:60 rounding pattern.
+        this.capacity = nextPow2(Math.max(initialCapacity, 8));
         this.maxCapacity = maxCapacity;
         this.arena = Arena.ofShared();
         this.tuner = tuner;
         allocate(this.capacity, 64 /* avg key bytes */, 64 /* avg value bytes */);
+    }
+
+    /** R15-L1: round {@code n} up to the next power of two (capped at 2^30). */
+    private static int nextPow2(int n) {
+        if (n <= 1) {
+            return 1;
+        }
+        int p = Integer.highestOneBit(n - 1) << 1;
+        // Guard against overflow on very large requests; cap at 2^30 which is
+        // already larger than any plausible buffer capacity.
+        return p > 0 ? p : (1 << 30);
     }
 
     private void allocate(int cap, int avgKeyBytes, int avgValueBytes) {

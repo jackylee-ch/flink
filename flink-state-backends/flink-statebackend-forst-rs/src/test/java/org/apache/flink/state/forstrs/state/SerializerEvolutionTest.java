@@ -248,4 +248,127 @@ class SerializerEvolutionTest {
                 ioe.getMessage().contains("magic mismatch"),
                 "magic mismatch message: " + ioe.getMessage());
     }
+
+    // ----------------------------------------------------------------
+    // R15-H2: state-kind mismatch (e.g. ValueState → ListState with the
+    // same name) must throw StateMigrationException BEFORE the
+    // resolveSchemaCompatibility check, because the element types might
+    // match while the storage layouts differ (single value vs.
+    // [count:int][elem...]). A silent compat-as-is would let the engine
+    // decode garbage on the first read.
+    // ----------------------------------------------------------------
+
+    @Test
+    void stateKindMismatchThrowsOnRegister() throws Exception {
+        // Session 1: register state "mixed" as VALUE (ordinal 0) with IntSerializer.
+        StateSerializerRegistry write = new StateSerializerRegistry();
+        write.register("mixed", /* VALUE */ 0, IntSerializer.INSTANCE);
+
+        // Round-trip through the wire codec to simulate persist + restore.
+        byte[] blob = write.serialize();
+        Map<String, StateSerializerMetadata> restored =
+                StateSerializerRegistry.deserialize(blob);
+        StateSerializerRegistry read = new StateSerializerRegistry();
+        read.seedFromRestore(restored);
+
+        // Session 2: same state name, but register as LIST (ordinal 1) with the same element
+        // serializer. The element types match (IntSerializer), so resolveSchemaCompatibility
+        // would return COMPATIBLE_AS_IS; without the H2 check the storage-layout mismatch
+        // (ValueState single payload vs. ListState [count][elem...]) would silently decode
+        // garbage on the first read.
+        StateMigrationException ex =
+                assertThrows(
+                        StateMigrationException.class,
+                        () ->
+                                read.verifyOrRegister(
+                                        "mixed", /* LIST */ 1, IntSerializer.INSTANCE));
+        assertTrue(
+                ex.getMessage().contains("State kind mismatch"),
+                "Exception must mention state kind mismatch: " + ex.getMessage());
+        assertTrue(
+                ex.getMessage().contains("VALUE"),
+                "Exception must mention the previous kind (VALUE): " + ex.getMessage());
+        assertTrue(
+                ex.getMessage().contains("LIST"),
+                "Exception must mention the new kind (LIST): " + ex.getMessage());
+        assertTrue(
+                ex.getMessage().contains("mixed"),
+                "Exception must mention the state name: " + ex.getMessage());
+    }
+
+    @Test
+    void stateKindMatchPassesCompatCheck() throws Exception {
+        // Sanity: when both sides agree on the state kind, the H2 guard does NOT fire and
+        // verifyOrRegister returns the new serializer (COMPATIBLE_AS_IS branch).
+        StateSerializerRegistry write = new StateSerializerRegistry();
+        write.register("samekind", /* VALUE */ 0, IntSerializer.INSTANCE);
+        byte[] blob = write.serialize();
+        StateSerializerRegistry read = new StateSerializerRegistry();
+        read.seedFromRestore(StateSerializerRegistry.deserialize(blob));
+        TypeSerializer<Integer> effective =
+                read.verifyOrRegister("samekind", /* VALUE */ 0, IntSerializer.INSTANCE);
+        assertSame(IntSerializer.INSTANCE, effective);
+    }
+
+    // ----------------------------------------------------------------
+    // R15-M1: deserialize must bound the entry count and per-entry
+    // snapshot bytes BEFORE allocating, to defend against corrupted /
+    // hostile blobs (the magic + version check alone does not constrain
+    // the per-length fields).
+    // ----------------------------------------------------------------
+
+    @Test
+    void deserializeRejectsOutOfBoundsEntryCount() throws Exception {
+        // Hand-build a blob whose entry-count exceeds MAX_ENTRY_COUNT.
+        org.apache.flink.core.memory.DataOutputSerializer out =
+                new org.apache.flink.core.memory.DataOutputSerializer(16);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_MAGIC);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_FORMAT_V1);
+        out.writeInt(StateSerializerRegistry.MAX_ENTRY_COUNT + 1);
+        IOException ioe =
+                assertThrows(
+                        IOException.class,
+                        () -> StateSerializerRegistry.deserialize(out.getCopyOfBuffer()));
+        assertTrue(
+                ioe.getMessage().contains("count=" + (StateSerializerRegistry.MAX_ENTRY_COUNT + 1)),
+                "expected count-bounds message, got: " + ioe.getMessage());
+    }
+
+    @Test
+    void deserializeRejectsOutOfBoundsPerEntryBytes() throws Exception {
+        // Hand-build a blob whose first entry claims a bytesLen above MAX_SNAPSHOT_BYTES.
+        org.apache.flink.core.memory.DataOutputSerializer out =
+                new org.apache.flink.core.memory.DataOutputSerializer(64);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_MAGIC);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_FORMAT_V1);
+        out.writeInt(1); // one entry
+        out.writeUTF("s");
+        out.writeInt(StateSerializerMetadata.CURRENT_FORMAT_VERSION);
+        out.writeInt(0); // VALUE kind ordinal
+        out.writeInt(StateSerializerRegistry.MAX_SNAPSHOT_BYTES + 1);
+        IOException ioe =
+                assertThrows(
+                        IOException.class,
+                        () -> StateSerializerRegistry.deserialize(out.getCopyOfBuffer()));
+        assertTrue(
+                ioe.getMessage()
+                        .contains("bytesLen=" + (StateSerializerRegistry.MAX_SNAPSHOT_BYTES + 1)),
+                "expected bytesLen-bounds message, got: " + ioe.getMessage());
+    }
+
+    @Test
+    void deserializeRejectsNegativeEntryCount() throws Exception {
+        org.apache.flink.core.memory.DataOutputSerializer out =
+                new org.apache.flink.core.memory.DataOutputSerializer(16);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_MAGIC);
+        out.writeInt(StateSerializerRegistry.REGISTRY_BLOB_FORMAT_V1);
+        out.writeInt(-1);
+        IOException ioe =
+                assertThrows(
+                        IOException.class,
+                        () -> StateSerializerRegistry.deserialize(out.getCopyOfBuffer()));
+        assertTrue(
+                ioe.getMessage().contains("count=-1"),
+                "expected count-bounds message, got: " + ioe.getMessage());
+    }
 }

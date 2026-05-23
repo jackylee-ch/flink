@@ -85,6 +85,21 @@ public final class FrsIterHandle implements AutoCloseable {
     /** Set atomically on first close; guards against double-close. */
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
+    /**
+     * R14-M1 / R15-M4: pre-allocated scratch out-parameter segments for {@link #next}. Allocated
+     * ONCE at construction and reused across every {@code next()} call so the per-call cost is a
+     * pure FFI invocation — no bump-allocation. Pre-fix, {@code perIterArena.allocate(JAVA_INT) × 2}
+     * fired per {@code next()}; under {@code ownsArena=false} (PR-E3 batched-open path) the arena
+     * is the executor's long-lived one, so each call leaked 8 bytes that accumulated for the
+     * lifetime of the executor.
+     *
+     * <p>The 8-byte cost per handle (one Arena slice for each int) is bounded; the unbounded leak
+     * came from the per-call growth pattern.
+     */
+    private final MemorySegment scratchOutRc;
+
+    private final MemorySegment scratchOutBu;
+
     public FrsIterHandle(
             long handleId,
             long nativeHandleId,
@@ -115,6 +130,12 @@ public final class FrsIterHandle implements AutoCloseable {
         this.slotScope = slotScope;
         this.lastNextNs = new AtomicLong(System.nanoTime());
         this.openedAtMs = System.currentTimeMillis();
+        // R14-M1 / R15-M4: allocate the scratch out-param segments ONCE per handle. Reused
+        // across every {@link #next} call so we do not pay an Arena bump per FFI invocation
+        // (and, under ownsArena=false, do not accumulate 8 bytes/call on the long-lived
+        // executor Arena).
+        this.scratchOutRc = perIterArena.allocate(ValueLayout.JAVA_INT);
+        this.scratchOutBu = perIterArena.allocate(ValueLayout.JAVA_INT);
     }
 
     /** Returns the stable Java-side handle ID (used as registry key). */
@@ -165,12 +186,17 @@ public final class FrsIterHandle implements AutoCloseable {
             close();
             throw new FrsIteratorExpiredException(0);
         }
-        // Scratch out-params reuse the per-iterator Arena (cheap bump allocation).
-        MemorySegment outRc = perIterArena.allocate(ValueLayout.JAVA_INT);
-        MemorySegment outBu = perIterArena.allocate(ValueLayout.JAVA_INT);
+        // R14-M1 / R15-M4: reuse the constructor-allocated scratch out-param segments. Under
+        // {@code ownsArena=false} the per-iter Arena is the executor's long-lived one, so the
+        // previous {@code perIterArena.allocate(JAVA_INT) × 2} per next() call accumulated
+        // 8 bytes/call indefinitely.
         int rc =
                 linker.frsVecIterPrefixNext(
-                        nativeHandleId, chunkBuf, (int) chunkBuf.byteSize(), outRc, outBu);
+                        nativeHandleId,
+                        chunkBuf,
+                        (int) chunkBuf.byteSize(),
+                        scratchOutRc,
+                        scratchOutBu);
         lastNextNs.set(System.nanoTime());
         if (rc != FrsErrorCode.OK.code()) {
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
@@ -180,14 +206,21 @@ public final class FrsIterHandle implements AutoCloseable {
             }
             throw new FrsException(code, 0, new byte[0]);
         }
-        return outRc.get(ValueLayout.JAVA_INT, 0);
+        return scratchOutRc.get(ValueLayout.JAVA_INT, 0);
     }
 
     /**
      * Requests that this handle be closed. Called by {@link IterLifetimeWatchdog} only — the actual
      * native close is deferred to the next {@link #next} call on the operator thread.
+     *
+     * <p>R15-L4: short-circuit when the handle is already closed. There is no operator-thread
+     * caller left to observe the flag, and a closed handle's {@code closeRequested.set(true)}
+     * would only stage a wasted CAS on a slot the watchdog should never resurrect.
      */
     public void requestClose() {
+        if (closed.get()) {
+            return;
+        }
         closeRequested.set(true);
     }
 

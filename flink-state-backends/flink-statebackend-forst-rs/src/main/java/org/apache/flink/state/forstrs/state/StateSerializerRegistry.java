@@ -171,6 +171,22 @@ public final class StateSerializerRegistry {
             register(stateName, stateKindOrdinal, serializer);
             return serializer;
         }
+        // R15-H2: assert state-kind invariance BEFORE running the value-element schema compat
+        // check. The element types of a ValueState<List<Foo>> and a ListState<Foo> can both
+        // resolve as "compatible as is" against each other (their TypeSerializerSnapshots are
+        // semantically equivalent), but the on-disk storage layout differs: ValueState stores
+        // a single serialized value; ListState stores {@code [count:int][elem...]}. Reading a
+        // ListState payload through a ValueState reader (or vice-versa) silently decodes
+        // garbage. Fail loudly here with the actionable kind-mismatch message rather than
+        // surfacing the issue as a Flink-level deserialization error at the first state read.
+        if (prior.stateKindOrdinal() != stateKindOrdinal) {
+            throw new StateMigrationException(
+                    "State kind mismatch for state '" + stateName
+                            + "': previously stored as " + stateKindName(prior.stateKindOrdinal())
+                            + ", now registered as " + stateKindName(stateKindOrdinal)
+                            + ". Storage layout differs — restore would silently decode garbage."
+                            + " Choose a different state name or restart from a clean state.");
+        }
         // PR-A1 dependency: in V1 the snapshot must be deserialized using Flink's standard helper
         // to reconstruct the prior TypeSerializerSnapshot instance.
         DataInputDeserializer in =
@@ -323,16 +339,75 @@ public final class StateSerializerRegistry {
                             + ")");
         }
         int count = in.readInt();
+        // R15-M1: bound the entry count BEFORE allocating the map — a corrupt or hostile blob
+        // could embed an arbitrarily large count and trigger an OOM via the LinkedHashMap
+        // capacity hint. 65536 is two orders of magnitude above any plausible state-count for a
+        // single backend instance (a TM typically hosts < 1000 states across all operators).
+        if (count < 0 || count > MAX_ENTRY_COUNT) {
+            throw new IOException(
+                    "StateSerializerRegistry blob malformed: count=" + count
+                            + " (expected 0.." + MAX_ENTRY_COUNT + ")");
+        }
         Map<String, StateSerializerMetadata> out = new LinkedHashMap<>(count * 2);
         for (int i = 0; i < count; i++) {
             String name = in.readUTF();
             int fmtVer = in.readInt();
             int kindOrd = in.readInt();
             int bytesLen = in.readInt();
+            // R15-M1: bound the per-entry snapshot size BEFORE allocating the byte[]. The
+            // upper cap matches the largest plausible TypeSerializerSnapshot envelope (a few MB
+            // for pathological POJO graphs); anything larger is corruption, not legitimate
+            // state metadata.
+            if (bytesLen < 0 || bytesLen > MAX_SNAPSHOT_BYTES) {
+                throw new IOException(
+                        "StateSerializerRegistry blob malformed: bytesLen=" + bytesLen
+                                + " for state '" + name + "' (expected 0.."
+                                + MAX_SNAPSHOT_BYTES + ")");
+            }
             byte[] bytes = new byte[bytesLen];
             in.readFully(bytes);
             out.put(name, new StateSerializerMetadata(name, kindOrd, fmtVer, bytes));
         }
         return out;
+    }
+
+    /**
+     * R15-M1: hard upper bound on the entry count to guard against malformed/hostile blobs. A
+     * 64Ki cap is two orders of magnitude above any plausible state-count for a single backend
+     * (a TM hosts ≪ 1000 states across all operators), so it never rejects legitimate data
+     * while preventing a malicious blob from triggering OOM in the LinkedHashMap allocation.
+     */
+    public static final int MAX_ENTRY_COUNT = 65_536;
+
+    /**
+     * R15-M1: hard upper bound on each entry's serialized snapshot bytes. 16 MiB is several
+     * orders of magnitude above the largest plausible TypeSerializerSnapshot envelope
+     * (typically tens of bytes; pathological POJO graphs reach kilobytes), so it never rejects
+     * legitimate snapshots while preventing OOM-via-blob-length attacks.
+     */
+    public static final int MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024;
+
+    /**
+     * R15-H2: human-readable name for a {@link
+     * org.apache.flink.api.common.state.v2.StateDescriptor.Type} ordinal. Used in the kind
+     * mismatch error message so operators can diagnose the regression without cross-referencing
+     * the enum source. Mirrors the Flink-side ordering (VALUE=0, LIST=1, REDUCING=2,
+     * AGGREGATING=3, MAP=4).
+     */
+    static String stateKindName(int ordinal) {
+        switch (ordinal) {
+            case 0:
+                return "VALUE";
+            case 1:
+                return "LIST";
+            case 2:
+                return "REDUCING";
+            case 3:
+                return "AGGREGATING";
+            case 4:
+                return "MAP";
+            default:
+                return "UNKNOWN(" + ordinal + ")";
+        }
     }
 }

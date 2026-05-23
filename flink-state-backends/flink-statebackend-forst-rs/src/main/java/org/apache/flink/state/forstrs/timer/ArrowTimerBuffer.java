@@ -115,10 +115,23 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     }
 
     public ArrowTimerBuffer(int initialCapacity, int maxCapacity) {
-        this.capacity = Math.max(initialCapacity, 16);
+        // R15-L1: capacity MUST be a power of two — the hash-index linear-probe mask
+        // {@code (capacity * 2) - 1} only spans all slots when {@code capacity * 2}
+        // is a power of two. A non-pow2 capacity would skip slots and silently drop
+        // entries on insert. Mirrors the FlatStateCache:60 rounding pattern.
+        this.capacity = nextPow2(Math.max(initialCapacity, 16));
         this.maxCapacity = Math.max(maxCapacity, this.capacity);
         this.arena = Arena.ofShared();
         allocate(this.capacity, 64 /* avg key bytes */);
+    }
+
+    /** R15-L1: round {@code n} up to the next power of two (capped at 2^30). */
+    private static int nextPow2(int n) {
+        if (n <= 1) {
+            return 1;
+        }
+        int p = Integer.highestOneBit(n - 1) << 1;
+        return p > 0 ? p : (1 << 30);
     }
 
     private void allocate(int cap, int avgKeyBytes) {

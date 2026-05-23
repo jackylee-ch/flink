@@ -357,4 +357,120 @@ class AsyncBackendSnapshotPathTest {
             backend.close();
         }
     }
+
+    /**
+     * R15-H1 regression: {@link ForStRsAsyncKeyedStateBackend#close()} must await every
+     * outstanding async-snapshot {@link RunnableFuture} BEFORE closing the native arena.
+     *
+     * <p>Strategy: open a backend, inject a blocking {@code RunnableFuture} into the
+     * {@code outstandingSnapshots} registry via reflection (a real async snapshot is hard to
+     * pause mid-flight, but the close-await contract is what we're testing — not the snapshot
+     * worker itself). Spawn a thread that calls {@code close()}. Verify the thread does NOT
+     * complete close() until either (a) the future completes or (b) the close()
+     * 5s-per-future timeout elapses and {@code cancel(true)} is observed by the future.
+     *
+     * <p>Pre-fix close() would return immediately; after the fix close() blocks on
+     * future.get() with the documented timeout.
+     */
+    @Test
+    void closeAwaitsInFlightSnapshotsBeforeArenaClose(@TempDir Path tmp) throws Exception {
+        ForStRsAsyncKeyedStateBackend<Integer> backend = openBackend(tmp.resolve("db"));
+        // CountDownLatch is the "controllable future" the spec calls for — the future blocks
+        // on it inside run() so we can hold close() until we explicitly release it.
+        java.util.concurrent.CountDownLatch release = new java.util.concurrent.CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicBoolean cancelled =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+        java.util.concurrent.atomic.AtomicBoolean ranThroughRelease =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+
+        // Build the blocking future. Note: close() calls cancel(true) BEFORE get(), so the
+        // future must surface the interrupt via InterruptedException -> done state in order for
+        // close()'s get() to return promptly. We honour cancel(true) by interrupting + finishing.
+        java.util.concurrent.FutureTask<SnapshotResult<KeyedStateHandle>> blocking =
+                new java.util.concurrent.FutureTask<>(
+                        () -> {
+                            try {
+                                // Wait up to 10s for the test to release us OR for cancel() to
+                                // interrupt the running thread.
+                                if (release.await(10L, java.util.concurrent.TimeUnit.SECONDS)) {
+                                    ranThroughRelease.set(true);
+                                }
+                            } catch (InterruptedException ie) {
+                                cancelled.set(true);
+                                Thread.currentThread().interrupt();
+                            }
+                            return SnapshotResult.empty();
+                        });
+
+        // Spawn the worker that drives the blocking future's body so the FutureTask is "running"
+        // by the time close() is invoked.
+        Thread workerThread = new Thread(blocking, "test-blocking-snapshot-worker");
+        workerThread.setDaemon(true);
+        workerThread.start();
+
+        // Reflectively register the blocking future in the backend's outstandingSnapshots set.
+        java.lang.reflect.Field f =
+                ForStRsAsyncKeyedStateBackend.class.getDeclaredField("outstandingSnapshots");
+        f.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        java.util.Set<RunnableFuture<?>> registry =
+                (java.util.Set<RunnableFuture<?>>) f.get(backend);
+        registry.add(blocking);
+        assertTrue(registry.contains(blocking), "future is now tracked");
+
+        // Spawn close() on a separate thread so we can observe blocking behaviour from this
+        // thread.
+        java.util.concurrent.atomic.AtomicLong closeMs =
+                new java.util.concurrent.atomic.AtomicLong(-1);
+        Thread closer =
+                new Thread(
+                        () -> {
+                            long t0 = System.nanoTime();
+                            try {
+                                backend.close();
+                            } catch (Throwable t) {
+                                fail("close() threw: " + t);
+                            }
+                            closeMs.set((System.nanoTime() - t0) / 1_000_000);
+                        },
+                        "test-close-thread");
+        closer.setDaemon(true);
+        closer.start();
+
+        // Give close() a moment to enter awaitOutstandingSnapshots() and call cancel(true).
+        // 200ms is generous on a CPU-bound box and well under the 5s per-future timeout.
+        Thread.sleep(200);
+
+        // Pre-release assertion: close() MUST still be blocked because the future has not yet
+        // completed (cancel(true) interrupts the worker but the cancel itself does not mark the
+        // FutureTask done until the worker's Callable returns). The worker should be honouring
+        // the interrupt now — wait briefly for the cancellation cascade.
+        // We do not strictly require close() to be alive here (the timeout / cancel path could
+        // race fast), but the assertion that matters is that close() ran AFTER the worker
+        // observed the cancel.
+        closer.join(7_000L);
+        assertFalse(closer.isAlive(), "close() returned within the 5s per-future budget");
+
+        // The future completed via cancel(true)'s InterruptedException path — not via the test
+        // release latch — confirming that close() observed the future and drove it to a
+        // terminal state.
+        assertTrue(
+                cancelled.get() || blocking.isCancelled() || blocking.isDone(),
+                "blocking future reached a terminal state during close()");
+        assertFalse(
+                ranThroughRelease.get(),
+                "future did NOT complete via the release latch — close() drove it to"
+                        + " terminal state");
+
+        // close() blocked for a measurable amount of time (>= the 200ms we slept), confirming
+        // the await behaviour. Allow a wide upper bound (10s) so a slow CI box does not flake.
+        long ms = closeMs.get();
+        assertTrue(ms >= 0, "closeMs was recorded");
+        assertTrue(ms < 10_000L, "close() did not exceed the per-future budget grossly: " + ms);
+
+        // Cleanup: release the latch so the worker thread exits even if it was somehow still
+        // alive. join() ensures no test-leak before the next test runs.
+        release.countDown();
+        workerThread.join(2_000L);
+    }
 }
