@@ -96,9 +96,19 @@ class SyncExecuteRequestOnClearThrowTest {
                                 + t);
             }
 
+            // R19-H1: must be EXACTLY 1, not >=1. {@code VectorizedClassifier.recordDelete}'s
+            // onClear-throw handler pre-completes the future exceptionally before rethrowing;
+            // the outer catch in {@code executeRequestSync} would re-complete the SAME future
+            // without an idempotence guard. In production
+            // {@code AsyncFutureImpl.completeExceptionally} delegates to
+            // {@code AsyncFrameworkExceptionHandler.handleException} with no idempotence —
+            // double-completion → double task-failure log. The R19-H1 isDone() guard ensures
+            // exactly one exceptional completion.
             assertThat(fut.exceptionalCalls.get())
-                    .as("R18-H2: request future must be completed exceptionally on onClear throw")
-                    .isGreaterThanOrEqualTo(1);
+                    .as("R19-H1: request future must be completed exceptionally EXACTLY once on"
+                            + " onClear throw (pre-fix: double-completion via recordDelete +"
+                            + " executeRequestSync outer catch)")
+                    .isEqualTo(1);
             assertThat(fut.normalCalls.get())
                     .as("request future must NOT receive a normal completion on the failure path")
                     .isEqualTo(0);

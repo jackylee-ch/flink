@@ -1717,8 +1717,31 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // Snapshot to a local list so concurrent removals from the worker-completion hook do
             // not surprise us mid-iteration.
             List<RunnableFuture<?>> pending = new ArrayList<>(outstandingSnapshots);
+            // R19-L2: once a per-future {@code TimeoutException} fires, the remaining entries in
+            // this inner-loop snapshot are statistically likely to also be stuck — and each one
+            // would consume up to {@code CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS} of the close budget on
+            // its own {@code f.get(...)} before timing out. Drain the rest with
+            // {@code cancel(true)} + immediate remove (no further {@code get()} calls) so the
+            // overall close path proceeds to arena teardown without blowing the 30s budget on
+            // serialized per-future timeouts. The outer {@code while (!outstandingSnapshots
+            // .isEmpty())} re-check picks up any real-future handoff that landed concurrently.
+            boolean shedRemaining = false;
             for (RunnableFuture<?> f : pending) {
                 if (f.isDone()) {
+                    outstandingSnapshots.remove(f);
+                    continue;
+                }
+                if (shedRemaining) {
+                    // Best-effort: cancel + immediate remove, no get() wait. Skip cancel on
+                    // placeholders (R17-H2) — their cancel() is a no-op anyway (R18-M1) but
+                    // omitting it preserves the documented contract.
+                    if (!(f instanceof PlaceholderRunnableFuture)) {
+                        try {
+                            f.cancel(true);
+                        } catch (Throwable ignored) {
+                            // best-effort cancel; some snapshot strategies are uninterruptible
+                        }
+                    }
                     outstandingSnapshots.remove(f);
                     continue;
                 }
@@ -1789,6 +1812,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                         + " best-effort fallback)",
                                 CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS);
                     }
+                    // R19-L2: shed the remaining inner-loop entries. Without this, each
+                    // remaining stuck future would consume its own
+                    // CLOSE_SNAPSHOT_AWAIT_TIMEOUT_MS budget on its f.get(...) before
+                    // timing out — serialised they could blow the 30s overall budget
+                    // before close() reaches arena teardown. cancel(true) + immediate
+                    // remove on the rest; the outer while-loop's isEmpty() re-check still
+                    // picks up any concurrent placeholder→real-future handoff.
+                    shedRemaining = true;
                 } catch (Throwable ignored) {
                     // ExecutionException / cancellation surfaced via get(); benign — the worker
                     // has terminated, which is all we needed before closing the arena.

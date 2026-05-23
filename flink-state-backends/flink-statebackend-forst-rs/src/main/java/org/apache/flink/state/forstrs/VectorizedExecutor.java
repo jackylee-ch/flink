@@ -450,7 +450,19 @@ public class VectorizedExecutor implements StateExecutor {
             // path doesn't leak the StateRequest's future (operator would hang).
             executeRequestSyncInner(single);
         } catch (Throwable t) {
-            completePutExceptionally(request, t);
+            // R19-H1: double-completion guard. {@code VectorizedClassifier.recordDelete}'s
+            // {@code onClear}-throw handler pre-completes the request's future exceptionally
+            // before rethrowing — the batched path ({@code executeBatchRequests}) relies on
+            // that pre-completion because the framework calls {@code classifier.offer(...)}
+            // OUTSIDE the executor's try block. On the sync path, however, both the
+            // pre-completion (in recordDelete) AND this outer catch would target the SAME
+            // future. In production {@code AsyncFutureImpl.completeExceptionally} delegates
+            // to {@code AsyncFrameworkExceptionHandler.handleException} with NO idempotence —
+            // double-completion → double task-failure log. Guard on {@code isDone()} so
+            // exactly one completion occurs.
+            if (!request.getFuture().isDone()) {
+                completePutExceptionally(request, t);
+            }
         }
     }
 
