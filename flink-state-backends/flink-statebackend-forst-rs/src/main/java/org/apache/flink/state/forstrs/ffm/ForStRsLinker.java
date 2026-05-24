@@ -2535,7 +2535,44 @@ public final class ForStRsLinker {
             throw new FrsBackendException(
                     FrsStatus.PANIC, "frs_vectorized_batch_put threw: " + t.getMessage());
         }
-        check(rc, "frs_vectorized_batch_put");
+        checkVectorized(rc, "frs_vectorized_batch_put");
+    }
+
+    /**
+     * R91-H1: defensive rc check for vectorized FFI paths that may return
+     * {@link FrsErrorCode} values outside the legacy {@link FrsStatus}
+     * enum (codes 100/101/110/200/201/300/301/302/303/900/999). Bare
+     * {@link #check(int, String)} would throw {@code IllegalArgumentException}
+     * from {@link FrsStatus#fromCode} on those codes — bypassing typed
+     * error handling and, more importantly, NOT escalating
+     * {@code PANIC_CAUGHT=900} to {@code FrsEnginePanicError} the way the
+     * GET path does inline (VectorizedExecutor.java:828-836). Without
+     * fatal escalation a panicked engine state on the WRITE path is
+     * silently swallowed and subsequent writes operate on poisoned state.
+     *
+     * <p>This helper decodes via {@link FrsErrorCode#fromU32} and throws
+     * {@link FrsBackendException} carrying the typed code; the caller's
+     * downstream {@code fatalHandler} (set on the executor) is invoked
+     * directly here when the code is fail-process.
+     */
+    private static void checkVectorized(int rc, String fn) {
+        if (rc == FrsStatus.OK.code()) {
+            return;
+        }
+        FrsErrorCode err = FrsErrorCode.fromU32(rc);
+        if (err.isFailProcess()) {
+            throw new FrsEnginePanicError(err, fn + " rc=" + rc);
+        }
+        // Map back into FrsStatus for backwards-compat callers; fall
+        // back to PANIC on unknown codes so an unmatched rc surfaces as
+        // a typed FrsBackendException rather than an IAE.
+        FrsStatus status;
+        try {
+            status = FrsStatus.fromCode(rc);
+        } catch (IllegalArgumentException ignored) {
+            status = FrsStatus.PANIC;
+        }
+        throw new FrsBackendException(status, fn + " rc=" + rc + " errCode=" + err);
     }
 
     /** Vectorized batch DELETE. */
@@ -2555,7 +2592,7 @@ public final class ForStRsLinker {
             throw new FrsBackendException(
                     FrsStatus.PANIC, "frs_vectorized_batch_delete threw: " + t.getMessage());
         }
-        check(rc, "frs_vectorized_batch_delete");
+        checkVectorized(rc, "frs_vectorized_batch_delete");
     }
 
     // -----------------------------------------------------------------
