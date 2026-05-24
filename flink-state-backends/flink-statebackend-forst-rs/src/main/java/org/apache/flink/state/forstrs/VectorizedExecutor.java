@@ -456,6 +456,23 @@ public class VectorizedExecutor implements StateExecutor {
             // FrsEnginePanicError extends Error, so a panic in executeGets/Puts/etc. would
             // previously escape the outer catch and the container future would never be
             // returned (operator hangs forever on the unresolved CompletableFuture).
+            //
+            // R99-H1: each `executeXxx` method drains ONLY its own kind's per-row
+            // futures on throw. A throw mid-pipeline (e.g., in `executeGets`) leaves
+            // pending iter / append-merge per-row futures unresolved because their
+            // dispatch methods never ran. Per the comment block at lines 282-290,
+            // the framework caller ignores the container future entirely; per-row
+            // InternalAsyncFuture#complete drives mailbox callbacks. So an
+            // unresolved per-row future indefinitely blocks the next op on that key
+            // → operator hang. Drain the remaining queued kinds here before
+            // returning the failed container.
+            try {
+                drainPendingFuturesExceptionally(classifier, t);
+            } catch (Throwable drainErr) {
+                // Drain must never mask the original failure. Attach as suppressed
+                // so the diagnostic chain is preserved.
+                t.addSuppressed(drainErr);
+            }
             return CompletableFuture.failedFuture(t);
         } finally {
             // PR-E2: end-of-batch hook for in-flight depth tracking. Runs even on the
@@ -1769,6 +1786,77 @@ public class VectorizedExecutor implements StateExecutor {
      * is already a {@link FrsEnginePanicError}: the dispatcher fired it once and
      * downstream layers must not double-escalate.
      */
+    /**
+     * R99-H1: drain ALL remaining per-row futures in a classifier after the
+     * outer pipeline catch fires. Each `executeXxx` method only drains its
+     * own kind on throw; a throw mid-pipeline (PUT, DEL, GET, ITER,
+     * APPEND_MERGE in that order) leaves un-dispatched kinds' futures
+     * unresolved. The framework caller ignores the container future and
+     * drives next-op scheduling off per-row InternalAsyncFuture completion,
+     * so any unresolved future indefinitely blocks the next op on its key
+     * — operator hang.
+     *
+     * <p>Idempotent against per-method drains: each row marked via
+     * `markCompletedExceptionally` is skipped by subsequent completion
+     * paths, and `InternalAsyncFuture.completeExceptionally` on an
+     * already-completed future is a no-op.
+     */
+    private static void drainPendingFuturesExceptionally(
+            VectorizedClassifier classifier, Throwable cause) {
+        if (classifier == null) {
+            return;
+        }
+        // PUT/DEL/APPEND_MERGE rows (writes/deletes paths)
+        StateRequest<?, ?, ?, ?>[] putReqs = classifier.putRequests();
+        int putCount = classifier.putCount();
+        for (int i = 0; i < putCount && putReqs != null && i < putReqs.length; i++) {
+            try {
+                classifier.markCompletedExceptionally(putReqs[i]);
+                completePutExceptionally(putReqs[i], cause);
+            } catch (Throwable ignore) {
+                // best-effort drain — never mask the primary cause
+            }
+        }
+        StateRequest<?, ?, ?, ?>[] delReqs = classifier.deleteRequests();
+        int delCount = classifier.deleteCount();
+        for (int i = 0; i < delCount && delReqs != null && i < delReqs.length; i++) {
+            try {
+                classifier.markCompletedExceptionally(delReqs[i]);
+                completeDeleteExceptionally(delReqs[i], cause);
+            } catch (Throwable ignore) {
+                // best-effort drain
+            }
+        }
+        // ITER rows
+        for (ForStRsDBIterRequest<?, ?, ?, ?> iter : classifier.iterRequests()) {
+            try {
+                StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
+                if (sr != null) {
+                    classifier.markCompletedExceptionally(sr);
+                }
+                iter.completeExceptionally(cause);
+            } catch (Throwable ignore) {
+                // best-effort drain
+            }
+        }
+        // APPEND_MERGE buffer rows — heap-path futures live in the buffer's
+        // futures() list (drained by dispatchAppendMergeBatch/PerRow on
+        // throw; here we re-drain idempotently in case the throw came
+        // before dispatch).
+        AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
+        if (amBuf != null) {
+            for (CompletableFuture<Void> f : amBuf.futures()) {
+                try {
+                    if (f != null && !f.isDone()) {
+                        f.completeExceptionally(cause);
+                    }
+                } catch (Throwable ignore) {
+                    // best-effort drain
+                }
+            }
+        }
+    }
+
     @SuppressWarnings("unchecked")
     private static void completePutExceptionally(
             StateRequest<?, ?, ?, ?> request, Throwable cause) {
