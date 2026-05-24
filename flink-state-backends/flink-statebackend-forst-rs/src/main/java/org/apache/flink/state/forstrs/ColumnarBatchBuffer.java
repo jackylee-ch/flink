@@ -122,6 +122,30 @@ public final class ColumnarBatchBuffer {
      * <p>Returns the index of the appended entry.
      */
     public int append(MemorySegment src, long srcOff, int len) {
+        // R73-M1: mirror R72-L1's validation for the MemorySegment-source
+        // overload. Pre-fix a buggy caller with `len < 0` silently corrupted
+        // `dataPos` (via `dataPos += len`); `srcOff + len > src.byteSize()`
+        // threw AIOOBE inside MemorySegment.copy AFTER `ensureData` had
+        // already grown the data segment. byteSize() returns long, so we
+        // can't use Objects.checkFromIndexSize; manually validate.
+        if (len < 0) {
+            throw new IllegalArgumentException(
+                    "ColumnarBatchBuffer.append: len=" + len + " must be non-negative");
+        }
+        if (srcOff < 0) {
+            throw new IllegalArgumentException(
+                    "ColumnarBatchBuffer.append: srcOff=" + srcOff + " must be non-negative");
+        }
+        long srcEnd = srcOff + len;
+        if (srcEnd < srcOff /* overflow */ || srcEnd > src.byteSize()) {
+            throw new IllegalArgumentException(
+                    "ColumnarBatchBuffer.append: srcOff="
+                            + srcOff
+                            + " len="
+                            + len
+                            + " exceeds src.byteSize()="
+                            + src.byteSize());
+        }
         ensureCapacity(1);
         ensureData(len);
         if (len > 0) {
