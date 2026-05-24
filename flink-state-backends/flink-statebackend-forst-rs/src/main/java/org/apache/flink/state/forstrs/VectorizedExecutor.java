@@ -1489,7 +1489,22 @@ public class VectorizedExecutor implements StateExecutor {
                 // Per-row failure — propagate the batch-level code (best-effort
                 // attribution; the Rust impl returns the FIRST per-row error code).
                 FrsErrorCode rowCode = batchCode != FrsErrorCode.OK ? batchCode : FrsErrorCode.UNKNOWN;
-                future.completeExceptionally(new FrsException(rowCode, row, new byte[0]));
+                // R92-H1: escalate fail-process codes (e.g. PANIC_CAUGHT=900)
+                // via the fatal handler — sister to the GET path at line
+                // 828-836 and APPEND_MERGE at 1102-1111. Pre-fix the iter
+                // path completed the row future with a plain FrsException
+                // and the engine kept running on potentially poisoned state.
+                if (rowCode.isFailProcess()) {
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(
+                                    rowCode, "kind=ITER_PREFIX row=" + row);
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
+                    }
+                    future.completeExceptionally(panicErr);
+                } else {
+                    future.completeExceptionally(new FrsException(rowCode, row, new byte[0]));
+                }
                 if (metrics != null) {
                     metrics.recordFfiError(
                             VectorizedStateRequest.Kind.ITER_PREFIX, "_mixed", rowCode);
@@ -1593,7 +1608,20 @@ public class VectorizedExecutor implements StateExecutor {
 
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
             if (code != FrsErrorCode.OK) {
-                future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                // R92-H1 (companion): escalate fail-process codes via
+                // fatalHandler — sister to dispatchIterPrefix above and
+                // GET / APPEND_MERGE paths.
+                if (code.isFailProcess()) {
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(
+                                    code, "kind=ITER_RANGE row=" + row);
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
+                    }
+                    future.completeExceptionally(panicErr);
+                } else {
+                    future.completeExceptionally(new FrsException(code, row, new byte[0]));
+                }
                 if (metrics != null) {
                     metrics.recordFfiError(
                             VectorizedStateRequest.Kind.ITER_RANGE, MIXED_STATE, code);
