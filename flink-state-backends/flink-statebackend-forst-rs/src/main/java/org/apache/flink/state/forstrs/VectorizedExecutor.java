@@ -1787,40 +1787,58 @@ public class VectorizedExecutor implements StateExecutor {
      * downstream layers must not double-escalate.
      */
     /**
-     * R99-H1: drain ALL remaining per-row futures in a classifier after the
-     * outer pipeline catch fires. Each `executeXxx` method only drains its
-     * own kind on throw; a throw mid-pipeline (PUT, DEL, GET, ITER,
-     * APPEND_MERGE in that order) leaves un-dispatched kinds' futures
-     * unresolved. The framework caller ignores the container future and
-     * drives next-op scheduling off per-row InternalAsyncFuture completion,
-     * so any unresolved future indefinitely blocks the next op on its key
-     * — operator hang.
+     * R99-H1 + R100-H1 + R100-M1 + R100-L1: drain ALL remaining per-row
+     * futures in a classifier after the outer pipeline catch fires. The
+     * executor runs `executeXxx` methods sequentially (PUT, DEL, GET,
+     * ITER, APPEND_MERGE); each only drains its own kind on throw, so a
+     * throw mid-pipeline leaves un-dispatched kinds' futures unresolved.
+     * The framework caller ignores the container future and drives
+     * next-op scheduling off per-row {@link InternalAsyncFuture}
+     * completion — any unresolved future indefinitely blocks the next
+     * op on its key, causing operator hang.
      *
-     * <p>Idempotent against per-method drains: each row marked via
-     * `markCompletedExceptionally` is skipped by subsequent completion
-     * paths, and `InternalAsyncFuture.completeExceptionally` on an
-     * already-completed future is a no-op.
+     * <p>R100-M1: per-row exceptional completion is gated behind {@link
+     * VectorizedClassifier#takeClassifierCompletedExceptionally}, which
+     * returns {@code true} when the request was ALREADY drained by a
+     * per-method catch (executePuts/executeDeletes/executeIters' inner
+     * `markCompletedExceptionally` set the marker). Skipping those
+     * preserves the R21-H1 anti-double-fire contract that
+     * `AsyncFutureImpl.completeExceptionally` would otherwise violate
+     * by re-firing the framework exception handler.
+     *
+     * <p>R100-H1: include APPEND_MERGE per-row `StateRequest`s
+     * (`appendMergeRequests` array) in the drain, not just the buffer's
+     * heap-path tracking futures — those are different objects from
+     * the row's `StateRequest.getFuture()`.
      */
     private static void drainPendingFuturesExceptionally(
             VectorizedClassifier classifier, Throwable cause) {
         if (classifier == null) {
             return;
         }
-        // PUT/DEL/APPEND_MERGE rows (writes/deletes paths)
+        // PUT rows
         StateRequest<?, ?, ?, ?>[] putReqs = classifier.putRequests();
         int putCount = classifier.putCount();
         for (int i = 0; i < putCount && putReqs != null && i < putReqs.length; i++) {
             try {
+                // R100-M1: skip rows already drained by `executePuts` catch.
+                if (classifier.takeClassifierCompletedExceptionally(putReqs[i])) {
+                    continue;
+                }
                 classifier.markCompletedExceptionally(putReqs[i]);
                 completePutExceptionally(putReqs[i], cause);
             } catch (Throwable ignore) {
                 // best-effort drain — never mask the primary cause
             }
         }
+        // DELETE rows
         StateRequest<?, ?, ?, ?>[] delReqs = classifier.deleteRequests();
         int delCount = classifier.deleteCount();
         for (int i = 0; i < delCount && delReqs != null && i < delReqs.length; i++) {
             try {
+                if (classifier.takeClassifierCompletedExceptionally(delReqs[i])) {
+                    continue;
+                }
                 classifier.markCompletedExceptionally(delReqs[i]);
                 completeDeleteExceptionally(delReqs[i], cause);
             } catch (Throwable ignore) {
@@ -1831,6 +1849,10 @@ public class VectorizedExecutor implements StateExecutor {
         for (ForStRsDBIterRequest<?, ?, ?, ?> iter : classifier.iterRequests()) {
             try {
                 StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
+                if (sr != null
+                        && classifier.takeClassifierCompletedExceptionally(sr)) {
+                    continue;
+                }
                 if (sr != null) {
                     classifier.markCompletedExceptionally(sr);
                 }
@@ -1839,10 +1861,32 @@ public class VectorizedExecutor implements StateExecutor {
                 // best-effort drain
             }
         }
-        // APPEND_MERGE buffer rows — heap-path futures live in the buffer's
-        // futures() list (drained by dispatchAppendMergeBatch/PerRow on
-        // throw; here we re-drain idempotently in case the throw came
-        // before dispatch).
+        // R100-H1: APPEND_MERGE row StateRequests. These are tracked
+        // separately from the buffer's heap-path `futures()` list —
+        // the buffer futures fire when the batched FFI flush completes
+        // (drained by dispatchAppendMerge's internal catch), whereas
+        // the row StateRequest.getFuture() resolves only in the
+        // post-dispatch loop at executeBatchRequests:432-438. A throw
+        // INSIDE dispatchAppendMerge skips that loop and leaves the
+        // row StateRequests unresolved → operator hang.
+        StateRequest<?, ?, ?, ?>[] amReqs = classifier.appendMergeRequests();
+        int amCount = classifier.appendMergeCount();
+        for (int i = 0; i < amCount && amReqs != null && i < amReqs.length; i++) {
+            try {
+                if (classifier.takeClassifierCompletedExceptionally(amReqs[i])) {
+                    continue;
+                }
+                classifier.markCompletedExceptionally(amReqs[i]);
+                // AM rows complete via the PUT-shaped path (the API
+                // returns Void to the caller, mirroring add/addAll).
+                completePutExceptionally(amReqs[i], cause);
+            } catch (Throwable ignore) {
+                // best-effort drain
+            }
+        }
+        // APPEND_MERGE buffer heap-path tracking futures. Idempotent:
+        // `isDone()` guard skips entries already drained by
+        // dispatchAppendMerge's internal catch.
         AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
         if (amBuf != null) {
             for (CompletableFuture<Void> f : amBuf.futures()) {
