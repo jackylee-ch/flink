@@ -994,6 +994,7 @@ public class VectorizedExecutor implements StateExecutor {
         long bytesIn = 0;
 
         ColumnarBatchBuffer keyBuf = buffer.keyBuffer();
+        ColumnarBatchBuffer valBuf = buffer.valueBuffer();
         List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
         List<CompletableFuture<Void>> futures = buffer.futures();
 
@@ -1006,7 +1007,7 @@ public class VectorizedExecutor implements StateExecutor {
         // safe to close as soon as the loop returns.
         try (Arena scratch = Arena.ofConfined()) {
             for (int row = 0; row < count; row++) {
-                MemorySegment[] vs = valueSliceLists.get(row);
+                MemorySegment[] vsOrig = valueSliceLists.get(row);
                 CompletableFuture<Void> future = futures.get(row);
 
                 // Extract key slice from the columnar key buffer.
@@ -1017,6 +1018,32 @@ public class VectorizedExecutor implements StateExecutor {
                                 .get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
                 int keyLen = keyEnd - keyStart;
                 MemorySegment keyPtr = keyBuf.dataSegment().asSlice(keyStart, keyLen);
+
+                // R70-H1: handle heap-path rows where `valueSliceLists.get(row) == null`
+                // signals "value lives in valueBuffer at this row index" (see
+                // AppendMergeBatchBuffer.appendHeapRow). Pre-fix the per-row dispatcher
+                // NPE'd on the `for (MemorySegment v : vs)` loop whenever a single
+                // classifier drain interleaved `addAll` (multi-operand) and `add`
+                // (heap-path) rows from different async-state instances. The NPE
+                // escaped the inner future-drain catch, leaving subsequent futures
+                // unresolved and wedging upstream callers.
+                //
+                // Resolution: synthesize a single-element MemorySegment[] from the
+                // valBuf slice when vs is null. The frsVecMergeAppend FFI is called
+                // identically — one operand with bytes from valBuf instead of vs[0].
+                MemorySegment[] vs;
+                if (vsOrig != null) {
+                    vs = vsOrig;
+                } else {
+                    int vStart =
+                            valBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                    int vEnd =
+                            valBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                    int vLen = vEnd - vStart;
+                    vs = new MemorySegment[] {valBuf.dataSegment().asSlice(vStart, vLen)};
+                }
 
                 bytesIn += keyLen;
                 for (MemorySegment v : vs) {
