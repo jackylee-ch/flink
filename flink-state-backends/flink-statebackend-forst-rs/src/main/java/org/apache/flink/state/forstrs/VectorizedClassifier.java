@@ -27,6 +27,7 @@ import org.apache.flink.state.forstrs.ffm.FrsIterator;
 
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -195,6 +196,16 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         putKeys.reset();
         putValues.reset();
         deleteKeys.reset();
+        // R42-H2: null out per-row request/table slots up to the prior counts so a
+        // spike batch's StateRequest/InnerTable references don't pin payloads
+        // (KeyGroupedInternalPriorityQueue entries, ForStRsValueState wrappers,
+        // user values) until the next batch happens to reach the same slot index.
+        // Mirrors the existing off-heap pattern below (lines just above appendMergeCount).
+        Arrays.fill(getRequests, 0, getCount, null);
+        Arrays.fill(getTables, 0, getCount, null);
+        Arrays.fill(putRequests, 0, putCount, null);
+        Arrays.fill(deleteRequests, 0, deleteCount, null);
+        Arrays.fill(appendMergeRequests, 0, appendMergeCount, null);
         getCount = 0;
         putCount = 0;
         deleteCount = 0;
