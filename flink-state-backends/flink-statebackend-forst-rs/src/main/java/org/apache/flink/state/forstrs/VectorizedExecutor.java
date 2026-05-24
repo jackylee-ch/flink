@@ -725,6 +725,16 @@ public class VectorizedExecutor implements StateExecutor {
             // {@code AsyncFrameworkExceptionHandler.handleException} fires
             // twice (once per per-op catch row, once from outer catch) and
             // produces a double task-failure log.
+            // R93-H1: escalate FrsEnginePanicError to fatalHandler.
+                // `ForStRsLinker.checkVectorized` (called by
+                // `frsVectorizedBatchPut` below) throws
+                // `FrsEnginePanicError` on fail-process FFI rc, but never
+                // invokes the fatal handler. Pre-fix the engine kept
+                // running on poisoned state after a PUT-path panic.
+                // Mirrors the GET path at lines 828-836.
+                if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                    fatalHandler.onFatalError(panicErr);
+                }
             for (int i = 0; i < n; i++) {
                 try {
                     c.markCompletedExceptionally(reqs[i]);
@@ -755,6 +765,10 @@ public class VectorizedExecutor implements StateExecutor {
             // R21-H1: populate the classifier marker set BEFORE per-row
             // completion so {@link #executeRequestSync}'s outer catch skips
             // a duplicate completion (see executePuts catch for rationale).
+            // R93-H1: escalate FrsEnginePanicError — sister to executePuts.
+            if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                fatalHandler.onFatalError(panicErr);
+            }
             for (int i = 0; i < n; i++) {
                 try {
                     c.markCompletedExceptionally(reqs[i]);
@@ -1494,7 +1508,15 @@ public class VectorizedExecutor implements StateExecutor {
                 // 828-836 and APPEND_MERGE at 1102-1111. Pre-fix the iter
                 // path completed the row future with a plain FrsException
                 // and the engine kept running on potentially poisoned state.
-                if (rowCode.isFailProcess()) {
+                //
+                // R93-L1: only escalate when batchCode was actually
+                // fail-process. The UNKNOWN fallback (when batchCode==OK
+                // but a per-row handle is unexpectedly null — a defensive
+                // path that should never fire per the Rust impl) returns
+                // `UNKNOWN(999)` which has `isFailProcess() == true`; we
+                // must NOT escalate that case to fatalHandler because
+                // it's a per-row anomaly, not an engine panic.
+                if (rowCode.isFailProcess() && batchCode != FrsErrorCode.OK) {
                     FrsEnginePanicError panicErr =
                             new FrsEnginePanicError(
                                     rowCode, "kind=ITER_PREFIX row=" + row);
