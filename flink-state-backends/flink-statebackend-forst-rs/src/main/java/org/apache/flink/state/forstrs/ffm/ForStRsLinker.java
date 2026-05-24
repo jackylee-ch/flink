@@ -2053,68 +2053,31 @@ public final class ForStRsLinker {
             }
             check(rc, "frs_batch_get");
 
+            // R66-H1: convert the 3-arg overload to the same
+            // `copyAndFreeCollect` + `rethrowIfAny` pattern as the
+            // sister overloads (batch 60). The earlier inline R64-M2
+            // fix only wrapped the `frs_bytes_free` call in try/catch
+            // — the preceding `MemorySegment.copy` and `new byte[len]`
+            // were OUTSIDE the try, so an OOM/IOOBE on entry i would
+            // abort the loop and leak entries i+1..count's engine-
+            // owned FrsBytes payloads. The helper widens the failure-
+            // tolerant window across copy AND free, and still calls
+            // free even when the pre-free copy fails.
+            // The outer `if (dataAddr != 0L)` gate preserves the
+            // "results[i] stays null = not found" caller contract;
+            // copyAndFreeCollect returns byte[0] for that case, which
+            // would be observationally different.
+            java.util.List<Throwable> pending = new java.util.ArrayList<>();
             byte[][] results = new byte[(int) count][];
-            // R64-M2: drain ALL native FrsBytes allocations regardless of
-            // per-entry copy/free failures. Pre-fix a throw on the i-th
-            // free left every later i+1..count entry's allocation
-            // unfreed (the try-with-resources arena releases only
-            // outValues, not the engine-owned heap). We now collect any
-            // throwables, continue draining, and rethrow with the others
-            // attached as suppressed exceptions.
-            FrsBackendException pending = null;
             for (int i = 0; i < (int) count; i++) {
                 MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
                 long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
-                long len = (long) FRS_BYTES_LEN.get(entry, 0L);
                 if (dataAddr != 0L) {
-                    // R64-L1: split the dataAddr-non-null and len>0 checks so
-                    // an unusual `dataAddr != 0 && len == 0` (not currently
-                    // produced by the engine, but the contract is not
-                    // formally guaranteed) still triggers the free below.
-                    if (len > 0) {
-                        MemorySegment dataSeg =
-                                MemorySegment.ofAddress(dataAddr).reinterpret(len);
-                        results[i] = new byte[(int) len];
-                        MemorySegment.copy(
-                                dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
-                    }
-                    // Free the native allocation. If this throws or the
-                    // returned status code is non-OK, capture the failure
-                    // but KEEP DRAINING the rest of the batch — otherwise
-                    // any subsequent entry's native allocation leaks.
-                    try {
-                        int freeRc = (int) frsBytesFree.invokeExact(entry);
-                        if (freeRc != FrsStatus.OK.code()) {
-                            FrsBackendException e =
-                                    new FrsBackendException(
-                                            FrsStatus.fromCode(freeRc),
-                                            "frs_batch_get/free: status="
-                                                    + freeRc
-                                                    + " at index="
-                                                    + i);
-                            if (pending == null) {
-                                pending = e;
-                            } else {
-                                pending.addSuppressed(e);
-                            }
-                        }
-                    } catch (Throwable t) {
-                        FrsBackendException e =
-                                new FrsBackendException(
-                                        FrsStatus.PANIC,
-                                        "frs_bytes_free threw at index=" + i + ": " + t.getMessage());
-                        if (pending == null) {
-                            pending = e;
-                        } else {
-                            pending.addSuppressed(e);
-                        }
-                    }
+                    results[i] = copyAndFreeCollect(entry, "frs_batch_get", pending);
                 }
                 // else: results[i] stays null (not found)
             }
-            if (pending != null) {
-                throw pending;
-            }
+            rethrowIfAny(pending);
             return results;
         }
     }
