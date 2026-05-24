@@ -720,9 +720,41 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     public long numKeyValueStateEntries() {
         // Flush buffered writes so the count reflects all pending mutations.
-        flushWriteBuffer();
-        flushAllMapStates();
-        flushAllOffHeapValueStateBuffers();
+        //
+        // R69-M1: each flush in its own try/catch so one phase's throw does not
+        // skip the others, leaving the engine only partially flushed and the
+        // iterator-based count silently undercounted. If any flush fails we
+        // refuse to return a fractional count and surface the captured throwable
+        // — better a loud failure than a silently wrong answer.
+        Throwable flushError = null;
+        try {
+            flushWriteBuffer();
+        } catch (Throwable t) {
+            flushError = t;
+        }
+        try {
+            flushAllMapStates();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        try {
+            flushAllOffHeapValueStateBuffers();
+        } catch (Throwable t) {
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
+        }
+        if (flushError != null) {
+            throw new RuntimeException(
+                    "numKeyValueStateEntries: flush phase failed; count is not safe to return",
+                    flushError);
+        }
         long count = 0;
         try (Arena local = Arena.ofShared();
                 org.apache.flink.state.forstrs.ffm.FrsIterator iter =
@@ -1471,11 +1503,17 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 }
             }
             // Release off-heap ArrowBinaryBuffers owned by ValueState + MapState instances.
+            //
+            // R69-M2: log close failures at WARN. Pre-fix the catch swallowed every
+            // throwable silently, which could hide an Arena-double-close UAF (a real
+            // sharing-bug symptom) until later allocations corrupt unrelated native
+            // memory. Logging keeps close() best-effort while preserving diagnostic
+            // visibility for sharing-bug regressions.
             for (ArrowBinaryBuffer b : ownedBuffers) {
                 try {
                     b.close();
-                } catch (Throwable ignore) {
-                    // best-effort; close() continues with the rest of the chain.
+                } catch (Throwable t) {
+                    LOG.warn("ArrowBinaryBuffer close failed during backend close", t);
                 }
             }
             ownedBuffers.clear();
