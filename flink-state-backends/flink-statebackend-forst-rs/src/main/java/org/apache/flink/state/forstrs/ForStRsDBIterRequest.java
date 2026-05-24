@@ -217,7 +217,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                             outBytesUsed);
             if (rc != FrsStatus.OK.code()) {
                 throw new FrsBackendException(
-                        FrsStatus.fromCode(rc), "frs_vec_iter_prefix_open rc=" + rc);
+                        statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
             }
             long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
             int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
@@ -284,7 +284,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                                 handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
                 if (rc != FrsStatus.OK.code()) {
                     throw new FrsBackendException(
-                            FrsStatus.fromCode(rc), "frs_vec_iter_prefix_next rc=" + rc);
+                            statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
                 }
                 int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
                 int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
@@ -374,7 +374,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                         outBytesUsed);
         if (rc != FrsStatus.OK.code()) {
             throw new FrsBackendException(
-                    FrsStatus.fromCode(rc), "frs_vec_iter_prefix_open rc=" + rc);
+                    statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
         }
         return outHandle.get(ValueLayout.JAVA_LONG, 0);
     }
@@ -393,6 +393,27 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
      * bounded by {@code O(chunks_per_drain × bytesUsed_per_chunk)}; far cheaper than the legacy
      * per-entry byte[] copy this commit replaced.
      */
+    /**
+     * R89-M1: defensive conversion from raw FFI return code to a typed
+     * {@link FrsStatus}. Sister-helper of R88-H1's inline pattern in
+     * {@link VectorizedExecutor}. The vectorized iterator FFI surface
+     * returns extended {@link FrsErrorCode} values (110, 200, 201, 300,
+     * 900, …) not mirrored in the legacy {@link FrsStatus} enum; the
+     * bare {@code FrsStatus.fromCode(rc)} throws
+     * {@code IllegalArgumentException} for those codes, escaping as an
+     * unchecked crash that bypasses downstream {@code catch
+     * (FrsBackendException)} handlers. Returning {@link FrsStatus#PANIC}
+     * on unknown codes keeps the exception type consistent across
+     * iterator + non-iterator FFI paths.
+     */
+    private static FrsStatus statusOrPanic(int rc) {
+        try {
+            return FrsStatus.fromCode(rc);
+        } catch (IllegalArgumentException ignored) {
+            return FrsStatus.PANIC;
+        }
+    }
+
     private static void parseChunkInto(
             MemorySegment chunkBuf,
             int rowCount,
