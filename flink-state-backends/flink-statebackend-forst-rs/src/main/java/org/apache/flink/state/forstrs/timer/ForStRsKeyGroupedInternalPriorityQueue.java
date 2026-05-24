@@ -940,9 +940,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             }
         }
         ensureFlushPairCapacity(Math.max(addCount, delCount));
-        if (delCount > 0) {
-            ensureFlushDelDataCapacity(totalDelBytes);
-        }
+        // R40-L1: the prior duplicate `ensureFlushDelDataCapacity(totalDelBytes)` here was
+        // dead — the identical call at the top of the `if (delCount > 0)` block in pass A
+        // below runs unconditionally on every code path that consumes flushDelData. Removed
+        // to drop the redundant arena-grow probe (cheap but measurable when the buffer is
+        // already at the right size every flush).
 
         // R38-H3: apply REMOVEs BEFORE ADDs so a mid-flush failure leaves
         // engine state ⊆ logical state (recoverable on retry — the

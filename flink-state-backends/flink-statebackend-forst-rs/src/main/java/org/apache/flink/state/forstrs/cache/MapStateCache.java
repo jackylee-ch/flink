@@ -25,6 +25,7 @@ import javax.annotation.Nullable;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Per-state-instance off-heap cache for MapState values. Eliminates engine round-trips for repeated
@@ -138,6 +139,26 @@ public final class MapStateCache<V> implements AutoCloseable {
      */
     private final Lookup<V> reusableHit = new Lookup<>();
 
+    /**
+     * R40-H1: close-gate flag. Mirrors the timer queue's R38-H2 / R39-H1 pattern. Every public
+     * mutator that reads or writes any off-heap segment (which becomes invalid after the
+     * {@link Arena} is closed) must check this flag first; if {@code true}, throw
+     * {@link IllegalStateException} with a precise message rather than letting the FFM access
+     * surface an opaque {@code IllegalStateException} from a closed shared arena. CAS-flipped in
+     * {@link #close()}.
+     */
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+
+    /**
+     * R40-H1: pre-flight check at the entry of every public off-heap-touching mutator. Cheap
+     * volatile read; the single-threaded contract makes the CAS unnecessary on the read path.
+     */
+    private void checkOpen() {
+        if (closed.get()) {
+            throw new IllegalStateException("MapStateCache closed");
+        }
+    }
+
     public MapStateCache() {
         this(DEFAULT_MAX_ENTRIES);
     }
@@ -194,6 +215,7 @@ public final class MapStateCache<V> implements AutoCloseable {
     @Nullable
     @SuppressWarnings("unchecked")
     public Lookup<V> lookup(byte[] key) {
+        checkOpen();
         int row = findRow(key);
         if (row < 0) {
             return null; // miss
@@ -217,6 +239,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * {@code cached=true} result and avoid hitting the engine.
      */
     public void put(byte[] key, @Nullable V value) {
+        checkOpen();
         Object stored = value == null ? TOMBSTONE : value;
         int row = findRow(key);
         if (row >= 0) {
@@ -237,6 +260,7 @@ public final class MapStateCache<V> implements AutoCloseable {
 
     /** Records a tombstone for {@code key}. Caller must subsequently dispatch the REMOVE. */
     public void remove(byte[] key) {
+        checkOpen();
         put(key, null);
     }
 
@@ -246,6 +270,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * invalidation would require a scan).
      */
     public void clear() {
+        checkOpen();
         int prevSize = size;
         size = 0;
         keyDataUsed = 0;
@@ -297,6 +322,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * the number of entries removed (visible for tests / observability).
      */
     public int clearForPrefix(byte[] prefix) {
+        checkOpen();
         if (size == 0) {
             return 0;
         }
@@ -327,6 +353,7 @@ public final class MapStateCache<V> implements AutoCloseable {
     }
 
     public int size() {
+        checkOpen();
         return size;
     }
 
@@ -345,6 +372,14 @@ public final class MapStateCache<V> implements AutoCloseable {
      */
     @Override
     public void close() {
+        // R40-H1: flip the close-gate FIRST so any concurrent or late mutator call (e.g. a
+        // straggling async callback) observes `closed == true` and bails out with a precise
+        // IllegalStateException rather than touching a closed Arena and getting an opaque FFM
+        // error. CAS guarantees the arena.close() below runs at most once even if close() is
+        // invoked from multiple disposal hooks.
+        if (!closed.compareAndSet(false, true)) {
+            return;
+        }
         try {
             arena.close();
         } catch (IllegalStateException alreadyClosedOrInUse) {

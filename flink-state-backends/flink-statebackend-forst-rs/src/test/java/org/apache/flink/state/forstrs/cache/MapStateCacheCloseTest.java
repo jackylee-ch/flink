@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -69,5 +70,45 @@ class MapStateCacheCloseTest {
         MapStateCache<String> cache = new MapStateCache<>();
         assertEquals(0, cache.size());
         assertDoesNotThrow(cache::close);
+    }
+
+    /**
+     * R40-H1: after {@link MapStateCache#close()} flips the close-gate, every public mutator that
+     * touches off-heap arena segments must throw {@link IllegalStateException} with the precise
+     * "MapStateCache closed" message rather than letting the FFM access surface an opaque arena-
+     * closed error from a late callback. Mirrors the timer queue's R38-H2 / R39-H1 contract.
+     */
+    @Test
+    void mutatorsThrowAfterClose() {
+        MapStateCache<String> cache = new MapStateCache<>(16);
+        cache.put(new byte[] {1}, "a");
+        cache.close();
+
+        byte[] key = new byte[] {1};
+        byte[] prefix = new byte[] {1};
+
+        IllegalStateException onLookup =
+                assertThrows(IllegalStateException.class, () -> cache.lookup(key));
+        assertEquals("MapStateCache closed", onLookup.getMessage());
+
+        IllegalStateException onPut =
+                assertThrows(IllegalStateException.class, () -> cache.put(key, "x"));
+        assertEquals("MapStateCache closed", onPut.getMessage());
+
+        IllegalStateException onRemove =
+                assertThrows(IllegalStateException.class, () -> cache.remove(key));
+        assertEquals("MapStateCache closed", onRemove.getMessage());
+
+        IllegalStateException onClear =
+                assertThrows(IllegalStateException.class, cache::clear);
+        assertEquals("MapStateCache closed", onClear.getMessage());
+
+        IllegalStateException onClearForPrefix =
+                assertThrows(IllegalStateException.class, () -> cache.clearForPrefix(prefix));
+        assertEquals("MapStateCache closed", onClearForPrefix.getMessage());
+
+        IllegalStateException onSize =
+                assertThrows(IllegalStateException.class, cache::size);
+        assertEquals("MapStateCache closed", onSize.getMessage());
     }
 }
