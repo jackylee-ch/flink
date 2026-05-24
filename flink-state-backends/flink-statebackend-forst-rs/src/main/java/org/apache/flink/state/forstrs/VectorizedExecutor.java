@@ -834,8 +834,27 @@ public class VectorizedExecutor implements StateExecutor {
                     }
                     throw panicErr;
                 }
+                // R88-H1: the vectorized FFI returns codes from
+                // `FrsErrorCode` (100, 101, 110, 200, 201, 300, 301, 302,
+                // 303, 999) which are NOT in the legacy `FrsStatus` enum
+                // (0..17). For any fail-row or fail-batch result that
+                // survives the `isFailProcess()` guard above (e.g.
+                // BATCH_HEADER_MALFORMED=110, KEY_TOO_LARGE=100,
+                // ITER_EXPIRED=200, ENGINE_IO=300), the bare
+                // `FrsStatus.fromCode(rc)` throws `IllegalArgumentException`
+                // — turning a typed error into an unchecked crash that
+                // bypasses the per-row exceptional-completion logic
+                // downstream. Catch the IAE and fall back to PANIC so the
+                // wrapped FrsBackendException always carries the original
+                // `rc` value in its message.
+                FrsStatus status;
+                try {
+                    status = FrsStatus.fromCode(rc);
+                } catch (IllegalArgumentException ignored) {
+                    status = FrsStatus.PANIC;
+                }
                 throw new FrsBackendException(
-                        FrsStatus.fromCode(rc), "frs_vectorized_batch_get rc=" + rc);
+                        status, "frs_vectorized_batch_get rc=" + rc + " errCode=" + errCode);
             }
 
             // Decode results: for each slot, read validity byte and (offsets, data) range.

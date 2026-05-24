@@ -755,9 +755,10 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             KeyGroupedInternalPriorityQueue<T> create(
                     String stateName, TypeSerializer<T> byteOrderedElementSerializer) {
         if (pickTimerFactory() == TimerServiceFactory.HEAP) {
-            // HEAP timer factory — see TimerServiceFactory javadoc above for why this is the
-            // default. The engine-backed path remains available via
-            // -Dforst.rs.timer-service.factory=FORSTRS.
+            // R88-L1 (post R87-H1): HEAP is now the OPT-IN override path
+            // (`-Dforst.rs.timer-service.factory=HEAP`); see the
+            // TimerServiceFactory javadoc above. The engine-backed FORSTRS
+            // path is the default.
             return new HeapPriorityQueueSetFactory(
                             getKeyGroupRange(), getNumberOfKeyGroups(), 128)
                     .create(stateName, byteOrderedElementSerializer);
