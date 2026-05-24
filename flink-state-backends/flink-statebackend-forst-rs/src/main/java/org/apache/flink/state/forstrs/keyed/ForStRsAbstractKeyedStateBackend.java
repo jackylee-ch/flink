@@ -109,11 +109,14 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * HeapPriorityQueueSetFactory}; FORSTRS uses the engine-backed {@link
      * ForStRsKeyGroupedInternalPriorityQueue}.
      *
-     * <p>Default is HEAP: per {@code project_q12_heap_timer_beats_forst}, the engine-backed timer
-     * queue incurs per-timer FFM crossings that dominate Q11/Q12 wall-clock; switching to HEAP
-     * recovers the v3.3 baselines (Q11 = 76.5 s, Q12 = 35.5 s).
-     *
-     * <p>Override via {@code -Dforst.rs.timer-service.factory=FORSTRS}.
+     * <p>R87-H1: default is FORSTRS, matching {@link ForStRsAsyncKeyedStateBackend}'s D-R4-1
+     * default and the actual code at {@link #pickTimerFactory} below. Pre-fix this javadoc
+     * claimed "Default is HEAP" referencing the historical parity-recovering default for Q11/Q12
+     * per {@code project_q12_heap_timer_beats_forst}; the code already defaulted to FORSTRS via
+     * `System.getProperty("forst.rs.timer-service.factory", "FORSTRS")` after the batched
+     * ArrowTimerBuffer reduced per-timer FFM crossings to amortized batches. Override via
+     * {@code -Dforst.rs.timer-service.factory=HEAP} for the legacy compatibility path that
+     * favors low-volume timer workloads.
      */
     private enum TimerServiceFactory {
         HEAP,
