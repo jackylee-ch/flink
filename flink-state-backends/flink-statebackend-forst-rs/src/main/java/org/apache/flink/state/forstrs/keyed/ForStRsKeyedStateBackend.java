@@ -1451,8 +1451,25 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             // 1b.3 + 1c.1: drain off-heap ValueState AND MapState buffers BEFORE closing the
             // underlying ArrowBinaryBuffers. Without this, any state writes that never crossed
             // the auto-flush threshold are silently lost on shutdown.
-            flushAllOffHeapValueStateBuffers();
-            flushAllMapStates();
+            //
+            // R68-M1: each flush call is independently guarded so a ValueState-flush
+            // failure (now a throw, per R67-H1) does not skip MapState's drain — which
+            // would silently lose MapState buffered writes during close. Mirrors the
+            // multi-phase suppression pattern used by snapshot() / keys() / restore.
+            try {
+                flushAllOffHeapValueStateBuffers();
+            } catch (Throwable t) {
+                flushError = t;
+            }
+            try {
+                flushAllMapStates();
+            } catch (Throwable t) {
+                if (flushError == null) {
+                    flushError = t;
+                } else {
+                    flushError.addSuppressed(t);
+                }
+            }
             // Release off-heap ArrowBinaryBuffers owned by ValueState + MapState instances.
             for (ArrowBinaryBuffer b : ownedBuffers) {
                 try {
@@ -1480,7 +1497,14 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             // Capture and proceed — the finally block MUST run the resource-release chain so
             // we don't leak slotArenaScope / defaultCf / db / arena on flush throw. Re-thrown
             // below after release completes.
-            flushError = t;
+            //
+            // R68-M1: preserve any flushError already captured by the inner per-flush
+            // try/catches (ValueState/MapState) rather than overwriting it.
+            if (flushError == null) {
+                flushError = t;
+            } else {
+                flushError.addSuppressed(t);
+            }
         } finally {
             stateCache.clear();
             if (iterWatchdog != null) {
