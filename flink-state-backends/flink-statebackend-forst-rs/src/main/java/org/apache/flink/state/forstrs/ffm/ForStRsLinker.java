@@ -2166,25 +2166,21 @@ public final class ForStRsLinker {
             }
             check(rc, "frs_batch_get");
 
+            // R65-H1: drain-tolerant per-entry copy+free so a single
+            // pre-free OOM / memcpy throw / non-OK free status does not
+            // abort the loop and leak the remaining entries' native
+            // FrsBytes payloads. See `copyAndFreeCollect` for the
+            // contract.
+            java.util.List<Throwable> pending = new java.util.ArrayList<>();
             byte[][] results = new byte[count][];
             for (int i = 0; i < count; i++) {
                 MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
                 long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
-                long len = (long) FRS_BYTES_LEN.get(entry, 0L);
-                if (dataAddr != 0L && len > 0) {
-                    MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
-                    results[i] = new byte[(int) len];
-                    MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, 0, results[i], 0, (int) len);
-                    int freeRc;
-                    try {
-                        freeRc = (int) frsBytesFree.invokeExact(entry);
-                    } catch (Throwable t) {
-                        throw new FrsBackendException(
-                                FrsStatus.PANIC, "frs_bytes_free threw: " + t.getMessage());
-                    }
-                    check(freeRc, "frs_batch_get/free");
+                if (dataAddr != 0L) {
+                    results[i] = copyAndFreeCollect(entry, "frs_batch_get", pending);
                 }
             }
+            rethrowIfAny(pending);
             return results;
         }
     }
@@ -2262,12 +2258,15 @@ public final class ForStRsLinker {
                     FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
         }
         check(rc, "frs_batch_get");
+        // R65-H2: drain-tolerant copy+free — see copyAndFreeCollect.
+        java.util.List<Throwable> pending = new java.util.ArrayList<>();
         byte[][] results = new byte[count][];
         long stride = FRS_BYTES_LAYOUT.byteSize();
         for (int i = 0; i < count; i++) {
             MemorySegment slot = outValues.asSlice(i * stride, stride);
-            results[i] = copyAndFree(slot, "frs_batch_get/value");
+            results[i] = copyAndFreeCollect(slot, "frs_batch_get/value", pending);
         }
+        rethrowIfAny(pending);
         return results;
     }
 
@@ -2958,15 +2957,20 @@ public final class ForStRsLinker {
             }
             check(rc, "frs_prefix_get_all");
             int count = (int) outCount.get(ValueLayout.JAVA_LONG, 0);
+            // R65-H3: drain-tolerant — see copyAndFreeCollect.
+            java.util.List<Throwable> pending = new java.util.ArrayList<>();
             IteratorEntry[] result = new IteratorEntry[count];
             long stride = FRS_BYTES_LAYOUT.byteSize();
             for (int i = 0; i < count; i++) {
                 MemorySegment keySlot = outKeys.asSlice(i * stride, stride);
                 MemorySegment valSlot = outValues.asSlice(i * stride, stride);
-                byte[] keyCopy = copyAndFree(keySlot, "frs_prefix_get_all/key");
-                byte[] valCopy = copyAndFree(valSlot, "frs_prefix_get_all/value");
+                byte[] keyCopy =
+                        copyAndFreeCollect(keySlot, "frs_prefix_get_all/key", pending);
+                byte[] valCopy =
+                        copyAndFreeCollect(valSlot, "frs_prefix_get_all/value", pending);
                 result[i] = new IteratorEntry(keyCopy, valCopy);
             }
+            rethrowIfAny(pending);
             return result;
         }
     }
@@ -3029,6 +3033,8 @@ public final class ForStRsLinker {
             check(rc, "frs_batch_prefix_scan");
             int total = (int) outTotal.get(ValueLayout.JAVA_LONG, 0);
             long stride = FRS_BYTES_LAYOUT.byteSize();
+            // R65-H3: drain-tolerant — see copyAndFreeCollect.
+            java.util.List<Throwable> pending = new java.util.ArrayList<>();
             IteratorEntry[][] results = new IteratorEntry[n][];
             int offset = 0;
             for (int i = 0; i < n; i++) {
@@ -3037,12 +3043,15 @@ public final class ForStRsLinker {
                 for (int j = 0; j < count; j++) {
                     MemorySegment keySlot = outKeys.asSlice((offset + j) * stride, stride);
                     MemorySegment valSlot = outValues.asSlice((offset + j) * stride, stride);
-                    byte[] keyCopy = copyAndFree(keySlot, "frs_batch_prefix_scan/key");
-                    byte[] valCopy = copyAndFree(valSlot, "frs_batch_prefix_scan/value");
+                    byte[] keyCopy =
+                            copyAndFreeCollect(keySlot, "frs_batch_prefix_scan/key", pending);
+                    byte[] valCopy =
+                            copyAndFreeCollect(valSlot, "frs_batch_prefix_scan/value", pending);
                     results[i][j] = new IteratorEntry(keyCopy, valCopy);
                 }
                 offset += count;
             }
+            rethrowIfAny(pending);
             return results;
         }
     }
@@ -3096,8 +3105,15 @@ public final class ForStRsLinker {
                 return null;
             }
 
-            byte[] keyCopy = copyAndFree(outKey, "frs_iterator_next/key");
-            byte[] valueCopy = copyAndFree(outValue, "frs_iterator_next/value");
+            // R65-M2: drain BOTH key and value even if the key's free
+            // returns non-OK or throws — pre-fix, a key-free failure
+            // leaked the value's native heap. Collect failures and
+            // rethrow after both calls so neither buffer leaks.
+            java.util.List<Throwable> pending = new java.util.ArrayList<>();
+            byte[] keyCopy = copyAndFreeCollect(outKey, "frs_iterator_next/key", pending);
+            byte[] valueCopy =
+                    copyAndFreeCollect(outValue, "frs_iterator_next/value", pending);
+            rethrowIfAny(pending);
             return new IteratorEntry(keyCopy, valueCopy);
         }
     }
@@ -3222,6 +3238,80 @@ public final class ForStRsLinker {
             }
             check(freeRc, fn);
         }
+    }
+
+    /**
+     * R65-H1/H2/H3 + R65-M1 drain-tolerant copy-and-free.
+     *
+     * <p>Reads a {@code FrsBytes} payload, copies to a fresh {@code byte[]}, and frees the native
+     * buffer. Unlike {@link #copyAndFree}, this variant NEVER throws on per-entry failure —
+     * pre-free copy failures (memcpy OOM, malformed addr/len, reinterpret violation) AND free
+     * failures (non-OK status, panicking method handle) are appended to {@code pending} so the
+     * caller's loop continues draining the rest of the batch. The free is attempted even on
+     * pre-free failure, so no entry's native heap is leaked. Returns {@code null} on copy
+     * failure, empty {@code byte[0]} on {@code dataAddr == 0} (no data), or the copy on success.
+     *
+     * <p>The caller drives a loop, accumulates failures, then throws after iteration:
+     *
+     * <pre>{@code
+     * List<Throwable> pending = new ArrayList<>();
+     * byte[][] results = new byte[count][];
+     * for (int i = 0; i < count; i++) {
+     *     results[i] = copyAndFreeCollect(entry(i), "fn", pending);
+     * }
+     * rethrowIfAny(pending);
+     * }</pre>
+     */
+    private byte[] copyAndFreeCollect(
+            MemorySegment frsBytes, String fn, java.util.List<Throwable> pending) {
+        long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(frsBytes, 0L)).address();
+        long len = (long) FRS_BYTES_LEN.get(frsBytes, 0L);
+        if (dataAddr == 0L) {
+            return new byte[0];
+        }
+        byte[] copy = null;
+        try {
+            MemorySegment dataSeg = MemorySegment.ofAddress(dataAddr).reinterpret(len);
+            copy = new byte[(int) len];
+            MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, 0, copy, 0, (int) len);
+        } catch (Throwable t) {
+            pending.add(
+                    new FrsBackendException(
+                            FrsStatus.PANIC, fn + "/copy threw: " + t.getMessage()));
+            // Fall through to free — we still own the native buffer.
+        }
+        try {
+            int freeRc = (int) frsBytesFree.invokeExact(frsBytes);
+            if (freeRc != FrsStatus.OK.code()) {
+                FrsStatus s;
+                try {
+                    s = FrsStatus.fromCode(freeRc);
+                } catch (Throwable ignored) {
+                    s = FrsStatus.PANIC;
+                }
+                pending.add(new FrsBackendException(s, fn + "/free: status=" + freeRc));
+            }
+        } catch (Throwable t) {
+            pending.add(
+                    new FrsBackendException(
+                            FrsStatus.PANIC, fn + "/free threw: " + t.getMessage()));
+        }
+        return copy;
+    }
+
+    /** Rethrows the first failure with the rest attached as suppressed. */
+    private static void rethrowIfAny(java.util.List<Throwable> pending) {
+        if (pending.isEmpty()) {
+            return;
+        }
+        Throwable first = pending.get(0);
+        for (int i = 1; i < pending.size(); i++) {
+            first.addSuppressed(pending.get(i));
+        }
+        if (first instanceof FrsBackendException) {
+            throw (FrsBackendException) first;
+        }
+        throw new FrsBackendException(FrsStatus.PANIC, "drain failed: " + first.getMessage());
     }
 
     /** Allocates a NUL-terminated UTF-8 C string in {@code arena}. */
