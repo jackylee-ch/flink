@@ -89,6 +89,13 @@ public final class ColumnarBatchBuffer {
      * appended entry.
      */
     public int append(byte[] src, int srcOff, int len) {
+        // R72-L1: validate (srcOff, len) against src.length BEFORE any state
+        // mutation. Pre-fix a buggy caller with len < 0 silently corrupted
+        // dataPos (via the `dataPos += len` decrement); srcOff + len > src.length
+        // was caught only when MemorySegment.copy threw AIOOBE, AFTER ensureData
+        // had already grown the data segment. checkFromIndexSize handles both
+        // (and the integer-overflow case `srcOff + len < 0`).
+        java.util.Objects.checkFromIndexSize(srcOff, len, src.length);
         ensureCapacity(1);
         ensureData(len);
         if (len > 0) {
