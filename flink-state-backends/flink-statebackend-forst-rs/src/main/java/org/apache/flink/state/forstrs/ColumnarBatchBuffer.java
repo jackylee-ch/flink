@@ -193,14 +193,31 @@ public final class ColumnarBatchBuffer {
         if (needed <= capacity) {
             return;
         }
-        int newCap = capacity;
-        while (newCap < needed) {
-            newCap <<= 1;
+        // R71-M1: int-overflow-safe doubling. Pre-fix `newCap <<= 1` wrapped to
+        // a negative value once capacity exceeded 2^30, causing an infinite loop
+        // (`newCap < needed` always true for negative newCap). Compute the
+        // next capacity in `long`, clamp to Integer.MAX_VALUE, and explicitly
+        // refuse `needed > Integer.MAX_VALUE` since the JDK array machinery
+        // backing MemorySegment.allocate cannot allocate beyond int range.
+        if (needed < 0) {
+            throw new IllegalArgumentException(
+                    "ColumnarBatchBuffer.ensureCapacity: needed=" + needed + " overflowed int");
         }
-        MemorySegment grown = arena.allocate(ValueLayout.JAVA_INT, (long) newCap + 1);
+        long newCap = capacity;
+        while (newCap < needed) {
+            newCap = Math.min(newCap * 2L, Integer.MAX_VALUE);
+            if (newCap == Integer.MAX_VALUE && newCap < needed) {
+                throw new IllegalArgumentException(
+                        "ColumnarBatchBuffer.ensureCapacity: needed="
+                                + needed
+                                + " exceeds Integer.MAX_VALUE — batch too large");
+            }
+        }
+        int newCapInt = (int) newCap;
+        MemorySegment grown = arena.allocate(ValueLayout.JAVA_INT, (long) newCapInt + 1);
         MemorySegment.copy(offsets, 0L, grown, 0L, (long) (count + 1) * Integer.BYTES);
         this.offsets = grown;
-        this.capacity = newCap;
+        this.capacity = newCapInt;
     }
 
     private void ensureData(int additional) {
@@ -208,15 +225,27 @@ public final class ColumnarBatchBuffer {
         if (needed <= dataCapacity) {
             return;
         }
-        int newCap = dataCapacity;
-        while (newCap < needed) {
-            newCap <<= 1;
+        // R71-M1: int-overflow-safe doubling — see ensureCapacity above.
+        if (needed < 0) {
+            throw new IllegalArgumentException(
+                    "ColumnarBatchBuffer.ensureData: needed=" + needed + " overflowed int");
         }
-        MemorySegment grown = arena.allocate(newCap);
+        long newCap = dataCapacity;
+        while (newCap < needed) {
+            newCap = Math.min(newCap * 2L, Integer.MAX_VALUE);
+            if (newCap == Integer.MAX_VALUE && newCap < needed) {
+                throw new IllegalArgumentException(
+                        "ColumnarBatchBuffer.ensureData: needed="
+                                + needed
+                                + " exceeds Integer.MAX_VALUE — batch too large");
+            }
+        }
+        int newCapInt = (int) newCap;
+        MemorySegment grown = arena.allocate(newCapInt);
         if (dataPos > 0) {
             MemorySegment.copy(data, 0L, grown, 0L, dataPos);
         }
         this.data = grown;
-        this.dataCapacity = newCap;
+        this.dataCapacity = newCapInt;
     }
 }

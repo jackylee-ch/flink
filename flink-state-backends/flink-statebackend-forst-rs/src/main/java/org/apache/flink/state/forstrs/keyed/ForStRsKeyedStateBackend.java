@@ -376,7 +376,15 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     private long keyGeneration;
 
-    private boolean closed = false;
+    // R71-M2: `closed` must be `volatile` so concurrent close() / dispose()
+    // calls observe each other's flag flip (preventing a double-close UAF on
+    // defaultCf / db / arena) AND so in-flight state ops on other threads
+    // checking `if (closed) throw IllegalStateException(...)` reliably see
+    // the transition. The Flink contract is typically single-threaded close,
+    // but cancel paths and async snapshot threads (and post R67-H1's
+    // exception-rethrowing flush phase) make the assumption fragile.
+    private volatile boolean closed = false;
+
     private IterLifetimeWatchdog iterWatchdog;
 
     /**
@@ -1464,10 +1472,20 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      */
     @Override
     public void close() throws IOException {
-        if (closed) {
-            return;
+        // R71-M2: serialize the `closed = true` transition under `this` so two
+        // concurrent close()/dispose() callers cannot both observe closed=false
+        // and both proceed to free defaultCf / db / arena (double-close UAF).
+        // The synchronized region is intentionally tiny — only the check and
+        // flag flip — so the long flush+release work below runs without
+        // holding the monitor; subsequent flag checks (e.g. by in-flight
+        // state ops on other threads) rely on the `volatile closed` declared
+        // above for the happens-before edge.
+        synchronized (this) {
+            if (closed) {
+                return;
+            }
+            closed = true;
         }
-        closed = true;
         // R24-H1: close() previously set {@code closed=true} BEFORE running
         // {@link #flushAllOffHeapValueStateBuffers}, {@link #flushAllMapStates}, and {@link
         // #flushWriteBuffer} without a try/finally guard around the resource-release block. A
