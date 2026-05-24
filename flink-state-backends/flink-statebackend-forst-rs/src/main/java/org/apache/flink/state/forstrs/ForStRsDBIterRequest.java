@@ -27,6 +27,8 @@ import org.apache.flink.runtime.asyncprocessing.StateRequestType;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
+import org.apache.flink.state.forstrs.ffm.FrsEnginePanicError;
+import org.apache.flink.state.forstrs.ffm.FrsErrorCode;
 import org.apache.flink.state.forstrs.ffm.FrsIterator;
 
 import javax.annotation.Nullable;
@@ -216,6 +218,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                             outRowCount,
                             outBytesUsed);
             if (rc != FrsStatus.OK.code()) {
+                throwIfFatal(rc, "frs_vec_iter_prefix_open");
                 throw new FrsBackendException(
                         statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
             }
@@ -283,6 +286,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                         linker.frsVecIterPrefixNext(
                                 handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
                 if (rc != FrsStatus.OK.code()) {
+                    throwIfFatal(rc, "frs_vec_iter_prefix_next");
                     throw new FrsBackendException(
                             statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
                 }
@@ -373,6 +377,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                         outRowCount,
                         outBytesUsed);
         if (rc != FrsStatus.OK.code()) {
+            throwIfFatal(rc, "frs_vec_iter_prefix_open");
             throw new FrsBackendException(
                     statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
         }
@@ -411,6 +416,26 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             return FrsStatus.fromCode(rc);
         } catch (IllegalArgumentException ignored) {
             return FrsStatus.PANIC;
+        }
+    }
+
+    /**
+     * R94-H1 / R93-H2: if the FFI rc is fail-process (PANIC_CAUGHT=900
+     * etc.), throw a typed {@link FrsEnginePanicError} so the executor's
+     * outer catch can route it through `fatalHandler.onFatalError(...)`.
+     * Otherwise this method is a no-op and the caller proceeds to wrap
+     * the rc via {@link #statusOrPanic} as before.
+     *
+     * <p>The iter FFI surface is reached by every MapState iterator
+     * (MAP_ITER / MAP_IS_EMPTY / MAP_ITER_KEY / MAP_ITER_VALUE) routed
+     * through the executor's `executeIters`; pre-fix a PANIC_CAUGHT
+     * there became `FrsBackendException(PANIC, ...)` and the engine
+     * kept running on poisoned state.
+     */
+    private static void throwIfFatal(int rc, String fn) {
+        FrsErrorCode code = FrsErrorCode.fromU32(rc);
+        if (code.isFailProcess()) {
+            throw new FrsEnginePanicError(code, fn + " rc=" + rc);
         }
     }
 

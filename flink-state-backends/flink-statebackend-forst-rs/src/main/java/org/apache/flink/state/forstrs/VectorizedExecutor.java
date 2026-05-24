@@ -951,6 +951,15 @@ public class VectorizedExecutor implements StateExecutor {
             try {
                 iter.process(linker, db, cf, arena);
             } catch (Throwable t) {
+                // R94-H1 / R93-H2: ForStRsDBIterRequest.throwIfFatal() throws
+                // FrsEnginePanicError for fail-process FFI rc (PANIC_CAUGHT
+                // etc.) on the MapState iter hot path. Escalate to the fatal
+                // handler so the engine doesn't keep running on poisoned
+                // state. Mirrors executePuts / executeDeletes / GET-path
+                // patterns.
+                if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                    fatalHandler.onFatalError(panicErr);
+                }
                 StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
                 if (sr != null) {
                     try {
