@@ -1388,16 +1388,40 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * 1b.3: Flushes all off-heap ArrowBinaryBuffers owned by ValueState instances in {@code
      * stateCache} so their buffered writes reach the engine. Without this, checkpoint/close
      * silently drops every buffered value-state write — a correctness bug.
+     *
+     * <p>R67-H1: this sister method to {@link #flushAllMapStates} was previously
+     * "best-effort" (swallowed all per-state failures). On the checkpoint path (called from
+     * {@code snapshot}/{@code snapshotInProgress}), a failing flush left buffered writes
+     * lost while {@code linker.createCheckpoint} proceeded — producing an incomplete
+     * checkpoint with no error surface. We now mirror the R25-M2 pattern verbatim: record
+     * the first failure, attach subsequent ones as suppressed, then rethrow as a
+     * {@code RuntimeException} after every state has had a chance to drain.
      */
     public void flushAllOffHeapValueStateBuffers() {
-        for (Object v : stateCache.values()) {
+        Throwable firstFailure = null;
+        // Defensive copy: same rationale as R26-M2 — a flush callback may reach
+        // back into the backend and mutate `stateCache` on the same thread,
+        // throwing ConcurrentModificationException on the live values() view.
+        java.util.List<Object> snapshot = new java.util.ArrayList<>(stateCache.values());
+        for (Object v : snapshot) {
             if (v instanceof ForStRsValueState<?> vs) {
                 try {
                     vs.flushStateBuffer();
-                } catch (Throwable ignore) {
-                    // best-effort; one state's failure must not block the rest.
+                } catch (Throwable t) {
+                    LOG.warn("ValueState flush failed", t);
+                    if (firstFailure == null) {
+                        firstFailure = t;
+                    } else {
+                        firstFailure.addSuppressed(t);
+                    }
                 }
             }
+        }
+        if (firstFailure != null) {
+            throw new RuntimeException(
+                    "One or more ValueState flushes failed during "
+                            + "flushAllOffHeapValueStateBuffers",
+                    firstFailure);
         }
     }
 

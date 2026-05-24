@@ -2333,38 +2333,92 @@ public final class ForStRsLinker {
                     valueBufsPtr.get(ValueLayout.ADDRESS, ptrSz).reinterpret((count + 1) * 4L);
             MemorySegment valueDataPtr = valueBufsPtr.get(ValueLayout.ADDRESS, 2 * ptrSz);
 
-            // Read values from Arrow buffer — zero-copy read via offset arithmetic
+            // R67-H2: the value-decode loop's `MemorySegment.copy` and
+            // `new byte[len]` can throw on OOM or malformed offsets.
+            // Pre-fix the Arrow release callbacks at the bottom of the
+            // function sat AFTER the loop with NO try/finally guard —
+            // any throw from the loop body bypassed the release calls
+            // and leaked the engine-owned Arrow output struct (children
+            // buffers, dictionaries, and any release-callback-owned
+            // payloads). The local Arena reclaimed only the
+            // outArray/outSchema struct slots, not the engine heap the
+            // pointers reference.
+            //
+            // Wrap the loop in try/finally so the release callbacks
+            // ALWAYS fire. If a release callback itself throws, we
+            // capture it and rethrow after invoking the sister release
+            // — guaranteeing no native heap leak regardless of which
+            // step fails.
             byte[][] results = new byte[count][];
-            for (int i = 0; i < count; i++) {
-                // Check validity bitmap
-                boolean isNull;
-                if (validityPtr.address() == 0L) {
-                    isNull = false; // no validity bitmap = all valid
-                } else {
-                    MemorySegment validitySeg = validityPtr.reinterpret((count + 7) / 8);
-                    int byteIdx = i / 8;
-                    int bitIdx = i % 8;
-                    isNull = (validitySeg.get(ValueLayout.JAVA_BYTE, byteIdx) & (1 << bitIdx)) == 0;
+            Throwable loopFailure = null;
+            try {
+                for (int i = 0; i < count; i++) {
+                    // Check validity bitmap
+                    boolean isNull;
+                    if (validityPtr.address() == 0L) {
+                        isNull = false; // no validity bitmap = all valid
+                    } else {
+                        MemorySegment validitySeg = validityPtr.reinterpret((count + 7) / 8);
+                        int byteIdx = i / 8;
+                        int bitIdx = i % 8;
+                        isNull =
+                                (validitySeg.get(ValueLayout.JAVA_BYTE, byteIdx) & (1 << bitIdx))
+                                        == 0;
+                    }
+                    if (isNull) {
+                        results[i] = null;
+                    } else {
+                        int start = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * i);
+                        int end = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * (i + 1));
+                        int len = end - start;
+                        results[i] = new byte[len];
+                        MemorySegment dataSeg = valueDataPtr.reinterpret((long) end);
+                        MemorySegment.copy(
+                                dataSeg, ValueLayout.JAVA_BYTE, start, results[i], 0, len);
+                    }
                 }
-                if (isNull) {
-                    results[i] = null;
-                } else {
-                    int start = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * i);
-                    int end = valueOffsetsPtr.get(ValueLayout.JAVA_INT, 4L * (i + 1));
-                    int len = end - start;
-                    results[i] = new byte[len];
-                    MemorySegment dataSeg = valueDataPtr.reinterpret((long) end);
-                    MemorySegment.copy(dataSeg, ValueLayout.JAVA_BYTE, start, results[i], 0, len);
+            } catch (Throwable t) {
+                loopFailure = t;
+            } finally {
+                // Release the output Arrow structs (call the release callback).
+                // D8-H2: use the cached release-handle lookup; was spinning a fresh
+                // downcallHandle per call which pinned JIT metadata on the hot read path.
+                Throwable releaseFailure = null;
+                try {
+                    MemorySegment outRelease =
+                            (MemorySegment) ARROW_ARRAY_RELEASE.get(outArray, 0L);
+                    invokeArrowRelease(outRelease, outArray);
+                } catch (Throwable t) {
+                    releaseFailure = t;
+                }
+                try {
+                    MemorySegment outSchemaRelease = outSchema.get(ValueLayout.ADDRESS, 56);
+                    invokeArrowRelease(outSchemaRelease, outSchema);
+                } catch (Throwable t) {
+                    if (releaseFailure == null) {
+                        releaseFailure = t;
+                    } else {
+                        releaseFailure.addSuppressed(t);
+                    }
+                }
+                if (loopFailure != null) {
+                    if (releaseFailure != null) {
+                        loopFailure.addSuppressed(releaseFailure);
+                    }
+                } else if (releaseFailure != null) {
+                    loopFailure = releaseFailure;
                 }
             }
-
-            // Release the output Arrow structs (call the release callback).
-            // D8-H2: use the cached release-handle lookup; was spinning a fresh
-            // downcallHandle per call which pinned JIT metadata on the hot read path.
-            MemorySegment outRelease = (MemorySegment) ARROW_ARRAY_RELEASE.get(outArray, 0L);
-            invokeArrowRelease(outRelease, outArray);
-            MemorySegment outSchemaRelease = outSchema.get(ValueLayout.ADDRESS, 56);
-            invokeArrowRelease(outSchemaRelease, outSchema);
+            if (loopFailure != null) {
+                if (loopFailure instanceof RuntimeException) {
+                    throw (RuntimeException) loopFailure;
+                }
+                if (loopFailure instanceof Error) {
+                    throw (Error) loopFailure;
+                }
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "batchGetArrow: " + loopFailure.getMessage());
+            }
 
             return results;
         }
