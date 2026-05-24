@@ -1620,6 +1620,31 @@ public final class ForStRsLinker {
      * <p>The returned pointer points directly into the memtable's {@code HashEntry.inline_value:
      * Box<[u8]>}. It is valid until the memtable is flushed (which cannot happen mid-record in
      * Flink's single-threaded-per-slot model).
+     *
+     * <h3>R44-M1 — Pinned-pointer use-after-flush safety invariant</h3>
+     *
+     * <p><b>CRITICAL:</b> the pointer returned from {@code frs_get_pinned} (and stored
+     * transiently in {@code outBuf}) is a raw pointer into the engine's active memtable inline
+     * storage. It remains valid <em>only</em> for as long as that memtable is the active one
+     * for this column family. If a memtable flush switches the active memtable between the
+     * {@code frs_get_pinned} return and the {@code toArray} copy below, the read on line {@code
+     * MemorySegment.ofAddress(ptr).reinterpret(len)} would dereference freed memory — a true
+     * use-after-free with all the usual undefined-behavior implications (silent data corruption,
+     * SIGSEGV, or arbitrary value bytes).
+     *
+     * <p>This call site is currently safe <b>solely</b> because of the Flink runtime
+     * single-threaded-per-slot invariant: the same task thread that issued {@code frs_get_pinned}
+     * also drives any flush trigger (write → switch → flush), so no flush can land between
+     * the pin-issue and the copy below within a single record's processing. If a future change
+     * ever introduces concurrent flush from a background worker that can race with the slot
+     * thread's read path — or if this method is called from a thread other than the slot
+     * thread — the invariant breaks and this code becomes unsound.
+     *
+     * <p>The proper fix (deferred to a follow-up spec) is an engine-side epoch counter:
+     * {@code frs_get_pinned} would return both the pointer and the issuing memtable's epoch;
+     * a subsequent helper would re-validate the epoch and return {@code FRS_STATUS_FALLBACK}
+     * if the memtable has been switched. Until that lands, do NOT call this method from any
+     * thread other than the owning slot thread, and do NOT introduce concurrent flush paths.
      */
     public byte[] getPinned(FrsDb db, FrsCfHandle cf, byte[] key) {
         MemorySegment keySeg = MemorySegment.ofArray(key);
@@ -1650,6 +1675,9 @@ public final class ForStRsLinker {
         if (ptr == 0 || len == 0) {
             return null;
         }
+        // R44-M1: see the class-level Javadoc on this method. The single-threaded-per-slot
+        // invariant is what makes this read-after-pin safe today; an engine-side epoch
+        // counter is the planned fix (deferred to follow-up).
         // Copy from native pointer to byte[] (one copy, no Rust allocation)
         return MemorySegment.ofAddress(ptr).reinterpret(len).toArray(ValueLayout.JAVA_BYTE);
     }
