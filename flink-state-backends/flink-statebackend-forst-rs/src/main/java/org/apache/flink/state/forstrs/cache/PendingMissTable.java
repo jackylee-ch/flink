@@ -58,20 +58,39 @@ public class PendingMissTable<IN, ACC> {
      */
     public void beginOrJoin(String stateName, Object key, IN input, Supplier<Void> issueGet) {
         MissKey mk = MissKey.of(stateName, key);
+        // E-R4-H2: route the input append through `compute` so the
+        // append-and-add happens UNDER the same map-level lock that
+        // `resolve()`'s `remove()` uses. Pre-fix shape was
+        // `computeIfAbsent` → `pendingInputs.add(input)` OUTSIDE the
+        // computeIfAbsent lambda — a thread that joined a convoy whose
+        // resolve()/remove() had already executed would append to the
+        // now-detached convoy, and the input would silently be lost
+        // (no fold, no engine PUT, no ack, but `beginOrJoin` returned
+        // normally so the caller treated it as success). The
+        // ReducingState/AggregatingState dropped record then never
+        // reached the aggregate.
+        //
+        // Under `compute`, the lambda runs while the bucket is locked
+        // and concurrent `remove()` waits — so either:
+        //   (a) we observe `existing == null` → create a new convoy,
+        //       add the input, and issueGet on return; or
+        //   (b) we observe a live convoy → add the input. The
+        //       subsequent resolve()'s remove() sees the input we
+        //       just appended.
         boolean[] created = {false};
-        PendingMiss<IN, ACC> pm =
-                pendingMisses.computeIfAbsent(
-                        mk,
-                        k -> {
-                            created[0] = true;
-                            return new PendingMiss<>();
-                        });
-        // Add input AFTER the entry is visible in the map, before issueGet.
-        // computeIfAbsent returns the same object for concurrent callers once it's inserted,
-        // so pendingInputs.add() is safe here: the convoy object itself is not replaced,
-        // only its contents are appended. For V1 single-operator-thread semantics this is fine;
-        // a ConcurrentLinkedDeque swap-in is the multi-thread upgrade path.
-        pm.pendingInputs.add(input);
+        pendingMisses.compute(
+                mk,
+                (k, existing) -> {
+                    PendingMiss<IN, ACC> pm;
+                    if (existing == null) {
+                        pm = new PendingMiss<>();
+                        created[0] = true;
+                    } else {
+                        pm = existing;
+                    }
+                    pm.pendingInputs.add(input);
+                    return pm;
+                });
         if (created[0]) {
             issueGet.get();
         }

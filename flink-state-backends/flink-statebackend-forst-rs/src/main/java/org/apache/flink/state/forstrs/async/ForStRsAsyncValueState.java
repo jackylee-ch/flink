@@ -161,11 +161,19 @@ public final class ForStRsAsyncValueState<K, T> {
         return chain.enqueue(
                 key,
                 () -> {
+                    // E-R4-H1: save/restore currentKey so V1-sync readers
+                    // see the prior task-thread key after this op returns.
                     synchronized (backend) {
+                        @SuppressWarnings("unchecked")
+                        K priorKey = (K) backend.getCurrentKey();
                         backend.setCurrentKey(key);
-                        ForStRsValueState<T> state =
-                                backend.getValueState(stateName, valueSerializer);
-                        return op.apply(state);
+                        try {
+                            ForStRsValueState<T> state =
+                                    backend.getValueState(stateName, valueSerializer);
+                            return op.apply(state);
+                        } finally {
+                            backend.setCurrentKey(priorKey);
+                        }
                     }
                 });
     }

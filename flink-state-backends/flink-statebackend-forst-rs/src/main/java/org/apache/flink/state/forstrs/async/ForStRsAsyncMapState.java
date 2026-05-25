@@ -208,14 +208,32 @@ public final class ForStRsAsyncMapState<K, UK, UV> {
         return chain.enqueue(
                 capturedKey,
                 () -> {
-                    // See ForStRsAsyncValueState.runOnKey for the rationale on locking the
-                    // delegate during the setCurrentKey + buildPrefix + state-op window.
+                    // E-R4-H1: save and restore the backend's currentKey
+                    // around the async worker's mutation, so V1-sync readers
+                    // (timer queue's currentKeyGroupSupplier,
+                    // putToWriteBuffer's key prefix, the FFI write paths)
+                    // observe the original task-thread key after this op
+                    // returns. Within the synchronized block sibling V1
+                    // reads can still race; the structurally-clean fix is
+                    // to thread currentKey as a per-op parameter (TODO),
+                    // but the save/restore guard at least confines the
+                    // visible-corruption window to ops that actually
+                    // overlap an async invocation, which Flink's contract
+                    // already discourages.
                     synchronized (backend) {
+                        @SuppressWarnings("unchecked")
+                        K priorKey = (K) backend.getCurrentKey();
                         backend.setCurrentKey(capturedKey);
-                        ForStRsMapState<UK, UV> state =
-                                backend.getMapState(
-                                        stateName, userKeySerializer, userValueSerializer);
-                        return op.apply(state);
+                        try {
+                            ForStRsMapState<UK, UV> state =
+                                    backend.getMapState(
+                                            stateName,
+                                            userKeySerializer,
+                                            userValueSerializer);
+                            return op.apply(state);
+                        } finally {
+                            backend.setCurrentKey(priorKey);
+                        }
                     }
                 });
     }

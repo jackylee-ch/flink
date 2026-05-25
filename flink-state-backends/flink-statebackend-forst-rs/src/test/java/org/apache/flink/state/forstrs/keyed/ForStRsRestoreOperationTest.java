@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.lang.foreign.Arena;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
@@ -41,6 +42,7 @@ import java.util.UUID;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -157,6 +159,92 @@ class ForStRsRestoreOperationTest {
         }
     }
 
+    @Test
+    void restoreRejectsEscapingSstLocalPath(@TempDir Path tmp) {
+        ForStRsIncrementalKeyedStateHandle owner = emptyOwner(44L);
+        ForStRsCheckpointRestoreException thrown =
+                assertThrows(
+                        ForStRsCheckpointRestoreException.class,
+                        () ->
+                                ForStRsRestoreOperation.resolveSafeRestoreLocalPath(
+                                        tmp.resolve("dl"), "../escape.sst", owner));
+        assertEquals(44L, thrown.getCheckpointId());
+    }
+
+    @Test
+    void restoreAcceptsSingleSstFileName(@TempDir Path tmp) throws Exception {
+        ForStRsIncrementalKeyedStateHandle owner = emptyOwner(45L);
+        Path downloadDir = tmp.resolve("dl");
+        Path resolved =
+                ForStRsRestoreOperation.resolveSafeRestoreLocalPath(
+                        downloadDir, "000123.sst", owner);
+        assertEquals(downloadDir.toAbsolutePath().normalize().resolve("000123.sst"), resolved);
+    }
+
+    @Test
+    void rescalingRestoreRejectsTimerPrefixCollisionKeyGroup(@TempDir Path tmp) {
+        ForStRsIncrementalKeyedStateHandle owner =
+                new ForStRsIncrementalKeyedStateHandle(
+                        UUID.randomUUID(),
+                        new KeyGroupRange(0x712F, 0x712F),
+                        46L,
+                        /* baseCheckpointId= */ 0L,
+                        List.of(),
+                        List.of(),
+                        new EmptyStreamHandle(),
+                        Map.of("default", 0L));
+        ForStRsRestoreOperation op =
+                new ForStRsRestoreOperation(
+                        null,
+                        null,
+                        tmp.resolve("restore"),
+                        new KeyGroupRange(0, 0),
+                        new ForStRsSstRegistry());
+
+        ForStRsCheckpointRestoreException thrown =
+                assertThrows(
+                        ForStRsCheckpointRestoreException.class,
+                        () -> op.restore(List.of(owner)));
+        assertEquals(46L, thrown.getCheckpointId());
+        assertTrue(thrown.getMessage().contains("0x71/0x2f"));
+    }
+
+    @Test
+    void timerRowKeyParserFailsFastOnMalformedQueueRows() {
+        byte[] marker =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .QUEUE_NS_MARKER;
+        byte[] malformed = "q/state-without-separator".getBytes(StandardCharsets.UTF_8);
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(
+                                malformed, marker, -1));
+    }
+
+    @Test
+    void timerRowKeyParserReadsEmbeddedKeyGroup() {
+        byte[] marker =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .QUEUE_NS_MARKER;
+        byte[] stateName = "timer-state".getBytes(StandardCharsets.UTF_8);
+        byte[] key = new byte[marker.length + stateName.length + 1 + 2 + Long.BYTES];
+        int pos = 0;
+        System.arraycopy(marker, 0, key, pos, marker.length);
+        pos += marker.length;
+        System.arraycopy(stateName, 0, key, pos, stateName.length);
+        pos += stateName.length;
+        int sepIdx = pos;
+        key[pos++] = (byte) '/';
+        key[pos++] = 0;
+        key[pos++] = 7;
+
+        assertEquals(
+                7,
+                ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(key, marker, sepIdx));
+    }
+
     /** Helper: opens a DB at {@code srcDir}, writes N keys, takes an incremental snapshot. */
     static ForStRsIncrementalKeyedStateHandle takeSnapshot(
             ForStRsLinker linker, Arena arena, Path srcDir, int n) throws Exception {
@@ -188,6 +276,18 @@ class ForStRsRestoreOperationTest {
             cf.close();
             db.close();
         }
+    }
+
+    private static ForStRsIncrementalKeyedStateHandle emptyOwner(long checkpointId) {
+        return new ForStRsIncrementalKeyedStateHandle(
+                UUID.randomUUID(),
+                new KeyGroupRange(0, 0),
+                checkpointId,
+                /* baseCheckpointId= */ 0L,
+                List.of(),
+                List.of(),
+                new EmptyStreamHandle(),
+                Map.of("default", 0L));
     }
 
     /** Test double — a StreamStateHandle whose openInputStream() yields zero bytes. */

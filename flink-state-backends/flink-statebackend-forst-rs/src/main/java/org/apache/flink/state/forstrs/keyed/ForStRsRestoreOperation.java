@@ -93,6 +93,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class ForStRsRestoreOperation {
 
     private static final Logger LOG = LoggerFactory.getLogger(ForStRsRestoreOperation.class);
+    private static final int TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP = 0x712F;
 
     private final ForStRsLinker linker;
     private final Arena arena;
@@ -455,6 +456,72 @@ public class ForStRsRestoreOperation {
         }
     }
 
+    static Path resolveSafeRestoreLocalPath(
+            Path downloadDir, String logicalPath, ForStRsIncrementalKeyedStateHandle owner)
+            throws ForStRsCheckpointRestoreException {
+        if (logicalPath == null || logicalPath.isBlank()) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: SST local path must not be null or blank");
+        }
+        if (logicalPath.indexOf('/') >= 0 || logicalPath.indexOf('\\') >= 0) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: SST local path must be a single file name: " + logicalPath);
+        }
+        Path relative;
+        try {
+            relative = Path.of(logicalPath);
+        } catch (RuntimeException re) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: malformed SST local path '" + logicalPath + "'",
+                    re);
+        }
+        if (relative.isAbsolute()
+                || relative.getFileName() == null
+                || ".".equals(relative.toString())
+                || "..".equals(relative.toString())) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: SST local path must be a relative file name: "
+                            + logicalPath);
+        }
+        Path root = downloadDir.toAbsolutePath().normalize();
+        Path resolved = root.resolve(relative).normalize();
+        if (!resolved.startsWith(root)
+                || resolved.getParent() == null
+                || !resolved.getParent().equals(root)) {
+            throw new ForStRsCheckpointRestoreException(
+                    logicalPath,
+                    owner.getCheckpointId(),
+                    "Strict restore: SST local path escapes restore directory: " + logicalPath);
+        }
+        return resolved;
+    }
+
+    private static void rejectTimerPrefixCollisionOnRescale(
+            List<ForStRsIncrementalKeyedStateHandle> handles)
+            throws ForStRsCheckpointRestoreException {
+        for (ForStRsIncrementalKeyedStateHandle handle : handles) {
+            if (handle.getKeyGroupRange().contains(TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP)) {
+                throw new ForStRsCheckpointRestoreException(
+                        "key-group-" + TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP,
+                        handle.getCheckpointId(),
+                        "Rescaling restore is unsafe for ForSt-RS checkpoints whose source "
+                                + "key-group range contains "
+                                + TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP
+                                + ": regular-state rows with prefix bytes 0x71/0x2f collide "
+                                + "with the legacy timer queue marker \"q/\". Restore must use "
+                                + "the same key-group assignment or a versioned timer key format.");
+            }
+        }
+    }
+
     /**
      * Sentinel IOException that signals "handle returned 0 bytes" — distinct from a transient I/O
      * error. Extends {@link java.io.FileNotFoundException} so the {@link
@@ -476,6 +543,8 @@ public class ForStRsRestoreOperation {
 
     private RestoreResult restoreWithRescaling(List<ForStRsIncrementalKeyedStateHandle> handles)
             throws IOException {
+        rejectTimerPrefixCollisionOnRescale(handles);
+
         // 1. Materialize each input handle into its own temp DB (using the no-rescaling path).
         //    PR-E1 (F5-6 / E-HIGH-2): handles materialize in parallel via a bounded thread
         //    pool — each handle's S3/blob download + dbOpenFromIncremental is fully
@@ -688,6 +757,13 @@ public class ForStRsRestoreOperation {
             }
 
             // 3. For each kg in the target range, find the source covering it and copy entries.
+            // E-H9: also group target kgs by source so we can do a SINGLE
+            // timer-row scan per source (timer rows live under a state-name-
+            // varying QUEUE_NS_MARKER prefix, so per-kg scans would replay
+            // every timer row once per target kg — quadratic in numKgs ×
+            // numTimerRows on large jobs).
+            java.util.Map<OpenSourceDb, java.util.BitSet> targetKgsBySrc =
+                    new java.util.IdentityHashMap<>();
             try {
                 for (int kg = targetRange.getStartKeyGroup();
                         kg <= targetRange.getEndKeyGroup();
@@ -700,7 +776,19 @@ public class ForStRsRestoreOperation {
                         // target range). We don't fail here.
                         continue;
                     }
-                    copyKeyGroup(src, targetDb, targetCf, kg);
+                    copyKeyGroupRegularState(src, targetDb, targetCf, kg);
+                    targetKgsBySrc
+                            .computeIfAbsent(
+                                    src,
+                                    k -> new java.util.BitSet(targetRange.getEndKeyGroup() + 1))
+                            .set(kg);
+                }
+                // E-H9: ONE timer-row scan per source, route each row to
+                // its embedded kg if that kg is in the target set for
+                // this source.
+                for (java.util.Map.Entry<OpenSourceDb, java.util.BitSet> e :
+                        targetKgsBySrc.entrySet()) {
+                    copyTimerRowsForSourceBatch(e.getKey(), targetDb, targetCf, e.getValue());
                 }
             } catch (RuntimeException re) {
                 try {
@@ -831,7 +919,15 @@ public class ForStRsRestoreOperation {
      * released when {@code copyKeyGroup} returns, so transient memory pressure stays bounded
      * by the largest single key-group being copied.
      */
-    private void copyKeyGroup(OpenSourceDb src, FrsDb targetDb, FrsCfHandle targetCf, int kg) {
+    /**
+     * E-H9: regular-state-only per-kg copy. Timer rows are no longer
+     * handled here — the caller batches all timer rows for a source DB
+     * via {@link #copyTimerRowsForSourceBatch} after the per-kg loop
+     * so each source's QUEUE_NS_MARKER prefix is scanned ONCE rather
+     * than once per target kg.
+     */
+    private void copyKeyGroupRegularState(
+            OpenSourceDb src, FrsDb targetDb, FrsCfHandle targetCf, int kg) {
         byte[] kgPrefix = new byte[] {(byte) ((kg >>> 8) & 0xFF), (byte) (kg & 0xFF)};
         try (Arena stagingArena = Arena.ofShared();
                 FrsIterator it = linker.prefixLookupOpen(src.db, src.cf, kgPrefix, stagingArena)) {
@@ -849,6 +945,74 @@ public class ForStRsRestoreOperation {
             }
             flushCopyKeyGroupBatch(batch, targetDb, targetCf);
         }
+    }
+
+    /**
+     * E-H1 + E-H9: scans the source DB's QUEUE_NS_MARKER prefix ONCE and
+     * routes each row to the target if its embedded kg is in
+     * {@code targetKgsForSrc}. Pre-E-H9 the same scan ran once per
+     * target kg, making restore O(numTargetKgs × numTimerRowsInSource)
+     * — quadratic on jobs with many timers.
+     */
+    private void copyTimerRowsForSourceBatch(
+            OpenSourceDb src,
+            FrsDb targetDb,
+            FrsCfHandle targetCf,
+            java.util.BitSet targetKgsForSrc) {
+        byte[] marker =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .QUEUE_NS_MARKER;
+        try (Arena stagingArena = Arena.ofShared();
+                FrsIterator it =
+                        linker.prefixLookupOpen(src.db, src.cf, marker, stagingArena)) {
+            BatchPutStaging batch =
+                    new BatchPutStaging(
+                            stagingArena, COPY_KG_BATCH_SIZE, COPY_KG_DATA_INITIAL_CAP);
+            while (true) {
+                ForStRsLinker.IteratorEntry entry = linker.iteratorNext(it);
+                if (entry == null) {
+                    break;
+                }
+                byte[] key = entry.key();
+                int sepIdx = -1;
+                for (int i = marker.length; i < key.length; i++) {
+                    if (key[i] == (byte) '/') {
+                        sepIdx = i;
+                        break;
+                    }
+                }
+                int rowKg = extractTimerRowKeyGroupOrThrow(key, marker, sepIdx);
+                if (rowKg < 0
+                        || rowKg >= targetKgsForSrc.length()
+                        || !targetKgsForSrc.get(rowKg)) {
+                    continue;
+                }
+                batch.append(key, entry.value());
+                if (batch.size() >= COPY_KG_BATCH_SIZE) {
+                    flushCopyKeyGroupBatch(batch, targetDb, targetCf);
+                }
+            }
+            flushCopyKeyGroupBatch(batch, targetDb, targetCf);
+        }
+    }
+
+    static int extractTimerRowKeyGroupOrThrow(byte[] key, byte[] marker, int sepIdx) {
+        if (sepIdx <= marker.length || sepIdx + 1 + 2 + Long.BYTES > key.length) {
+            throw new IllegalArgumentException(
+                    "Malformed ForSt-RS timer key under q/ prefix: missing state-name separator,"
+                            + " key-group, or timestamp bytes; length="
+                            + key.length
+                            + ", sepIdx="
+                            + sepIdx);
+        }
+        for (int i = 0; i < marker.length; i++) {
+            if (key[i] != marker[i]) {
+                throw new IllegalArgumentException("Malformed ForSt-RS timer key prefix");
+            }
+        }
+        int rowHi = key[sepIdx + 1] & 0xFF;
+        int rowLo = key[sepIdx + 2] & 0xFF;
+        return (rowHi << 8) | rowLo;
     }
 
     /**
@@ -1104,7 +1268,7 @@ public class ForStRsRestoreOperation {
             // Serial fallback — keeps single-handle paths simple and zero-overhead.
             for (int i = 0; i < hlps.size(); i++) {
                 HandleAndLocalPath hlp = hlps.get(i);
-                Path local = downloadDir.resolve(hlp.getLocalPath());
+                Path local = resolveSafeRestoreLocalPath(downloadDir, hlp.getLocalPath(), owner);
                 downloadHandleStrict(hlp.getHandle(), local, hlp.getLocalPath(), owner);
                 resolved[i] = local.toString();
             }
@@ -1116,7 +1280,7 @@ public class ForStRsRestoreOperation {
             List<Future<String>> futures = new ArrayList<>(hlps.size());
             for (int i = 0; i < hlps.size(); i++) {
                 final HandleAndLocalPath hlp = hlps.get(i);
-                final Path local = downloadDir.resolve(hlp.getLocalPath());
+                final Path local = resolveSafeRestoreLocalPath(downloadDir, hlp.getLocalPath(), owner);
                 futures.add(
                         dl.submit(
                                 (Callable<String>)

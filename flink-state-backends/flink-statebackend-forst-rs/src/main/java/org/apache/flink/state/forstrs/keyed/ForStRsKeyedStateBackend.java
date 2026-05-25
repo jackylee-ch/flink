@@ -1200,10 +1200,24 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
      * Removes a key from the write buffer and issues a native delete. Called by {@link
      * ForStRsValueState#clear()} to ensure the delete reaches the engine and the buffer doesn't
      * serve stale data.
+     *
+     * <p>E-R4-H3: the pre-fix shape did {@code writeBuffer.remove(key); linker.delete(...);}
+     * which DROPPED only this key's pending put and let the DELETE bypass the rest of the
+     * buffer. If a checkpoint barrier arrived between the synchronous DELETE and the next
+     * {@link #flushWriteBuffer()} call, the snapshot captured the DELETE without the
+     * still-buffered PUTs — restoring from that checkpoint silently lost user writes.
+     * Same hazard on crash: the DELETE persists while buffered PUTs do not. The fix flushes
+     * the ENTIRE write buffer first (ordering: all buffered PUTs land, then this DELETE
+     * lands, then return). This preserves the write-buffer's contract that "engine state
+     * matches the sequence of user-issued ops" across snapshot and crash boundaries.
      */
     public void deleteFromWriteBuffer(byte[] key) {
         // B9-H1: primitive-keyed map → no ByteArrayWrapper alloc.
         writeBuffer.remove(key);
+        // E-R4-H3: drain any prior PUTs so the engine sees them strictly
+        // before this DELETE. The flush is a no-op when the buffer is
+        // empty (which is the typical fast path in pure-delete workloads).
+        flushWriteBuffer();
         linker.delete(db, defaultCf, key);
     }
 

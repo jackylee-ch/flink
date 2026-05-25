@@ -102,13 +102,20 @@ public final class ForStRsAsyncReducingState<K, T> {
         return chain.enqueue(
                 capturedKey,
                 () -> {
-                    // See ForStRsAsyncValueState.runOnKey for the rationale on locking the
-                    // delegate during the setCurrentKey + buildPrefix + state-op window.
+                    // E-R4-H1: save/restore currentKey — see
+                    // ForStRsAsyncMapState.runOnKey for the rationale.
                     synchronized (backend) {
+                        @SuppressWarnings("unchecked")
+                        K priorKey = (K) backend.getCurrentKey();
                         backend.setCurrentKey(capturedKey);
-                        ForStRsReducingState<T> state =
-                                backend.getReducingState(stateName, serializer, reduceFunction);
-                        return op.apply(state);
+                        try {
+                            ForStRsReducingState<T> state =
+                                    backend.getReducingState(
+                                            stateName, serializer, reduceFunction);
+                            return op.apply(state);
+                        } finally {
+                            backend.setCurrentKey(priorKey);
+                        }
                     }
                 });
     }

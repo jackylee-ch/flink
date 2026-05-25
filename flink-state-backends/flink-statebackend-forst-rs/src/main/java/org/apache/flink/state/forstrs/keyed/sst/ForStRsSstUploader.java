@@ -29,6 +29,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Semaphore;
 
 /**
  * Virtual-thread SST uploader (B-Prod-P3 Task 3.2).
@@ -63,7 +64,23 @@ public final class ForStRsSstUploader {
 
     private static final int IO_BUFFER_BYTES = 8 * 1024;
 
+    /**
+     * D-R4-NEW-H3: cap concurrent in-flight uploads to prevent FD / connection
+     * exhaustion. JDK 21+ virtual threads are intentionally unbounded — the
+     * caller MUST gate spawn count via {@link Semaphore} or a bounded
+     * executor. Pre-fix this class did neither, so a single checkpoint with
+     * hundreds of L0 SSTs (common on Q11/Q12) would spawn hundreds of
+     * concurrent uploads, each holding two open streams + an S3 connection,
+     * trivially blowing past the default TM ulimit (Linux 4096, macOS 256-
+     * 1024) and failing checkpoints non-deterministically. RocksDB's
+     * RocksDBStateUploader uses a similar Semaphore — we adopt the same
+     * mechanism for parity.
+     */
+    private static final int MAX_CONCURRENT_UPLOADS =
+            Math.max(8, Math.min(32, Runtime.getRuntime().availableProcessors() * 4));
+
     private final SstRetryStrategy retryStrategy;
+    private final Semaphore concurrencyGate = new Semaphore(MAX_CONCURRENT_UPLOADS);
 
     /** Constructs an uploader with the production default retry policy. */
     public ForStRsSstUploader() {
@@ -91,8 +108,18 @@ public final class ForStRsSstUploader {
                 .start(
                         () -> {
                             try {
-                                StreamStateHandle handle = uploadBlocking(file, factory, scope);
-                                result.complete(handle);
+                                // D-R4-NEW-H3: bound concurrency via semaphore.
+                                // acquireUninterruptibly because checkpoint
+                                // workers must not be cancelled mid-flight;
+                                // the upload itself is already retried.
+                                concurrencyGate.acquireUninterruptibly();
+                                try {
+                                    StreamStateHandle handle =
+                                            uploadBlocking(file, factory, scope);
+                                    result.complete(handle);
+                                } finally {
+                                    concurrencyGate.release();
+                                }
                             } catch (Throwable t) {
                                 result.completeExceptionally(t);
                             }

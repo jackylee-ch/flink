@@ -100,7 +100,32 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         implements KeyGroupedInternalPriorityQueue<T>, AutoCloseable {
 
     /** Distinguishes priority-queue rows from regular keyed-state rows in the same default CF. */
-    private static final byte[] QUEUE_NS_MARKER = "q/".getBytes(StandardCharsets.UTF_8);
+    /**
+     * E-H1: namespace marker for timer-queue rows. Made public-package so the
+     * rescaling restore path can scan all timer rows by this prefix and filter
+     * by embedded kg per row, regardless of state name.
+     *
+     * <p>E-H7: the marker bytes "q/" = (0x71, 0x2F) MATCH the first two bytes
+     * of a regular-state key whose kg=28975 (since regular-state encoding
+     * places kg(2B BE) at offset 0). Changing the marker is a wire-format
+     * break that would orphan existing checkpoints, so we instead REFUSE
+     * deployments where any reachable kg could collide — see
+     * {@code MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY} below.
+     */
+    public static final byte[] QUEUE_NS_MARKER = "q/".getBytes(StandardCharsets.UTF_8);
+
+    /**
+     * E-H7: the largest {@code totalKeyGroups} where no regular kg's first
+     * two BE bytes can equal {@link #QUEUE_NS_MARKER} bytes {0x71, 0x2F} =
+     * decimal 28975. Construction below refuses higher values so the
+     * rescaling-restore timer scan never aliases a regular-state row.
+     * Flink's default maxParallelism is 128; production deployments rarely
+     * exceed a few thousand. Operators that legitimately need
+     * {@code maxParallelism &gt; 28975} must either downgrade their setting
+     * or migrate the engine to a non-aliasing wire format (out of scope
+     * for this fix because it would orphan existing checkpoints).
+     */
+    private static final int MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY = 28975;
 
     private static final byte SEP = (byte) '/';
 
@@ -247,6 +272,24 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             java.util.function.IntSupplier currentKeyGroupSupplier,
             KeyGroupRange keyGroupRange,
             LongFunction<T> rebinder) {
+        // E-H4: reject state names containing the SEP byte ('/'). The
+        // rescaling-restore path locates the embedded kg by scanning
+        // forward from QUEUE_NS_MARKER for the first '/', so a name
+        // containing '/' would put the kg lookup at the wrong offset
+        // and silently drop every timer for this queue on rescale.
+        // Validating at construction is the least-invasive defense
+        // (vs. wire-format change to length-prefix the name). The
+        // default Flink StateDescriptor names never contain '/', so
+        // this only rejects deliberately pathological inputs.
+        if (stateName == null) {
+            throw new IllegalArgumentException("stateName must not be null");
+        }
+        if (stateName.indexOf('/') >= 0) {
+            throw new IllegalArgumentException(
+                    "stateName must not contain '/' (rescaling-restore parses the kg by"
+                            + " scanning to the first '/' after QUEUE_NS_MARKER): "
+                            + stateName);
+        }
         this.linker = linker;
         this.db = db;
         this.cf = cf;
@@ -349,6 +392,18 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (totalKeyGroups <= 0) {
             throw new IllegalArgumentException(
                     "totalKeyGroups must be > 0, got " + totalKeyGroups);
+        }
+        // E-H7 guard — see QUEUE_NS_MARKER doc and
+        // MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY.
+        if (totalKeyGroups > MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY) {
+            throw new IllegalArgumentException(
+                    "totalKeyGroups must be <= "
+                            + MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY
+                            + " because higher values produce regular-state row prefixes"
+                            + " that alias the timer-queue namespace marker"
+                            + " {0x71, 0x2F} (\"q/\") in the rescaling-restore path."
+                            + " Got "
+                            + totalKeyGroups);
         }
         final int fallback = keyGroupRange.getStartKeyGroup();
         return () -> {
@@ -492,13 +547,42 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 // Idempotent — already pending. No-op.
                 return true;
             }
-            // op == REMOVE — cancellation: remove the pending REMOVE so the engine still keeps
-            // the original entry (or, if the engine doesn't have it either, the add lands as a
-            // fresh insert below).
-            pendingBuffer.removeAt(existing);
-            // If there's still an engine entry under this key, the (add then remove then add) net
-            // is "keep present". If there isn't, we still need an ADD pending — fall through.
-            // For correctness we re-insert ADD so the engine reflects "present" after flush.
+            // op == REMOVE.
+            //
+            // R0E-H3: the pre-fix code did `pendingBuffer.removeAt(existing)`
+            // and then `insertAdd`. That trace correctly produced
+            // {ADD} for the (absent engine + REMOVE + ADD) case but
+            // SILENTLY LEAKED engine state for the (engine has X +
+            // REMOVE + ADD + REMOVE) sequence: the second REMOVE in
+            // step 5 found a pending ADD (created by the cancellation
+            // in step 4), canceled it, and left an empty buffer — but
+            // the engine still held X from before the first REMOVE,
+            // so the user's last-op REMOVE was lost on flush.
+            //
+            // The buffer encodes one op per composite key and cannot
+            // distinguish "ADD over a prior REMOVE" from "fresh ADD",
+            // so we cannot defer the resolution to a follow-up
+            // remove(). Force an immediate drain of the REMOVE to
+            // engine before inserting the new ADD; the buffer becomes
+            // empty, then insertAdd lands a clean ADD that subsequent
+            // remove() correctly cancels (since engine has been
+            // updated by our drain). The drain cost is one vectorized
+            // FFI call, paid only on the rare REMOVE→ADD transition
+            // path.
+            //
+            // Why we cannot just `removeAt(existing); insertAdd`:
+            // see comment block above — the engine retains X.
+            //
+            // Why we cannot keep both REMOVE + ADD in the buffer:
+            // {@link ArrowTimerBuffer} enforces one entry per key.
+            //
+            // Why we cannot introduce a READD op variant in this
+            // round: would require buffer-format changes and is too
+            // invasive; the inline-flush approach is locally
+            // correct and matches the existing flush_pending_to_engine
+            // contract.
+            flushPendingToEngine();
+            // After flush, buffer is empty — fall through to insertAdd.
         }
         pendingBuffer.insertAdd(scratchSeg, 0L, keyLen, ts);
         invalidateCache();
@@ -561,14 +645,91 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         }
         // Flush pending mutations so the engine view reflects all add/remove decisions.
         flushPendingToEngine();
-        int kg = currentKeyGroupSupplier.getAsInt();
-        Entry head = cachedHeadEntry(kg);
+        // E-H2: KeyGroupedInternalPriorityQueue.poll() must return the
+        // GLOBAL minimum element across every key group in this subtask's
+        // KeyGroupRange — Flink's InternalTimerServiceImpl.advanceWatermark
+        // calls poll() BEFORE setCurrentKey(), so we cannot use the
+        // current-key supplier here. Pre-fix code single-kg'd on the
+        // start kg's fallback, silently leaving timers in every other
+        // kg undelivered (event-time stuck on rescaling-heavy jobs).
+        if (keyGroupRange.getNumberOfKeyGroups() == 1) {
+            int kg = keyGroupRange.getStartKeyGroup();
+            Entry head = cachedHeadEntry(kg);
+            if (head == null) {
+                return null;
+            }
+            linker.delete(db, cf, head.composite);
+            pollCache.pollFirst();
+            return head.element;
+        }
+        // Multi-kg path: open one prefix iter per kg, pick the global
+        // min-ts head, delete from engine. poll() already flushed
+        // pending above, so there are no in-buffer REMOVEs to suppress.
+        Entry head = findGlobalEngineHeadInRange(false);
         if (head == null) {
             return null;
         }
         linker.delete(db, cf, head.composite);
-        pollCache.pollFirst();
+        // pollCache may hold cached entries for an arbitrary kg; the
+        // safest fix in the multi-kg path is to invalidate it. The
+        // poll-ahead optimization only helps the single-kg case, which
+        // the fast path above preserves.
+        invalidateCache();
         return head.element;
+    }
+
+    /**
+     * E-H2: scans engine heads across every key group in {@code keyGroupRange}
+     * and returns the entry with the smallest timestamp (or null if all kgs
+     * are empty). One prefix-iterator open per kg in the range — the iter
+     * is closed before the next kg opens. Per-kg the prefix-iter yields
+     * entries in ts-ascending order (sign-flipped encoding) so the first
+     * entry is the per-kg head; the function compares the heads and picks
+     * the global minimum.
+     */
+    private Entry findGlobalEngineHeadInRange(boolean suppressRemoved) {
+        Entry best = null;
+        long bestTs = Long.MAX_VALUE;
+        int start = keyGroupRange.getStartKeyGroup();
+        int end = keyGroupRange.getEndKeyGroup();
+        for (int kg = start; kg <= end; kg++) {
+            // E-H6: use a per-call confined arena so the 8-byte iter
+            // handle is reclaimed when the try-with-resources block
+            // exits. Pre-fix code passed the backend's shared `arena`
+            // (operator-lifetime), which `Arena.ofShared` cannot
+            // partially deallocate — every peek/poll permanently
+            // leaked `numKgs * 8` bytes, exhausting the TM heap on
+            // any timer-heavy workload. Confined arena is safe here:
+            // every iter is opened, drained for its first entry, and
+            // closed before the next kg's iter opens, so no handle
+            // outlives the scope.
+            try (Arena perKgArena = Arena.ofConfined();
+                    FrsIterator iter =
+                            linker.prefixLookupOpen(
+                                    db, cf, keyGroupPrefix(kg), perKgArena)) {
+                // E-H5: skip engine heads masked by a pending REMOVE
+                // when called from the peek path. Without this, Flink's
+                // tryAdvanceWatermark fires timers the user has already
+                // cancelled because peek() returned a logically-deleted
+                // entry. The poll() path passes suppressRemoved=false
+                // because it flushes pending first (so no REMOVEs are
+                // outstanding) — flushing-then-suppressing would be a
+                // double-walk.
+                ForStRsLinker.IteratorEntry e;
+                while ((e = linker.iteratorNext(iter)) != null) {
+                    if (suppressRemoved && isRemovePendingFor(e.key())) {
+                        continue;
+                    }
+                    long ts = decodeTimestamp(e.key());
+                    if (ts < bestTs) {
+                        bestTs = ts;
+                        best = new Entry(e.key(), decodeElement(e.key()));
+                    }
+                    break;
+                }
+            }
+        }
+        return best;
     }
 
     /**
@@ -589,7 +750,15 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (closed.get()) {
             throw new IllegalStateException("timer queue closed");
         }
-        int kg = currentKeyGroupSupplier.getAsInt();
+        // E-H2: same contract as poll() — peek() must return the GLOBAL
+        // minimum across every kg in the subtask's range. Fast-path the
+        // single-kg case (preserves the existing zero-FFM hot path used
+        // by registerProcessingTimeTimer); fall back to a multi-kg scan
+        // otherwise.
+        if (keyGroupRange.getNumberOfKeyGroups() > 1) {
+            return peekMultiKg();
+        }
+        int kg = keyGroupRange.getStartKeyGroup();
 
         // 1. Best ADD in buffer for this key group — happy path is heap[0] (min-ts root), which
         //    in steady state matches the current kg + is an ADD. Fall back to full scan only if
@@ -628,17 +797,24 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             }
         }
 
-        // 2. Engine side: consult the EXISTING poll-ahead cache ONLY if it's already populated for
-        //    this key group. Do NOT refill on a peek — refill is reserved for poll(). On a cache
-        //    miss we conservatively trust the buffer side. This matches Flink's only use of peek
-        //    on the registerTimer hot path: it just wants to know "is the head before mine?".
+        // 2. Engine side: consult the EXISTING poll-ahead cache for this kg, then SKIP
+        //    every cached entry that has a matching pending REMOVE in the buffer.
+        //
+        // H-R4-1: the pre-fix code returned `pollCache.peekFirst()` directly and called
+        // the resulting stale-head view "not correctness-critical". That was wrong —
+        // the multi-kg path's own comment (peekMultiKg) explicitly notes that Flink's
+        // `tryAdvanceWatermark` fires the timer object that peek() returns and discards
+        // poll()'s return value; returning an entry that has a pending REMOVE causes
+        // Flink to fire a cancelled timer. The fix routes through the same
+        // suppress-removes filter peek-multi-kg already uses (E-H5).
         Entry engineHead = null;
         if (cachedKg == kg && !pollCache.isEmpty()) {
-            // Use the cache front directly — even if a pending REMOVE eventually masks it, the
-            // worst case is a slightly-stale "head" view returned from peek, which Flink only
-            // uses for the "head may have changed" hint (not correctness-critical). poll()
-            // re-establishes the truth via flush + cache refresh.
-            engineHead = pollCache.peekFirst();
+            for (Entry candidate : pollCache) {
+                if (!isRemovePendingFor(candidate.composite)) {
+                    engineHead = candidate;
+                    break;
+                }
+            }
         }
 
         if (bufferBestPos < 0 && engineHead == null) {
@@ -655,6 +831,73 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             return decodeElementFromBuffer(bufferBestPos);
         }
         return engineHead.element;
+    }
+
+    /**
+     * E-H2: multi-key-group peek. Returns the global earliest-ts entry across:
+     *   (a) pendingBuffer ADD entries whose embedded kg lies in {@link #keyGroupRange};
+     *   (b) engine prefix-iter heads for every kg in {@link #keyGroupRange}.
+     * Engine entries masked by a pending REMOVE are not skipped here (peek is
+     * advisory; poll() flushes pending first and re-reads). This is the slow
+     * but correct path; single-kg deployments use the fast {@code peek()} branch.
+     */
+    private T peekMultiKg() {
+        int bufferBestPos = -1;
+        long bufferBestTs = Long.MAX_VALUE;
+        int n = pendingBuffer.size();
+        int start = keyGroupRange.getStartKeyGroup();
+        int end = keyGroupRange.getEndKeyGroup();
+        for (int i = 0; i < n; i++) {
+            if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
+                continue;
+            }
+            int kOff = pendingBuffer.keyOffsetAt(i);
+            int kLen = pendingBuffer.keyLenAt(i);
+            int entryKg = decodeKgFromBuffer(kOff, kLen);
+            if (entryKg < start || entryKg > end) {
+                continue;
+            }
+            long ts = pendingBuffer.tsAt(i);
+            if (ts < bufferBestTs) {
+                bufferBestTs = ts;
+                bufferBestPos = i;
+            }
+        }
+        // E-H5: peek MUST suppress engine entries masked by a
+        // pending REMOVE — Flink's tryAdvanceWatermark fires the
+        // timer object peek() returns and discards poll()'s return
+        // value, so a peek result that doesn't reflect pending
+        // REMOVEs causes the runtime to fire a deleted timer.
+        Entry engineHead = findGlobalEngineHeadInRange(true);
+
+        if (bufferBestPos < 0 && engineHead == null) {
+            return null;
+        }
+        if (bufferBestPos < 0) {
+            return engineHead.element;
+        }
+        if (engineHead == null) {
+            return decodeElementFromBuffer(bufferBestPos);
+        }
+        long engineTs = decodeTimestamp(engineHead.composite);
+        if (bufferBestTs <= engineTs) {
+            return decodeElementFromBuffer(bufferBestPos);
+        }
+        return engineHead.element;
+    }
+
+    /**
+     * E-H2 helper: extract the 2-byte BE key-group field from a buffer entry's
+     * composite key. Returns -1 if the entry is too short to contain a kg.
+     */
+    private int decodeKgFromBuffer(int offset, int len) {
+        if (len < queuePrefix.length + 2) {
+            return -1;
+        }
+        MemorySegment seg = pendingBuffer.keyDataSegment();
+        int hi = seg.get(ValueLayout.JAVA_BYTE, offset + queuePrefix.length) & 0xFF;
+        int lo = seg.get(ValueLayout.JAVA_BYTE, offset + queuePrefix.length + 1) & 0xFF;
+        return (hi << 8) | lo;
     }
 
     private boolean keyPrefixMatches(
@@ -819,7 +1062,14 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         flushPendingToEngine();
         invalidateCache();
         Set<T> out = new LinkedHashSet<>();
-        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(keyGroup), arena)) {
+        // E-H8: per-call confined arena (same rationale as E-H6 fix).
+        // The constructor-time shared arena cannot deallocate the iter
+        // handle's 8 bytes, so repeated iterator opens against it
+        // permanently leak memory.
+        try (Arena perCallArena = Arena.ofConfined();
+                FrsIterator iter =
+                        linker.prefixLookupOpen(
+                                db, cf, keyGroupPrefix(keyGroup), perCallArena)) {
             while (true) {
                 ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
                 if (e == null) {
@@ -887,8 +1137,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         flushPendingToEngine();
         int kg = currentKeyGroupSupplier.getAsInt();
         // STEP 2 — open ONE prefix iterator on the engine kg-prefix. Single FFM crossing.
+        // E-H8: per-call confined arena to reclaim the iter handle.
         java.util.ArrayList<byte[]> dueKeyList = new java.util.ArrayList<>();
-        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
+        try (Arena perCallArena = Arena.ofConfined();
+                FrsIterator iter =
+                        linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perCallArena)) {
             while (true) {
                 ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
                 if (e == null) {
@@ -1179,7 +1432,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * reading up to {@link #REFILL_BATCH} entries in one go.
      */
     private void refillCache(int kg) {
-        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
+        // E-H8: per-call confined arena to reclaim the iter handle.
+        try (Arena perCallArena = Arena.ofConfined();
+                FrsIterator iter =
+                        linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perCallArena)) {
             int read = 0;
             while (read < REFILL_BATCH) {
                 ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
@@ -1200,7 +1456,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     private int sizeForKeyGroup(int kg) {
         int n = 0;
-        try (FrsIterator iter = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena)) {
+        // E-H8: per-call confined arena to reclaim the iter handle.
+        try (Arena perCallArena = Arena.ofConfined();
+                FrsIterator iter =
+                        linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perCallArena)) {
             while (linker.iteratorNext(iter) != null) {
                 n++;
             }
@@ -1212,6 +1471,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     private final class MultiKeyGroupIterator implements CloseableIterator<T> {
         private int kg = keyGroupRange.getStartKeyGroup();
         private FrsIterator current;
+        // E-H8: per-kg arena lives for one iter handle's lifetime. We
+        // close it in `closeCurrent` so the handle's 8 bytes are
+        // reclaimed before opening the next kg's iter, mirroring the
+        // E-H6 pattern but adapted to a stateful iterator.
+        private Arena currentArena;
         private T next;
         private boolean closed;
 
@@ -1226,7 +1490,9 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                         next = null;
                         return;
                     }
-                    current = linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), arena);
+                    currentArena = Arena.ofConfined();
+                    current = linker.prefixLookupOpen(
+                            db, cf, keyGroupPrefix(kg), currentArena);
                 }
                 ForStRsLinker.IteratorEntry e = linker.iteratorNext(current);
                 if (e == null) {
@@ -1244,6 +1510,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             if (current != null) {
                 current.close();
                 current = null;
+            }
+            if (currentArena != null) {
+                currentArena.close();
+                currentArena = null;
             }
         }
 

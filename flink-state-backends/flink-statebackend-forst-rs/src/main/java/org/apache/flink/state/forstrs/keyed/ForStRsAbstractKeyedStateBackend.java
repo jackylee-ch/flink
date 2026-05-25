@@ -793,7 +793,8 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                         stateName,
                         elementSerializer,
                         tsExtractor,
-                        this::getCurrentKeyGroupIndex,
+                        this,
+                        getNumberOfKeyGroups(),
                         getKeyGroupRange());
         engineTimerQueues.add(q);
         return q;

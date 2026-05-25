@@ -500,8 +500,18 @@ public final class ForStRsLinker {
         // instead of allocating a per-call native staging buffer; this matches
         // the JNI GetByteArrayElements pin semantics and eliminates the
         // dominant per-op overhead the original confined-Arena path imposed.
+        // D-R4-NEW-H1: do NOT bind frs_put critical. The Rust impl
+        // routes through `db.put` → `write_single` →
+        // `write_controller.may_throttle()` which can `std::thread::sleep`
+        // (Slowdown) or `condvar.wait_timeout` (Stall) for ms- to seconds-
+        // class durations. Critical-mode FFI suspends JVM safepoints for
+        // the duration — every sibling thread stalls at every safepoint
+        // poll, GC cannot run. The sister batched paths
+        // (frs_vectorized_batch_put / frs_vectorized_batch_delete) were
+        // already moved to plain `bind` for the same reason; we extend
+        // that fix to single-key writers.
         this.frsPut =
-                bindCritical(
+                bind(
                         "frs_put",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -513,7 +523,7 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG)); // value_len
 
         this.frsGet =
-                bindCritical(
+                bind(
                         "frs_get",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -538,8 +548,11 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // out_ptr (*const u8*)
                                 ValueLayout.ADDRESS)); // out_len (usize*)
 
+        // D-R4-NEW-H1: same rationale as frs_put — get_and_put + delete
+        // also call into write_single → may_throttle() and must not
+        // suspend safepoints. Plain `bind`.
         this.frsGetAndPut =
-                bindCritical(
+                bind(
                         "frs_get_and_put",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -552,7 +565,7 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out FrsBytes* (old value)
 
         this.frsDelete =
-                bindCritical(
+                bind(
                         "frs_delete",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -616,12 +629,8 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // array (FFI_ArrowArray*)
                                 ValueLayout.ADDRESS)); // schema (FFI_ArrowSchema*)
 
-        // PR-B2 (D-H2): critical mode — frs_batch_get_arrow is synchronous (no thread
-        // park, no blocking I/O on the engine path; LSM memtable reads + Arrow C
-        // Data Interface export). The MAX_BATCH_COUNT cap inside the Rust impl
-        // bounds wall-clock so the JVM safepoint window is acceptable.
         this.frsBatchGetArrow =
-                bindCritical(
+                bind(
                         "frs_batch_get_arrow",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -661,9 +670,8 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out_seq (u64*)
 
         // 6. Delta-Join lookup + iterator
-        // frsLookupKv is hot — same critical-mode binding as frsGet.
         this.frsLookupKv =
-                bindCritical(
+                bind(
                         "frs_lookup_kv",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -674,7 +682,7 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out FrsBytes*
 
         this.frsGetIntoBuf =
-                bindCritical(
+                bind(
                         "frs_get_into_buf",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -687,9 +695,10 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS)); // out_val_len ptr
 
         // frs_get_fast: same signature as frs_get_into_buf but skips catch_unwind
-        // and Arc::clone on the FFI hot path. ~1.5µs faster per call.
+        // and Arc::clone on the FFI hot path. Keep it safepoint-friendly because
+        // full LSM reads may still touch blocking storage.
         this.frsGetFast =
-                bindCritical(
+                bind(
                         "frs_get_fast",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -928,10 +937,8 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // db
                                 ValueLayout.ADDRESS)); // snapshot (FrsSnapshot)
 
-        // get_at is hot like get/lookup_kv — bound critical so heap-byte-array
-        // segments work without per-call native staging.
         this.frsGetAt =
-                bindCritical(
+                bind(
                         "frs_get_at",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
@@ -1167,13 +1174,11 @@ public final class ForStRsLinker {
      * Linker.Option#critical(boolean) critical(true)}). Critical-mode handles can accept heap
      * {@link MemorySegment}s such as {@link MemorySegment#ofArray(byte[])}; the linker pins the
      * underlying primitive array for the duration of the native call instead of forcing the caller
-     * to stage bytes through a per-call native arena. This eliminates two {@code Arena.allocate} +
-     * {@code MemorySegment.copy} pairs per put/get, making the FFM bridge competitive with the JNI
-     * {@code GetByteArrayElements} pin path.
+     * to stage bytes through a per-call native arena.
      *
-     * <p>Use only on hot point-op symbols ({@code frs_put}, {@code frs_get}, {@code frs_delete},
-     * {@code frs_lookup_kv}) — critical mode disables the JVM's safepoint mechanism for the
-     * duration of the call, so the native function MUST return promptly and MUST NOT block.
+     * <p>Use only on tiny non-blocking symbols such as {@code frs_get_pinned} and
+     * {@code frs_bytes_free}. Full LSM reads and all writers stay on plain downcalls because they
+     * can touch storage or throttling paths and must remain JVM-safepoint-friendly.
      */
     private MethodHandle bindCritical(String name, FunctionDescriptor descriptor) {
         MemorySegment sym =
@@ -1539,9 +1544,8 @@ public final class ForStRsLinker {
     /**
      * Writes a key/value pair.
      *
-     * <p>Hot path: the key/value arrays are passed directly to the critical-mode {@code frs_put}
-     * downcall handle via {@link MemorySegment#ofArray(byte[])}. The Linker pins both arrays for
-     * the duration of the native call instead of staging them through a per-call native arena.
+     * <p>The downcall remains non-critical because the Rust write path can throttle or stall, so
+     * the key/value arrays are staged into native memory before crossing FFM.
      */
     public void put(FrsDb db, FrsCfHandle cf, byte[] key, byte[] value) {
         put(db, cf, key, value, 0, value.length);
@@ -1578,23 +1582,25 @@ public final class ForStRsLinker {
                             + " value.length="
                             + value.length);
         }
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        MemorySegment valSeg = MemorySegment.ofArray(value).asSlice(valueOffset, valueLength);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsPut.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    valSeg,
-                                    (long) valueLength);
-        } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            MemorySegment valSeg = copyBytesRangeToNative(local, value, valueOffset, valueLength);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsPut.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        valSeg,
+                                        (long) valueLength);
+            } catch (Throwable t) {
+                throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
+            }
+            check(rc, "frs_put");
         }
-        check(rc, "frs_put");
     }
 
     /** Returns the value for {@code key} or {@code null} if absent. */
@@ -1744,40 +1750,40 @@ public final class ForStRsLinker {
             return (int) len;
         }
 
-        // ----- 2. Not inline: try frs_get_fast directly into the per-thread native buffer.
-        byte[] fastOutBuf = GET_INTO_BUF.get();
-        MemorySegment fastOutSeg = MemorySegment.ofArray(fastOutBuf);
-        byte[] lenBuf = GET_INTO_LEN_BUF.get();
-        MemorySegment lenSeg = MemorySegment.ofArray(lenBuf);
-        int fastRc;
-        try {
-            fastRc =
-                    (int)
-                            frsGetFast.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySlice,
-                                    (long) keyLen,
-                                    fastOutSeg,
-                                    (long) GET_INTO_BUF_CAP,
-                                    lenSeg);
-        } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_get_fast (segment) threw: " + t.getMessage());
-        }
-        if (fastRc == 0) {
-            long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
-            if (valLen == 0) {
-                return -1;
+        // ----- 2. Not inline: try frs_get_fast through native staging. The downcall is plain
+        // (safepoint-friendly), so heap segments must not cross the FFM boundary.
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment nativeKey = copySegmentToNative(local, keySlice, 0L, keyLen);
+            MemorySegment fastOutSeg = local.allocate(GET_INTO_BUF_CAP);
+            MemorySegment lenSeg = local.allocate(Long.BYTES);
+            int fastRc;
+            try {
+                fastRc =
+                        (int)
+                                frsGetFast.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        nativeKey,
+                                        (long) keyLen,
+                                        fastOutSeg,
+                                        (long) GET_INTO_BUF_CAP,
+                                        lenSeg);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_get_fast (segment) threw: " + t.getMessage());
             }
-            if (valLen > outMaxLen) {
-                throw new IllegalArgumentException(
-                        "out segment too small: need " + valLen + " bytes, got " + outMaxLen);
+            if (fastRc == 0) {
+                long valLen = lenSeg.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+                if (valLen == 0) {
+                    return -1;
+                }
+                if (valLen > outMaxLen) {
+                    throw new IllegalArgumentException(
+                            "out segment too small: need " + valLen + " bytes, got " + outMaxLen);
+                }
+                MemorySegment.copy(fastOutSeg, 0L, outSegment, outOffset, valLen);
+                return (int) valLen;
             }
-            // byte[] → native copy. The byte[] is a JVM ThreadLocal, not a per-call alloc.
-            MemorySegment.copy(
-                    fastOutBuf, 0, outSegment, ValueLayout.JAVA_BYTE, outOffset, (int) valLen);
-            return (int) valLen;
         }
 
         // ----- 3. Cold path: value > GET_INTO_BUF_CAP — fall back to legacy byte[] entry.
@@ -1798,8 +1804,8 @@ public final class ForStRsLinker {
 
     /**
      * Segment-based variant of {@link #put}. Caller-owned segments for both key and value. The
-     * key/value slices are passed directly to the critical-mode {@code frs_put} FFI (no per-call
-     * {@code byte[]} allocation) — PR-B1 (V2-10).
+     * key/value slices are passed directly to {@code frs_put} (no per-call {@code byte[]}
+     * allocation) — PR-B1 (V2-10).
      */
     public void putSegment(
             FrsDb db,
@@ -1834,8 +1840,8 @@ public final class ForStRsLinker {
     }
 
     /**
-     * Segment-based delete (key only). The key slice is passed directly to the critical-mode
-     * {@code frs_delete} FFI — no {@code byte[]} allocation (PR-B1 / V2-10).
+     * Segment-based delete (key only). The key slice is passed directly to {@code frs_delete} — no
+     * {@code byte[]} allocation (PR-B1 / V2-10).
      */
     public void deleteSegment(
             FrsDb db,
@@ -1892,38 +1898,39 @@ public final class ForStRsLinker {
                             + " newValue.length="
                             + newValue.length);
         }
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        MemorySegment valSeg =
-                MemorySegment.ofArray(newValue).asSlice(newValueOffset, newValueLength);
-        byte[] outBytesArr = FRS_BYTES_BUF.get();
-        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsGetAndPut.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    valSeg,
-                                    (long) newValueLength,
-                                    outBytes);
-        } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_get_and_put threw: " + t.getMessage());
-        }
-        if (rc == FrsStatus.NOT_FOUND.code()) {
-            return null; // key didn't exist before the put (put still succeeded)
-        }
-        check(rc, "frs_get_and_put");
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            MemorySegment valSeg =
+                    copyBytesRangeToNative(local, newValue, newValueOffset, newValueLength);
+            MemorySegment outBytes = local.allocate(24);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsGetAndPut.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        valSeg,
+                                        (long) newValueLength,
+                                        outBytes);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_get_and_put threw: " + t.getMessage());
+            }
+            if (rc == FrsStatus.NOT_FOUND.code()) {
+                return null; // key didn't exist before the put (put still succeeded)
+            }
+            check(rc, "frs_get_and_put");
 
-        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
-        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
-        if (dataAddr == 0L) {
-            return null;
+            long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+            long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
+            if (dataAddr == 0L) {
+                return null;
+            }
+            return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_and_put/free");
         }
-        return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_and_put/free");
     }
 
     /**
@@ -2773,14 +2780,20 @@ public final class ForStRsLinker {
 
     /** Deletes {@code key} from the column family. No-op if absent. */
     public void delete(FrsDb db, FrsCfHandle cf, byte[] key) {
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        int rc;
-        try {
-            rc = (int) frsDelete.invokeExact(db.handle(), cf.handle(), keySeg, (long) key.length);
-        } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, "frs_delete threw: " + t.getMessage());
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsDelete.invokeExact(
+                                        db.handle(), cf.handle(), keySeg, (long) key.length);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_delete threw: " + t.getMessage());
+            }
+            check(rc, "frs_delete");
         }
-        check(rc, "frs_delete");
     }
 
     // ------------------------------------------------------------------
@@ -2842,44 +2855,39 @@ public final class ForStRsLinker {
     }
 
     private static final int GET_INTO_BUF_CAP = 4096;
-    private static final ThreadLocal<byte[]> GET_INTO_BUF =
-            ThreadLocal.withInitial(() -> new byte[GET_INTO_BUF_CAP]);
-    private static final ThreadLocal<byte[]> GET_INTO_LEN_BUF =
-            ThreadLocal.withInitial(() -> new byte[8]);
-
     public byte[] getIntoBuf(FrsDb db, FrsCfHandle cf, byte[] key) {
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        byte[] outBuf = GET_INTO_BUF.get();
-        MemorySegment outBufSeg = MemorySegment.ofArray(outBuf);
-        byte[] lenBuf = GET_INTO_LEN_BUF.get();
-        MemorySegment lenSeg = MemorySegment.ofArray(lenBuf);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsGetIntoBuf.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    outBufSeg,
-                                    (long) GET_INTO_BUF_CAP,
-                                    lenSeg);
-        } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_get_into_buf threw: " + t.getMessage());
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            MemorySegment outBufSeg = local.allocate(GET_INTO_BUF_CAP);
+            MemorySegment lenSeg = local.allocate(Long.BYTES);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsGetIntoBuf.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        outBufSeg,
+                                        (long) GET_INTO_BUF_CAP,
+                                        lenSeg);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_get_into_buf threw: " + t.getMessage());
+            }
+            if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL
+                return lookupKv(db, cf, key);
+            }
+            check(rc, "frs_get_into_buf");
+            long valLen = lenSeg.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+            if (valLen == 0) {
+                return null;
+            }
+            byte[] result = new byte[(int) valLen];
+            MemorySegment.copy(outBufSeg, ValueLayout.JAVA_BYTE, 0, result, 0, (int) valLen);
+            return result;
         }
-        if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL
-            return lookupKv(db, cf, key);
-        }
-        check(rc, "frs_get_into_buf");
-        long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
-        if (valLen == 0) {
-            return null;
-        }
-        byte[] result = new byte[(int) valLen];
-        System.arraycopy(outBuf, 0, result, 0, (int) valLen);
-        return result;
     }
 
     /**
@@ -2889,40 +2897,41 @@ public final class ForStRsLinker {
      * TaskExecutor (the backend holds the db open until close).
      */
     public byte[] getFast(FrsDb db, FrsCfHandle cf, byte[] key) {
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        byte[] outBuf = GET_INTO_BUF.get();
-        MemorySegment outBufSeg = MemorySegment.ofArray(outBuf);
-        byte[] lenBuf = GET_INTO_LEN_BUF.get();
-        MemorySegment lenSeg = MemorySegment.ofArray(lenBuf);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsGetFast.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    outBufSeg,
-                                    (long) GET_INTO_BUF_CAP,
-                                    lenSeg);
-        } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, "frs_get_fast threw: " + t.getMessage());
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            MemorySegment outBufSeg = local.allocate(GET_INTO_BUF_CAP);
+            MemorySegment lenSeg = local.allocate(Long.BYTES);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsGetFast.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        outBufSeg,
+                                        (long) GET_INTO_BUF_CAP,
+                                        lenSeg);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_get_fast threw: " + t.getMessage());
+            }
+            if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL → fall back to general get
+                return get(db, cf, key);
+            }
+            if (rc != 0) {
+                // Caller-side fallback (no exception): get_fast trades robustness for speed.
+                return get(db, cf, key);
+            }
+            long valLen = lenSeg.get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
+            if (valLen == 0) {
+                return null;
+            }
+            byte[] result = new byte[(int) valLen];
+            MemorySegment.copy(outBufSeg, ValueLayout.JAVA_BYTE, 0, result, 0, (int) valLen);
+            return result;
         }
-        if (rc == 17) { // FRS_STATUS_BUFFER_TOO_SMALL → fall back to general get
-            return get(db, cf, key);
-        }
-        if (rc != 0) {
-            // Caller-side fallback (no exception): get_fast trades robustness for speed.
-            return get(db, cf, key);
-        }
-        long valLen = MemorySegment.ofArray(lenBuf).get(ValueLayout.JAVA_LONG_UNALIGNED, 0);
-        if (valLen == 0) {
-            return null;
-        }
-        byte[] result = new byte[(int) valLen];
-        System.arraycopy(outBuf, 0, result, 0, (int) valLen);
-        return result;
     }
 
     /** Opens a forward iterator over the entire column family. */
@@ -3232,37 +3241,59 @@ public final class ForStRsLinker {
     /**
      * Shared Get/LookupKv helper: marshals the key, reads the FrsBytes, frees the buffer.
      *
-     * <p>Hot path optimization: both the key buffer and the small (24-byte) {@code FrsBytes} out
-     * struct are heap-allocated and passed via {@link MemorySegment#ofArray(byte[])} to the
-     * critical-mode handle, eliminating any per-call native allocation. The pointer + length we
-     * read back from the heap-byte-array view use unaligned address/long layouts (alignment 1)
-     * because a {@code byte[]} only guarantees 1-byte alignment.
-     *
-     * <p>The 24-byte out buffer is pooled via ThreadLocal to avoid per-call allocation (Phase B1+B3
-     * optimization).
+     * <p>Plain downcalls are JVM-safepoint-friendly but cannot rely on critical-mode heap segment
+     * pinning, so the key and 24-byte {@code FrsBytes} out struct are staged in a confined native
+     * arena for the duration of the call.
      */
     private byte[] getInternal(MethodHandle mh, String fn, FrsDb db, FrsCfHandle cf, byte[] key) {
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
-        byte[] outBytesArr = FRS_BYTES_BUF.get();
-        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            mh.invokeExact(
-                                    db.handle(), cf.handle(), keySeg, (long) key.length, outBytes);
-        } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, fn + " threw: " + t.getMessage());
-        }
-        check(rc, fn);
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
+            MemorySegment outBytes = local.allocate(24);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                mh.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        outBytes);
+            } catch (Throwable t) {
+                throw new FrsBackendException(FrsStatus.PANIC, fn + " threw: " + t.getMessage());
+            }
+            check(rc, fn);
 
-        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
-        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
-        if (dataAddr == 0L) {
-            return null; // not found
+            long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+            long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
+            if (dataAddr == 0L) {
+                return null; // not found
+            }
+            return copyAndFreeRaw(outBytes, dataAddr, len, fn + "/free");
         }
-        return copyAndFreeRaw(outBytes, dataAddr, len, fn + "/free");
+    }
+
+    private static MemorySegment copyBytesToNative(Arena arena, byte[] bytes) {
+        return copyBytesRangeToNative(arena, bytes, 0, bytes.length);
+    }
+
+    private static MemorySegment copyBytesRangeToNative(
+            Arena arena, byte[] bytes, int offset, int len) {
+        MemorySegment dst = arena.allocate(Math.max(1L, (long) len));
+        if (len > 0) {
+            MemorySegment.copy(bytes, offset, dst, ValueLayout.JAVA_BYTE, 0, len);
+        }
+        return dst;
+    }
+
+    private static MemorySegment copySegmentToNative(
+            Arena arena, MemorySegment src, long offset, long len) {
+        MemorySegment dst = arena.allocate(Math.max(1L, len));
+        if (len > 0) {
+            MemorySegment.copy(src, offset, dst, 0L, len);
+        }
+        return dst;
     }
 
     /** Reads a non-null FrsBytes payload, copies to byte[], and frees the native buffer. */
@@ -3512,38 +3543,38 @@ public final class ForStRsLinker {
      * {@code null} if no version is visible (or the latest visible version is a tombstone).
      */
     public byte[] getAt(FrsDb db, FrsCfHandle cf, FrsSnapshot snapshot, byte[] key) {
-        MemorySegment keySeg = MemorySegment.ofArray(key);
-        // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
-        byte[] outBytesArr = new byte[24];
-        MemorySegment outBytes = MemorySegment.ofArray(outBytesArr);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsGetAt.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    snapshot.handle(),
-                                    keySeg,
-                                    (long) key.length,
-                                    outBytes);
-        } catch (Throwable t) {
-            throw new FrsBackendException(FrsStatus.PANIC, "frs_get_at threw: " + t.getMessage());
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
+            MemorySegment outBytes = local.allocate(24);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsGetAt.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        snapshot.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        outBytes);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_get_at threw: " + t.getMessage());
+            }
+            if (rc == FrsStatus.NOT_FOUND.code()) {
+                return null;
+            }
+            check(rc, "frs_get_at");
+            long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
+            long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
+            if (dataAddr == 0L) {
+                // Defensive: native should have returned NOT_FOUND already, but
+                // honor the same hit/miss convention as Get.
+                return null;
+            }
+            return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_at/free");
         }
-        if (rc == FrsStatus.NOT_FOUND.code()) {
-            return null;
-        }
-        check(rc, "frs_get_at");
-        // Heap byte[24] only guarantees 1-byte alignment; use unaligned reads
-        // (mirrors `getInternal` for the non-snapshot Get path).
-        long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
-        long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
-        if (dataAddr == 0L) {
-            // Defensive: native should have returned NOT_FOUND already, but
-            // honor the same hit/miss convention as Get.
-            return null;
-        }
-        return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_at/free");
     }
 
     /**
