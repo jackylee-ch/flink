@@ -18,6 +18,7 @@
 
 package org.apache.flink.state.forstrs;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
@@ -68,6 +69,21 @@ import java.util.UUID;
 public class ForStRsStateBackend implements StateBackend {
 
     private static final long serialVersionUID = 1L;
+
+    private final ForStRsOptions options;
+
+    public ForStRsStateBackend() {
+        this(new ForStRsOptions());
+    }
+
+    ForStRsStateBackend(ForStRsOptions options) {
+        this.options = options == null ? new ForStRsOptions() : options;
+    }
+
+    @VisibleForTesting
+    ForStRsOptions optionsForTesting() {
+        return options;
+    }
 
     @Override
     public boolean supportsAsyncKeyedStateBackend() {
@@ -155,7 +171,29 @@ public class ForStRsStateBackend implements StateBackend {
         FrsDb db = null;
         FrsCfHandle cf = null;
         try {
-            db = linker.dbOpen(arena, localDbPath.toString());
+            String storageUri = options.storageUri();
+            if (storageUri != null && !storageUri.isEmpty()) {
+                String cacheDir = options.cacheDir();
+                if (cacheDir == null || cacheDir.isEmpty()) {
+                    cacheDir = localDbPath.resolveSibling("cache").toString();
+                    Files.createDirectories(Path.of(cacheDir));
+                }
+                db =
+                        linker.dbOpenRemoteWithOptions(
+                                arena,
+                                storageUri,
+                                options.opendalConfigJson(),
+                                cacheDir,
+                                options.cacheCapacityBytes(),
+                                options.writeBufferSizeBytes(),
+                                options.maxWriteBufferNumber(),
+                                options.maxBackgroundCompactions(),
+                                options.maxBackgroundFlushes(),
+                                options.blockCacheCapacityBytes(),
+                                options.writeBufferManagerCapacityBytes());
+            } else {
+                db = openLocalDbWithOptions(arena, linker, localDbPath);
+            }
             cf = linker.dbDefaultCf(db, arena);
             org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<K> backend =
                     new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
@@ -228,7 +266,6 @@ public class ForStRsStateBackend implements StateBackend {
         boolean handedOff = false;
         try {
 
-        ForStRsOptions options = new ForStRsOptions();
         Environment env = parameters.getEnv();
 
         // Resolve a unique local DB path under the TaskManager's tmp working directory.
@@ -260,10 +297,7 @@ public class ForStRsStateBackend implements StateBackend {
             // rejected with a typed exception that surfaces back to the JM.
             Collection<KeyedStateHandle> restoredHandles = parameters.getStateHandles();
             String storageUri = options.storageUri();
-            boolean useRestore =
-                    restoredHandles != null
-                            && !restoredHandles.isEmpty()
-                            && (storageUri == null || storageUri.isEmpty());
+            boolean useRestore = restoredHandles != null && !restoredHandles.isEmpty();
 
             ForStRsRestoreOperation.RestoreResult restored = null;
             if (useRestore) {
@@ -285,15 +319,21 @@ public class ForStRsStateBackend implements StateBackend {
                     Files.createDirectories(Path.of(cacheDir));
                 }
                 db =
-                        linker.dbOpenRemote(
+                        linker.dbOpenRemoteWithOptions(
                                 arena,
                                 storageUri,
                                 options.opendalConfigJson(),
                                 cacheDir,
-                                options.cacheCapacityBytes());
+                                options.cacheCapacityBytes(),
+                                options.writeBufferSizeBytes(),
+                                options.maxWriteBufferNumber(),
+                                options.maxBackgroundCompactions(),
+                                options.maxBackgroundFlushes(),
+                                options.blockCacheCapacityBytes(),
+                                options.writeBufferManagerCapacityBytes());
                 cf = linker.dbDefaultCf(db, arena);
             } else {
-                db = linker.dbOpen(arena, localDbPath.toString());
+                db = openLocalDbWithOptions(arena, linker, localDbPath);
                 cf = linker.dbDefaultCf(db, arena);
             }
 
@@ -483,5 +523,17 @@ public class ForStRsStateBackend implements StateBackend {
             return UUID.randomUUID();
         }
         return inc.getBackendIdentifier();
+    }
+
+    private FrsDb openLocalDbWithOptions(Arena arena, ForStRsLinker linker, Path localDbPath) {
+        return linker.dbOpenWithOptions(
+                arena,
+                localDbPath.toString(),
+                options.writeBufferSizeBytes(),
+                options.maxWriteBufferNumber(),
+                options.maxBackgroundCompactions(),
+                options.maxBackgroundFlushes(),
+                options.blockCacheCapacityBytes(),
+                options.writeBufferManagerCapacityBytes());
     }
 }

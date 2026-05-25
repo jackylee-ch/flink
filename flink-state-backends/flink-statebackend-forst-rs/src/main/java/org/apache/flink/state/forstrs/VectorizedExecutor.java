@@ -343,10 +343,14 @@ public class VectorizedExecutor implements StateExecutor {
         // R29-M2 closes); failing the container future is the same shape the
         // AsyncExecutionController already handles for batch-dispatch failures.
         if (shutdown.get()) {
-            return CompletableFuture.failedFuture(
+            IllegalStateException err =
                     new IllegalStateException(
                             "VectorizedExecutor shutdown: rejecting batch request"
-                                    + " (backend dispose() is in progress)"));
+                                    + " (backend dispose() is in progress)");
+            if (container instanceof VectorizedClassifier classifier) {
+                drainPendingFuturesExceptionally(classifier, err);
+            }
+            return CompletableFuture.failedFuture(err);
         }
         VectorizedClassifier classifier = (VectorizedClassifier) container;
         if (metrics != null) {
@@ -364,6 +368,9 @@ public class VectorizedExecutor implements StateExecutor {
             Throwable poison = classifier.batchPoisonCause();
             if (poison != null) {
                 return CompletableFuture.failedFuture(poison);
+            }
+            if (requiresOrderedDispatch(classifier)) {
+                return executeBatchInOfferOrder(classifier);
             }
             // Spec §Correctness Invariant 2: any deferred / cached writes must be
             // flushed BEFORE iterator ops. Within a single batch the natural
@@ -483,8 +490,194 @@ public class VectorizedExecutor implements StateExecutor {
         }
     }
 
+    private CompletableFuture<Void> executeBatchInOfferOrder(VectorizedClassifier classifier) {
+        if (classifier.hasOffHeapAppendMergeRows()) {
+            IllegalStateException err =
+                    new IllegalStateException(
+                            "ForSt-RS batch contains same-key ordering hazards involving "
+                                    + "off-heap APPEND_MERGE rows; fail fast to avoid replaying "
+                                    + "already-staged list operands out of order");
+            drainPendingFuturesExceptionally(classifier, err);
+            return CompletableFuture.failedFuture(err);
+        }
+        StateRequest<?, ?, ?, ?>[] reqs = classifier.orderedRequests();
+        int n = classifier.orderedCount();
+        Throwable firstFailure = null;
+        for (int i = 0; i < n; i++) {
+            try {
+                executeRequestSync(reqs[i], true);
+            } catch (Throwable t) {
+                if (firstFailure == null) {
+                    firstFailure = t;
+                    for (int j = i + 1; j < n; j++) {
+                        try {
+                            completePutExceptionally(reqs[j], t);
+                        } catch (Throwable ignored) {
+                            // Continue draining the unexecuted tail so ordered replay is fail-stop.
+                        }
+                    }
+                    break;
+                } else {
+                    firstFailure.addSuppressed(t);
+                }
+            }
+        }
+        return firstFailure == null
+                ? CompletableFuture.completedFuture(null)
+                : CompletableFuture.failedFuture(firstFailure);
+    }
+
+    private boolean requiresOrderedDispatch(VectorizedClassifier classifier) {
+        int writes =
+                classifier.putCount() + classifier.deleteCount() + classifier.appendMergeCount();
+        if (writes == 0) {
+            return false;
+        }
+        if (!classifier.iterRequests().isEmpty()) {
+            return true;
+        }
+        AppendMergeBatchBuffer appendMerge = classifier.appendMergeBuffer();
+        ColumnarBatchBuffer heapAppendKeys = appendMerge == null ? null : appendMerge.keyBuffer();
+        int heapAppendCount = heapAppendKeys == null ? 0 : heapAppendKeys.count();
+        ColumnarBatchBuffer offHeapAppendKeys = classifier.offHeapAppendMergeKeys();
+        int offHeapAppendCount = offHeapAppendKeys == null ? 0 : offHeapAppendKeys.count();
+        if (hasSameKey(
+                        classifier.getKeys(),
+                        classifier.getCount(),
+                        classifier.putKeys(),
+                        classifier.putCount())
+                || hasSameKey(
+                        classifier.getKeys(), classifier.getCount(), heapAppendKeys, heapAppendCount)
+                || hasSameKey(
+                        classifier.getKeys(),
+                        classifier.getCount(),
+                        offHeapAppendKeys,
+                        offHeapAppendCount)
+                || hasSameKey(
+                        classifier.putKeys(), classifier.putCount(), heapAppendKeys, heapAppendCount)
+                || hasSameKey(
+                        classifier.putKeys(),
+                        classifier.putCount(),
+                        offHeapAppendKeys,
+                        offHeapAppendCount)) {
+            return true;
+        }
+        return hasDeleteOrderingHazard(
+                classifier, heapAppendKeys, heapAppendCount, offHeapAppendKeys, offHeapAppendCount);
+    }
+
+    private boolean hasDeleteOrderingHazard(
+            VectorizedClassifier classifier,
+            ColumnarBatchBuffer heapAppendKeys,
+            int heapAppendCount,
+            ColumnarBatchBuffer offHeapAppendKeys,
+            int offHeapAppendCount) {
+        int deleteCount = classifier.deleteCount();
+        if (deleteCount == 0) {
+            return false;
+        }
+        StateRequest<?, ?, ?, ?>[] deleteReqs = classifier.deleteRequests();
+        ColumnarBatchBuffer deleteKeys = classifier.deleteKeys();
+        for (int i = 0; i < deleteCount; i++) {
+            boolean prefixDelete = deleteReqs[i].getRequestType() == StateRequestType.CLEAR;
+            if (hasDeleteConflict(
+                            deleteKeys, i, classifier.getKeys(), classifier.getCount(), prefixDelete)
+                    || hasDeleteConflict(
+                            deleteKeys, i, classifier.putKeys(), classifier.putCount(), prefixDelete)
+                    || hasDeleteConflict(deleteKeys, i, heapAppendKeys, heapAppendCount, prefixDelete)
+                    || hasDeleteConflict(
+                            deleteKeys, i, offHeapAppendKeys, offHeapAppendCount, prefixDelete)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasSameKey(
+            ColumnarBatchBuffer left, int leftCount, ColumnarBatchBuffer right, int rightCount) {
+        if (left == null || right == null || leftCount == 0 || rightCount == 0) {
+            return false;
+        }
+        for (int i = 0; i < leftCount; i++) {
+            for (int j = 0; j < rightCount; j++) {
+                if (sliceEquals(left, i, right, j)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasDeleteConflict(
+            ColumnarBatchBuffer deleteKeys,
+            int deleteRow,
+            ColumnarBatchBuffer other,
+            int otherCount,
+            boolean prefixDelete) {
+        if (other == null || otherCount == 0) {
+            return false;
+        }
+        for (int i = 0; i < otherCount; i++) {
+            if (prefixDelete
+                    ? sliceStartsWith(other, i, deleteKeys, deleteRow)
+                    : sliceEquals(deleteKeys, deleteRow, other, i)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean sliceEquals(
+            ColumnarBatchBuffer left, int leftRow, ColumnarBatchBuffer right, int rightRow) {
+        int leftStart = sliceStart(left, leftRow);
+        int leftLen = sliceEnd(left, leftRow) - leftStart;
+        int rightStart = sliceStart(right, rightRow);
+        int rightLen = sliceEnd(right, rightRow) - rightStart;
+        if (leftLen != rightLen) {
+            return false;
+        }
+        return sliceBytesEqual(
+                left.dataSegment(), leftStart, right.dataSegment(), rightStart, leftLen);
+    }
+
+    private static boolean sliceStartsWith(
+            ColumnarBatchBuffer value, int valueRow, ColumnarBatchBuffer prefix, int prefixRow) {
+        int valueStart = sliceStart(value, valueRow);
+        int valueLen = sliceEnd(value, valueRow) - valueStart;
+        int prefixStart = sliceStart(prefix, prefixRow);
+        int prefixLen = sliceEnd(prefix, prefixRow) - prefixStart;
+        if (prefixLen > valueLen) {
+            return false;
+        }
+        return sliceBytesEqual(
+                value.dataSegment(), valueStart, prefix.dataSegment(), prefixStart, prefixLen);
+    }
+
+    private static int sliceStart(ColumnarBatchBuffer buffer, int row) {
+        return buffer.offsetsSegment().get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+    }
+
+    private static int sliceEnd(ColumnarBatchBuffer buffer, int row) {
+        return buffer.offsetsSegment().get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+    }
+
+    private static boolean sliceBytesEqual(
+            MemorySegment left, long leftStart, MemorySegment right, long rightStart, int len) {
+        for (int i = 0; i < len; i++) {
+            if (left.get(ValueLayout.JAVA_BYTE, leftStart + i)
+                    != right.get(ValueLayout.JAVA_BYTE, rightStart + i)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
+        executeRequestSync(request, false);
+    }
+
+    private void executeRequestSync(StateRequest<?, ?, ?, ?> request, boolean rethrowFailure) {
         // R29-M2: same post-shutdown gate as {@link #executeBatchRequests}. The sync
         // path is used by SYNC_SAVEPOINT and tests; refusing new work post-shutdown
         // prevents UAF on the slot {@link Arena} that dispose() is about to close.
@@ -544,7 +737,20 @@ public class VectorizedExecutor implements StateExecutor {
             if (!single.takeClassifierCompletedExceptionally(request)) {
                 completePutExceptionally(request, t);
             }
+            if (rethrowFailure) {
+                throw asRuntimeException(t);
+            }
         }
+    }
+
+    private static RuntimeException asRuntimeException(Throwable t) {
+        if (t instanceof RuntimeException) {
+            return (RuntimeException) t;
+        }
+        if (t instanceof Error) {
+            throw (Error) t;
+        }
+        return new RuntimeException(t);
     }
 
     private void executeRequestSyncInner(VectorizedClassifier single) {
@@ -569,6 +775,7 @@ public class VectorizedExecutor implements StateExecutor {
             // B5-H7: flatten heap-path futures to avoid per-row List.get() interface dispatch.
             CompletableFuture<Void>[] heapFuturesArr = null;
             int heapFuturesSize = 0;
+            Throwable firstAppendFailure = null;
             if (heapFutures != null && !heapFutures.isEmpty()) {
                 heapFuturesArr = flattenHeapFutures(heapFutures);
                 heapFuturesSize = heapFutures.size();
@@ -597,9 +804,15 @@ public class VectorizedExecutor implements StateExecutor {
                     // completion attempt for this same single request.
                     single.markCompletedExceptionally(amReqs[i]);
                     completePutExceptionally(amReqs[i], cause);
+                    if (firstAppendFailure == null) {
+                        firstAppendFailure = cause;
+                    }
                 } else {
                     completePut(amReqs[i]);
                 }
+            }
+            if (firstAppendFailure != null) {
+                throw asRuntimeException(firstAppendFailure);
             }
         }
         IterPrefixBatchBuffer ipBuf = single.iterPrefixBuffer();
@@ -1206,9 +1419,8 @@ public class VectorizedExecutor implements StateExecutor {
      * batched FFI expects one operand per row — for multi-element {@code asyncAddAll}, the
      * caller should pre-concatenate elements into a single operand with {@code count=N}.
      *
-     * <p>NOT YET WIRED to any call site in Phase A.1 — {@link #dispatchAppendMerge} is still
-     * the only caller of the engine FFI. Phase A.2 switches the call site by replacing the
-     * per-row {@code dispatchAppendMerge} loop with this batched form.
+     * <p>Called by {@link #dispatchAppendMerge} for the single-operand batch path; legacy
+     * multi-operand rows still use the per-row dispatcher.
      *
      * @param buffer the APPEND_MERGE batch buffer populated by the classifier
      * @return native error code (0 = OK)
@@ -1240,79 +1452,95 @@ public class VectorizedExecutor implements StateExecutor {
         FrsErrorCode code;
         try (Arena scratch = Arena.ofConfined()) {
             try {
-                // B6-H4: lift the per-row List.get(row) interface dispatch onto a flattened
-                // scratch array via the same exponential-grow pattern as flattenHeapFutures.
-                // Reused across batches.
-                MemorySegment[] scratchSlices = flattenValueSlices(valueSliceLists);
                 // B6-H5: index-based completion loop — flatten the per-row futures list into
                 // a primitive array so the OK / error completion loops below don't allocate
                 // an ArrayList.Itr.
                 futuresArr = flattenHeapFutures(futures);
 
-                // A6-H3 / B6-H2 / D6-H1: per-batch Arena.ofConfined so opsOffSeg + opsDataSeg
-                // segments are reclaimed deterministically when the dispatch returns. The FFI
-                // call (frs_vec_merge_append_batch) is synchronous — engine copies the bytes
-                // into the WriteBatch before returning, so the scratch is safe to close. This
-                // replaces the previous "allocate from executor arena" path that caused
-                // monotonic growth at the audited rate of ~MB/s on a 10K-batch/s stream.
-                // B5-H7: opsOffsets uses the reusable scratchOpsOffsets field (grows on demand)
-                // so we don't `new int[count+1]` per dispatch; only the MemorySegment scratch
-                // moves to per-batch confined.
-                // Compute total ops byte size and per-row offset.
-                int[] opsOffsets = ensureScratchOpsOffsets(count + 1);
-                int opsTotal = 0;
                 MemorySegment valOffSeg = valBuf.offsetsSegment();
-                for (int row = 0; row < count; row++) {
-                    MemorySegment vs = scratchSlices[row];
-                    int opLen;
-                    if (vs == null) {
-                        // B6-H1: value lives in valBuf at this index — use its offset delta
-                        // as the size.
+                MemorySegment opsOffSeg;
+                MemorySegment opsDataSeg;
+                if (allValuesInValueBuffer(valueSliceLists)) {
+                    // The common Async ListState path already stores operands as an Arrow Binary
+                    // column. Hand that column directly to native merge-append instead of copying
+                    // it into a scratch ops buffer.
+                    opsOffSeg = valOffSeg;
+                    opsDataSeg = valBuf.dataSegment();
+                    for (int row = 0; row < count; row++) {
                         int vStart =
                                 valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
                         int vEnd =
                                 valOffSeg.get(
                                         ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                        opLen = vEnd - vStart;
-                    } else {
-                        opLen = (int) vs.byteSize();
+                        bytesIn += vEnd - vStart;
                     }
-                    opsOffsets[row] = opsTotal;
-                    opsTotal += opLen;
-                }
-                opsOffsets[count] = opsTotal;
+                } else {
+                    // B6-H4: lift the per-row List.get(row) interface dispatch onto a flattened
+                    // scratch array via the same exponential-grow pattern as flattenHeapFutures.
+                    // Reused across batches.
+                    MemorySegment[] scratchSlices = flattenValueSlices(valueSliceLists);
 
-                MemorySegment opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
-                MemorySegment opsDataSeg =
-                        opsTotal == 0 ? MemorySegment.NULL : scratch.allocate(opsTotal);
-                int writeOff = 0;
-                MemorySegment valDataSeg = valBuf.dataSegment();
-                for (int row = 0; row < count; row++) {
-                    opsOffSeg.set(
-                            ValueLayout.JAVA_INT, (long) row * Integer.BYTES, opsOffsets[row]);
-                    MemorySegment vs = scratchSlices[row];
-                    long opLen;
-                    if (vs == null) {
-                        // B6-H1: copy from the heap-path value column buffer.
-                        int vStart =
-                                valOffSeg.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-                        int vEnd =
-                                valOffSeg.get(
-                                        ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-                        opLen = vEnd - vStart;
-                        if (opLen > 0) {
-                            MemorySegment.copy(valDataSeg, vStart, opsDataSeg, writeOff, opLen);
+                    // A6-H3 / B6-H2 / D6-H1: per-batch Arena.ofConfined so opsOffSeg + opsDataSeg
+                    // segments are reclaimed deterministically when the dispatch returns.
+                    // B5-H7: opsOffsets uses the reusable scratchOpsOffsets field (grows on
+                    // demand) so we don't `new int[count+1]` per dispatch.
+                    int[] opsOffsets = ensureScratchOpsOffsets(count + 1);
+                    int opsTotal = 0;
+                    for (int row = 0; row < count; row++) {
+                        MemorySegment vs = scratchSlices[row];
+                        int opLen;
+                        if (vs == null) {
+                            int vStart =
+                                    valOffSeg.get(
+                                            ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                            int vEnd =
+                                    valOffSeg.get(
+                                            ValueLayout.JAVA_INT,
+                                            (long) (row + 1) * Integer.BYTES);
+                            opLen = vEnd - vStart;
+                        } else {
+                            opLen = (int) vs.byteSize();
                         }
-                    } else {
-                        opLen = vs.byteSize();
-                        if (opLen > 0) {
-                            MemorySegment.copy(vs, 0L, opsDataSeg, writeOff, opLen);
-                        }
+                        opsOffsets[row] = opsTotal;
+                        opsTotal += opLen;
                     }
-                    writeOff += (int) opLen;
-                    bytesIn += opLen;
+                    opsOffsets[count] = opsTotal;
+
+                    opsOffSeg = scratch.allocate(ValueLayout.JAVA_INT, count + 1L);
+                    opsDataSeg = opsTotal == 0 ? MemorySegment.NULL : scratch.allocate(opsTotal);
+                    int writeOff = 0;
+                    MemorySegment valDataSeg = valBuf.dataSegment();
+                    for (int row = 0; row < count; row++) {
+                        opsOffSeg.set(
+                                ValueLayout.JAVA_INT,
+                                (long) row * Integer.BYTES,
+                                opsOffsets[row]);
+                        MemorySegment vs = scratchSlices[row];
+                        long opLen;
+                        if (vs == null) {
+                            int vStart =
+                                    valOffSeg.get(
+                                            ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                            int vEnd =
+                                    valOffSeg.get(
+                                            ValueLayout.JAVA_INT,
+                                            (long) (row + 1) * Integer.BYTES);
+                            opLen = vEnd - vStart;
+                            if (opLen > 0) {
+                                MemorySegment.copy(
+                                        valDataSeg, vStart, opsDataSeg, writeOff, opLen);
+                            }
+                        } else {
+                            opLen = vs.byteSize();
+                            if (opLen > 0) {
+                                MemorySegment.copy(vs, 0L, opsDataSeg, writeOff, opLen);
+                            }
+                        }
+                        writeOff += (int) opLen;
+                        bytesIn += opLen;
+                    }
+                    opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
                 }
-                opsOffSeg.set(ValueLayout.JAVA_INT, (long) count * Integer.BYTES, opsTotal);
 
                 // Keys are already in the columnar layout of keyBuf — no copy.
                 MemorySegment keysOffSeg = keyBuf.offsetsSegment();
@@ -1326,15 +1554,7 @@ public class VectorizedExecutor implements StateExecutor {
                     bytesIn += kEnd - kStart;
                 }
 
-                rc =
-                        linker.frsVecMergeAppendBatch(
-                                db.handle(),
-                                cf.handle(),
-                                keysOffSeg,
-                                keysDataSeg,
-                                opsOffSeg,
-                                opsDataSeg,
-                                count);
+                rc = invokeVecMergeAppendBatch(keysOffSeg, keysDataSeg, opsOffSeg, opsDataSeg, count);
                 code = FrsErrorCode.fromU32(rc);
             } catch (Throwable t) {
                 // A7-H1: B12-C consolidation introduced this per-batch Arena.ofConfined
@@ -1769,6 +1989,17 @@ public class VectorizedExecutor implements StateExecutor {
                 outDataLenSegArg);
     }
 
+    /** Test seam for batched APPEND_MERGE dispatch. */
+    protected int invokeVecMergeAppendBatch(
+            MemorySegment keysOffSeg,
+            MemorySegment keysDataSeg,
+            MemorySegment opsOffSeg,
+            MemorySegment opsDataSeg,
+            int count) {
+        return linker.frsVecMergeAppendBatch(
+                db.handle(), cf.handle(), keysOffSeg, keysDataSeg, opsOffSeg, opsDataSeg, count);
+    }
+
     // -----------------------------------------------------------------
     // Future completion
     // -----------------------------------------------------------------
@@ -1815,6 +2046,22 @@ public class VectorizedExecutor implements StateExecutor {
             VectorizedClassifier classifier, Throwable cause) {
         if (classifier == null) {
             return;
+        }
+        classifier.discardOffHeapAppendMergeRows(cause);
+        // GET rows
+        StateRequest<?, ?, ?, ?>[] getReqs = classifier.getRequests();
+        ForStRsInnerTable<?, ?, ?>[] getTables = classifier.getTables();
+        int getCount = classifier.getCount();
+        for (int i = 0; i < getCount && getReqs != null && i < getReqs.length; i++) {
+            try {
+                if (classifier.takeClassifierCompletedExceptionally(getReqs[i])) {
+                    continue;
+                }
+                classifier.markCompletedExceptionally(getReqs[i]);
+                completeGetExceptionally(getReqs[i], getTables[i], cause);
+            } catch (Throwable ignore) {
+                // best-effort drain — never mask the primary cause
+            }
         }
         // PUT rows
         StateRequest<?, ?, ?, ?>[] putReqs = classifier.putRequests();
@@ -2057,6 +2304,16 @@ public class VectorizedExecutor implements StateExecutor {
         }
         scratchValueSlicesPrevSize = n;
         return scratchValueSlices;
+    }
+
+    private static boolean allValuesInValueBuffer(List<MemorySegment[]> valueSliceLists) {
+        int n = valueSliceLists.size();
+        for (int i = 0; i < n; i++) {
+            if (valueSliceLists.get(i) != null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**

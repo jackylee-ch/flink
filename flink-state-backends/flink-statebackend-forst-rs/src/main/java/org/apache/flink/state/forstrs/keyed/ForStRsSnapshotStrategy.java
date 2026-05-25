@@ -49,6 +49,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
@@ -163,6 +164,12 @@ public class ForStRsSnapshotStrategy
     private final java.util.concurrent.ConcurrentHashMap<Long, List<HandleAndLocalPath>>
             pendingRegistrations = new java.util.concurrent.ConcurrentHashMap<>();
 
+    /** Completed-checkpoint contribution ledger, released on checkpoint subsumption. */
+    private final java.util.concurrent.ConcurrentHashMap<Long, List<HandleAndLocalPath>>
+            completedRegistrations = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private final Object checkpointRegistrationLock = new Object();
+
     /**
      * E8-H2: per-checkpoint "aborted" markers. Populated by
      * {@link #takePendingRegistrationsForAbort} (called from {@code notifyCheckpointAborted})
@@ -258,6 +265,38 @@ public class ForStRsSnapshotStrategy
         clearAbortMarker(checkpointId);
     }
 
+    public List<HandleAndLocalPath> completeCheckpoint(long checkpointId) {
+        synchronized (checkpointRegistrationLock) {
+            recordCompletedCheckpoint(checkpointId);
+            List<HandleAndLocalPath> completed = takePendingRegistrations(checkpointId);
+            if (completed != null && !completed.isEmpty()) {
+                completedRegistrations.merge(
+                        checkpointId,
+                        completed,
+                        (oldList, newList) -> {
+                            ArrayList<HandleAndLocalPath> merged =
+                                    new ArrayList<>(oldList.size() + newList.size());
+                            merged.addAll(oldList);
+                            merged.addAll(newList);
+                            return merged;
+                        });
+            }
+            return completed;
+        }
+    }
+
+    public List<HandleAndLocalPath> takeCompletedRegistrationsForSubsumed(long checkpointId) {
+        synchronized (checkpointRegistrationLock) {
+            List<HandleAndLocalPath> list = completedRegistrations.remove(checkpointId);
+            if (list == null) {
+                return java.util.Collections.emptyList();
+            }
+            synchronized (list) {
+                return new ArrayList<>(list);
+            }
+        }
+    }
+
     /** Test accessor — returns the strategy's last-completed checkpoint id. */
     public long getLastCompletedCheckpointId() {
         return lastCompletedCheckpointId.get();
@@ -318,8 +357,32 @@ public class ForStRsSnapshotStrategy
             CheckpointStreamFactory streamFactory,
             CheckpointOptions checkpointOptions) {
         return (CloseableRegistry registry) -> {
+            SnapshotUploadTracker uploadTracker = new SnapshotUploadTracker();
+            boolean registeredTracker = false;
             try {
-                return doAsyncSnapshot(resources, streamFactory, checkpointOptions);
+                if (registry != null) {
+                    registry.registerCloseable(uploadTracker);
+                    registeredTracker = true;
+                }
+                SnapshotResult<KeyedStateHandle> result =
+                        doAsyncSnapshot(
+                                resources, streamFactory, checkpointOptions, uploadTracker);
+                if (isCheckpointAborted(checkpointId)) {
+                    throw new CancellationException(
+                            "Checkpoint " + checkpointId + " was aborted during async snapshot");
+                }
+                uploadTracker.commit();
+                if (registeredTracker) {
+                    registry.unregisterCloseable(uploadTracker);
+                }
+                return result;
+            } catch (Throwable t) {
+                rollbackPendingRegistrationsForFailedSnapshot(checkpointId);
+                if (registeredTracker && registry != null) {
+                    registry.unregisterCloseable(uploadTracker);
+                }
+                uploadTracker.close();
+                throw t;
             } finally {
                 // Whether success or failure, release the engine snapshot + result struct now —
                 // the uploaded handles + Java IncrementalKeyedStateHandle below carry zero
@@ -377,14 +440,19 @@ public class ForStRsSnapshotStrategy
      * {@link #drainLatePendingRegistrations(long, List)} as a defensive second sweep.
      */
     public List<HandleAndLocalPath> takePendingRegistrationsForAbort(long checkpointId) {
-        // E8-H2: install the abort marker BEFORE removing the list.
-        abortedCheckpoints.put(checkpointId, Boolean.TRUE);
-        List<HandleAndLocalPath> list = pendingRegistrations.remove(checkpointId);
-        if (list == null) {
-            return null;
-        }
-        synchronized (list) {
-            return new ArrayList<>(list);
+        synchronized (checkpointRegistrationLock) {
+            if (completedRegistrations.containsKey(checkpointId)) {
+                return null;
+            }
+            // E8-H2: install the abort marker BEFORE removing the list.
+            abortedCheckpoints.put(checkpointId, Boolean.TRUE);
+            List<HandleAndLocalPath> list = pendingRegistrations.remove(checkpointId);
+            if (list == null) {
+                return null;
+            }
+            synchronized (list) {
+                return new ArrayList<>(list);
+            }
         }
     }
 
@@ -401,7 +469,13 @@ public class ForStRsSnapshotStrategy
      * sweep exists to defend against future refactors that might re-introduce a window.
      */
     public List<HandleAndLocalPath> drainLatePendingRegistrations(long checkpointId) {
-        List<HandleAndLocalPath> late = pendingRegistrations.remove(checkpointId);
+        List<HandleAndLocalPath> late;
+        synchronized (checkpointRegistrationLock) {
+            if (completedRegistrations.containsKey(checkpointId)) {
+                return java.util.Collections.emptyList();
+            }
+            late = pendingRegistrations.remove(checkpointId);
+        }
         if (late == null) {
             return java.util.Collections.emptyList();
         }
@@ -410,6 +484,31 @@ public class ForStRsSnapshotStrategy
             late.clear();
             return copy;
         }
+    }
+
+    void rollbackPendingRegistrationsForFailedSnapshot(long checkpointId) {
+        List<HandleAndLocalPath> rollback;
+        synchronized (checkpointRegistrationLock) {
+            rollback = pendingRegistrations.remove(checkpointId);
+        }
+        if (rollback == null) {
+            return;
+        }
+        List<HandleAndLocalPath> copy;
+        synchronized (rollback) {
+            copy = new ArrayList<>(rollback);
+            rollback.clear();
+        }
+        for (HandleAndLocalPath h : copy) {
+            sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
+        }
+        if (!abortedCheckpoints.containsKey(checkpointId)) {
+            clearAbortMarker(checkpointId);
+        }
+    }
+
+    public boolean isCheckpointAborted(long checkpointId) {
+        return abortedCheckpoints.containsKey(checkpointId);
     }
 
     /**
@@ -462,9 +561,11 @@ public class ForStRsSnapshotStrategy
             return;
         }
         // Fast-path abort probe: if the abort handler has already installed the marker we
-        // skip the register entirely. (The canonical rollback list has been drained.)
+        // fail the in-flight snapshot. Silently skipping the register would let the async phase
+        // return a handle whose shared SSTs have no local registry contribution.
         if (abortedCheckpoints.containsKey(checkpointId)) {
-            return;
+            throw new CancellationException(
+                    "Checkpoint " + checkpointId + " was aborted before SST registration");
         }
         // E8-H2 invariant: register + list.add happen atomically under the list's monitor.
         // takePendingRegistrations acquires the same monitor when it copies the list — so the
@@ -477,7 +578,8 @@ public class ForStRsSnapshotStrategy
             // a guarantee that the handler's snapshot did not include our (yet-to-be-added)
             // entry. Skip both register and append.
             if (abortedCheckpoints.containsKey(checkpointId)) {
-                return;
+                throw new CancellationException(
+                        "Checkpoint " + checkpointId + " was aborted during SST registration");
             }
             sstRegistry.register(id, handle);
             installedList.add(HandleAndLocalPath.of(handle, id.getKeyString()));
@@ -506,7 +608,8 @@ public class ForStRsSnapshotStrategy
     private SnapshotResult<KeyedStateHandle> doAsyncSnapshot(
             ForStRsSnapshotResources resources,
             CheckpointStreamFactory streamFactory,
-            CheckpointOptions checkpointOptions)
+            CheckpointOptions checkpointOptions,
+            SnapshotUploadTracker uploadTracker)
             throws Exception {
         // R35-H2: branch on the checkpoint type's sharing strategy. Pre-R35-H2 the sync phase
         // set {@code baseCheckpointId = lastCompletedCheckpointId.get()} unconditionally, so a
@@ -605,7 +708,11 @@ public class ForStRsSnapshotStrategy
 
         // ---- Upload manifest (private state) under EXCLUSIVE scope. ----
         CompletableFuture<StreamStateHandle> manifestFut =
-                uploader.upload(manifestPath, streamFactory, CheckpointedStateScope.EXCLUSIVE);
+                trackedUpload(
+                        manifestPath,
+                        streamFactory,
+                        CheckpointedStateScope.EXCLUSIVE,
+                        uploadTracker);
 
         // ---- Upload each new SST. ----
         // R35-H2: under {@link SharingFilesStrategy#NO_SHARING} (FULL_CHECKPOINT and CANONICAL
@@ -622,7 +729,7 @@ public class ForStRsSnapshotStrategy
         for (Path p : newSstFiles) {
             String localPath = p.getFileName().toString();
             CompletableFuture<HandleAndLocalPath> f =
-                    uploader.upload(p, streamFactory, newSstScope)
+                    trackedUpload(p, streamFactory, newSstScope, uploadTracker)
                             .thenApply(h -> HandleAndLocalPath.of(h, localPath));
             newSstFuts.add(f);
         }
@@ -768,6 +875,7 @@ public class ForStRsSnapshotStrategy
         byte[] registryBlob = resources.getRegistryBlob();
         if (registryBlob != null && registryBlob.length > 0) {
             StreamStateHandle registryHandle = uploadRegistryBlob(registryBlob, streamFactory);
+            uploadTracker.trackHandle(registryHandle);
             privateStateEntries.add(
                     HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
         }
@@ -810,6 +918,113 @@ public class ForStRsSnapshotStrategy
                 streamFactory.createCheckpointStateOutputStream(CheckpointedStateScope.EXCLUSIVE)) {
             out.write(blob, 0, blob.length);
             return out.closeAndGetHandle();
+        }
+    }
+
+    private CompletableFuture<StreamStateHandle> trackedUpload(
+            Path file,
+            CheckpointStreamFactory streamFactory,
+            CheckpointedStateScope scope,
+            SnapshotUploadTracker uploadTracker) {
+        CompletableFuture<StreamStateHandle> future = uploader.upload(file, streamFactory, scope);
+        uploadTracker.track(future);
+        return future;
+    }
+
+    /**
+     * Tracks async upload futures/handles until the checkpoint handle is fully built. Closing the
+     * tracker means the checkpoint has failed or been cancelled, so all pending futures are
+     * cancelled and every already-created handle is discarded. Once {@link #commit()} runs, Flink's
+     * returned snapshot owns the handles and subsequent registry closure must not discard them.
+     */
+    private static final class SnapshotUploadTracker implements java.io.Closeable {
+        private final Object lock = new Object();
+        private final List<CompletableFuture<StreamStateHandle>> futures = new ArrayList<>();
+        private final List<StreamStateHandle> handles = new ArrayList<>();
+        private boolean closed;
+        private boolean committed;
+
+        void track(CompletableFuture<StreamStateHandle> future) {
+            synchronized (lock) {
+                if (closed && !committed) {
+                    future.cancel(true);
+                    return;
+                }
+                futures.add(future);
+            }
+            future.whenComplete(
+                    (handle, failure) -> {
+                        if (handle == null) {
+                            return;
+                        }
+                        boolean discardNow;
+                        synchronized (lock) {
+                            discardNow = closed && !committed;
+                            if (!discardNow) {
+                                handles.add(handle);
+                            }
+                        }
+                        if (discardNow) {
+                            discardQuietly(handle);
+                        }
+                    });
+        }
+
+        void trackHandle(StreamStateHandle handle) {
+            boolean discardNow;
+            synchronized (lock) {
+                discardNow = closed && !committed;
+                if (!discardNow) {
+                    handles.add(handle);
+                }
+            }
+            if (discardNow) {
+                discardQuietly(handle);
+            }
+        }
+
+        void commit() {
+            synchronized (lock) {
+                if (closed) {
+                    throw new CancellationException(
+                            "ForSt-RS snapshot upload tracker was closed before commit");
+                }
+                committed = true;
+                futures.clear();
+                handles.clear();
+            }
+        }
+
+        @Override
+        public void close() {
+            List<CompletableFuture<StreamStateHandle>> futuresToCancel;
+            List<StreamStateHandle> handlesToDiscard;
+            synchronized (lock) {
+                if (closed) {
+                    return;
+                }
+                closed = true;
+                if (committed) {
+                    return;
+                }
+                futuresToCancel = new ArrayList<>(futures);
+                handlesToDiscard = new ArrayList<>(handles);
+                handles.clear();
+            }
+            for (CompletableFuture<StreamStateHandle> future : futuresToCancel) {
+                future.cancel(true);
+            }
+            for (StreamStateHandle handle : handlesToDiscard) {
+                discardQuietly(handle);
+            }
+        }
+
+        private static void discardQuietly(StreamStateHandle handle) {
+            try {
+                handle.discardState();
+            } catch (Exception ignored) {
+                // Best-effort cleanup for failed/cancelled checkpoint uploads.
+            }
         }
     }
 

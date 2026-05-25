@@ -369,6 +369,13 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      */
     public void close() {
         cache.close();
+        if (offHeapBuf != null) {
+            try {
+                offHeapBuf.flushTo(linker, db, cf);
+            } finally {
+                offHeapBuf.close();
+            }
+        }
     }
 
     /** Visible for tests: exposes the internal cache so tests can assert lifecycle behaviour. */
@@ -502,6 +509,15 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         return new ForStRsDBPutRequest<>(key, value, request);
     }
 
+    @Override
+    public void onClear(StateRequest<K, N, ?, ?> request) {
+        byte[] prefix = getIterPrefix(request);
+        cache.clearForPrefix(prefix);
+        if (offHeapBuf != null) {
+            offHeapBuf.clearForPrefix(prefix, linker, db, cf);
+        }
+    }
+
     // -- Vectorized serialization (writes directly into off-heap buffer) --
 
     @Override
@@ -562,6 +578,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
 
     @Override
     public byte[] getIterPrefix(StateRequest<K, N, ?, ?> request) {
+        // Iteration and MAP_IS_EMPTY scan the engine, so pending off-heap writes/tombstones must
+        // be made visible before the prefix is handed to the vectorized iterator path.
+        flushOffHeapBuffer();
         RecordContext<K> ctx = request.getRecordContext();
         N namespace = request.getNamespace();
         try {

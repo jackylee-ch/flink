@@ -21,8 +21,12 @@ package org.apache.flink.state.forstrs;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 
+import java.io.Serializable;
+
 /** Configuration options for {@link ForStRsStateBackend}. */
-public final class ForStRsOptions {
+public final class ForStRsOptions implements Serializable {
+
+    private static final long serialVersionUID = 1L;
 
     /** Optional override for the cdylib path (defaults to System.loadLibrary). */
     public static final ConfigOption<String> NATIVE_LIB_PATH =
@@ -99,6 +103,10 @@ public final class ForStRsOptions {
     // B-Prod-P7 §6d: shared LRU block cache + cross-CF WriteBufferManager.
     // Defaults match the design doc (256 MiB cache, 512 MiB WBM); 0 means
     // "use the engine default" (same value, but skips the FFI wire-up).
+    private long writeBufferSizeBytes = 64L * 1024 * 1024;
+    private int maxWriteBufferNumber = 4;
+    private int maxBackgroundCompactions = 2;
+    private int maxBackgroundFlushes = 1;
     private long blockCacheCapacityBytes = 256L * 1024 * 1024;
     private long writeBufferManagerCapacityBytes = 512L * 1024 * 1024;
 
@@ -190,11 +198,48 @@ public final class ForStRsOptions {
         return blockCacheCapacityBytes;
     }
 
+    public long writeBufferSizeBytes() {
+        return writeBufferSizeBytes;
+    }
+
+    public ForStRsOptions writeBufferSizeBytes(long bytes) {
+        validateNonNegativeCapacity("writeBufferSizeBytes", bytes);
+        this.writeBufferSizeBytes = bytes;
+        return this;
+    }
+
+    public int maxWriteBufferNumber() {
+        return maxWriteBufferNumber;
+    }
+
+    public ForStRsOptions maxWriteBufferNumber(int n) {
+        validateNonNegativeCount("maxWriteBufferNumber", n);
+        this.maxWriteBufferNumber = n;
+        return this;
+    }
+
+    public int maxBackgroundCompactions() {
+        return maxBackgroundCompactions;
+    }
+
+    public ForStRsOptions maxBackgroundCompactions(int n) {
+        validateNonNegativeCount("maxBackgroundCompactions", n);
+        this.maxBackgroundCompactions = n;
+        return this;
+    }
+
+    public int maxBackgroundFlushes() {
+        return maxBackgroundFlushes;
+    }
+
+    public ForStRsOptions maxBackgroundFlushes(int n) {
+        validateNonNegativeCount("maxBackgroundFlushes", n);
+        this.maxBackgroundFlushes = n;
+        return this;
+    }
+
     public ForStRsOptions blockCacheCapacityBytes(long bytes) {
-        if (bytes < 0) {
-            throw new IllegalArgumentException(
-                    "blockCacheCapacityBytes must be >= 0, got " + bytes);
-        }
+        validateNonNegativeCapacity("blockCacheCapacityBytes", bytes);
         // R18-L3: upper-bound validation — the FFI layer represents the
         // capacity as a {@code usize}, which on a 64-bit target maps to a
         // Rust {@code u64} cast from this {@code long}. A {@code Long.MAX_VALUE}
@@ -206,15 +251,6 @@ public final class ForStRsOptions {
         // production deployment (1 PiB) while flagging the obvious
         // misconfiguration cases (e.g., {@code Long.MAX_VALUE} from a
         // misconfigured ConfigOption parse).
-        long maxBytes = 1L << 50; // 1 PiB
-        if (bytes > maxBytes) {
-            throw new IllegalArgumentException(
-                    "blockCacheCapacityBytes="
-                            + bytes
-                            + " exceeds the practical ceiling (max="
-                            + maxBytes
-                            + " bytes = 1 PiB); this is almost certainly a misconfiguration");
-        }
         this.blockCacheCapacityBytes = bytes;
         return this;
     }
@@ -229,25 +265,35 @@ public final class ForStRsOptions {
     }
 
     public ForStRsOptions writeBufferManagerCapacityBytes(long bytes) {
-        if (bytes < 0) {
-            throw new IllegalArgumentException(
-                    "writeBufferManagerCapacityBytes must be >= 0, got " + bytes);
-        }
+        validateNonNegativeCapacity("writeBufferManagerCapacityBytes", bytes);
         // R18-L3: see blockCacheCapacityBytes for rationale on the 1 PiB
         // ceiling. The cross-CF write-buffer manager cap is similarly bounded
         // at the FFI {@code usize} surface — a {@code Long.MAX_VALUE} value
         // is operator-error rather than a meaningful configuration.
+        this.writeBufferManagerCapacityBytes = bytes;
+        return this;
+    }
+
+    private static void validateNonNegativeCount(String name, int n) {
+        if (n < 0) {
+            throw new IllegalArgumentException(name + " must be >= 0, got " + n);
+        }
+    }
+
+    private static void validateNonNegativeCapacity(String name, long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException(name + " must be >= 0, got " + bytes);
+        }
         long maxBytes = 1L << 50; // 1 PiB
         if (bytes > maxBytes) {
             throw new IllegalArgumentException(
-                    "writeBufferManagerCapacityBytes="
+                    name
+                            + "="
                             + bytes
                             + " exceeds the practical ceiling (max="
                             + maxBytes
                             + " bytes = 1 PiB); this is almost certainly a misconfiguration");
         }
-        this.writeBufferManagerCapacityBytes = bytes;
-        return this;
     }
 
     /** Column-family routing mode. */

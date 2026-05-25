@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.keyed.sst;
 
+import org.apache.flink.runtime.state.CheckpointStateOutputStream;
+import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.StreamStateHandle;
 import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory;
@@ -25,13 +27,18 @@ import org.apache.flink.runtime.state.memory.MemCheckpointStreamFactory;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -80,6 +87,22 @@ class ForStRsSstUploaderTest {
     }
 
     @Test
+    void cancelInterruptsOrClosesRunningUpload(@TempDir Path tmp) throws Exception {
+        Path sst = tmp.resolve("000125.sst");
+        Files.write(sst, new byte[16 * 1024]);
+
+        ForStRsSstUploader uploader = new ForStRsSstUploader();
+        BlockingCheckpointStreamFactory factory = new BlockingCheckpointStreamFactory();
+        CompletableFuture<StreamStateHandle> fut =
+                uploader.upload(sst, factory, CheckpointedStateScope.SHARED);
+
+        assertTrue(factory.writeEntered.await(30, TimeUnit.SECONDS));
+        assertTrue(fut.cancel(true));
+        assertTrue(factory.unblocked.await(30, TimeUnit.SECONDS));
+        assertTrue(fut.isCancelled());
+    }
+
+    @Test
     void uploadBlockingReturnsHandle(@TempDir Path tmp) throws Exception {
         Path sst = tmp.resolve("000124.sst");
         byte[] payload = "hello forst-rs sst upload".getBytes();
@@ -93,5 +116,81 @@ class ForStRsSstUploaderTest {
         Optional<byte[]> bytes = handle.asBytesIfInMemory();
         assertTrue(bytes.isPresent());
         assertTrue(Arrays.equals(payload, bytes.get()));
+    }
+
+    private static final class BlockingCheckpointStreamFactory implements CheckpointStreamFactory {
+        final CountDownLatch writeEntered = new CountDownLatch(1);
+        final CountDownLatch unblocked = new CountDownLatch(1);
+
+        @Override
+        public CheckpointStateOutputStream createCheckpointStateOutputStream(
+                CheckpointedStateScope scope) {
+            return new BlockingCheckpointStateOutputStream(writeEntered, unblocked);
+        }
+
+        @Override
+        public boolean canFastDuplicate(StreamStateHandle stateHandle, CheckpointedStateScope scope) {
+            return false;
+        }
+
+        @Override
+        public java.util.List<StreamStateHandle> duplicate(
+                java.util.List<StreamStateHandle> stateHandles, CheckpointedStateScope scope) {
+            throw new UnsupportedOperationException();
+        }
+    }
+
+    private static final class BlockingCheckpointStateOutputStream
+            extends CheckpointStateOutputStream {
+        private final CountDownLatch writeEntered;
+        private final CountDownLatch unblocked;
+        private final AtomicBoolean closed = new AtomicBoolean();
+
+        BlockingCheckpointStateOutputStream(
+                CountDownLatch writeEntered, CountDownLatch unblocked) {
+            this.writeEntered = writeEntered;
+            this.unblocked = unblocked;
+        }
+
+        @Override
+        public long getPos() {
+            return 0L;
+        }
+
+        @Override
+        public void write(int b) throws IOException {
+            write(new byte[] {(byte) b}, 0, 1);
+        }
+
+        @Override
+        public void write(byte[] b, int off, int len) throws IOException {
+            writeEntered.countDown();
+            while (!closed.get()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    unblocked.countDown();
+                    throw new InterruptedIOException("upload cancelled");
+                }
+                LockSupport.parkNanos(TimeUnit.MILLISECONDS.toNanos(10));
+            }
+            unblocked.countDown();
+        }
+
+        @Override
+        public void flush() {}
+
+        @Override
+        public void sync() {}
+
+        @Override
+        public StreamStateHandle closeAndGetHandle() {
+            closed.set(true);
+            return null;
+        }
+
+        @Override
+        public void close() {
+            closed.set(true);
+            unblocked.countDown();
+        }
     }
 }

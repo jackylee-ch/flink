@@ -82,23 +82,28 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
                         "state.backend.forst-rs.storage.cache-dir must be set when storage.uri is set");
             }
             opened =
-                    linker.dbOpenRemote(
+                    linker.dbOpenRemoteWithOptions(
                             arena,
                             uri,
                             options.opendalConfigJson(),
                             cacheDir,
-                            options.cacheCapacityBytes());
+                            options.cacheCapacityBytes(),
+                            options.writeBufferSizeBytes(),
+                            options.maxWriteBufferNumber(),
+                            options.maxBackgroundCompactions(),
+                            options.maxBackgroundFlushes(),
+                            options.blockCacheCapacityBytes(),
+                            options.writeBufferManagerCapacityBytes());
         } else {
             opened =
                     linker.dbOpenWithOptions(
                             arena,
                             localPath,
-                            512L * 1024
-                                    * 1024, // write_buffer_size: 512MB (fits 1M+ keys in memtable)
-                            3, // max_write_buffer_number
-                            4, // max_background_compactions
-                            2, // max_background_flushes
-                            256L * 1024 * 1024, // block_cache_capacity_bytes
+                            options.writeBufferSizeBytes(),
+                            options.maxWriteBufferNumber(),
+                            options.maxBackgroundCompactions(),
+                            options.maxBackgroundFlushes(),
+                            options.blockCacheCapacityBytes(),
                             options.writeBufferManagerCapacityBytes());
         }
         // R16-M4: wrap dbDefaultCf in try/catch so a failure between dbOpen and CF

@@ -89,16 +89,24 @@ public final class ForStRsSstRegistry {
      * was not present.
      */
     public synchronized boolean unregister(StateHandleID id) {
+        return unregisterAndGetEvicted(id).isPresent();
+    }
+
+    /**
+     * Decrements the ref-count for {@code id} and returns the evicted handle when this call drops
+     * the final local reference.
+     */
+    public synchronized Optional<StreamStateHandle> unregisterAndGetEvicted(StateHandleID id) {
         RegistryEntry entry = entries.get(id);
         if (entry == null) {
-            return false;
+            return Optional.empty();
         }
         entry.refCount--;
         if (entry.refCount <= 0) {
             entries.remove(id);
-            return true;
+            return Optional.of(entry.handle);
         }
-        return false;
+        return Optional.empty();
     }
 
     /** Returns the stream handle for {@code id} if registered, empty otherwise. */

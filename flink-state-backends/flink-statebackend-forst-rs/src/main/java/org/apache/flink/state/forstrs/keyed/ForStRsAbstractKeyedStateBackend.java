@@ -849,11 +849,18 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // base_checkpoint_id). The strategy keeps a monotonic max so out-of-order completes are
         // safely ignored.
         if (snapshotStrategy != null) {
-            snapshotStrategy.recordCompletedCheckpoint(checkpointId);
-            // Drop the per-checkpoint registration tracking — the registry's ref-counts persist
-            // (the SSTs registered for this checkpoint stay alive until subsumed by the registry
-            // when the next checkpoint completes).
-            snapshotStrategy.takePendingRegistrations(checkpointId);
+            snapshotStrategy.completeCheckpoint(checkpointId);
+        }
+    }
+
+    @Override
+    public void notifyCheckpointSubsumed(long checkpointId) throws Exception {
+        if (sstRegistry == null || snapshotStrategy == null) {
+            return;
+        }
+        for (HandleAndLocalPath h :
+                snapshotStrategy.takeCompletedRegistrationsForSubsumed(checkpointId)) {
+            unregisterAndDiscardEvictedSst(h);
         }
     }
 
@@ -878,7 +885,7 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
                 snapshotStrategy.takePendingRegistrationsForAbort(checkpointId);
         if (rollback != null) {
             for (HandleAndLocalPath h : rollback) {
-                sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
+                unregisterAndDiscardEvictedSst(h);
             }
         }
         // E8-H2 post-abort drain: defensive second sweep for entries that landed AFTER the
@@ -888,7 +895,18 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         List<HandleAndLocalPath> late =
                 snapshotStrategy.drainLatePendingRegistrations(checkpointId);
         for (HandleAndLocalPath h : late) {
-            sstRegistry.unregister(new StateHandleID(h.getLocalPath()));
+            unregisterAndDiscardEvictedSst(h);
+        }
+    }
+
+    private void unregisterAndDiscardEvictedSst(HandleAndLocalPath h) {
+        var evicted = sstRegistry.unregisterAndGetEvicted(new StateHandleID(h.getLocalPath()));
+        if (evicted.isPresent()) {
+            try {
+                evicted.get().discardState();
+            } catch (Exception ignored) {
+                // Best-effort cleanup; continue releasing remaining registry refs.
+            }
         }
     }
 

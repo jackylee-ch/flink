@@ -26,7 +26,21 @@ public class ForStRsStateBackendFactory implements StateBackendFactory<ForStRsSt
 
     @Override
     public ForStRsStateBackend createFromConfig(ReadableConfig config, ClassLoader classLoader) {
-        // MVP: configuration is parsed but not yet wired into the backend.
-        return new ForStRsStateBackend();
+        ForStRsOptions options = new ForStRsOptions();
+        options.cfMode(ForStRsOptions.CfMode.fromConfig(config.get(ForStRsOptions.CF_MODE)));
+        options.storageUri(config.get(ForStRsOptions.STORAGE_URI));
+        options.opendalConfigJson(config.get(ForStRsOptions.OPENDAL_CONFIG));
+        options.cacheDir(config.get(ForStRsOptions.CACHE_DIR));
+        options.cacheCapacityMb(config.get(ForStRsOptions.CACHE_CAPACITY_MB));
+        ForStRsEngineOptionsBuilder engineOptions =
+                new ForStRsConfigurableOptionsFactory(config)
+                        .createForStRsOptions(new ForStRsEngineOptionsBuilder());
+        options.writeBufferSizeBytes(engineOptions.writeBufferSize);
+        options.maxWriteBufferNumber(engineOptions.maxWriteBufferNumber);
+        options.maxBackgroundCompactions(engineOptions.maxBackgroundCompactions);
+        options.maxBackgroundFlushes(engineOptions.maxBackgroundFlushes);
+        options.blockCacheCapacityBytes(engineOptions.blockCacheCapacity);
+        options.writeBufferManagerCapacityBytes(engineOptions.writeBufferManagerCapacity);
+        return new ForStRsStateBackend(options);
     }
 }

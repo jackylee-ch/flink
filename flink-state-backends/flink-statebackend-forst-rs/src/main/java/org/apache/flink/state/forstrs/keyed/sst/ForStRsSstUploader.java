@@ -26,6 +26,7 @@ import org.apache.flink.runtime.state.StreamStateHandle;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InterruptedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
@@ -102,29 +103,100 @@ public final class ForStRsSstUploader {
      */
     public CompletableFuture<StreamStateHandle> upload(
             Path file, CheckpointStreamFactory factory, CheckpointedStateScope scope) {
-        CompletableFuture<StreamStateHandle> result = new CompletableFuture<>();
-        Thread.ofVirtual()
-                .name("forst-rs-sst-upload-" + file.getFileName())
-                .start(
-                        () -> {
-                            try {
-                                // D-R4-NEW-H3: bound concurrency via semaphore.
-                                // acquireUninterruptibly because checkpoint
-                                // workers must not be cancelled mid-flight;
-                                // the upload itself is already retried.
-                                concurrencyGate.acquireUninterruptibly();
-                                try {
-                                    StreamStateHandle handle =
-                                            uploadBlocking(file, factory, scope);
-                                    result.complete(handle);
-                                } finally {
-                                    concurrencyGate.release();
-                                }
-                            } catch (Throwable t) {
-                                result.completeExceptionally(t);
-                            }
-                        });
+        InterruptibleUploadFuture result = new InterruptibleUploadFuture();
+        Thread uploadThread =
+                Thread.ofVirtual()
+                        .name("forst-rs-sst-upload-" + file.getFileName())
+                        .unstarted(
+                                () -> {
+                                    boolean acquired = false;
+                                    try {
+                                        result.runner = Thread.currentThread();
+                                        // D-R4-NEW-H3 + cancellation: wait interruptibly so a
+                                        // cancelled checkpoint does not keep queued uploads alive
+                                        // behind the semaphore.
+                                        concurrencyGate.acquire();
+                                        acquired = true;
+                                        if (result.isCancelled()) {
+                                            return;
+                                        }
+                                        StreamStateHandle handle =
+                                                uploadBlocking(file, factory, scope, result);
+                                        if (result.isCancelled() || !result.complete(handle)) {
+                                            discardQuietly(handle);
+                                        }
+                                    } catch (InterruptedException ie) {
+                                        Thread.currentThread().interrupt();
+                                        result.completeExceptionally(ie);
+                                    } catch (Throwable t) {
+                                        result.completeExceptionally(t);
+                                    } finally {
+                                        if (acquired) {
+                                            concurrencyGate.release();
+                                        }
+                                        result.runner = null;
+                                    }
+                                });
+        result.runner = uploadThread;
+        uploadThread.start();
         return result;
+    }
+
+    private static final class InterruptibleUploadFuture
+            extends CompletableFuture<StreamStateHandle> {
+        private volatile Thread runner;
+
+        @Override
+        public boolean cancel(boolean mayInterruptIfRunning) {
+            boolean cancelled = super.cancel(mayInterruptIfRunning);
+            Thread t = runner;
+            if (mayInterruptIfRunning && t != null) {
+                t.interrupt();
+            }
+            closeCurrentStream();
+            return cancelled;
+        }
+
+        private final Object streamLock = new Object();
+        private AutoCloseable currentStream;
+
+        private void setCurrentStream(AutoCloseable stream) {
+            synchronized (streamLock) {
+                currentStream = stream;
+            }
+        }
+
+        private void clearCurrentStream(AutoCloseable stream) {
+            synchronized (streamLock) {
+                if (currentStream == stream) {
+                    currentStream = null;
+                }
+            }
+        }
+
+        private void closeCurrentStream() {
+            AutoCloseable stream;
+            synchronized (streamLock) {
+                stream = currentStream;
+            }
+            if (stream != null) {
+                try {
+                    stream.close();
+                } catch (Exception ignored) {
+                    // Best-effort unblock for non-interruptible filesystem/object-store streams.
+                }
+            }
+        }
+    }
+
+    private static void discardQuietly(StreamStateHandle handle) {
+        try {
+            if (handle != null) {
+                handle.discardState();
+            }
+        } catch (Exception ignored) {
+            // Best-effort cleanup after cancellation or a completion race.
+        }
     }
 
     /**
@@ -138,22 +210,108 @@ public final class ForStRsSstUploader {
     public StreamStateHandle uploadBlocking(
             Path file, CheckpointStreamFactory factory, CheckpointedStateScope scope)
             throws IOException {
+        return uploadBlocking(file, factory, scope, null);
+    }
+
+    private StreamStateHandle uploadBlocking(
+            Path file,
+            CheckpointStreamFactory factory,
+            CheckpointedStateScope scope,
+            InterruptibleUploadFuture cancellable)
+            throws IOException {
         return retryStrategy.execute(
                 "upload " + file.getFileName(),
                 () -> {
                     // IMPORTANT: open fresh streams per attempt. The destination stream from a
                     // failed attempt is unusable (its handle would be partially populated); the
                     // source InputStream's position would be at EOF on a successful append loop.
-                    try (CheckpointStateOutputStream out =
-                                    factory.createCheckpointStateOutputStream(scope);
-                            InputStream in = Files.newInputStream(file)) {
+                    InputStream in = Files.newInputStream(file);
+                    CheckpointStateOutputStream out = null;
+                    StreamStateHandle handle = null;
+                    boolean outputClosed = false;
+                    boolean inputClosed = false;
+                    try {
+                        out = factory.createCheckpointStateOutputStream(scope);
+                    } catch (IOException | RuntimeException | Error t) {
+                        try {
+                            in.close();
+                        } catch (IOException closeErr) {
+                            t.addSuppressed(closeErr);
+                        }
+                        throw t;
+                    }
+                    CheckpointStateOutputStream finalOut = out;
+                    InputStream finalIn = in;
+                    AutoCloseable closeBoth =
+                            () -> {
+                                IOException failure = null;
+                                try {
+                                    finalIn.close();
+                                } catch (IOException e) {
+                                    failure = e;
+                                }
+                                try {
+                                    finalOut.close();
+                                } catch (IOException e) {
+                                    if (failure == null) {
+                                        failure = e;
+                                    } else {
+                                        failure.addSuppressed(e);
+                                    }
+                                }
+                                if (failure != null) {
+                                    throw failure;
+                                }
+                            };
+                    if (cancellable != null) {
+                        cancellable.setCurrentStream(closeBoth);
+                    }
+                    try {
+                        if (isUploadCancelled(cancellable)) {
+                            throw new InterruptedIOException("upload cancelled before copy");
+                        }
                         byte[] buf = new byte[IO_BUFFER_BYTES];
                         int n;
                         while ((n = in.read(buf)) > 0) {
+                            if (isUploadCancelled(cancellable)) {
+                                throw new InterruptedIOException("upload cancelled during copy");
+                            }
                             out.write(buf, 0, n);
                         }
-                        return out.closeAndGetHandle();
+                        in.close();
+                        inputClosed = true;
+                        handle = out.closeAndGetHandle();
+                        outputClosed = true;
+                        return handle;
+                    } catch (IOException | RuntimeException | Error t) {
+                        if (handle != null) {
+                            discardQuietly(handle);
+                        }
+                        if (!inputClosed) {
+                            try {
+                                in.close();
+                            } catch (IOException closeErr) {
+                                t.addSuppressed(closeErr);
+                            }
+                        }
+                        if (!outputClosed) {
+                            try {
+                                out.close();
+                            } catch (IOException closeErr) {
+                                t.addSuppressed(closeErr);
+                            }
+                        }
+                        throw t;
+                    } finally {
+                        if (cancellable != null) {
+                            cancellable.clearCurrentStream(closeBoth);
+                        }
                     }
                 });
+    }
+
+    private static boolean isUploadCancelled(InterruptibleUploadFuture cancellable) {
+        return Thread.currentThread().isInterrupted()
+                || (cancellable != null && cancellable.isCancelled());
     }
 }

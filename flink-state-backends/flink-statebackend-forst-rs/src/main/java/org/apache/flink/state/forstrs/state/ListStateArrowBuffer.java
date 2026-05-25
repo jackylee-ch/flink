@@ -19,6 +19,8 @@
 package org.apache.flink.state.forstrs.state;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.state.forstrs.ffm.FrsEnginePanicError;
+import org.apache.flink.state.forstrs.ffm.FrsErrorCode;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
@@ -199,13 +201,25 @@ public final class ListStateArrowBuffer implements AutoCloseable {
                 f.complete(null);
             }
         } else {
-            RuntimeException err =
-                    new RuntimeException(
-                            "ListStateArrowBuffer.flushTo: frs_vec_merge_append_batch failed with rc="
-                                    + rc);
+            FrsErrorCode code = FrsErrorCode.fromU32(rc);
+            Throwable err =
+                    code.isFailProcess()
+                            ? new FrsEnginePanicError(
+                                    code,
+                                    "ListStateArrowBuffer.flushTo: frs_vec_merge_append_batch rc="
+                                            + rc)
+                            : new RuntimeException(
+                                    "ListStateArrowBuffer.flushTo: frs_vec_merge_append_batch failed with rc="
+                                            + rc
+                                            + " errCode="
+                                            + code);
             for (CompletableFuture<Void> f : toComplete) {
                 f.completeExceptionally(err);
             }
+            if (err instanceof Error) {
+                throw (Error) err;
+            }
+            throw (RuntimeException) err;
         }
     }
 

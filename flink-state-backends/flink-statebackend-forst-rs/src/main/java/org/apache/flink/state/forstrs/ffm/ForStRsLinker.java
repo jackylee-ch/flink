@@ -255,6 +255,7 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbOpenMemoryTuned;
     private final MethodHandle frsDbOpenFromCheckpoint;
     private final MethodHandle frsDbOpenRemote;
+    private final MethodHandle frsDbOpenRemoteWithOptions;
     private final MethodHandle frsDbClose;
     // B-Prod-P7 §6d: structured open + WriteBufferManager diagnostics.
     private final MethodHandle frsDbOpenWithOptions;
@@ -432,6 +433,17 @@ public final class ForStRsLinker {
                         "frs_db_open_remote",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // uri (c_char*)
+                                ValueLayout.ADDRESS, // opendal_config_json (c_char*)
+                                ValueLayout.ADDRESS, // cache_dir (c_char*)
+                                ValueLayout.JAVA_LONG, // cache_capacity_bytes (u64)
+                                ValueLayout.ADDRESS)); // out_handle
+        this.frsDbOpenRemoteWithOptions =
+                bind(
+                        "frs_db_open_remote_with_options",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // const FrsEngineOptions*
                                 ValueLayout.ADDRESS, // uri (c_char*)
                                 ValueLayout.ADDRESS, // opendal_config_json (c_char*)
                                 ValueLayout.ADDRESS, // cache_dir (c_char*)
@@ -793,7 +805,7 @@ public final class ForStRsLinker {
         // Native signature (frs_vectorized_batch_get):
         //   int frs_vectorized_batch_get(
         //     FrsDb, FrsCfHandle,
-        //     *const i32 key_offsets, *const u8 key_data, usize count,
+        //     *const i32 key_offsets, *const u8 key_data, usize key_data_len, usize count,
         //     *mut i32 out_offsets, *mut u8 out_data, *mut u8 out_validity,
         //     usize out_data_cap, *mut usize out_data_len);
         this.frsVectorizedBatchGet =
@@ -805,6 +817,7 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // key_offsets (*const i32)
                                 ValueLayout.ADDRESS, // key_data    (*const u8)
+                                ValueLayout.JAVA_LONG, // key_data_len (usize)
                                 ValueLayout.JAVA_LONG, // count     (usize)
                                 ValueLayout.ADDRESS, // out_offsets (*mut i32)
                                 ValueLayout.ADDRESS, // out_data    (*mut u8)
@@ -815,8 +828,8 @@ public final class ForStRsLinker {
         // Native signature (frs_vectorized_batch_put):
         //   int frs_vectorized_batch_put(
         //     FrsDb, FrsCfHandle,
-        //     *const i32 key_offsets, *const u8 key_data,
-        //     *const i32 val_offsets, *const u8 val_data,
+        //     *const i32 key_offsets, *const u8 key_data, usize key_data_len,
+        //     *const i32 val_offsets, *const u8 val_data, usize val_data_len,
         //     usize count);
         // D6-H2: REMOVED critical mode (was PR-B2 / D-R3-1). The batched put can stall
         // for tens-of-ms to multi-second on WAL fsync, memtable-full waits, or
@@ -836,14 +849,16 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // key_offsets (*const i32)
                                 ValueLayout.ADDRESS, // key_data    (*const u8)
+                                ValueLayout.JAVA_LONG, // key_data_len (usize)
                                 ValueLayout.ADDRESS, // val_offsets (*const i32)
                                 ValueLayout.ADDRESS, // val_data    (*const u8)
+                                ValueLayout.JAVA_LONG, // val_data_len (usize)
                                 ValueLayout.JAVA_LONG)); // count   (usize)
 
         // Native signature (frs_vectorized_batch_delete):
         //   int frs_vectorized_batch_delete(
         //     FrsDb, FrsCfHandle,
-        //     *const i32 key_offsets, *const u8 key_data, usize count);
+        //     *const i32 key_offsets, *const u8 key_data, usize key_data_len, usize count);
         // D6-H2: REMOVED critical mode — same rationale as the batch_put binding above.
         // Synchronous WriteBatch commit, but the commit itself can block on WAL fsync /
         // memtable-full / rate-limited flush. Critical mode is reserved for truly
@@ -857,6 +872,7 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // key_offsets
                                 ValueLayout.ADDRESS, // key_data
+                                ValueLayout.JAVA_LONG, // key_data_len
                                 ValueLayout.JAVA_LONG)); // count
 
         // 6c. Explicit WriteBatch — Java holds a handle so it can stage cross-CF
@@ -1118,8 +1134,10 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS,   // cf
                                 ValueLayout.ADDRESS,   // keys_off (u32*)
                                 ValueLayout.ADDRESS,   // keys_data (u8*)
+                                ValueLayout.JAVA_LONG, // keys_data_len (usize)
                                 ValueLayout.ADDRESS,   // ops_off (u32*)
                                 ValueLayout.ADDRESS,   // ops_data (u8*)
+                                ValueLayout.JAVA_LONG, // ops_data_len (usize)
                                 ValueLayout.JAVA_INT));// n
 
         // 13. Vectorized chunked range iterator (P9, spec §2 component D)
@@ -1336,8 +1354,40 @@ public final class ForStRsLinker {
             int maxBackgroundFlushes,
             long blockCacheCapacityBytes,
             long writeBufferManagerCapacityBytes) {
-        MemorySegment optsSeg = arena.allocate(FRS_ENGINE_OPTIONS_LAYOUT);
+        MemorySegment optsSeg =
+                allocateEngineOptions(
+                        arena,
+                        dbPath,
+                        writeBufferSize,
+                        maxWriteBufferNumber,
+                        maxBackgroundCompactions,
+                        maxBackgroundFlushes,
+                        blockCacheCapacityBytes,
+                        writeBufferManagerCapacityBytes);
 
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsDbOpenWithOptions.invokeExact(optsSeg, outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_open_with_options threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_with_options");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    private MemorySegment allocateEngineOptions(
+            Arena arena,
+            String dbPath,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int maxBackgroundCompactions,
+            int maxBackgroundFlushes,
+            long blockCacheCapacityBytes,
+            long writeBufferManagerCapacityBytes) {
+        MemorySegment optsSeg = arena.allocate(FRS_ENGINE_OPTIONS_LAYOUT);
         MemorySegment pathSeg =
                 (dbPath == null || dbPath.isEmpty())
                         ? MemorySegment.NULL
@@ -1352,18 +1402,7 @@ public final class ForStRsLinker {
         // 4 bytes padding at offset 28
         optsSeg.set(ValueLayout.JAVA_LONG, 32, blockCacheCapacityBytes);
         optsSeg.set(ValueLayout.JAVA_LONG, 40, writeBufferManagerCapacityBytes);
-
-        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
-        int rc;
-        try {
-            rc = (int) frsDbOpenWithOptions.invokeExact(optsSeg, outHandle);
-        } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_db_open_with_options threw: " + t.getMessage());
-        }
-        check(rc, "frs_db_open_with_options");
-        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
-        return new FrsDb(this, handle);
+        return optsSeg;
     }
 
     /**
@@ -1460,6 +1499,62 @@ public final class ForStRsLinker {
                     FrsStatus.PANIC, "frs_db_open_remote threw: " + t.getMessage());
         }
         check(rc, "frs_db_open_remote");
+        MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
+        return new FrsDb(this, handle);
+    }
+
+    /**
+     * Opens a remote-storage-backed engine while also applying the structured engine tuning knobs
+     * used by {@link #dbOpenWithOptions}. The native side ignores {@code dbPath} and derives a
+     * stable logical remote DB path from {@code uri}; every other field is honoured exactly as in
+     * the local open path.
+     */
+    public FrsDb dbOpenRemoteWithOptions(
+            Arena arena,
+            String uri,
+            String opendalConfigJson,
+            String cacheDir,
+            long cacheCapacityBytes,
+            long writeBufferSize,
+            int maxWriteBufferNumber,
+            int maxBackgroundCompactions,
+            int maxBackgroundFlushes,
+            long blockCacheCapacityBytes,
+            long writeBufferManagerCapacityBytes) {
+        MemorySegment optsSeg =
+                allocateEngineOptions(
+                        arena,
+                        null,
+                        writeBufferSize,
+                        maxWriteBufferNumber,
+                        maxBackgroundCompactions,
+                        maxBackgroundFlushes,
+                        blockCacheCapacityBytes,
+                        writeBufferManagerCapacityBytes);
+        MemorySegment uriSeg = allocateCString(arena, uri);
+        MemorySegment cfgSeg =
+                opendalConfigJson == null
+                        ? MemorySegment.NULL
+                        : allocateCString(arena, opendalConfigJson);
+        MemorySegment cacheDirSeg = allocateCString(arena, cacheDir);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDbOpenRemoteWithOptions.invokeExact(
+                                    optsSeg,
+                                    uriSeg,
+                                    cfgSeg,
+                                    cacheDirSeg,
+                                    cacheCapacityBytes,
+                                    outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_open_remote_with_options threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_remote_with_options");
         MemorySegment handle = outHandle.get(ValueLayout.ADDRESS, 0);
         return new FrsDb(this, handle);
     }
@@ -2474,6 +2569,7 @@ public final class ForStRsLinker {
                             cf.handle(),
                             keyOffsetsSeg,
                             keyDataSeg,
+                            keyDataSeg.byteSize(),
                             count,
                             outOffsetsSeg,
                             outDataSeg,
@@ -2535,8 +2631,10 @@ public final class ForStRsLinker {
                                     cf.handle(),
                                     keyOffsetsSeg,
                                     keyDataSeg,
+                                    keyDataSeg.byteSize(),
                                     valOffsetsSeg,
                                     valDataSeg,
+                                    valDataSeg.byteSize(),
                                     count);
         } catch (Throwable t) {
             throw new FrsBackendException(
@@ -2594,7 +2692,12 @@ public final class ForStRsLinker {
             rc =
                     (int)
                             frsVectorizedBatchDelete.invokeExact(
-                                    db.handle(), cf.handle(), keyOffsetsSeg, keyDataSeg, count);
+                                    db.handle(),
+                                    cf.handle(),
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    keyDataSeg.byteSize(),
+                                    count);
         } catch (Throwable t) {
             throw new FrsBackendException(
                     FrsStatus.PANIC, "frs_vectorized_batch_delete threw: " + t.getMessage());
@@ -3987,9 +4090,8 @@ public final class ForStRsLinker {
      *
      * <p>Consumes {@code n} (key, operand) rows in a single FFI call. Each row's operand is the
      * caller-encoded payload bytes (e.g. {@code [count][elem_bytes*]} for ListState semantics).
-     * The engine groups rows by key internally and performs one read-combine-write per distinct
-     * key, eliminating both the per-row FFM crossing and the per-row {@code Arena.ofConfined()}
-     * allocation pattern of {@link #frsVecMergeAppend}.
+     * The engine writes one Merge row per input row, eliminating both the per-row FFM crossing and
+     * the lost-update window of read-combine-write append paths.
      *
      * <p>Layout: {@code keys_off[i+1] - keys_off[i] = keys[i].length}; same for {@code ops_off}.
      *
@@ -4007,7 +4109,15 @@ public final class ForStRsLinker {
         try {
             return (int)
                     frsVecMergeAppendBatch.invokeExact(
-                            db, cf, keysOff, keysData, opsOff, opsData, n);
+                            db,
+                            cf,
+                            keysOff,
+                            keysData,
+                            keysData.byteSize(),
+                            opsOff,
+                            opsData,
+                            opsData.byteSize(),
+                            n);
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_merge_append_batch failed", t);
         }

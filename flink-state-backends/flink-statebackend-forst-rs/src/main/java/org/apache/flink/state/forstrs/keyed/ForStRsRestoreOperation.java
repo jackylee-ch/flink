@@ -38,7 +38,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.io.OutputStream;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -51,7 +53,9 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -94,6 +98,8 @@ public class ForStRsRestoreOperation {
 
     private static final Logger LOG = LoggerFactory.getLogger(ForStRsRestoreOperation.class);
     private static final int TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP = 0x712F;
+    private static final int V2_STATE_PREFIX_COLLISION_KEY_GROUP = 0x6B2F;
+    private static final byte[] V2_STATE_PREFIX = new byte[] {'k', '/'};
 
     private final ForStRsLinker linker;
     private final Arena arena;
@@ -101,6 +107,7 @@ public class ForStRsRestoreOperation {
     private final KeyGroupRange targetRange;
     private final ForStRsSstRegistry sstRegistry;
     private final SstRetryStrategy retryStrategy;
+    private final Set<Closeable> activeDownloadStreams = ConcurrentHashMap.newKeySet();
 
     public ForStRsRestoreOperation(
             ForStRsLinker linker,
@@ -413,12 +420,21 @@ public class ForStRsRestoreOperation {
                         // Open fresh source + destination streams per attempt. The local target
                         // file is truncated (CREATE + TRUNCATE_EXISTING is the default for
                         // Files.newOutputStream) so a half-written attempt is discarded cleanly.
-                        try (FSDataInputStream in = handle.openInputStream();
-                                OutputStream out = Files.newOutputStream(localTarget)) {
+                        FSDataInputStream in = null;
+                        OutputStream out = null;
+                        try {
+                            in = handle.openInputStream();
+                            out = Files.newOutputStream(localTarget);
+                            activeDownloadStreams.add(in);
+                            activeDownloadStreams.add(out);
                             byte[] buf = new byte[8 * 1024];
                             int n;
                             long total = 0L;
                             while ((n = in.read(buf)) > 0) {
+                                if (Thread.currentThread().isInterrupted()) {
+                                    throw new InterruptedIOException(
+                                            "Interrupted while downloading " + logicalPath);
+                                }
                                 out.write(buf, 0, n);
                                 total += n;
                             }
@@ -433,6 +449,35 @@ public class ForStRsRestoreOperation {
                                 throw new EmptyHandleException(logicalPath);
                             }
                             return null;
+                        } finally {
+                            if (in != null) {
+                                activeDownloadStreams.remove(in);
+                            }
+                            if (out != null) {
+                                activeDownloadStreams.remove(out);
+                            }
+                            IOException failure = null;
+                            if (out != null) {
+                                try {
+                                    out.close();
+                                } catch (IOException e) {
+                                    failure = e;
+                                }
+                            }
+                            if (in != null) {
+                                try {
+                                    in.close();
+                                } catch (IOException e) {
+                                    if (failure == null) {
+                                        failure = e;
+                                    } else {
+                                        failure.addSuppressed(e);
+                                    }
+                                }
+                            }
+                            if (failure != null) {
+                                throw failure;
+                            }
                         }
                     });
         } catch (EmptyHandleException ehe) {
@@ -453,6 +498,18 @@ public class ForStRsRestoreOperation {
                             + ": "
                             + ioe.getMessage(),
                     ioe);
+        }
+    }
+
+    private void closeActiveDownloadStreams() {
+        for (Closeable c : activeDownloadStreams) {
+            try {
+                c.close();
+            } catch (IOException ignored) {
+                // Best-effort unblock for restore cancellation/failure.
+            } finally {
+                activeDownloadStreams.remove(c);
+            }
         }
     }
 
@@ -522,6 +579,24 @@ public class ForStRsRestoreOperation {
         }
     }
 
+    private static void rejectV2PrefixCollisionOnRescale(
+            List<ForStRsIncrementalKeyedStateHandle> handles)
+            throws ForStRsCheckpointRestoreException {
+        for (ForStRsIncrementalKeyedStateHandle handle : handles) {
+            if (handle.getKeyGroupRange().contains(V2_STATE_PREFIX_COLLISION_KEY_GROUP)) {
+                throw new ForStRsCheckpointRestoreException(
+                        "key-group-" + V2_STATE_PREFIX_COLLISION_KEY_GROUP,
+                        handle.getCheckpointId(),
+                        "Rescaling restore is unsafe for ForSt-RS checkpoints whose source "
+                                + "key-group range contains "
+                                + V2_STATE_PREFIX_COLLISION_KEY_GROUP
+                                + ": regular-state rows with prefix bytes 0x6b/0x2f collide "
+                                + "with the Async v2 state prefix \"k/\". Restore must use the "
+                                + "same key-group assignment or a versioned v2 key format.");
+            }
+        }
+    }
+
     /**
      * Sentinel IOException that signals "handle returned 0 bytes" — distinct from a transient I/O
      * error. Extends {@link java.io.FileNotFoundException} so the {@link
@@ -544,6 +619,7 @@ public class ForStRsRestoreOperation {
     private RestoreResult restoreWithRescaling(List<ForStRsIncrementalKeyedStateHandle> handles)
             throws IOException {
         rejectTimerPrefixCollisionOnRescale(handles);
+        rejectV2PrefixCollisionOnRescale(handles);
 
         // 1. Materialize each input handle into its own temp DB (using the no-rescaling path).
         //    PR-E1 (F5-6 / E-HIGH-2): handles materialize in parallel via a bounded thread
@@ -740,6 +816,8 @@ public class ForStRsRestoreOperation {
 
         try {
 
+            rejectAsyncV2StateRowsOnRescale(sources, maxRestoredCkpt);
+
             // 2. Open an empty target DB.
             Path targetEngine = targetDir.resolve("_restore_target");
             Files.createDirectories(targetEngine);
@@ -790,6 +868,13 @@ public class ForStRsRestoreOperation {
                         targetKgsBySrc.entrySet()) {
                     copyTimerRowsForSourceBatch(e.getKey(), targetDb, targetCf, e.getValue());
                 }
+            } catch (ForStRsCheckpointRestoreException cre) {
+                try {
+                    targetCf.close();
+                } catch (RuntimeException ignored) {
+                }
+                targetDb.close();
+                throw cre;
             } catch (RuntimeException re) {
                 try {
                     targetCf.close();
@@ -821,36 +906,45 @@ public class ForStRsRestoreOperation {
             // collisions match the value is well-defined and deterministic by construction —
             // restore retries see the same metadata for every state name. Insertion-ordered
             // {@link LinkedHashMap} keeps the entry order stable for review and tests.
-            Map<String, StateSerializerMetadata> unionedMetadata = new LinkedHashMap<>();
-            for (OpenSourceDb src : sources) {
-                if (src.serializerMetadata == null || src.serializerMetadata.isEmpty()) {
-                    continue;
-                }
-                for (Map.Entry<String, StateSerializerMetadata> e :
-                        src.serializerMetadata.entrySet()) {
-                    String name = e.getKey();
-                    StateSerializerMetadata incoming = e.getValue();
-                    StateSerializerMetadata existing = unionedMetadata.get(name);
-                    if (existing == null) {
-                        unionedMetadata.put(name, incoming);
-                    } else if (!existing.equals(incoming)) {
-                        throw new IOException(
-                                "schema mismatch across restore handles for state "
-                                        + name
-                                        + ": found incompatible metadata"
-                                        + " (rescaling union-merge requires every source-handle to"
-                                        + " contribute byte-identical StateSerializerMetadata for"
-                                        + " the same state name)");
+            try {
+                Map<String, StateSerializerMetadata> unionedMetadata = new LinkedHashMap<>();
+                for (OpenSourceDb src : sources) {
+                    if (src.serializerMetadata == null || src.serializerMetadata.isEmpty()) {
+                        continue;
                     }
-                    // else: equal — no-op, deterministic regardless of iteration order.
+                    for (Map.Entry<String, StateSerializerMetadata> e :
+                            src.serializerMetadata.entrySet()) {
+                        String name = e.getKey();
+                        StateSerializerMetadata incoming = e.getValue();
+                        StateSerializerMetadata existing = unionedMetadata.get(name);
+                        if (existing == null) {
+                            unionedMetadata.put(name, incoming);
+                        } else if (!existing.equals(incoming)) {
+                            throw new IOException(
+                                    "schema mismatch across restore handles for state "
+                                            + name
+                                            + ": found incompatible metadata"
+                                            + " (rescaling union-merge requires every source-handle to"
+                                            + " contribute byte-identical StateSerializerMetadata for"
+                                            + " the same state name)");
+                        }
+                        // else: equal — no-op, deterministic regardless of iteration order.
+                    }
                 }
+                return new RestoreResult(
+                        targetDb,
+                        targetCf,
+                        mergedCfMap,
+                        maxRestoredCkpt,
+                        unionedMetadata.isEmpty() ? Collections.emptyMap() : unionedMetadata);
+            } catch (IOException | RuntimeException e) {
+                try {
+                    targetCf.close();
+                } catch (RuntimeException ignored) {
+                }
+                targetDb.close();
+                throw e;
             }
-            return new RestoreResult(
-                    targetDb,
-                    targetCf,
-                    mergedCfMap,
-                    maxRestoredCkpt,
-                    unionedMetadata.isEmpty() ? Collections.emptyMap() : unionedMetadata);
         } finally {
             // Always close the source DBs/CFs, success or failure.
             for (OpenSourceDb src : sources) {
@@ -947,6 +1041,27 @@ public class ForStRsRestoreOperation {
         }
     }
 
+    private void rejectAsyncV2StateRowsOnRescale(List<OpenSourceDb> sources, long checkpointId)
+            throws ForStRsCheckpointRestoreException {
+        for (OpenSourceDb src : sources) {
+            try (Arena scanArena = Arena.ofShared();
+                    FrsIterator it =
+                            linker.prefixLookupOpen(src.db, src.cf, V2_STATE_PREFIX, scanArena)) {
+                ForStRsLinker.IteratorEntry entry = linker.iteratorNext(it);
+                if (entry != null) {
+                    throw new ForStRsCheckpointRestoreException(
+                            "prefix-k/",
+                            checkpointId,
+                            "Rescaling restore is unsafe for Async v2 ForSt-RS state rows: "
+                                    + "keys encoded with prefix \"k/\" do not carry a leading "
+                                    + "key-group prefix, so copyKeyGroupRegularState cannot "
+                                    + "redistribute them accurately. Restore without rescaling "
+                                    + "or migrate to a key-group-prefixed v2 key format.");
+                }
+            }
+        }
+    }
+
     /**
      * E-H1 + E-H9: scans the source DB's QUEUE_NS_MARKER prefix ONCE and
      * routes each row to the target if its embedded kg is in
@@ -958,7 +1073,8 @@ public class ForStRsRestoreOperation {
             OpenSourceDb src,
             FrsDb targetDb,
             FrsCfHandle targetCf,
-            java.util.BitSet targetKgsForSrc) {
+            java.util.BitSet targetKgsForSrc)
+            throws ForStRsCheckpointRestoreException {
         byte[] marker =
                 org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
                         .QUEUE_NS_MARKER;
@@ -982,6 +1098,17 @@ public class ForStRsRestoreOperation {
                     }
                 }
                 int rowKg = extractTimerRowKeyGroupOrThrow(key, marker, sepIdx);
+                if (!src.range.contains(rowKg)) {
+                    throw new ForStRsCheckpointRestoreException(
+                            "timer-row-key-group",
+                            -1L,
+                            "Timer row declares key-group "
+                                    + rowKg
+                                    + " but the source handle range is "
+                                    + src.range
+                                    + ". Refusing rescale restore because the checkpoint metadata "
+                                    + "and timer key encoding disagree.");
+                }
                 if (rowKg < 0
                         || rowKg >= targetKgsForSrc.length()
                         || !targetKgsForSrc.get(rowKg)) {
@@ -1335,6 +1462,7 @@ public class ForStRsRestoreOperation {
             if (success) {
                 dl.shutdown();
             } else {
+                closeActiveDownloadStreams();
                 dl.shutdownNow();
                 try {
                     dl.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS);

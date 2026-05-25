@@ -1598,7 +1598,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // the max of (existing, id).
         ForStRsSnapshotStrategy s = snapshotStrategy;
         if (s != null) {
-            s.recordCompletedCheckpoint(id);
+            s.completeCheckpoint(id);
         }
         // R38-M2: do NOT call {@code managedExecutors.forEach(flushDirty)} here.
         // A flushDirty AFTER the snapshot manifest is already on durable
@@ -1620,21 +1620,44 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             var regs = s.takePendingRegistrationsForAbort(id);
             if (regs != null) {
                 for (var hlp : regs) {
-                    reg.unregister(
-                            new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
+                    unregisterAndDiscardEvictedSst(reg, hlp);
                 }
             }
             // E8-H2 post-abort drain: catch any entries that landed after the initial take.
             var late = s.drainLatePendingRegistrations(id);
             for (var hlp : late) {
-                reg.unregister(
-                        new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
+                unregisterAndDiscardEvictedSst(reg, hlp);
             }
         }
     }
 
+    private static void unregisterAndDiscardEvictedSst(
+            ForStRsSstRegistry reg,
+            org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath hlp) {
+        var evicted =
+                reg.unregisterAndGetEvicted(
+                        new org.apache.flink.runtime.state.StateHandleID(hlp.getLocalPath()));
+        evicted.ifPresent(
+                h -> {
+                    try {
+                        h.discardState();
+                    } catch (Exception ignored) {
+                        // Best-effort cleanup for aborted checkpoint uploads.
+                    }
+                });
+    }
+
     @Override
-    public void notifyCheckpointSubsumed(long id) {}
+    public void notifyCheckpointSubsumed(long id) {
+        ForStRsSnapshotStrategy s = snapshotStrategy;
+        ForStRsSstRegistry reg = sstRegistry;
+        if (s == null || reg == null) {
+            return;
+        }
+        for (var hlp : s.takeCompletedRegistrationsForSubsumed(id)) {
+            unregisterAndDiscardEvictedSst(reg, hlp);
+        }
+    }
 
     @Nonnull
     @Override

@@ -34,7 +34,7 @@ import java.lang.foreign.ValueLayout;
  * (operatorKey + namespace + userKey) → value pair into an underlying {@link ArrowBinaryBuffer}
  * whose key/value bytes live off-heap in a per-instance shared Arena. Subsequent {@code asyncGet}
  * / {@code asyncContains} on the same composite key resolve from the buffer without re-crossing
- * the FFM boundary; on flush the buffer drains its rows via a single {@code linker.batchPut}.
+ * the FFM boundary; on flush the buffer drains its rows via vectorized batch calls.
  *
  * <h3>Why not extend ArrowBinaryBuffer</h3>
  *
@@ -248,8 +248,8 @@ public final class MapStateArrowBuffer implements AutoCloseable {
     }
 
     /**
-     * Drains all buffered rows to the engine via {@code linker.batchPut} and issues a delete
-     * for every tombstoned row. Clears the buffer on return.
+     * Drains all buffered rows to the engine via vectorized batch calls. Clears the buffer on
+     * return.
      *
      * <p>Called by:
      *
@@ -264,13 +264,12 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         if (closed) {
             return;
         }
-        // Issue per-row deletes for tombstoned rows BEFORE flushTo clears the buffer. The
-        // tombstoned rows' key bytes still live in the off-heap keyData region, but flushTo's
-        // clear() wipes them, so we have to extract them first.
+        // Issue deletes BEFORE flushTo clears the buffer. The tombstoned rows' key bytes still
+        // live in the off-heap keyData region, but flushTo's clear() wipes them, so stage a compact
+        // Arrow Binary offsets/data vector first and cross FFM once.
         int[] tombstones = buf.tombstonedRows();
-        for (int row : tombstones) {
-            byte[] keyBytes = buf.copyKey(row);
-            linker.delete(db, cf, keyBytes);
+        if (tombstones.length > 0) {
+            vectorizedDeleteTombstones(linker, db, cf, tombstones);
         }
         if (buf.size() > 0) {
             buf.flushTo(linker, db, cf);
@@ -341,6 +340,36 @@ public final class MapStateArrowBuffer implements AutoCloseable {
         // synchronously inside a single put/remove call), so we can simply allocate fresh.
         staging = stagingArena.allocate(newCap);
         stagingCap = newCap;
+    }
+
+    private void vectorizedDeleteTombstones(
+            ForStRsLinker linker, FrsDb db, FrsCfHandle cf, int[] tombstones) {
+        long totalBytes = 0L;
+        for (int row : tombstones) {
+            totalBytes += buf.keyLengthOf(row);
+        }
+        if (totalBytes > Integer.MAX_VALUE) {
+            throw new IllegalStateException(
+                    "MapState tombstone flush exceeds Arrow i32 offset limit: " + totalBytes);
+        }
+        try (Arena deleteArena = Arena.ofConfined()) {
+            MemorySegment keyOffsets =
+                    deleteArena.allocate(
+                            ValueLayout.JAVA_INT.byteSize() * (long) (tombstones.length + 1));
+            MemorySegment keyData = deleteArena.allocate(totalBytes);
+            keyOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+            long pos = 0L;
+            for (int i = 0; i < tombstones.length; i++) {
+                int row = tombstones[i];
+                int kOff = buf.keyOffsetOf(row);
+                int kLen = buf.keyLengthOf(row);
+                MemorySegment.copy(buf.keyDataSegment(), kOff, keyData, pos, kLen);
+                pos += kLen;
+                keyOffsets.set(
+                        ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES, (int) pos);
+            }
+            linker.vectorizedBatchDelete(db, cf, keyOffsets, keyData, tombstones.length);
+        }
     }
 
     /** Result of {@link #lookup}. {@code row} is meaningful only when {@code cached && !tombstone}. */

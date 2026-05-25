@@ -237,8 +237,8 @@ public class ForStRsIncrementalKeyedStateHandle extends AbstractIncrementalState
             // hold the canonical handle from a prior checkpoint).
             StreamStateHandle reused =
                     stateRegistry.registerReference(
-                            new org.apache.flink.runtime.state.SharedStateRegistryKey(
-                                    h.getLocalPath()),
+                            org.apache.flink.runtime.state.SharedStateRegistryKey
+                                    .forStreamStateHandle(h.getHandle()),
                             h.getHandle(),
                             checkpointID);
             h.replaceHandle(reused);

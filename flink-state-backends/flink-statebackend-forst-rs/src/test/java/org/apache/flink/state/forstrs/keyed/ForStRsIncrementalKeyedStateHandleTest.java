@@ -18,21 +18,29 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.core.execution.RecoveryClaimMode;
+import org.apache.flink.runtime.checkpoint.CompletedCheckpoint;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
 import org.apache.flink.runtime.state.KeyGroupRange;
+import org.apache.flink.runtime.state.SharedStateRegistry;
+import org.apache.flink.runtime.state.SharedStateRegistryKey;
 import org.apache.flink.runtime.state.StreamStateHandle;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -164,5 +172,69 @@ class ForStRsIncrementalKeyedStateHandleTest {
                         Map.of());
         h.discardState();
         assertTrue(true, "discard completed without throwing");
+    }
+
+    @Test
+    void registerSharedStatesUsesPhysicalHandleIdsNotLocalBasename() {
+        StreamStateHandle first = bytes("s3://bucket/job-a/000001.sst", 1);
+        StreamStateHandle second = bytes("s3://bucket/job-b/000001.sst", 2);
+        ForStRsIncrementalKeyedStateHandle h =
+                new ForStRsIncrementalKeyedStateHandle(
+                        UUID.randomUUID(),
+                        new KeyGroupRange(0, 0),
+                        11L,
+                        10L,
+                        List.of(
+                                HandleAndLocalPath.of(first, "000001.sst"),
+                                HandleAndLocalPath.of(second, "000001.sst")),
+                        List.of(),
+                        bytes("m", 1),
+                        Map.of());
+        RecordingSharedStateRegistry registry = new RecordingSharedStateRegistry();
+
+        h.registerSharedStates(registry, 11L);
+
+        SharedStateRegistryKey firstKey = SharedStateRegistryKey.forStreamStateHandle(first);
+        SharedStateRegistryKey secondKey = SharedStateRegistryKey.forStreamStateHandle(second);
+        assertNotEquals(firstKey, secondKey, "test precondition: physical handles differ");
+        assertEquals(List.of(firstKey, secondKey), registry.keys);
+        assertEquals(
+                2,
+                new HashSet<>(registry.keys).size(),
+                "same local basename must not collapse distinct uploaded SST objects");
+    }
+
+    private static final class RecordingSharedStateRegistry implements SharedStateRegistry {
+        private final List<SharedStateRegistryKey> keys = new ArrayList<>();
+
+        @Override
+        public StreamStateHandle registerReference(
+                SharedStateRegistryKey registrationKey,
+                StreamStateHandle state,
+                long checkpointID,
+                boolean preventDiscardingCreatedCheckpoint) {
+            keys.add(registrationKey);
+            return state;
+        }
+
+        @Override
+        public Set<Long> unregisterUnusedState(long lowestCheckpointID) {
+            return Set.of();
+        }
+
+        @Override
+        public void registerAll(
+                Iterable<? extends org.apache.flink.runtime.state.CompositeStateHandle>
+                        stateHandles,
+                long checkpointID) {}
+
+        @Override
+        public void registerAllAfterRestored(CompletedCheckpoint checkpoint, RecoveryClaimMode mode) {}
+
+        @Override
+        public void checkpointCompleted(long checkpointId) {}
+
+        @Override
+        public void close() {}
     }
 }

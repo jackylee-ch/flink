@@ -210,6 +210,34 @@ class ForStRsRestoreOperationTest {
     }
 
     @Test
+    void rescalingRestoreRejectsAsyncV2PrefixCollisionKeyGroup(@TempDir Path tmp) {
+        ForStRsIncrementalKeyedStateHandle owner =
+                new ForStRsIncrementalKeyedStateHandle(
+                        UUID.randomUUID(),
+                        new KeyGroupRange(0x6B2F, 0x6B2F),
+                        47L,
+                        /* baseCheckpointId= */ 0L,
+                        List.of(),
+                        List.of(),
+                        new EmptyStreamHandle(),
+                        Map.of("default", 0L));
+        ForStRsRestoreOperation op =
+                new ForStRsRestoreOperation(
+                        null,
+                        null,
+                        tmp.resolve("restore"),
+                        new KeyGroupRange(0, 0),
+                        new ForStRsSstRegistry());
+
+        ForStRsCheckpointRestoreException thrown =
+                assertThrows(
+                        ForStRsCheckpointRestoreException.class,
+                        () -> op.restore(List.of(owner)));
+        assertEquals(47L, thrown.getCheckpointId());
+        assertTrue(thrown.getMessage().contains("0x6b/0x2f"));
+    }
+
+    @Test
     void timerRowKeyParserFailsFastOnMalformedQueueRows() {
         byte[] marker =
                 org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue

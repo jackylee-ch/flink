@@ -67,6 +67,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     private static final int INIT_SLOTS = 256;
 
+    private static final boolean ENABLE_OFF_HEAP_APPEND_MERGE =
+            Boolean.getBoolean("state.backend.forst-rs.list.offheap-append.enabled");
+
     private final ColumnarBatchBuffer getKeys;
     private final ColumnarBatchBuffer putKeys;
     private final ColumnarBatchBuffer putValues;
@@ -76,6 +79,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     /** Buffer for APPEND_MERGE requests (ListState-only, spec §1 §a). Wired to FFI in P6. */
     private AppendMergeBatchBuffer appendMergeBuffer;
+
+    /** Key-only hazard buffer for off-heap APPEND_MERGE rows. */
+    private ColumnarBatchBuffer offHeapAppendMergeKeys;
 
     /** Buffer for ITER_PREFIX requests. Wired to FFI in P3. */
     private IterPrefixBatchBuffer iterPrefixBuffer;
@@ -104,6 +110,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     // plumbed back to the Flink-runtime async future at dispatch end (Option Z, §4.3).
     private StateRequest<?, ?, ?, ?>[] appendMergeRequests;
     private int appendMergeCount;
+
+    private StateRequest<?, ?, ?, ?>[] orderedRequests;
+    private int orderedCount;
 
     // PR-C2: parallel arrays for the off-heap APPEND_MERGE fast path. For each row {@code i}, if
     // {@code offHeapAppendMergeFutures[i] != null} the row went through the per-state
@@ -163,6 +172,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         this.putRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.deleteRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         this.appendMergeRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
+        this.orderedRequests = new StateRequest<?, ?, ?, ?>[INIT_SLOTS];
         @SuppressWarnings({"unchecked", "rawtypes"})
         java.util.concurrent.CompletableFuture<Void>[] futs =
                 (java.util.concurrent.CompletableFuture<Void>[])
@@ -182,6 +192,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     public void initNewKindBuffers(Arena arena) {
         if (appendMergeBuffer == null) {
             appendMergeBuffer = new AppendMergeBatchBuffer(arena);
+        }
+        if (offHeapAppendMergeKeys == null) {
+            offHeapAppendMergeKeys = new ColumnarBatchBuffer(arena);
         }
         if (iterPrefixBuffer == null) {
             iterPrefixBuffer = new IterPrefixBatchBuffer();
@@ -206,6 +219,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         Arrays.fill(putRequests, 0, putCount, null);
         Arrays.fill(deleteRequests, 0, deleteCount, null);
         Arrays.fill(appendMergeRequests, 0, appendMergeCount, null);
+        Arrays.fill(orderedRequests, 0, orderedCount, null);
         getCount = 0;
         putCount = 0;
         deleteCount = 0;
@@ -218,9 +232,13 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
             }
         }
         appendMergeCount = 0;
+        orderedCount = 0;
         iterRequests.clear();
         if (appendMergeBuffer != null) {
             appendMergeBuffer.reset();
+        }
+        if (offHeapAppendMergeKeys != null) {
+            offHeapAppendMergeKeys.reset();
         }
         if (iterPrefixBuffer != null) {
             iterPrefixBuffer.reset();
@@ -331,22 +349,7 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         // {@link ForStRsAsyncListStateV2#discardBufferedRows} clears the buffer on the first
         // call and {@link ListStateArrowBuffer#discardWithCause} short-circuits on an empty
         // buffer for subsequent rows pointing to the same state.
-        if (offHeapAppendMergeStates != null) {
-            for (int i = 0; i < appendMergeCount; i++) {
-                org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
-                        offHeapAppendMergeStates[i];
-                if (s != null) {
-                    try {
-                        s.discardBufferedRows(cause);
-                    } catch (Throwable ignore) {
-                        // Best-effort: keep draining remaining states even if one buffer
-                        // discard throws. The amDirty bit is cleared inside the discard path
-                        // even on the empty-buffer short-circuit, so subsequent batches won't
-                        // re-walk this state.
-                    }
-                }
-            }
-        }
+        discardOffHeapAppendMergeRows(cause);
         for (int i = 0; i < getCount; i++) {
             failPerRowFuture(getRequests[i], msg, cause);
         }
@@ -482,6 +485,10 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         return appendMergeBuffer;
     }
 
+    public ColumnarBatchBuffer offHeapAppendMergeKeys() {
+        return offHeapAppendMergeKeys;
+    }
+
     /** Returns the ITER_PREFIX buffer, or {@code null} if not yet initialised. */
     public IterPrefixBatchBuffer iterPrefixBuffer() {
         return iterPrefixBuffer;
@@ -610,51 +617,66 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         if (kind == null) {
             throw new UnsupportedOperationException("Unsupported state request type: " + type);
         }
-        switch (kind) {
-            case GET:
-                recordGet(table, (StateRequest) stateRequest);
-                break;
-            case PUT:
-                // A null payload on an UPDATE/ADD is the canonical Flink idiom
-                // for "clear this entry" (matches the legacy path's
-                // `serializedValue == null → delete` behaviour).
-                if (stateRequest.getPayload() == null) {
+        try {
+            switch (kind) {
+                case GET:
+                    recordGet(table, (StateRequest) stateRequest);
+                    break;
+                case PUT:
+                    // A null payload on an UPDATE/ADD is the canonical Flink idiom
+                    // for "clear this entry" (matches the legacy path's
+                    // `serializedValue == null → delete` behaviour).
+                    if (stateRequest.getPayload() == null) {
+                        recordDelete(table, (StateRequest) stateRequest);
+                    } else {
+                        recordPut(table, (StateRequest) stateRequest);
+                    }
+                    break;
+                case DELETE:
                     recordDelete(table, (StateRequest) stateRequest);
-                } else {
-                    recordPut(table, (StateRequest) stateRequest);
-                }
-                break;
-            case DELETE:
-                recordDelete(table, (StateRequest) stateRequest);
-                break;
-            case ITER:
-                iterRequests.add(buildIterRequest(table, stateRequest));
-                break;
-            case APPEND_MERGE_CANDIDATE:
-                // V3.1: LIST_ADD / LIST_ADD_ALL on a registered ListState routes to
-                // APPEND_MERGE instead of destructive PUT. Falls back to PUT if the
-                // state is not registered (shouldn't happen via the public API, but
-                // defensive). A null payload still routes to delete.
-                //
-                // B4-H4 (zero-copy): replaces the previous per-record {@code
-                // listStateNames.contains(name)} {@link java.util.Set#contains} + {@code
-                // String.hashCode()} with a single per-state-instance boolean read on the
-                // table itself ({@link ForStRsInnerTable#isListState()}, default-false,
-                // overridden to true by {@code ForStRsAsyncListStateV2}). The
-                // {@link #listStateNames} registry is still maintained for inspection / tests,
-                // but is no longer consulted on the dispatch hot path.
-                if (stateRequest.getPayload() == null) {
-                    recordDelete(table, (StateRequest) stateRequest);
-                } else if (table.isListState()) {
-                    recordAppendMerge(table, (StateRequest) stateRequest);
-                } else {
-                    recordPut(table, (StateRequest) stateRequest);
-                }
-                break;
-            default:
-                // Unreachable: DISPATCH_TABLE only ever stores enum constants above.
-                throw new UnsupportedOperationException(
-                        "Unsupported dispatch kind: " + kind + " (state request type: " + type + ")");
+                    break;
+                case ITER:
+                    iterRequests.add(buildIterRequest(table, stateRequest));
+                    break;
+                case APPEND_MERGE_CANDIDATE:
+                    // V3.1: LIST_ADD / LIST_ADD_ALL on a registered ListState routes to
+                    // APPEND_MERGE instead of destructive PUT. Falls back to PUT if the
+                    // state is not registered (shouldn't happen via the public API, but
+                    // defensive). A null payload still routes to delete.
+                    //
+                    // B4-H4 (zero-copy): replaces the previous per-record {@code
+                    // listStateNames.contains(name)} {@link java.util.Set#contains} + {@code
+                    // String.hashCode()} with a single per-state-instance boolean read on the
+                    // table itself ({@link ForStRsInnerTable#isListState()}, default-false,
+                    // overridden to true by {@code ForStRsAsyncListStateV2}). The
+                    // {@link #listStateNames} registry is still maintained for inspection / tests,
+                    // but is no longer consulted on the dispatch hot path.
+                    if (stateRequest.getPayload() == null) {
+                        recordDelete(table, (StateRequest) stateRequest);
+                    } else if (table.isListState()) {
+                        recordAppendMerge(table, (StateRequest) stateRequest);
+                    } else {
+                        recordPut(table, (StateRequest) stateRequest);
+                    }
+                    break;
+                default:
+                    // Unreachable: DISPATCH_TABLE only ever stores enum constants above.
+                    throw new UnsupportedOperationException(
+                            "Unsupported dispatch kind: "
+                                    + kind
+                                    + " (state request type: "
+                                    + type
+                                    + ")");
+            }
+            recordOrdered(stateRequest);
+        } catch (Throwable t) {
+            batchPoisonCause = t;
+            drainClassifiedRowsExceptionally(t);
+            failPerRowFuture(
+                    stateRequest,
+                    "ForSt-RS classification failed: " + t.getClass().getSimpleName(),
+                    t);
+            throw t;
         }
     }
 
@@ -677,6 +699,10 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     public int deleteCount() {
         return deleteCount;
+    }
+
+    public int orderedCount() {
+        return orderedCount;
     }
 
     public ColumnarBatchBuffer getKeys() {
@@ -709,6 +735,10 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
 
     public StateRequest<?, ?, ?, ?>[] deleteRequests() {
         return deleteRequests;
+    }
+
+    public StateRequest<?, ?, ?, ?>[] orderedRequests() {
+        return orderedRequests;
     }
 
     public List<ForStRsDBIterRequest<?, ?, ?, ?>> iterRequests() {
@@ -814,6 +844,42 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         deleteCount++;
     }
 
+    private void recordOrdered(StateRequest<?, ?, ?, ?> request) {
+        ensureOrderedCapacity();
+        orderedRequests[orderedCount++] = request;
+    }
+
+    void discardOffHeapAppendMergeRows(Throwable cause) {
+        if (offHeapAppendMergeStates == null) {
+            return;
+        }
+        for (int i = 0; i < appendMergeCount; i++) {
+            org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 s =
+                    offHeapAppendMergeStates[i];
+            if (s != null) {
+                try {
+                    s.discardBufferedRows(cause);
+                } catch (Throwable ignore) {
+                    // Best-effort: keep draining remaining states even if one buffer discard
+                    // throws. The amDirty bit is cleared inside the discard path even on the
+                    // empty-buffer short-circuit, so subsequent batches won't re-walk this state.
+                }
+            }
+        }
+    }
+
+    boolean hasOffHeapAppendMergeRows() {
+        if (offHeapAppendMergeFutures == null) {
+            return false;
+        }
+        for (int i = 0; i < appendMergeCount; i++) {
+            if (offHeapAppendMergeFutures[i] != null) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     /**
      * V3.1: route a LIST_ADD / LIST_ADD_ALL request through APPEND_MERGE rather than the
      * destructive PUT path. Constructs an {@link AppendMergeRequest} whose key + operand are
@@ -836,13 +902,21 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private <K, N, V> void recordAppendMerge(
             ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
         // PR-C2: off-heap fast path when the state has a configured ListStateArrowBuffer.
-        if (table instanceof org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2) {
+        if (ENABLE_OFF_HEAP_APPEND_MERGE
+                && table instanceof org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2) {
             org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2 list =
                     (org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2) table;
             if (list.buffer() != null) {
-                java.util.concurrent.CompletableFuture<Void> fut =
-                        list.recordAppendMergeOffHeap((StateRequest) request);
+                java.util.concurrent.CompletableFuture<Void> fut = null;
+                try {
+                    fut = list.recordAppendMergeOffHeap((StateRequest) request);
                 if (fut != null) {
+                    if (offHeapAppendMergeKeys == null) {
+                        throw new IllegalStateException(
+                                "Off-heap append-merge hazard buffer not initialised — call"
+                                        + " initNewKindBuffers(Arena) first");
+                    }
+                    table.serializeKeyInto(request, offHeapAppendMergeKeys);
                     ensureAppendMergeCapacity();
                     appendMergeRequests[appendMergeCount] = request;
                     ensureOffHeapAppendMergeCapacity();
@@ -853,6 +927,12 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                     list.markAmDirty();
                     appendMergeCount++;
                     return;
+                }
+                } catch (Throwable t) {
+                    if (fut != null) {
+                        list.discardBufferedRows(t);
+                    }
+                    throw t;
                 }
                 // null return means defensive fall-through to recordDelete (null payload) —
                 // handle that here so we don't double-count.
@@ -1006,6 +1086,16 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         StateRequest<?, ?, ?, ?>[] r = new StateRequest<?, ?, ?, ?>[newCap];
         System.arraycopy(deleteRequests, 0, r, 0, deleteRequests.length);
         deleteRequests = r;
+    }
+
+    private void ensureOrderedCapacity() {
+        if (orderedCount < orderedRequests.length) {
+            return;
+        }
+        int newCap = orderedRequests.length << 1;
+        StateRequest<?, ?, ?, ?>[] r = new StateRequest<?, ?, ?, ?>[newCap];
+        System.arraycopy(orderedRequests, 0, r, 0, orderedRequests.length);
+        orderedRequests = r;
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
