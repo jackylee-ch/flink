@@ -294,6 +294,10 @@ public final class ForStRsLinker {
     // --- 5. Flush / checkpoint / metadata ---
     private final MethodHandle frsFlush;
     private final MethodHandle frsCreateCheckpoint;
+    // FRS-CKPT-NOFLUSH (2026-06-01): snapshot/restore the live memtable as an
+    // Arrow-IPC artifact instead of flushing it to an L0 SST.
+    private final MethodHandle frsSnapshotMemtablesToDir;
+    private final MethodHandle frsReplayMemtableArtifacts;
     private final MethodHandle frsSequenceNumber;
 
     // --- 6. Delta-Join lookup + iterator ---
@@ -333,6 +337,9 @@ public final class ForStRsLinker {
     private final MethodHandle frsGetAt;
     private final MethodHandle frsIteratorOpenAt;
     private final MethodHandle frsCreateIncrementalCheckpointAt;
+    // FRS-CKPT-NOFLUSH (2026-06-01): incremental checkpoint that skips the
+    // memtable→L0-SST flush (memtable captured as Arrow-IPC artifact instead).
+    private final MethodHandle frsCreateIncrementalCheckpointAtNoflush;
     private final MethodHandle frsDbOpenFromIncremental;
     private final MethodHandle frsDbIncrementalCheckpointResultFree;
 
@@ -673,6 +680,25 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // db
                                 ValueLayout.ADDRESS)); // target_dir (c_char*)
 
+        // FRS-CKPT-NOFLUSH: (db, target_dir c_char*, out_count u64*) -> int
+        this.frsSnapshotMemtablesToDir =
+                bind(
+                        "frs_snapshot_memtables_to_dir",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // snapshot (seq-bounded cut)
+                                ValueLayout.ADDRESS, // target_dir
+                                ValueLayout.ADDRESS)); // out_count (u64*)
+        this.frsReplayMemtableArtifacts =
+                bind(
+                        "frs_replay_memtable_artifacts",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // dir
+                                ValueLayout.ADDRESS)); // out_rows (u64*)
+
         this.frsSequenceNumber =
                 bind(
                         "frs_sequence_number",
@@ -978,6 +1004,19 @@ public final class ForStRsLinker {
         this.frsCreateIncrementalCheckpointAt =
                 bind(
                         "frs_create_incremental_checkpoint_at",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // snapshot
+                                ValueLayout.JAVA_LONG, // checkpoint_id (u64)
+                                ValueLayout.JAVA_LONG, // base_checkpoint_id (u64)
+                                ValueLayout.ADDRESS)); // out (FrsIncrementalCheckpointResult*)
+
+        // FRS-CKPT-NOFLUSH: same ABI as frs_create_incremental_checkpoint_at,
+        // but does not flush the memtable to an L0 SST.
+        this.frsCreateIncrementalCheckpointAtNoflush =
+                bind(
+                        "frs_create_incremental_checkpoint_at_noflush",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT,
                                 ValueLayout.ADDRESS, // db
@@ -1911,9 +1950,44 @@ public final class ForStRsLinker {
             MemorySegment valueSegment,
             long valueOffset,
             int valueLen) {
-        // Slice the caller's segments; both heap- and native-backed MemorySegments work
-        // because frs_put is bound with Linker.Option.critical(true), which pins heap
-        // segments for the duration of the call.
+        // D-C5R1-NEW-H1: frs_put is plain-bound (not critical) per D-R4-NEW-H1
+        // (write_controller.may_throttle can sleep — critical mode would suspend
+        // safepoints). Plain downcall handles REJECT heap MemorySegments at
+        // invocation with IllegalArgumentException; only native segments pass.
+        // If either input is heap-backed (MemorySegment.ofArray(byte[])), stage
+        // both into a per-call confined Arena. The implicit alloc cost is the
+        // price for never blocking GC during throttle stalls.
+        boolean keyHeap = !keySegment.isNative();
+        boolean valHeap = !valueSegment.isNative();
+        if (keyHeap || valHeap) {
+            try (java.lang.foreign.Arena local = java.lang.foreign.Arena.ofConfined()) {
+                MemorySegment keyNative =
+                        keyHeap
+                                ? copyToNative(local, keySegment, keyOffset, keyLen)
+                                : keySegment.asSlice(keyOffset, keyLen);
+                MemorySegment valNative =
+                        valHeap
+                                ? copyToNative(local, valueSegment, valueOffset, valueLen)
+                                : valueSegment.asSlice(valueOffset, valueLen);
+                int rcLocal;
+                try {
+                    rcLocal =
+                            (int)
+                                    frsPut.invokeExact(
+                                            db.handle(),
+                                            cf.handle(),
+                                            keyNative,
+                                            (long) keyLen,
+                                            valNative,
+                                            (long) valueLen);
+                } catch (Throwable t) {
+                    throw new FrsBackendException(
+                            FrsStatus.PANIC, "frs_put (segment) threw: " + t.getMessage());
+                }
+                check(rcLocal, "frs_put");
+                return;
+            }
+        }
         MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
         MemorySegment valSlice = valueSegment.asSlice(valueOffset, valueLen);
         int rc;
@@ -1935,6 +2009,21 @@ public final class ForStRsLinker {
     }
 
     /**
+     * D-C5R1-NEW-H1 helper: stage a heap-backed MemorySegment slice into a native segment in
+     * the given arena. Cheap allocation + single bulk copy; called only when the caller passes
+     * a heap segment (e.g., {@code MemorySegment.ofArray(byte[])}).
+     */
+    private static MemorySegment copyToNative(
+            java.lang.foreign.Arena arena,
+            MemorySegment src,
+            long srcOffset,
+            int len) {
+        MemorySegment dst = arena.allocate(len);
+        MemorySegment.copy(src, srcOffset, dst, 0L, len);
+        return dst;
+    }
+
+    /**
      * Segment-based delete (key only). The key slice is passed directly to {@code frs_delete} — no
      * {@code byte[]} allocation (PR-B1 / V2-10).
      */
@@ -1944,6 +2033,28 @@ public final class ForStRsLinker {
             MemorySegment keySegment,
             long keyOffset,
             int keyLen) {
+        // D-C5R1-NEW-H1 (sister): frs_delete is plain-bound; heap segments
+        // must be staged to native. See putSegment for full rationale.
+        if (!keySegment.isNative()) {
+            try (java.lang.foreign.Arena local = java.lang.foreign.Arena.ofConfined()) {
+                MemorySegment keyNative = copyToNative(local, keySegment, keyOffset, keyLen);
+                int rcLocal;
+                try {
+                    rcLocal =
+                            (int)
+                                    frsDelete.invokeExact(
+                                            db.handle(),
+                                            cf.handle(),
+                                            keyNative,
+                                            (long) keyLen);
+                } catch (Throwable t) {
+                    throw new FrsBackendException(
+                            FrsStatus.PANIC, "frs_delete (segment) threw: " + t.getMessage());
+                }
+                check(rcLocal, "frs_delete");
+                return;
+            }
+        }
         MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
         int rc;
         try {
@@ -2130,125 +2241,9 @@ public final class ForStRsLinker {
      *
      * @return array of length {@code count}; null entries mean "not found".
      */
-    public byte[][] batchGet(
-            FrsDb db, FrsCfHandle cf, MemorySegment keyPtrs, MemorySegment keyLens, long count) {
-        if (count == 0) {
-            return new byte[0][];
-        }
-        try (Arena local = Arena.ofConfined()) {
-            long bytesSize = FRS_BYTES_LAYOUT.byteSize();
-            MemorySegment outValues = local.allocate(bytesSize * count);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsBatchGet.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        keyPtrs,
-                                        keyLens,
-                                        count,
-                                        outValues);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
-            }
-            check(rc, "frs_batch_get");
-
-            // R66-H1: convert the 3-arg overload to the same
-            // `copyAndFreeCollect` + `rethrowIfAny` pattern as the
-            // sister overloads (batch 60). The earlier inline R64-M2
-            // fix only wrapped the `frs_bytes_free` call in try/catch
-            // — the preceding `MemorySegment.copy` and `new byte[len]`
-            // were OUTSIDE the try, so an OOM/IOOBE on entry i would
-            // abort the loop and leak entries i+1..count's engine-
-            // owned FrsBytes payloads. The helper widens the failure-
-            // tolerant window across copy AND free, and still calls
-            // free even when the pre-free copy fails.
-            // The outer `if (dataAddr != 0L)` gate preserves the
-            // "results[i] stays null = not found" caller contract;
-            // copyAndFreeCollect returns byte[0] for that case, which
-            // would be observationally different.
-            java.util.List<Throwable> pending = new java.util.ArrayList<>();
-            byte[][] results = new byte[(int) count][];
-            for (int i = 0; i < (int) count; i++) {
-                MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
-                long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
-                if (dataAddr != 0L) {
-                    results[i] = copyAndFreeCollect(entry, "frs_batch_get", pending);
-                }
-                // else: results[i] stays null (not found)
-            }
-            rethrowIfAny(pending);
-            return results;
-        }
-    }
-
-    /**
-     * Convenience overload — stages {@code keys} into a fresh confined arena and forwards to {@link
-     * #batchGet(FrsDb, FrsCfHandle, MemorySegment, MemorySegment, long)}.
-     *
-     * @return array of length {@code keys.length}; null entries mean "not found".
-     */
-    public byte[][] batchGet(FrsDb db, FrsCfHandle cf, byte[][] keys) {
-        int count = keys.length;
-        if (count == 0) {
-            return new byte[0][];
-        }
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keyPtrs = local.allocate((long) count * ValueLayout.ADDRESS.byteSize());
-            MemorySegment keyLens = local.allocate((long) count * ValueLayout.JAVA_LONG.byteSize());
-            for (int i = 0; i < count; i++) {
-                byte[] k = keys[i];
-                MemorySegment ks = local.allocate(k.length == 0 ? 1 : k.length);
-                if (k.length > 0) {
-                    MemorySegment.copy(k, 0, ks, ValueLayout.JAVA_BYTE, 0, k.length);
-                }
-                keyPtrs.set(ValueLayout.ADDRESS, (long) i * ValueLayout.ADDRESS.byteSize(), ks);
-                keyLens.set(
-                        ValueLayout.JAVA_LONG,
-                        (long) i * ValueLayout.JAVA_LONG.byteSize(),
-                        (long) k.length);
-            }
-            // Allocate out_values in this arena (will be freed with the arena, but we
-            // free individual FrsBytes payloads inside batchGetRaw).
-            long bytesSize = FRS_BYTES_LAYOUT.byteSize();
-            MemorySegment outValues = local.allocate(bytesSize * count);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsBatchGet.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        keyPtrs,
-                                        keyLens,
-                                        (long) count,
-                                        outValues);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
-            }
-            check(rc, "frs_batch_get");
-
-            // R65-H1: drain-tolerant per-entry copy+free so a single
-            // pre-free OOM / memcpy throw / non-OK free status does not
-            // abort the loop and leak the remaining entries' native
-            // FrsBytes payloads. See `copyAndFreeCollect` for the
-            // contract.
-            java.util.List<Throwable> pending = new java.util.ArrayList<>();
-            byte[][] results = new byte[count][];
-            for (int i = 0; i < count; i++) {
-                MemorySegment entry = outValues.asSlice(bytesSize * i, bytesSize);
-                long dataAddr = ((MemorySegment) FRS_BYTES_DATA.get(entry, 0L)).address();
-                if (dataAddr != 0L) {
-                    results[i] = copyAndFreeCollect(entry, "frs_batch_get", pending);
-                }
-            }
-            rethrowIfAny(pending);
-            return results;
-        }
-    }
+    // R0C-NEW-H1 Tier-1: legacy `batchGet(byte[][])` and segment-ptr-array variant
+    // removed under the byte[]/byte[][] ban. Callers use `vectorizedBatchGet` (Arrow
+    // off-heap output) or `batchGetArrow` (Arrow C Data Interface output) instead.
 
     /**
      * C1 zero-copy batch_put via the Arrow C Data Interface.
@@ -2287,53 +2282,9 @@ public final class ForStRsLinker {
         check(rc, "frs_batch_put_arrow");
     }
 
-    /**
-     * Batch get using the existing batchGet path but with reduced allocation: reuses a
-     * pre-allocated output segment across calls. Returns values as byte[][] but avoids Arena
-     * allocation overhead by using a shared Arena.
-     */
-    public byte[][] batchGetReuse(FrsDb db, FrsCfHandle cf, byte[][] keys, Arena sharedArena) {
-        int count = keys.length;
-        if (count == 0) {
-            return new byte[0][];
-        }
-        MemorySegment keyPtrs = sharedArena.allocate(ValueLayout.ADDRESS, count);
-        MemorySegment keyLens = sharedArena.allocate(ValueLayout.JAVA_LONG, count);
-        MemorySegment[] keySegs = new MemorySegment[count];
-        for (int i = 0; i < count; i++) {
-            keySegs[i] = sharedArena.allocate(keys[i].length);
-            MemorySegment.copy(keys[i], 0, keySegs[i], ValueLayout.JAVA_BYTE, 0, keys[i].length);
-            keyPtrs.setAtIndex(ValueLayout.ADDRESS, i, keySegs[i]);
-            keyLens.setAtIndex(ValueLayout.JAVA_LONG, i, (long) keys[i].length);
-        }
-        MemorySegment outValues = sharedArena.allocate(FRS_BYTES_LAYOUT.byteSize() * count);
-        int rc;
-        try {
-            rc =
-                    (int)
-                            frsBatchGet.invokeExact(
-                                    db.handle(),
-                                    cf.handle(),
-                                    keyPtrs,
-                                    keyLens,
-                                    (long) count,
-                                    outValues);
-        } catch (Throwable t) {
-            throw new FrsBackendException(
-                    FrsStatus.PANIC, "frs_batch_get threw: " + t.getMessage());
-        }
-        check(rc, "frs_batch_get");
-        // R65-H2: drain-tolerant copy+free — see copyAndFreeCollect.
-        java.util.List<Throwable> pending = new java.util.ArrayList<>();
-        byte[][] results = new byte[count][];
-        long stride = FRS_BYTES_LAYOUT.byteSize();
-        for (int i = 0; i < count; i++) {
-            MemorySegment slot = outValues.asSlice(i * stride, stride);
-            results[i] = copyAndFreeCollect(slot, "frs_batch_get/value", pending);
-        }
-        rethrowIfAny(pending);
-        return results;
-    }
+    // R0C-NEW-H1: `batchGetReuse(byte[][])` removed — superseded by `vectorizedBatchGet`
+    // (off-heap segment-based) under the byte[]/byte[][] ban. Zero live or test callers
+    // when removed.
 
     private static final long ARROW_SCHEMA_BYTES = 72L;
     private static final long ARROW_ARRAY_BYTES = FFI_ARROW_ARRAY_LAYOUT.byteSize();
@@ -2929,6 +2880,59 @@ public final class ForStRsLinker {
         }
     }
 
+    /**
+     * FRS-CKPT-NOFLUSH (2026-06-01): serialise every CF's LIVE memtables to
+     * per-CF Arrow-IPC artifacts under {@code dir} WITHOUT flushing them to L0
+     * SSTs (the memtable stays RAM-resident + writable). Returns the number of
+     * artifacts written. The snapshot strategy includes these as private-state
+     * files in the incremental keyed-state handle.
+     */
+    public long snapshotMemtablesToDir(FrsDb db, FrsSnapshot snapshot, String dir) {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment dirSeg = allocateCString(local, dir);
+            MemorySegment outCount = local.allocate(ValueLayout.JAVA_LONG);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsSnapshotMemtablesToDir.invokeExact(
+                                        db.handle(), snapshot.handle(), dirSeg, outCount);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC,
+                        "frs_snapshot_memtables_to_dir threw: " + t.getMessage());
+            }
+            check(rc, "frs_snapshot_memtables_to_dir");
+            return outCount.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
+    /**
+     * FRS-CKPT-NOFLUSH: restore counterpart — replay every memtable artifact
+     * found under {@code dir} into its CF (preserving sequence + op_type). Call
+     * AFTER the engine has opened the checkpoint's SST set. Returns total rows
+     * replayed.
+     */
+    public long replayMemtableArtifacts(FrsDb db, String dir) {
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment dirSeg = allocateCString(local, dir);
+            MemorySegment outRows = local.allocate(ValueLayout.JAVA_LONG);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsReplayMemtableArtifacts.invokeExact(
+                                        db.handle(), dirSeg, outRows);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC,
+                        "frs_replay_memtable_artifacts threw: " + t.getMessage());
+            }
+            check(rc, "frs_replay_memtable_artifacts");
+            return outRows.get(ValueLayout.JAVA_LONG, 0);
+        }
+    }
+
     /** Returns the current global sequence number. */
     public long sequenceNumber(FrsDb db) {
         try (Arena local = Arena.ofConfined()) {
@@ -3085,166 +3089,15 @@ public final class ForStRsLinker {
         return new FrsIterator(this, handle, true);
     }
 
-    /**
-     * Returns all key-value pairs matching {@code prefix} in a single FFM call. Much faster than
-     * iterator-based prefix scan for small result sets.
-     */
-    public IteratorEntry[] prefixGetAll(FrsDb db, FrsCfHandle cf, byte[] prefix, int maxCount) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment prefixSeg;
-            long prefixLen;
-            if (prefix == null || prefix.length == 0) {
-                prefixSeg = MemorySegment.NULL;
-                prefixLen = 0L;
-            } else {
-                prefixSeg = local.allocate(prefix.length);
-                MemorySegment.copy(prefix, 0, prefixSeg, ValueLayout.JAVA_BYTE, 0, prefix.length);
-                prefixLen = prefix.length;
-            }
-            MemorySegment outKeys = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxCount);
-            MemorySegment outValues = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxCount);
-            MemorySegment outCount = local.allocate(ValueLayout.JAVA_LONG);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsPrefixGetAll.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        prefixSeg,
-                                        prefixLen,
-                                        (long) maxCount,
-                                        outKeys,
-                                        outValues,
-                                        outCount);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_prefix_get_all threw: " + t.getMessage());
-            }
-            check(rc, "frs_prefix_get_all");
-            int count = (int) outCount.get(ValueLayout.JAVA_LONG, 0);
-            // R65-H3: drain-tolerant — see copyAndFreeCollect.
-            java.util.List<Throwable> pending = new java.util.ArrayList<>();
-            IteratorEntry[] result = new IteratorEntry[count];
-            long stride = FRS_BYTES_LAYOUT.byteSize();
-            for (int i = 0; i < count; i++) {
-                MemorySegment keySlot = outKeys.asSlice(i * stride, stride);
-                MemorySegment valSlot = outValues.asSlice(i * stride, stride);
-                byte[] keyCopy =
-                        copyAndFreeCollect(keySlot, "frs_prefix_get_all/key", pending);
-                byte[] valCopy =
-                        copyAndFreeCollect(valSlot, "frs_prefix_get_all/value", pending);
-                result[i] = new IteratorEntry(keyCopy, valCopy);
-            }
-            rethrowIfAny(pending);
-            return result;
-        }
-    }
+    // R0C-NEW-H1: `prefixGetAll(byte[])` and `batchPrefixScan(byte[][])` removed —
+    // superseded by `frs_vec_iter_prefix_open` + `frs_vec_iter_prefix_next` (Arrow
+    // chunked iterator) under the byte[]/byte[][] ban. Zero live or test callers
+    // when removed. The IteratorEntry-returning shape allocated per-row `byte[]`
+    // pairs which defeated end-to-end Arrow throughput.
 
-    /**
-     * Batch prefix scan: takes N prefixes, returns all entries for each in a single FFM call.
-     * Returns a 2D array where result[i] contains the entries for prefix[i].
-     */
-    public IteratorEntry[][] batchPrefixScan(
-            FrsDb db, FrsCfHandle cf, byte[][] prefixes, int maxPerPrefix) {
-        int n = prefixes.length;
-        if (n == 0) {
-            return new IteratorEntry[0][];
-        }
-        int maxTotal = n * maxPerPrefix;
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment prefixPtrs = local.allocate(ValueLayout.ADDRESS, n);
-            MemorySegment prefixLens = local.allocate(ValueLayout.JAVA_LONG, n);
-            MemorySegment[] prefixSegs = new MemorySegment[n];
-            for (int i = 0; i < n; i++) {
-                if (prefixes[i] != null && prefixes[i].length > 0) {
-                    prefixSegs[i] = local.allocate(prefixes[i].length);
-                    MemorySegment.copy(
-                            prefixes[i],
-                            0,
-                            prefixSegs[i],
-                            ValueLayout.JAVA_BYTE,
-                            0,
-                            prefixes[i].length);
-                    prefixPtrs.setAtIndex(ValueLayout.ADDRESS, i, prefixSegs[i]);
-                    prefixLens.setAtIndex(ValueLayout.JAVA_LONG, i, (long) prefixes[i].length);
-                } else {
-                    prefixPtrs.setAtIndex(ValueLayout.ADDRESS, i, MemorySegment.NULL);
-                    prefixLens.setAtIndex(ValueLayout.JAVA_LONG, i, 0L);
-                }
-            }
-            MemorySegment outKeys = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxTotal);
-            MemorySegment outValues = local.allocate(FRS_BYTES_LAYOUT.byteSize() * maxTotal);
-            MemorySegment outCounts = local.allocate(ValueLayout.JAVA_LONG, n);
-            MemorySegment outTotal = local.allocate(ValueLayout.JAVA_LONG);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsBatchPrefixScan.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        prefixPtrs,
-                                        prefixLens,
-                                        (long) n,
-                                        (long) maxPerPrefix,
-                                        outKeys,
-                                        outValues,
-                                        outCounts,
-                                        outTotal);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_batch_prefix_scan threw: " + t.getMessage());
-            }
-            check(rc, "frs_batch_prefix_scan");
-            int total = (int) outTotal.get(ValueLayout.JAVA_LONG, 0);
-            long stride = FRS_BYTES_LAYOUT.byteSize();
-            // R65-H3: drain-tolerant — see copyAndFreeCollect.
-            java.util.List<Throwable> pending = new java.util.ArrayList<>();
-            IteratorEntry[][] results = new IteratorEntry[n][];
-            int offset = 0;
-            for (int i = 0; i < n; i++) {
-                int count = (int) outCounts.getAtIndex(ValueLayout.JAVA_LONG, i);
-                results[i] = new IteratorEntry[count];
-                for (int j = 0; j < count; j++) {
-                    MemorySegment keySlot = outKeys.asSlice((offset + j) * stride, stride);
-                    MemorySegment valSlot = outValues.asSlice((offset + j) * stride, stride);
-                    byte[] keyCopy =
-                            copyAndFreeCollect(keySlot, "frs_batch_prefix_scan/key", pending);
-                    byte[] valCopy =
-                            copyAndFreeCollect(valSlot, "frs_batch_prefix_scan/value", pending);
-                    results[i][j] = new IteratorEntry(keyCopy, valCopy);
-                }
-                offset += count;
-            }
-            rethrowIfAny(pending);
-            return results;
-        }
-    }
-
-    /** Repositions the iterator at the first key {@code >=} {@code key}. */
-    public void iteratorSeek(FrsIterator iter, byte[] key) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keySeg;
-            long keyLen;
-            if (key == null || key.length == 0) {
-                keySeg = MemorySegment.NULL;
-                keyLen = 0L;
-            } else {
-                keySeg = local.allocate(key.length);
-                MemorySegment.copy(key, 0, keySeg, ValueLayout.JAVA_BYTE, 0, key.length);
-                keyLen = key.length;
-            }
-            int rc;
-            try {
-                rc = (int) frsIteratorSeek.invokeExact(iter.handle(), keySeg, keyLen);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_iterator_seek threw: " + t.getMessage());
-            }
-            check(rc, "frs_iterator_seek");
-        }
-    }
+    // R0C-NEW-H1 Tier-1: legacy `iteratorSeek(byte[])` removed under the byte[]/byte[][]
+    // ban. Iterator-based prefix scans go through `iteratorOpenAt` / `vecIterPrefixOpen`
+    // which expose segment-shaped key positioning at iterator construction time.
 
     /**
      * Advances {@code iter} and returns the next entry, or {@code null} when the iterator is
@@ -3252,36 +3105,39 @@ public final class ForStRsLinker {
      * Java heap and frees the native buffers via {@code frs_bytes_free}.
      */
     public IteratorEntry iteratorNext(FrsIterator iter) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment outKey = local.allocate(FRS_BYTES_LAYOUT);
-            MemorySegment outValue = local.allocate(FRS_BYTES_LAYOUT);
-            MemorySegment outValid = local.allocate(ValueLayout.JAVA_BOOLEAN);
-            int rc;
-            try {
-                rc = (int) frsIteratorNext.invokeExact(iter.handle(), outKey, outValue, outValid);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_iterator_next threw: " + t.getMessage());
-            }
-            check(rc, "frs_iterator_next");
-
-            boolean valid = outValid.get(ValueLayout.JAVA_BOOLEAN, 0);
-            if (!valid) {
-                // Rust set both FrsBytes to NULL in this case — nothing to free.
-                return null;
-            }
-
-            // R65-M2: drain BOTH key and value even if the key's free
-            // returns non-OK or throws — pre-fix, a key-free failure
-            // leaked the value's native heap. Collect failures and
-            // rethrow after both calls so neither buffer leaks.
-            java.util.List<Throwable> pending = new java.util.ArrayList<>();
-            byte[] keyCopy = copyAndFreeCollect(outKey, "frs_iterator_next/key", pending);
-            byte[] valueCopy =
-                    copyAndFreeCollect(outValue, "frs_iterator_next/value", pending);
-            rethrowIfAny(pending);
-            return new IteratorEntry(keyCopy, valueCopy);
+        // D-R3-H4: reuse the iterator's pre-allocated scratch segments
+        // instead of opening a fresh Arena.ofConfined() per call. Pre-fix
+        // a 1000-row scan paid 1000 arena lifecycles + 3000 native allocs;
+        // now those allocations happen ONCE at iter open and amortize
+        // across the entire scan.
+        MemorySegment outKey = iter.scratchKey;
+        MemorySegment outValue = iter.scratchValue;
+        MemorySegment outValid = iter.scratchValid;
+        int rc;
+        try {
+            rc = (int) frsIteratorNext.invokeExact(iter.handle(), outKey, outValue, outValid);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_iterator_next threw: " + t.getMessage());
         }
+        check(rc, "frs_iterator_next");
+
+        boolean valid = outValid.get(ValueLayout.JAVA_BOOLEAN, 0);
+        if (!valid) {
+            // Rust set both FrsBytes to NULL in this case — nothing to free.
+            return null;
+        }
+
+        // R65-M2: drain BOTH key and value even if the key's free
+        // returns non-OK or throws — pre-fix, a key-free failure
+        // leaked the value's native heap. Collect failures and
+        // rethrow after both calls so neither buffer leaks.
+        java.util.List<Throwable> pending = new java.util.ArrayList<>();
+        byte[] keyCopy = copyAndFreeCollect(outKey, "frs_iterator_next/key", pending);
+        byte[] valueCopy =
+                copyAndFreeCollect(outValue, "frs_iterator_next/value", pending);
+        rethrowIfAny(pending);
+        return new IteratorEntry(keyCopy, valueCopy);
     }
 
     // ------------------------------------------------------------------
@@ -3641,44 +3497,9 @@ public final class ForStRsLinker {
         check(rc, "frs_db_release_snapshot");
     }
 
-    /**
-     * Versioned point-lookup: returns the value visible at {@code snapshot}'s sequence number, or
-     * {@code null} if no version is visible (or the latest visible version is a tombstone).
-     */
-    public byte[] getAt(FrsDb db, FrsCfHandle cf, FrsSnapshot snapshot, byte[] key) {
-        try (Arena local = Arena.ofConfined()) {
-            MemorySegment keySeg = copyBytesToNative(local, key);
-            // FrsBytes layout: data ptr (8) + len (8) + capacity (8) = 24 bytes.
-            MemorySegment outBytes = local.allocate(24);
-            int rc;
-            try {
-                rc =
-                        (int)
-                                frsGetAt.invokeExact(
-                                        db.handle(),
-                                        cf.handle(),
-                                        snapshot.handle(),
-                                        keySeg,
-                                        (long) key.length,
-                                        outBytes);
-            } catch (Throwable t) {
-                throw new FrsBackendException(
-                        FrsStatus.PANIC, "frs_get_at threw: " + t.getMessage());
-            }
-            if (rc == FrsStatus.NOT_FOUND.code()) {
-                return null;
-            }
-            check(rc, "frs_get_at");
-            long dataAddr = ((MemorySegment) FRS_BYTES_DATA_U.get(outBytes, 0L)).address();
-            long len = (long) FRS_BYTES_LEN_U.get(outBytes, 0L);
-            if (dataAddr == 0L) {
-                // Defensive: native should have returned NOT_FOUND already, but
-                // honor the same hit/miss convention as Get.
-                return null;
-            }
-            return copyAndFreeRaw(outBytes, dataAddr, len, "frs_get_at/free");
-        }
-    }
+    // R0C-NEW-H1 Tier-1: legacy `getAt(byte[]) → byte[]` removed under the byte[]/
+    // byte[][] ban. Snapshot point-lookups now go via `iteratorOpenAt` + segment-
+    // shaped iteration, which exposes the same MVCC semantics with off-heap output.
 
     /**
      * Opens a forward iterator that yields the latest version of each user-key with {@code seq
@@ -3741,6 +3562,37 @@ public final class ForStRsLinker {
                     "frs_create_incremental_checkpoint_at threw: " + t.getMessage());
         }
         check(rc, "frs_create_incremental_checkpoint_at");
+    }
+
+    /**
+     * FRS-CKPT-NOFLUSH: incremental checkpoint that enumerates only the
+     * already-flushed SST set WITHOUT flushing the memtable. The caller captures
+     * the live memtable via {@link #snapshotMemtablesToDir} and uploads those
+     * artifacts as private checkpoint state. Same result-struct contract as
+     * {@link #createIncrementalCheckpointAt}.
+     */
+    public void createIncrementalCheckpointAtNoflush(
+            FrsDb db,
+            FrsSnapshot snapshot,
+            long checkpointId,
+            long baseCheckpointId,
+            MemorySegment resultPtr) {
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsCreateIncrementalCheckpointAtNoflush.invokeExact(
+                                    db.handle(),
+                                    snapshot.handle(),
+                                    checkpointId,
+                                    baseCheckpointId,
+                                    resultPtr);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_create_incremental_checkpoint_at_noflush threw: " + t.getMessage());
+        }
+        check(rc, "frs_create_incremental_checkpoint_at_noflush");
     }
 
     /**

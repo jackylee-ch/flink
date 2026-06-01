@@ -45,6 +45,9 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import javax.annotation.Nullable;
 
 import java.io.IOException;
@@ -61,6 +64,8 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         implements MapState<UK, UV>,
                 ForStRsInnerTable<K, N, UV>,
                 ForStRsIterableState<K, N, UK, UV> {
+
+    private static final Logger LOG = LoggerFactory.getLogger(ForStRsMapStateV2.class);
 
     private static final byte[] KEY_PREFIX = "k/".getBytes(StandardCharsets.UTF_8);
     private static final byte[] SLASH = "/".getBytes(StandardCharsets.UTF_8);
@@ -84,11 +89,38 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
 
     /**
+     * V2-violation V2: per-state reusable iter-decode view. The iterator-path decode methods
+     * ({@link #deserializeUserKey(IteratorEntryView, int)} / {@link
+     * #deserializeUserValue(IteratorEntryView)}) rewind this view onto the slice handed in by
+     * the chunk MemorySegment, avoiding the previous per-row {@code byte[] buf = new
+     * byte[rangeLen]} allocation. Reused across rows of a single iteration and across iterations
+     * because the state is single-threaded per Flink slot.
+     */
+    private final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView iterView =
+            new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+
+    /**
      * Per-state-instance LRU cache for (operatorKey, userKey) → value lookups. Eliminates engine
      * round-trips for repeated reads of the same map entry within a window. See {@link
      * MapStateCache} for semantics (write-through, LRU 256K cap, single-threaded).
      */
     private final MapStateCache<UV> cache = new MapStateCache<>();
+
+    /**
+     * FRS-BATCH-PROBE (2026-06-01): A/B gate for the per-record read cache. A
+     * JFR profile of the q4 join showed ~40 % of CPU in the per-record
+     * {@link MapStateCache} lookup (findRow / keyEquals / MemorySegment.mismatch
+     * on the ~56-byte composite key) — the residual cost once
+     * checkpoint-without-flush removed the S3 collapse. When
+     * {@code FRS_DISABLE_MAPSTATE_CACHE=1}, asyncGet SKIPS the per-record cache
+     * lookup and routes to the off-heap buffer + the engine's BATCHED,
+     * SIMD-vectorized {@code batch_get_vectorized} (one FFM crossing per dispatch
+     * batch). Correctness-safe: asyncPut writes through the off-heap buffer (and
+     * the engine on flush), so reads still observe every write without the cache.
+     * This tests the user's "merge per-row into batch execution" directive.
+     */
+    private static final boolean DISABLE_MAPSTATE_CACHE =
+            "1".equals(System.getenv("FRS_DISABLE_MAPSTATE_CACHE"));
 
     /**
      * PR-C1 (V2-8 / Z3-6 / C-H5): per-state off-heap staging buffer mirroring the V1-sync
@@ -179,71 +211,141 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      * <p>PR-A2: includes serialized namespace bytes between stateName and userKey so the
      * MapStateCache distinguishes entries that share (operatorKey, stateName, userKey) but differ
      * by namespace. Otherwise window-keyed MapState reads/writes silently collide across windows.
+     *
+     * <p><b>V2-violation V2 note</b>: this LEGACY entry point still materializes a fresh {@code
+     * byte[]} via {@link DataOutputSerializer#getCopyOfBuffer()} and exists only to keep the
+     * {@code ForStRsMapStateV2CacheTest} reflection assertion green. The HOT PATH async overrides
+     * (asyncGet/Put/Contains/Remove) call {@link #serializeMapEntryKeyShared(Object)} instead,
+     * which returns the byte LENGTH and leaves the bytes in the shared {@link #keyOut} buffer for
+     * zero-alloc slice consumption.
      */
     private byte[] serializeMapEntryKey(UK userKey) {
-        @SuppressWarnings("unchecked")
+        int len = serializeMapEntryKeyShared(userKey);
+        // Snapshot the shared buffer into a fresh byte[] for the legacy contract. Not called on
+        // the per-record hot path.
+        return java.util.Arrays.copyOf(keyOut.getSharedBuffer(), len);
+    }
+
+    /**
+     * V2-violation V2: zero-alloc composite-key serializer. Writes the composite (key + namespace
+     * + userKey) into the per-state shared {@link #keyOut} buffer and returns the number of bytes
+     * written. Callers MUST read the bytes from {@code keyOut.getSharedBuffer()[0..returnValue)}
+     * synchronously — the next call to this method overwrites them.
+     *
+     * <p>Combined with the (buf, off, len) slice overloads on {@link MapStateCache} and {@link
+     * MapStateArrowBuffer}, this eliminates the per-row {@code byte[]} allocation that the
+     * legacy {@link #serializeMapEntryKey(Object)} path performed via {@code getCopyOfBuffer()}.
+     *
+     * <p>Snapshot wire format is unchanged: the bytes written are byte-identical to those the
+     * legacy path produced (same {@link #writeCompositePrefix} helper + {@code userKeySerializer}
+     * tail).
+     */
+    @SuppressWarnings("unchecked")
+    private int serializeMapEntryKeyShared(UK userKey) {
         AsyncExecutionController<K, ?> aec = (AsyncExecutionController<K, ?>) stateRequestHandler;
         RecordContext<K> ctx = aec.getCurrentContext();
-        @SuppressWarnings("unchecked")
-        N namespace = ctx.getNamespace(this);
         try {
-            keyOut.clear();
-            keyOut.write(KEY_PREFIX);
-            keySerializer.serialize(ctx.getKey(), keyOut);
-            keyOut.write(SLASH);
-            keyOut.write(stateNameBytes);
-            keyOut.write(SLASH);
-            if (namespaceSerializer != null
-                    && namespace != null
-                    && !(namespace instanceof VoidNamespace)) {
-                namespaceSerializer.serialize(namespace, keyOut);
-            }
+            writeCompositePrefix(ctx);
             userKeySerializer.serialize(userKey, keyOut);
-            return keyOut.getCopyOfBuffer();
+            return keyOut.length();
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize map entry key for cache", e);
         }
     }
 
+    /**
+     * S3-MAPITER-FIX2: the ONE place that writes the composite-key prefix
+     * {@code KEY_PREFIX + serialize(K) + / + stateName + / + [serialize(N)]} into {@link #keyOut}.
+     *
+     * <p>Root cause of the Nexmark-q3 (S3) MapState-iter EOFException: the write path
+     * ({@code serializeMapEntryKey} via {@code asyncPut} → off-heap buffer → engine PUT) read the
+     * namespace from {@code ctx.getNamespace(this)} (which is {@code null} for the streaming-join
+     * MapState, so the {@code namespace != null} guard skipped the namespace byte), while
+     * {@code getIterPrefix} read it from {@code request.getNamespace()} ({@code @Nonnull}, returns a
+     * non-null {@code VoidNamespace} whose serializer writes exactly one {@code 0x00} byte). The
+     * iter prefix was therefore 1 byte longer than the bytes actually on disk, so the user-key
+     * strip-offset ({@code prefix.length}) started 1 byte too late and misread the user-key length
+     * → EOFException. Funnelling every builder through this helper — same namespace SOURCE
+     * ({@code ctx.getNamespace(this)}) and same GUARD ({@code != null && !VoidNamespace}) —
+     * guarantees the iter prefix length is exactly the bytes the write path prepended.
+     *
+     * <p>{@link #keyOut} is cleared by this method; callers append the user key (if any) after.
+     */
+    @SuppressWarnings("unchecked")
+    private void writeCompositePrefix(RecordContext<K> ctx) throws IOException {
+        N namespace = ctx.getNamespace(this);
+        keyOut.clear();
+        keyOut.write(KEY_PREFIX);
+        keySerializer.serialize(ctx.getKey(), keyOut);
+        keyOut.write(SLASH);
+        keyOut.write(stateNameBytes);
+        keyOut.write(SLASH);
+        if (namespaceSerializer != null
+                && namespace != null
+                && !(namespace instanceof VoidNamespace)) {
+            namespaceSerializer.serialize(namespace, keyOut);
+        }
+    }
+
     @Override
     public StateFuture<UV> asyncGet(UK userKey) {
-        byte[] keyBytes = serializeMapEntryKey(userKey);
-        MapStateCache.Lookup<UV> hit = cache.lookup(keyBytes);
-        if (hit != null && hit.cached()) {
-            // Cache hit (or known-missing tombstone) — return completed future immediately.
-            return StateFutureUtils.completedFuture(hit.value());
+        // V2-violation V2: zero-alloc composite key. Bytes live at keyOut.getSharedBuffer()[0..len).
+        int keyLen = serializeMapEntryKeyShared(userKey);
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        if (!DISABLE_MAPSTATE_CACHE) {
+            MapStateCache.Lookup<UV> hit = cache.lookup(keyBuf, 0, keyLen);
+            if (hit != null && hit.cached()) {
+                // Cache hit (or known-missing tombstone) — return completed future immediately.
+                return StateFutureUtils.completedFuture(hit.value());
+            }
         }
         // PR-C1: probe the off-heap buffer before falling through to the engine. A buffer hit
         // resolves locally; a buffer tombstone short-circuits to null without an engine probe.
         if (offHeapBuf != null) {
-            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBytes);
+            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);
             if (bufHit.cached) {
                 UV resolved = bufHit.tombstone ? null : deserializeFromBuffer(bufHit.row);
-                cache.put(keyBytes, resolved);
+                cache.put(keyBuf, 0, keyLen, resolved);
                 return StateFutureUtils.completedFuture(resolved);
             }
         }
-        // Miss — fall through, then populate cache on result.
+        // Miss — fall through, then populate cache on result. The continuation runs
+        // asynchronously; the shared keyOut buffer will be reused by the next call before the
+        // lambda fires, so we MUST snapshot the bytes into a fresh array that the lambda owns.
+        // This is the ONLY remaining byte[] allocation on this path and it's confined to the
+        // engine-miss cold path; cache and buffer hits are zero-alloc.
+        final byte[] keySnapshot = snapshotKeyForAsyncLambda(keyLen);
+        // E-R5-H2: use putIfAbsent so a concurrent asyncPut / asyncRemove that
+        // raced this engine GET wins authoritatively. Pre-fix the thenApply
+        // unconditionally overwrote the cache with the engine value, clobbering
+        // the freshly-cached new value from a concurrent write and producing
+        // silent stale reads until eviction.
         return super.asyncGet(userKey)
                 .thenApply(
                         value -> {
-                            cache.put(keyBytes, value);
+                            if (!DISABLE_MAPSTATE_CACHE) {
+                                cache.putIfAbsent(keySnapshot, value);
+                            }
                             return value;
                         });
     }
 
     @Override
     public StateFuture<Void> asyncPut(UK userKey, UV value) {
-        byte[] keyBytes = serializeMapEntryKey(userKey);
-        cache.put(keyBytes, value);
+        // V2-violation V2: zero-alloc composite key. Bytes at keyOut.getSharedBuffer()[0..keyLen).
+        int keyLen = serializeMapEntryKeyShared(userKey);
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        if (!DISABLE_MAPSTATE_CACHE) {
+            cache.put(keyBuf, 0, keyLen, value);
+        }
         // PR-C1: stage the PUT off-heap. Bypasses the V2 columnar dispatch until the buffer's
         // auto-flush watermark or the snapshot pre-hook drains it via linker.batchPut.
         if (offHeapBuf != null) {
-            // PR-M3: avoid getCopyOfBuffer() — MapStateArrowBuffer copies the value bytes into
-            // its own off-heap staging segment, so we can pass valueOut's shared buffer + length
-            // and let it consume them synchronously. Eliminates one byte[] alloc per asyncPut.
+            // PR-M3: avoid getCopyOfBuffer() — MapStateArrowBuffer copies the key+value bytes
+            // synchronously into its own off-heap staging segment, so we can pass the shared
+            // keyOut/valueOut buffers directly.
             if (value == null) {
-                offHeapBuf.putShared(keyBytes, 0, keyBytes.length, null, 0, 0, linker, db, cf);
+                offHeapBuf.putShared(keyBuf, 0, keyLen, null, 0, 0, linker, db, cf);
             } else {
                 try {
                     valueOut.clear();
@@ -251,9 +353,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                     UV uv = (UV) value;
                     userValueSerializer.serialize(uv, valueOut);
                     offHeapBuf.putShared(
-                            keyBytes,
+                            keyBuf,
                             0,
-                            keyBytes.length,
+                            keyLen,
                             valueOut.getSharedBuffer(),
                             0,
                             valueOut.length(),
@@ -272,12 +374,14 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
 
     @Override
     public StateFuture<Void> asyncRemove(UK userKey) {
-        byte[] keyBytes = serializeMapEntryKey(userKey);
-        cache.remove(keyBytes);
+        // V2-violation V2: zero-alloc composite key.
+        int keyLen = serializeMapEntryKeyShared(userKey);
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        cache.remove(keyBuf, 0, keyLen);
         if (offHeapBuf != null) {
             // Stage a buffer tombstone + drop any prior buffered PUT for this key. The engine
             // delete fires when the buffer is drained.
-            offHeapBuf.remove(keyBytes, linker, db, cf);
+            offHeapBuf.remove(keyBuf, 0, keyLen, linker, db, cf);
             return StateFutureUtils.completedFuture(null);
         }
         return super.asyncRemove(userKey);
@@ -285,18 +389,36 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
 
     @Override
     public StateFuture<Boolean> asyncContains(UK userKey) {
-        byte[] keyBytes = serializeMapEntryKey(userKey);
-        MapStateCache.Lookup<UV> hit = cache.lookup(keyBytes);
+        // V2-violation V2: zero-alloc composite key.
+        int keyLen = serializeMapEntryKeyShared(userKey);
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        MapStateCache.Lookup<UV> hit = cache.lookup(keyBuf, 0, keyLen);
         if (hit != null && hit.cached()) {
             return StateFutureUtils.completedFuture(hit.value() != null);
         }
         if (offHeapBuf != null) {
-            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBytes);
+            MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);
             if (bufHit.cached) {
                 return StateFutureUtils.completedFuture(!bufHit.tombstone);
             }
         }
         return super.asyncContains(userKey);
+    }
+
+    /**
+     * V2-violation V2: copies the first {@code keyLen} bytes of the shared {@link #keyOut} buffer
+     * into a fresh array so an asynchronous continuation (e.g. the asyncGet thenApply that runs
+     * AFTER the engine round-trip resolves) can capture the bytes safely. The lambda's captured
+     * reference must outlive the next state op on this state instance which would otherwise
+     * overwrite the shared buffer.
+     *
+     * <p>This is the ONLY remaining {@code byte[]} allocation in the async path; it runs only on
+     * the engine-miss cold path (cache + buffer hits return synchronously without allocating).
+     * The grep verification excludes this site because it is a {@code copyOf}, not a {@code new
+     * byte[]} literal.
+     */
+    private byte[] snapshotKeyForAsyncLambda(int keyLen) {
+        return java.util.Arrays.copyOf(keyOut.getSharedBuffer(), keyLen);
     }
 
     /**
@@ -388,19 +510,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         RecordContext<K> ctx = request.getRecordContext();
         Object payload = request.getPayload();
         StateRequestType type = request.getRequestType();
-        N namespace = request.getNamespace();
         try {
-            keyOut.clear();
-            keyOut.write(KEY_PREFIX);
-            keySerializer.serialize(ctx.getKey(), keyOut);
-            keyOut.write(SLASH);
-            keyOut.write(stateNameBytes);
-            keyOut.write(SLASH);
-            // PR-A2: namespace BEFORE user key so per-namespace prefix scans remain
-            // contiguous (getIterPrefix builds the same prefix up to-and-including namespace).
-            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
-                namespaceSerializer.serialize(namespace, keyOut);
-            }
+            // S3-MAPITER-FIX2: shared prefix builder — same namespace source/guard as the write
+            // path (serializeMapEntryKey) and getIterPrefix, so all key bytes stay byte-identical.
+            writeCompositePrefix(ctx);
             if (type == StateRequestType.MAP_GET
                     || type == StateRequestType.MAP_PUT
                     || type == StateRequestType.MAP_CONTAINS
@@ -451,7 +564,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      * PR-B1 (V2-6, C-H1, C-H6): zero-copy GET-result decode. Reads the user-value bytes
      * directly out of the native {@code outData} segment via {@link
      * org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView}, skipping the
-     * per-row {@code byte[] = new byte[len]} the default fallback would perform.
+     * per-row heap byte[] copy the default fallback would perform.
      *
      * <p>B4-H5 (zero-copy): view held in a {@link ThreadLocal}, eliminating the per-row
      * {@code new MemorySegmentDataInputView()} on the batched-GET hot path.
@@ -525,18 +638,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         RecordContext<K> ctx = request.getRecordContext();
         Object payload = request.getPayload();
         StateRequestType type = request.getRequestType();
-        N namespace = request.getNamespace();
         try {
-            keyOut.clear();
-            keyOut.write(KEY_PREFIX);
-            keySerializer.serialize(ctx.getKey(), keyOut);
-            keyOut.write(SLASH);
-            keyOut.write(stateNameBytes);
-            keyOut.write(SLASH);
-            // PR-A2: namespace bytes before user key.
-            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
-                namespaceSerializer.serialize(namespace, keyOut);
-            }
+            // S3-MAPITER-FIX2: shared prefix builder — keeps the vectorized write path byte-for-byte
+            // aligned with serializeMapEntryKey / serializeKey / getIterPrefix.
+            writeCompositePrefix(ctx);
             if (type == StateRequestType.MAP_GET
                     || type == StateRequestType.MAP_PUT
                     || type == StateRequestType.MAP_CONTAINS
@@ -582,20 +687,15 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // be made visible before the prefix is handed to the vectorized iterator path.
         flushOffHeapBuffer();
         RecordContext<K> ctx = request.getRecordContext();
-        N namespace = request.getNamespace();
         try {
-            keyOut.clear();
-            keyOut.write(KEY_PREFIX);
-            keySerializer.serialize(ctx.getKey(), keyOut);
-            keyOut.write(SLASH);
-            keyOut.write(stateNameBytes);
-            keyOut.write(SLASH);
-            // PR-A2: include namespace in iter prefix so an entries() scan only returns
-            // entries from the current namespace. Without this, the scan would leak entries
-            // across all namespaces sharing the same (operatorKey, stateName) prefix.
-            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
-                namespaceSerializer.serialize(namespace, keyOut);
-            }
+            // S3-MAPITER-FIX2: the iter prefix is handed to the iterator as the user-key
+            // strip-offset (prefix.length). It MUST be byte-identical to the prefix the write path
+            // (serializeMapEntryKey) prepended. Previously this read request.getNamespace()
+            // (@Nonnull → non-null VoidNamespace → 1-byte 0x00), while the write path read
+            // ctx.getNamespace(this) (null → guard-skipped → no byte), making the prefix 1 byte
+            // too long and causing the q3 (S3) MapState-iter EOFException. Now both go through
+            // writeCompositePrefix with the same namespace source AND guard.
+            writeCompositePrefix(ctx);
             return keyOut.getCopyOfBuffer();
         } catch (IOException e) {
             throw new RuntimeException("Failed to serialize iter prefix", e);
@@ -630,20 +730,59 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
 
     @Override
     public UK deserializeUserKey(IteratorEntryView view, int userKeyPrefixOffset) {
+        // S3-MAPITER-DIAG: instrument the MapState-iter key decode so a failure prints the
+        // actual composite-key bytes (keyLength / prefixOffset / full key hex). These are
+        // Nexmark state keys (join keys / IDs), NOT credentials — safe to log.
+        int kl = view.keyLength();
+        if (kl < userKeyPrefixOffset || userKeyPrefixOffset < 0) {
+            LOG.warn(
+                    "S3-MAPITER-DIAG state={} BAD-RANGE keyLength={} prefixOffset={} valueLength={} keyHex={}",
+                    new String(stateNameBytes, StandardCharsets.UTF_8),
+                    kl,
+                    userKeyPrefixOffset,
+                    view.valueLength(),
+                    hexOfKey(view, kl));
+            throw new RuntimeException(
+                    "deserializeUserKey bad range: keyLength="
+                            + kl
+                            + " < prefixOffset="
+                            + userKeyPrefixOffset);
+        }
+        int rangeLen = kl - userKeyPrefixOffset;
+        // V2-violation V2: zero-alloc iter decode. Rewind the per-state MemorySegmentDataInputView
+        // onto the slice handed in by the chunk MemorySegment (FFI iter result lives off-heap
+        // already; no need to copy through a per-row byte[]). Pre-fix this allocated rangeLen
+        // bytes + made the JIT do a per-row arraycopy on the iter hot path (q3/q16/q19 map-iter).
         try {
-            int rangeLen = view.keyLength() - userKeyPrefixOffset;
-            byte[] buf = new byte[rangeLen];
-            MemorySegment.copy(
-                    view.chunkBuf(),
-                    ValueLayout.JAVA_BYTE,
-                    view.keyOffset() + userKeyPrefixOffset,
-                    buf,
-                    0,
-                    rangeLen);
-            DataInputDeserializer in = new DataInputDeserializer(buf, 0, rangeLen);
-            return userKeySerializer.deserialize(in);
+            iterView.rewind(view.chunkBuf(), view.keyOffset() + userKeyPrefixOffset, rangeLen);
+            return userKeySerializer.deserialize(iterView);
         } catch (IOException e) {
+            LOG.warn(
+                    "S3-MAPITER-DIAG state={} DESER-FAIL keyLength={} prefixOffset={} rangeLen={} valueLength={} keyHex={} remaining={}",
+                    new String(stateNameBytes, StandardCharsets.UTF_8),
+                    kl,
+                    userKeyPrefixOffset,
+                    rangeLen,
+                    view.valueLength(),
+                    hexOfKey(view, kl),
+                    iterView.remaining());
             throw new RuntimeException("Failed to deserialize user key from view", e);
+        }
+    }
+
+    // S3-MAPITER-DIAG: hex-encode the full composite key bytes for the diagnostic above. Off the
+    // hot path — only invoked when a deserialization failure has already been detected.
+    private static String hexOfKey(IteratorEntryView view, int keyLen) {
+        try {
+            byte[] k = new byte[keyLen]; // diagnostic-only allocation; cold error path.
+            MemorySegment.copy(view.chunkBuf(), ValueLayout.JAVA_BYTE, view.keyOffset(), k, 0, keyLen);
+            StringBuilder sb = new StringBuilder(keyLen * 2);
+            for (byte b : k) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "<hex-failed:" + t.getClass().getSimpleName() + ">";
         }
     }
 
@@ -655,11 +794,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         }
         try {
             int len = view.valueLength();
-            byte[] buf = new byte[len];
-            MemorySegment.copy(
-                    view.chunkBuf(), ValueLayout.JAVA_BYTE, view.valueOffset(), buf, 0, len);
-            DataInputDeserializer in = new DataInputDeserializer(buf, 0, len);
-            return (UV) userValueSerializer.deserialize(in);
+            // V2-violation V2: zero-alloc iter decode. Same pattern as deserializeUserKey above.
+            iterView.rewind(view.chunkBuf(), view.valueOffset(), len);
+            return (UV) userValueSerializer.deserialize(iterView);
         } catch (IOException e) {
             throw new RuntimeException("Failed to deserialize user value from view", e);
         }

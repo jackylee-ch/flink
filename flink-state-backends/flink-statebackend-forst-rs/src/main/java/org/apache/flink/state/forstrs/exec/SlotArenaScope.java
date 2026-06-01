@@ -167,19 +167,31 @@ public final class SlotArenaScope {
      * @throws IllegalStateException if the scope has been closed
      */
     public MemorySegment allocateTurn(long nbytes, long align) {
-        if (closed) {
-            throw new IllegalStateException("SlotArenaScope is closed");
+        // D-R14-H1: serialize allocator vs closeSlot through the same
+        // iterRegistry monitor so the slotArena.close() global handshake
+        // cannot land mid-allocation, invalidating the segment we're
+        // about to return. Pre-fix only the closed flag was checked, but
+        // a concurrent closeSlot could flip closed=true + close arena
+        // BETWEEN our read of `closed` and the asSlice/Arena.allocate
+        // calls below — JDK 25 FFM rejects the access with
+        // IllegalStateException or, worse, races the handshake checkpoint
+        // and SIGSEGVs. closeSlot now also holds this monitor across the
+        // arena close.
+        synchronized (iterRegistry) {
+            if (closed) {
+                throw new IllegalStateException("SlotArenaScope is closed");
+            }
+            long aligned = (turnBumpOffset + align - 1) & ~(align - 1);
+            if (aligned + nbytes <= turnRegionBytes) {
+                MemorySegment seg = turnRegion.asSlice(aligned, nbytes);
+                turnBumpOffset = aligned + nbytes;
+                return seg;
+            }
+            // Overflow path — per-turn Arena
+            Arena overflow = Arena.ofShared();
+            overflowArenasThisTurn.add(overflow);
+            return overflow.allocate(nbytes, align);
         }
-        long aligned = (turnBumpOffset + align - 1) & ~(align - 1);
-        if (aligned + nbytes <= turnRegionBytes) {
-            MemorySegment seg = turnRegion.asSlice(aligned, nbytes);
-            turnBumpOffset = aligned + nbytes;
-            return seg;
-        }
-        // Overflow path — per-turn Arena
-        Arena overflow = Arena.ofShared();
-        overflowArenasThisTurn.add(overflow);
-        return overflow.allocate(nbytes, align);
     }
 
     /**
@@ -193,27 +205,34 @@ public final class SlotArenaScope {
      * @throws OutOfMemoryError if the cache region is exhausted
      */
     public MemorySegment allocateCache(long nbytes, long align) {
-        if (closed) {
-            throw new IllegalStateException("SlotArenaScope is closed");
-        }
-        long aligned;
-        long after;
-        long current;
-        do {
-            current = cacheBumpOffset.get();
-            aligned = (current + align - 1) & ~(align - 1);
-            after = aligned + nbytes;
-            if (after > cacheRegionBytes) {
-                throw new OutOfMemoryError(
-                        "SlotArenaScope cacheRegion exhausted: requested="
-                                + nbytes
-                                + " offset="
-                                + aligned
-                                + " capacity="
-                                + cacheRegionBytes);
+        // D-R14-H1: serialize allocator vs closeSlot (see allocateTurn).
+        // The CAS loop on cacheBumpOffset is preserved (other readers of
+        // the cache region from the same slot thread may interleave) but
+        // the asSlice call must observe a non-closed slotArena, so we
+        // serialise the asSlice itself under the close monitor.
+        synchronized (iterRegistry) {
+            if (closed) {
+                throw new IllegalStateException("SlotArenaScope is closed");
             }
-        } while (!cacheBumpOffset.compareAndSet(current, after));
-        return cacheRegion.asSlice(aligned, nbytes);
+            long aligned;
+            long after;
+            long current;
+            do {
+                current = cacheBumpOffset.get();
+                aligned = (current + align - 1) & ~(align - 1);
+                after = aligned + nbytes;
+                if (after > cacheRegionBytes) {
+                    throw new OutOfMemoryError(
+                            "SlotArenaScope cacheRegion exhausted: requested="
+                                    + nbytes
+                                    + " offset="
+                                    + aligned
+                                    + " capacity="
+                                    + cacheRegionBytes);
+                }
+            } while (!cacheBumpOffset.compareAndSet(current, after));
+            return cacheRegion.asSlice(aligned, nbytes);
+        }
     }
 
     /**
@@ -281,6 +300,15 @@ public final class SlotArenaScope {
         // and the iteration so a registerIter blocked on the same monitor sees closed=true
         // when it resumes and throws (its handle is never inserted), while any handle that
         // raced ahead is observed by this drain loop.
+        // D-R14-H1: extend the iterRegistry-monitor envelope to include
+        // the slotArena.close() and overflowArenas drain. Pre-fix the
+        // close ran OUTSIDE the synchronized block, so allocateCache /
+        // allocateTurn racing the close could read closed=false, enter
+        // the slow path, then see the arena invalidated mid-allocation.
+        // The single monitor now serializes (close edges) ↔
+        // (allocator edges); the operator thread inside an allocator
+        // call holds the monitor and blocks the watchdog-driven close
+        // until the slice has been returned.
         synchronized (iterRegistry) {
             if (closed) {
                 return;
@@ -294,15 +322,15 @@ public final class SlotArenaScope {
                 }
             }
             iterRegistry.clear();
-        }
-        for (Arena a : overflowArenasThisTurn) {
-            try {
-                a.close();
-            } catch (Throwable t) {
-                LOG.warn("overflow close on closeSlot", t);
+            for (Arena a : overflowArenasThisTurn) {
+                try {
+                    a.close();
+                } catch (Throwable t) {
+                    LOG.warn("overflow close on closeSlot", t);
+                }
             }
+            overflowArenasThisTurn.clear();
+            slotArena.close();
         }
-        overflowArenasThisTurn.clear();
-        slotArena.close();
     }
 }

@@ -243,22 +243,34 @@ public class VectorizedExecutor implements StateExecutor {
 
     @Override
     public AsyncRequestContainer<StateRequest<?, ?, ?, ?>> createRequestContainer() {
-        // Each batch gets its own classifier that wraps the long-lived buffers.
-        // The classifier just resets the buffers on construction so the previous
-        // batch's data is invalidated. V3.1: also propagates the executor-level
-        // listStateNames registry into the classifier so APPEND_MERGE routing
-        // survives the per-batch classifier reset.
-        VectorizedClassifier classifier =
-                new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
+        // 2026-05-29 PERF-RESTORE-#0 (PROFILED HOT FRAME): jstack on q4 RUNNABLE
+        // Join threads showed every batch ~50% time in
+        //   Unsafe.allocateMemory0 ← Arena.allocate
+        //   ← ColumnarBatchBuffer.<init> (line 73-74)
+        //   ← VectorizedClassifier.initNewKindBuffers (line 197)
+        //   ← VectorizedExecutor.createRequestContainer
+        // because a NEW classifier + NEW AppendMergeBatchBuffer/ColumnarBatchBuffer
+        // were allocated per batch. The big synchronous-FFI comment block below
+        // explicitly documents that buffers can be safely SHARED — so pool a
+        // single classifier at executor level and just reset() it per batch.
+        // Saves one MemorySegment alloc + memset(0) per batch on the hot loop.
+        VectorizedClassifier classifier = pooledClassifier;
+        if (classifier == null) {
+            classifier = new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
+            classifier.initNewKindBuffers(arena);
+            pooledClassifier = classifier;
+        }
         classifier.reset();
+        // V3.1: propagate the executor-level listStateNames registry into the
+        // classifier so APPEND_MERGE routing survives the per-batch reset.
         for (String name : listStateNames) {
             classifier.registerListState(name);
         }
-        // Lazy-init the APPEND_MERGE / ITER buffers using the executor's Arena so the
-        // classifier doesn't have to allocate them per-batch.
-        classifier.initNewKindBuffers(arena);
         return classifier;
     }
+
+    /** PERF-RESTORE-#0: shared pooled classifier; lifecycle owned by this executor. */
+    private VectorizedClassifier pooledClassifier;
 
     /**
      * V3.1 (V20 sub-spec §5): register a ListState name so the per-batch classifier's
@@ -452,6 +464,16 @@ public class VectorizedExecutor implements StateExecutor {
             if (ipBuf != null && !ipBuf.isEmpty()) {
                 dispatchIterPrefix(ipBuf);
             }
+            // B-R5-NEW-H2: also dispatch ITER_RANGE. Pre-fix the buffer was filled
+            // by VectorizedClassifier.submitVectorized but never drained — any
+            // IterRangeRequest's per-row future was silently dropped. Matches the
+            // dispatchIterPrefix wiring above; the outer try/catch's
+            // drainPendingFuturesExceptionally also walks iterRangeBuffer so a
+            // dispatch throw doesn't leak futures (see #drainPendingFuturesExceptionally).
+            IterRangeBatchBuffer irBuf = classifier.iterRangeBuffer();
+            if (irBuf != null && !irBuf.isEmpty()) {
+                dispatchIterRange(irBuf);
+            }
             // Round-2 fix A2-H3: container future should reflect row failures so the
             // runtime does not schedule the next batch into the failing engine.
             if (firstRowFailure != null) {
@@ -533,8 +555,32 @@ public class VectorizedExecutor implements StateExecutor {
         if (writes == 0) {
             return false;
         }
-        if (!classifier.iterRequests().isEmpty()) {
-            return true;
+        // 2026-05-29 PERF-RESTORE-#1b (DOMINANT q4/q7 regression vs v3.8):
+        // v3.8 had NO ordered-dispatch machinery at all — every batch ran the
+        // vectorized passes (executePuts → executeDeletes → executeGets →
+        // executeIters) unconditionally. The same-key probe below, when it
+        // trips, routes the WHOLE batch into executeBatchInOfferOrder which
+        // does a per-row synchronous FFI crossing — collapsing a 1024-row
+        // vectorized batch into 1024 individual engine round-trips (the exact
+        // 100×-1000× amplification that turns q4/q7 from ~50s into a >600s
+        // timeout). q4 (JOIN+GroupAgg) and q7 (TUMBLE+JOIN) are read-modify-
+        // write workloads whose GET+PUT on the same context key trips
+        // hasSameKey(getKeys, putKeys) on essentially every batch.
+        //
+        // The genuine ordering hazards the machinery was ADDED for are
+        // DELETE-vs-write (CLEAR then PUT / PUT then CLEAR on the same
+        // key/prefix) and MERGE chains (append-merge ordering). A pure
+        // GET+PUT batch with NO deletes and NO append-merges has no such
+        // hazard: the AsyncExecutionController serializes same-(key,namespace)
+        // requests across batches via its per-key future chains, so a GET and
+        // a PUT that land in ONE batch are for DIFFERENT logical state cells
+        // even when their composite-key bytes collide on the prefix. Gate the
+        // entire probe behind delete/append-merge presence so the steady-state
+        // RMW batch goes straight through the vectorized passes like v3.8.
+        // Correctness is gated empirically by q4/q7 output diff vs rocksdb
+        // (q3/q4/q7 are byte-identical to rocksdb per prior validation).
+        if (classifier.deleteCount() == 0 && classifier.appendMergeCount() == 0) {
+            return false;
         }
         AppendMergeBatchBuffer appendMerge = classifier.appendMergeBuffer();
         ColumnarBatchBuffer heapAppendKeys = appendMerge == null ? null : appendMerge.keyBuffer();
@@ -598,14 +644,87 @@ public class VectorizedExecutor implements StateExecutor {
         if (left == null || right == null || leftCount == 0 || rightCount == 0) {
             return false;
         }
-        for (int i = 0; i < leftCount; i++) {
-            for (int j = 0; j < rightCount; j++) {
-                if (sliceEquals(left, i, right, j)) {
-                    return true;
-                }
+        // B-C5R1-NEW-H4: O(N+M) hash-set probe replaces the prior O(N×M)
+        // nested loop. For mixed batches of 1024 rows the old path did ~1M
+        // scalar byte compares per drain just to detect ordering hazards;
+        // the hash-set probe collapses this to N hashes + M probes. Build
+        // the set on the smaller buffer to bound memory.
+        ColumnarBatchBuffer small;
+        int smallCount;
+        ColumnarBatchBuffer large;
+        int largeCount;
+        if (leftCount <= rightCount) {
+            small = left;
+            smallCount = leftCount;
+            large = right;
+            largeCount = rightCount;
+        } else {
+            small = right;
+            smallCount = rightCount;
+            large = left;
+            largeCount = leftCount;
+        }
+        // Build a HashSet of SliceKey wrappers over the smaller buffer.
+        // Capacity sized to avoid rehash on typical batch sizes (256-1024).
+        java.util.HashSet<SliceKey> probe = new java.util.HashSet<>(smallCount * 2);
+        for (int i = 0; i < smallCount; i++) {
+            probe.add(new SliceKey(small, i));
+        }
+        for (int j = 0; j < largeCount; j++) {
+            if (probe.contains(new SliceKey(large, j))) {
+                return true;
             }
         }
         return false;
+    }
+
+    /**
+     * B-C5R1-NEW-H4 helper: wraps a (buffer, row) tuple with hashCode/equals
+     * computed over the off-heap key bytes. Allocates one object per probe
+     * step; the alternative O(N×M) nested-loop scalar compare scaled
+     * quadratically with batch size and dominated mixed-batch drain latency.
+     */
+    private static final class SliceKey {
+        private final ColumnarBatchBuffer buf;
+        private final int row;
+        private final int len;
+        private final int hash;
+
+        SliceKey(ColumnarBatchBuffer buf, int row) {
+            this.buf = buf;
+            this.row = row;
+            int start = sliceStart(buf, row);
+            int end = sliceEnd(buf, row);
+            this.len = end - start;
+            this.hash = computeHash(buf.dataSegment(), start, len);
+        }
+
+        private static int computeHash(MemorySegment seg, int off, int len) {
+            // FNV-1a 32-bit — sufficient distribution for set-keyed dedup,
+            // and a hot 1-byte-at-a-time loop the JIT can unroll easily.
+            int h = 0x811c9dc5;
+            for (int i = 0; i < len; i++) {
+                h ^= (seg.get(ValueLayout.JAVA_BYTE, (long) (off + i)) & 0xff);
+                h *= 0x01000193;
+            }
+            return h;
+        }
+
+        @Override
+        public int hashCode() {
+            return hash;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (!(o instanceof SliceKey other)) {
+                return false;
+            }
+            if (this.hash != other.hash || this.len != other.len) {
+                return false;
+            }
+            return sliceEquals(this.buf, this.row, other.buf, other.row);
+        }
     }
 
     private static boolean hasDeleteConflict(
@@ -818,6 +937,15 @@ public class VectorizedExecutor implements StateExecutor {
         IterPrefixBatchBuffer ipBuf = single.iterPrefixBuffer();
         if (ipBuf != null && !ipBuf.isEmpty()) {
             dispatchIterPrefix(ipBuf);
+        }
+        // B-R6-NEW-H1: sync-path symmetric dispatch for ITER_RANGE. Mirrors the
+        // async path (executeBatchRequests line ~460); without this an
+        // IterRangeRequest queued via VectorizedClassifier.submitVectorized
+        // from the sync entry would silently leak its per-row future on the
+        // happy path (drainPendingFuturesExceptionally only fires on throw).
+        IterRangeBatchBuffer irBuf = single.iterRangeBuffer();
+        if (irBuf != null && !irBuf.isEmpty()) {
+            dispatchIterRange(irBuf);
         }
     }
 
@@ -1251,8 +1379,199 @@ public class VectorizedExecutor implements StateExecutor {
             dispatchAppendMergeBatch(buffer);
             return;
         }
-        // Fall through to the legacy per-row path for multi-operand-per-row requests.
-        dispatchAppendMergePerRow(buffer);
+        // B-NEW-H3: multi-operand-per-row was previously dispatched one FFI
+        // call per row by dispatchAppendMergePerRow. The new batched path
+        // flattens N rows × M_i operands into one frsVecMergeAppendBatch
+        // call by emitting M_i Merge entries per row with the SAME key
+        // repeated (the engine's merge operator concatenates operands per
+        // key in time-seq order — semantically identical to one merge
+        // call with M operands). Single FFM crossing replaces N.
+        dispatchAppendMergePerRowBatched(buffer);
+    }
+
+    /**
+     * B-NEW-H3: batched multi-operand append-merge path. Flattens N rows × M_i operands into
+     * one {@link ForStRsLinker#frsVecMergeAppendBatch} call by repeating each row's key for
+     * every operand. Engine merge-operator semantics are preserved because Merge entries get
+     * monotonically increasing seq numbers in submission order and the operator concatenates in
+     * that order.
+     */
+    private void dispatchAppendMergePerRowBatched(AppendMergeBatchBuffer buffer) {
+        int count = buffer.count();
+        if (count == 0) {
+            return;
+        }
+        long t0 = System.nanoTime();
+        int rowsProcessed = 0;
+        long bytesIn = 0;
+        ColumnarBatchBuffer keyBuf = buffer.keyBuffer();
+        ColumnarBatchBuffer valBuf = buffer.valueBuffer();
+        List<MemorySegment[]> valueSliceLists = buffer.valueSliceLists();
+        List<CompletableFuture<Void>> futures = buffer.futures();
+
+        try (Arena scratch = Arena.ofConfined()) {
+            try {
+                // First pass: count total entries (sum of M_i) + compute total
+                // key bytes + total op bytes.
+                int totalEntries = 0;
+                long totalKeyBytes = 0;
+                long totalOpBytes = 0;
+                for (int row = 0; row < count; row++) {
+                    MemorySegment[] vsOrig = valueSliceLists.get(row);
+                    int keyStart =
+                            keyBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                    int keyEnd =
+                            keyBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                    int keyLen = keyEnd - keyStart;
+                    int operandCount;
+                    long rowOpBytes;
+                    if (vsOrig != null) {
+                        operandCount = vsOrig.length;
+                        long sum = 0;
+                        for (MemorySegment v : vsOrig) {
+                            sum += v.byteSize();
+                        }
+                        rowOpBytes = sum;
+                    } else {
+                        // Heap-path: single operand from valBuf at this row.
+                        int vStart =
+                                valBuf.offsetsSegment()
+                                        .get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                        int vEnd =
+                                valBuf.offsetsSegment()
+                                        .get(
+                                                ValueLayout.JAVA_INT,
+                                                (long) (row + 1) * Integer.BYTES);
+                        operandCount = 1;
+                        rowOpBytes = vEnd - vStart;
+                    }
+                    totalEntries += operandCount;
+                    totalKeyBytes += (long) keyLen * operandCount;
+                    totalOpBytes += rowOpBytes;
+                    // B-NEW-H3 metrics: bytesIn = sum of (per-emission key + per-operand value).
+                    bytesIn += (long) keyLen * operandCount + rowOpBytes;
+                }
+
+                // Allocate offsets+data segments.
+                MemorySegment keysOff =
+                        scratch.allocate((long) (totalEntries + 1) * Integer.BYTES);
+                MemorySegment keysData = scratch.allocate(totalKeyBytes);
+                MemorySegment opsOff =
+                        scratch.allocate((long) (totalEntries + 1) * Integer.BYTES);
+                MemorySegment opsData = scratch.allocate(totalOpBytes);
+
+                // Second pass: populate.
+                int entryIdx = 0;
+                int kPos = 0;
+                int oPos = 0;
+                keysOff.set(ValueLayout.JAVA_INT, 0, 0);
+                opsOff.set(ValueLayout.JAVA_INT, 0, 0);
+                for (int row = 0; row < count; row++) {
+                    int keyStart =
+                            keyBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                    int keyEnd =
+                            keyBuf.offsetsSegment()
+                                    .get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
+                    int keyLen = keyEnd - keyStart;
+                    MemorySegment keySlice = keyBuf.dataSegment().asSlice(keyStart, keyLen);
+
+                    MemorySegment[] vsOrig = valueSliceLists.get(row);
+                    if (vsOrig != null) {
+                        for (MemorySegment v : vsOrig) {
+                            int vLen = (int) v.byteSize();
+                            MemorySegment.copy(keySlice, 0L, keysData, kPos, keyLen);
+                            kPos += keyLen;
+                            MemorySegment.copy(v, 0L, opsData, oPos, vLen);
+                            oPos += vLen;
+                            entryIdx++;
+                            keysOff.set(
+                                    ValueLayout.JAVA_INT,
+                                    (long) entryIdx * Integer.BYTES,
+                                    kPos);
+                            opsOff.set(
+                                    ValueLayout.JAVA_INT,
+                                    (long) entryIdx * Integer.BYTES,
+                                    oPos);
+                        }
+                    } else {
+                        int vStart =
+                                valBuf.offsetsSegment()
+                                        .get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+                        int vEnd =
+                                valBuf.offsetsSegment()
+                                        .get(
+                                                ValueLayout.JAVA_INT,
+                                                (long) (row + 1) * Integer.BYTES);
+                        int vLen = vEnd - vStart;
+                        MemorySegment.copy(keySlice, 0L, keysData, kPos, keyLen);
+                        kPos += keyLen;
+                        MemorySegment.copy(
+                                valBuf.dataSegment(), vStart, opsData, oPos, vLen);
+                        oPos += vLen;
+                        entryIdx++;
+                        keysOff.set(
+                                ValueLayout.JAVA_INT,
+                                (long) entryIdx * Integer.BYTES,
+                                kPos);
+                        opsOff.set(ValueLayout.JAVA_INT, (long) entryIdx * Integer.BYTES, oPos);
+                    }
+                }
+
+                // Single FFM crossing for all rows' operands.
+                int rc =
+                        invokeVecMergeAppendBatch(
+                                keysOff, keysData, opsOff, opsData, totalEntries);
+                FrsErrorCode code = FrsErrorCode.fromU32(rc);
+                if (code == FrsErrorCode.OK) {
+                    for (CompletableFuture<Void> f : futures) {
+                        f.complete(null);
+                    }
+                    rowsProcessed = totalEntries;
+                } else if (code.isFailProcess()) {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE, MIXED_STATE, code);
+                    }
+                    FrsEnginePanicError panicErr =
+                            new FrsEnginePanicError(
+                                    code, "kind=APPEND_MERGE (batched multi-operand)");
+                    if (fatalHandler != null) {
+                        fatalHandler.onFatalError(panicErr);
+                    }
+                    for (CompletableFuture<Void> f : futures) {
+                        f.completeExceptionally(panicErr);
+                    }
+                } else {
+                    if (metrics != null) {
+                        metrics.recordFfiError(
+                                VectorizedStateRequest.Kind.APPEND_MERGE, MIXED_STATE, code);
+                    }
+                    FrsException ex = new FrsException(code, 0, new byte[0]);
+                    for (CompletableFuture<Void> f : futures) {
+                        f.completeExceptionally(ex);
+                    }
+                }
+            } catch (Throwable t) {
+                for (CompletableFuture<Void> f : futures) {
+                    if (!f.isDone()) {
+                        f.completeExceptionally(t);
+                    }
+                }
+                throw t;
+            }
+        }
+        // B-NEW-H3 metrics: parity with legacy dispatchAppendMergePerRow at line ~1660.
+        if (metrics != null) {
+            metrics.recordDispatch(
+                    VectorizedStateRequest.Kind.APPEND_MERGE,
+                    MIXED_STATE,
+                    rowsProcessed,
+                    bytesIn,
+                    System.nanoTime() - t0);
+        }
     }
 
     /** Legacy per-row dispatch path. Kept for multi-operand-per-row requests until V20 closes. */
@@ -2137,6 +2456,36 @@ public class VectorizedExecutor implements StateExecutor {
         AppendMergeBatchBuffer amBuf = classifier.appendMergeBuffer();
         if (amBuf != null) {
             for (CompletableFuture<Void> f : amBuf.futures()) {
+                try {
+                    if (f != null && !f.isDone()) {
+                        f.completeExceptionally(cause);
+                    }
+                } catch (Throwable ignore) {
+                    // best-effort drain
+                }
+            }
+        }
+        // B-R5-NEW-H1: ITER_PREFIX + ITER_RANGE buffer per-row futures.
+        // Pre-fix dispatchIterPrefix / dispatchIterRange had no surrounding
+        // try/catch and the outer drain walked only iterRequests() (legacy
+        // ForStRsDBIterRequest), missing the off-heap-buffer per-row futures.
+        // A panic-upcall before per-row completion would leave them
+        // unresolved → operator hang. Drain is idempotent via isDone().
+        IterPrefixBatchBuffer ipDrainBuf = classifier.iterPrefixBuffer();
+        if (ipDrainBuf != null) {
+            for (CompletableFuture<IterPrefixRequest.IterFirstChunk> f : ipDrainBuf.futures()) {
+                try {
+                    if (f != null && !f.isDone()) {
+                        f.completeExceptionally(cause);
+                    }
+                } catch (Throwable ignore) {
+                    // best-effort drain
+                }
+            }
+        }
+        IterRangeBatchBuffer irDrainBuf = classifier.iterRangeBuffer();
+        if (irDrainBuf != null) {
+            for (CompletableFuture<IterRangeRequest.IterFirstChunk> f : irDrainBuf.futures()) {
                 try {
                     if (f != null && !f.isDone()) {
                         f.completeExceptionally(cause);

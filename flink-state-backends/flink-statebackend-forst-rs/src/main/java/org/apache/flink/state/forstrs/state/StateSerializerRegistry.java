@@ -302,13 +302,33 @@ public final class StateSerializerRegistry {
                             + " Use a custom migration or restart from a clean state.");
         }
 
+        // E10-HIGH-2: refuse COMPATIBLE_AFTER_MIGRATION until migration
+        // plumbing is wired. Pre-fix we silently promoted the new
+        // serializer despite the old on-disk bytes requiring migration
+        // — the next read fed old-format bytes through the new
+        // `deserialize`, producing garbage values that were then
+        // snapshot-rewritten as canonical state. Silent payload
+        // corruption on any user-driven serializer evolution (POJO
+        // reorder/rename, evolution-aware Avro/Kryo, custom snapshot
+        // v→v+1 paths). Until Flink's standard migration plumbing
+        // lands, surface this as a hard fail so operators diagnose
+        // early instead of discovering wrong-bytes-once exactly-once.
+        if (compat.isCompatibleAfterMigration()) {
+            throw new StateMigrationException(
+                    "TypeSerializer for state '"
+                            + stateName
+                            + "' requires MIGRATION between the persisted snapshot's serializer"
+                            + " and the new serializer. ForSt-RS V1 has not yet wired Flink's"
+                            + " standard migration plumbing (PR-A1 dependency). Silent promotion"
+                            + " would feed old-format bytes through the new deserializer and"
+                            + " corrupt every subsequent read. Either restart from a clean"
+                            + " state or pin the previous serializer until migration is wired.");
+        }
+
         TypeSerializer<T> effective = serializer;
         if (compat.isCompatibleWithReconfiguredSerializer()) {
             effective = compat.getReconfiguredSerializer();
         }
-        // COMPATIBLE_AFTER_MIGRATION is accepted in V1 with the understanding that reads will use
-        // the old serializer's snapshot via Flink's standard migration plumbing once PR-A1 lands.
-        // For now we promote the new serializer; release notes flag this lazy-on-read behavior.
 
         // Promote: replace the restored entry with a fresh registration under the *new*
         // serializer's snapshot so subsequent snapshots persist the current schema. R24-H2:

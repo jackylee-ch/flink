@@ -18,7 +18,10 @@
 
 package org.apache.flink.state.forstrs.ffm;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemoryLayout;
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -51,10 +54,40 @@ public final class FrsIterator implements AutoCloseable {
     // check-then-act race that admitted double-free under concurrent close().
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
+    // D-R3-H4: per-iterator scratch arena hosting the 3 small out-slots
+    // (outKey FrsBytes, outValue FrsBytes, outValid bool) used by
+    // {@link ForStRsLinker#iteratorNext(FrsIterator)}. Pre-fix each
+    // iteratorNext call opened a fresh Arena.ofConfined() and allocated
+    // these 3 slots — for a 1000-row scan that's 1000 arena lifecycles
+    // + 3000 native allocs. With the arena hoisted to the iterator's
+    // lifetime, those allocations happen ONCE at construction.
+    // Confined-arena lifecycle bounded by FrsIterator close().
+    // D-R3-H4-NEW-H1: must mirror ForStRsLinker.FRS_BYTES_LAYOUT exactly —
+    // FrsBytes is {data: *mut u8, len: usize, capacity: usize} = 24 bytes
+    // on 64-bit. Pre-fix this used a 16-byte struct (ADDRESS + JAVA_LONG)
+    // and Rust's `frs_iterator_next` wrote the third capacity field 8
+    // bytes past the segment, corrupting the adjacent scratch slot and
+    // making `frs_bytes_free` read a bogus capacity → heap corruption.
+    private static final MemoryLayout FRS_BYTES_LAYOUT =
+            MemoryLayout.structLayout(
+                    ValueLayout.ADDRESS,
+                    ValueLayout.JAVA_LONG,
+                    ValueLayout.JAVA_LONG);
+    private final Arena scratchArena;
+    final MemorySegment scratchKey;
+    final MemorySegment scratchValue;
+    final MemorySegment scratchValid;
+
     FrsIterator(ForStRsLinker linker, MemorySegment handle, boolean prefix) {
         this.linker = linker;
         this.handle = handle;
         this.prefix = prefix;
+        // Allocate scratch in a confined arena owned by this iterator.
+        // Closed by close() below — bounded lifecycle.
+        this.scratchArena = Arena.ofConfined();
+        this.scratchKey = scratchArena.allocate(FRS_BYTES_LAYOUT);
+        this.scratchValue = scratchArena.allocate(FRS_BYTES_LAYOUT);
+        this.scratchValid = scratchArena.allocate(ValueLayout.JAVA_BOOLEAN);
     }
 
     public MemorySegment handle() {
@@ -76,7 +109,17 @@ public final class FrsIterator implements AutoCloseable {
         if (closed.compareAndSet(false, true)) {
             MemorySegment h = handle;
             handle = MemorySegment.NULL;
-            linker.iteratorClose(h, prefix);
+            try {
+                linker.iteratorClose(h, prefix);
+            } finally {
+                // D-R3-H4: release the scratch arena owning the per-iterator
+                // out-slots. Best-effort — engine close already happened.
+                try {
+                    scratchArena.close();
+                } catch (Throwable ignore) {
+                    // already-closed or thread-affinity issues — non-fatal.
+                }
+            }
         }
     }
 }

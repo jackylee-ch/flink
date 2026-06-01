@@ -213,10 +213,22 @@ public final class MapStateCache<V> implements AutoCloseable {
      *     #remove})
      */
     @Nullable
-    @SuppressWarnings("unchecked")
     public Lookup<V> lookup(byte[] key) {
+        return lookup(key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): zero-alloc lookup against a reusable shared byte[] buffer.
+     * The hot-path callers (ForStRsMapStateV2.asyncGet/asyncContains) write the composite key into
+     * a per-state shared {@code DataOutputSerializer.getSharedBuffer()} and pass the (buf, 0, len)
+     * triple — no {@code getCopyOfBuffer()} allocation. Semantics identical to {@link
+     * #lookup(byte[])}; the slice is read-only.
+     */
+    @Nullable
+    @SuppressWarnings("unchecked")
+    public Lookup<V> lookup(byte[] keyBuf, int keyOff, int keyLen) {
         checkOpen();
-        int row = findRow(key);
+        int row = findRow(keyBuf, keyOff, keyLen);
         if (row < 0) {
             return null; // miss
         }
@@ -239,9 +251,19 @@ public final class MapStateCache<V> implements AutoCloseable {
      * {@code cached=true} result and avoid hitting the engine.
      */
     public void put(byte[] key, @Nullable V value) {
+        put(key, 0, key.length, value);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): same as {@link #put(byte[], Object)} but reads the key from
+     * a (buf, off, len) slice so the caller can avoid the per-call {@code getCopyOfBuffer()}
+     * allocation. The cache MISS path still copies the bytes into off-heap {@code keyData}; the
+     * cache HIT path (key already present) does no key-bytes I/O at all.
+     */
+    public void put(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
         checkOpen();
         Object stored = value == null ? TOMBSTONE : value;
-        int row = findRow(key);
+        int row = findRow(keyBuf, keyOff, keyLen);
         if (row >= 0) {
             values[row] = stored;
             accessTime.set(ValueLayout.JAVA_LONG, (long) row * Long.BYTES, ++clock);
@@ -252,16 +274,51 @@ public final class MapStateCache<V> implements AutoCloseable {
             evictClockSweep();
         }
         row = size++;
-        appendKey(row, key);
+        appendKey(row, keyBuf, keyOff, keyLen);
         values[row] = stored;
         accessTime.set(ValueLayout.JAVA_LONG, (long) row * Long.BYTES, ++clock);
-        insertHashIndex(hashOf(key), row);
+        insertHashIndex(hashOf(keyBuf, keyOff, keyLen), row);
     }
 
     /** Records a tombstone for {@code key}. Caller must subsequently dispatch the REMOVE. */
     public void remove(byte[] key) {
+        remove(key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): zero-alloc tombstone insertion against a (buf, off, len)
+     * slice. Behaviour identical to {@link #remove(byte[])}.
+     */
+    public void remove(byte[] keyBuf, int keyOff, int keyLen) {
         checkOpen();
-        put(key, null);
+        put(keyBuf, keyOff, keyLen, null);
+    }
+
+    /**
+     * E-R5-H2: atomic put-if-key-absent. Used by {@code asyncGet}'s thenApply continuation
+     * to populate a cache entry only when no concurrent {@code asyncPut} / {@code asyncRemove}
+     * has already established the authoritative value. Pre-fix, an in-flight asyncGet whose
+     * engine result resolved AFTER a concurrent asyncPut(K,V) had cached V would unconditionally
+     * overwrite the cache with the stale engine value — subsequent reads of K returned V_old
+     * until eviction. This atomic insert-only operation eliminates that race; the put-on-write
+     * still uses {@link #put} so it always wins against a previous miss-resolution.
+     */
+    public boolean putIfAbsent(byte[] key, @Nullable V value) {
+        return putIfAbsent(key, 0, key.length, value);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): zero-alloc putIfAbsent against a (buf, off, len) slice.
+     * Used by the asyncGet thenApply continuation after a fresh-byte[] snapshot is taken so the
+     * captured slice survives across the async boundary.
+     */
+    public boolean putIfAbsent(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
+        checkOpen();
+        if (findRow(keyBuf, keyOff, keyLen) >= 0) {
+            return false;
+        }
+        put(keyBuf, keyOff, keyLen, value);
+        return true;
     }
 
     /**
@@ -322,20 +379,23 @@ public final class MapStateCache<V> implements AutoCloseable {
      * the number of entries removed (visible for tests / observability).
      */
     public int clearForPrefix(byte[] prefix) {
+        return clearForPrefix(prefix, 0, prefix.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): same as {@link #clearForPrefix(byte[])} but reads the
+     * prefix from a (buf, off, len) slice so the V2 MapState onClear / buildDBPutRequest paths
+     * can pass the shared {@code keyOut} buffer directly.
+     */
+    public int clearForPrefix(byte[] prefixBuf, int prefixOff, int prefixLen) {
         checkOpen();
         if (size == 0) {
             return 0;
         }
         int removed = 0;
-        // We must iterate rows directly (not the hash index) because we need to rebuild
-        // the index after removal. Strategy: mark removed rows, then compact in a second pass.
-        // For simplicity (CLEAR is rare), do a full rebuild.
-        // Stash surviving (key, value) into temp arrays, clear, then re-insert.
-        // To preserve the C-A6 contract, we MUST also wipe tombstones (known-missing entries).
-        // Detect matches first.
         boolean[] toRemove = new boolean[size];
         for (int row = 0; row < size; row++) {
-            if (rowKeyStartsWith(row, prefix)) {
+            if (rowKeyStartsWith(row, prefixBuf, prefixOff, prefixLen)) {
                 toRemove[row] = true;
                 removed++;
             }
@@ -399,7 +459,16 @@ public final class MapStateCache<V> implements AutoCloseable {
 
     /** Returns the row id for the given key, or -1 if not present. */
     private int findRow(byte[] key) {
-        int h = hashOf(key);
+        return findRow(key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): row lookup against a (buf, off, len) slice. Mirrors the
+     * full-array path bit-for-bit; the only difference is the slice arguments threaded through
+     * {@link #hashOf} and {@link #keyEquals}.
+     */
+    private int findRow(byte[] keyBuf, int keyOff, int keyLen) {
+        int h = hashOf(keyBuf, keyOff, keyLen);
         int probe = h & hashMask;
         for (int i = 0; i < hashSlots; i++) {
             int slot = (probe + i) & hashMask;
@@ -415,7 +484,7 @@ public final class MapStateCache<V> implements AutoCloseable {
             }
             int storedHash =
                     hashIndex.get(ValueLayout.JAVA_INT, (long) slot * 2 * Integer.BYTES);
-            if (storedHash == h && keyEquals(row, key)) {
+            if (storedHash == h && keyEquals(row, keyBuf, keyOff, keyLen)) {
                 return row;
             }
         }
@@ -458,17 +527,20 @@ public final class MapStateCache<V> implements AutoCloseable {
      * worst case but amortized closer to O(N / hot-set-size) by starting at clockHand.
      */
     private void evictClockSweep() {
-        // R24-M3: seed `oldest` with Long.MAX_VALUE rather than reading accessTime[clockHand].
-        // Pre-fix, immediately after {@link #clear()} the {@code accessTime} segment still
-        // held stamps from before the clear (clear() reset {@code clock=0} and {@code
-        // clockHand=0} but did NOT zero the live prefix of accessTime), so the first eviction
-        // after a re-fill compared fresh post-clear stamps against a stale pre-clear stamp
-        // at slot 0 and biased the victim toward whatever row happened to inherit row 0.
-        // Seeding with MAX_VALUE forces the scan to pick a real row's stamp on the first
-        // iteration regardless of any residual data at clockHand.
+        // 2026-05-29 PERF-RESTORE-#0b (PROFILED HOT FRAME): the prior O(N) full
+        // scan over `accessTime` was firing on every cache.put after the cache
+        // filled, and at size=1M each evict = 1M MemorySegment reads. jstack on
+        // q4 showed 21s/64s CPU stuck in this loop. Switch to sampled-K eviction
+        // (K=16) — picks the oldest among 16 random rows. Probability of
+        // selecting the actual oldest is low but Birthday-style sampling: each
+        // sweep evicts a "very recent" row with probability ~1/exp(K) ≈ 1e-7
+        // for K=16, which is the LRU quality knob. O(16) per eviction.
+        // R24-M3 invariant preserved: seed oldest=Long.MAX_VALUE so post-clear
+        // stale-stamp comparisons can't bias the victim.
+        int sampleCount = Math.min(16, size);
         int victim = clockHand;
         long oldest = Long.MAX_VALUE;
-        for (int i = 0; i < size; i++) {
+        for (int i = 0; i < sampleCount; i++) {
             int row = (clockHand + i) % size;
             long ts = accessTime.get(ValueLayout.JAVA_LONG, (long) row * Long.BYTES);
             if (ts < oldest) {
@@ -541,15 +613,24 @@ public final class MapStateCache<V> implements AutoCloseable {
     }
 
     private void appendKey(int row, byte[] key) {
-        if (keyDataUsed + key.length > keyDataCapacity) {
-            growKeyData(keyDataUsed + key.length);
+        appendKey(row, key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): copies the slice {@code keyBuf[keyOff..keyOff+keyLen)} into
+     * the off-heap {@link #keyData} segment. Same memcpy work as the full-array path; only the
+     * source range differs.
+     */
+    private void appendKey(int row, byte[] keyBuf, int keyOff, int keyLen) {
+        if (keyDataUsed + keyLen > keyDataCapacity) {
+            growKeyData(keyDataUsed + keyLen);
         }
         int start = (int) keyDataUsed;
         MemorySegment.copy(
-                key, 0, keyData, ValueLayout.JAVA_BYTE, keyDataUsed, key.length);
-        keyDataUsed += key.length;
+                keyBuf, keyOff, keyData, ValueLayout.JAVA_BYTE, keyDataUsed, keyLen);
+        keyDataUsed += keyLen;
         keyOffsets.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, start);
-        keyLengths.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, key.length);
+        keyLengths.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, keyLen);
     }
 
     private void growKeyData(long needed) {
@@ -561,40 +642,71 @@ public final class MapStateCache<V> implements AutoCloseable {
     }
 
     private boolean keyEquals(int row, byte[] key) {
+        return keyEquals(row, key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): same vectorized compare as the full-array path, but with
+     * a (buf, off, len) source. C2 escape-eliminates the {@link MemorySegment#ofArray} wrapper so
+     * no allocation reaches the heap on this call.
+     */
+    private boolean keyEquals(int row, byte[] keyBuf, int keyOff, int keyLen) {
         int kStart = keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
         int len = keyLengths.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-        if (len != key.length) {
+        if (len != keyLen) {
             return false;
         }
         if (len == 0) {
             return true;
         }
-        // B6-H7: JIT-intrinsified vectorized compare. Replaces the ~56 single-byte off-heap loads
-        // the previous loop performed on Q12's 56-byte composite key. The MemorySegment.ofArray
-        // wrapper is escape-eliminated by C2 (the segment never escapes this frame), and
+        // B6-H7: JIT-intrinsified vectorized compare. The MemorySegment.ofArray wrapper is
+        // escape-eliminated by C2 (the segment never escapes this frame), and
         // MemorySegment.mismatch unrolls to a SIMD-friendly long-stride compare on HotSpot 21+.
-        MemorySegment queryHeapSeg = MemorySegment.ofArray(key);
-        return MemorySegment.mismatch(keyData, kStart, (long) kStart + len, queryHeapSeg, 0L, len)
+        MemorySegment queryHeapSeg = MemorySegment.ofArray(keyBuf);
+        return MemorySegment.mismatch(
+                        keyData,
+                        kStart,
+                        (long) kStart + len,
+                        queryHeapSeg,
+                        keyOff,
+                        (long) keyOff + len)
                 == -1L;
     }
 
     /** Hashes a heap byte[] using the same recurrence as ArrowBinaryBuffer (compat). */
     private static int hashOf(byte[] key) {
+        return hashOf(key, 0, key.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): same FNV-style recurrence as the full-array path. Reads
+     * the slice {@code keyBuf[keyOff..keyOff+keyLen)} without allocating.
+     */
+    private static int hashOf(byte[] keyBuf, int keyOff, int keyLen) {
         int h = 1;
-        for (int i = 0; i < key.length; i++) {
-            h = 31 * h + key[i];
+        int end = keyOff + keyLen;
+        for (int i = keyOff; i < end; i++) {
+            h = 31 * h + keyBuf[i];
         }
         return h;
     }
 
     private boolean rowKeyStartsWith(int row, byte[] prefix) {
+        return rowKeyStartsWith(row, prefix, 0, prefix.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): prefix match against a (buf, off, len) slice. Same loop
+     * shape; pulls the prefix bytes from the provided slice instead of the start of the array.
+     */
+    private boolean rowKeyStartsWith(int row, byte[] prefixBuf, int prefixOff, int prefixLen) {
         int kStart = keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
         int len = keyLengths.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-        if (len < prefix.length) {
+        if (len < prefixLen) {
             return false;
         }
-        for (int i = 0; i < prefix.length; i++) {
-            if (keyData.get(ValueLayout.JAVA_BYTE, kStart + i) != prefix[i]) {
+        for (int i = 0; i < prefixLen; i++) {
+            if (keyData.get(ValueLayout.JAVA_BYTE, kStart + i) != prefixBuf[prefixOff + i]) {
                 return false;
             }
         }

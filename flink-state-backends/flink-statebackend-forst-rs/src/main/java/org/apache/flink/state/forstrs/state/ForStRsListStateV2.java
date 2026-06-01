@@ -69,6 +69,20 @@ public class ForStRsListStateV2<V> {
     private final VectorizedClassifier classifier;
 
     /**
+     * C-R8-NEW-H1: pooled {@link DataOutputSerializer} reused across {@link #add}/
+     * {@link #addAll} calls so each list element does not allocate a fresh
+     * {@code DataOutputSerializer} object on the Q5/Q11 LIST_ADD hot path.
+     * The heap {@code byte[]} returned by {@code getCopyOfBuffer()} is still
+     * a fresh allocation per call (the request can outlive the next
+     * encodeOneElement on this same state instance, so the underlying
+     * buffer cannot be shared without changing the request API). Safe to
+     * pool the serializer object because state instances follow the
+     * single-thread-per-slot mailbox invariant — concurrent encode is
+     * structurally impossible.
+     */
+    private final DataOutputSerializer reusableOut = new DataOutputSerializer(64);
+
+    /**
      * Creates a new {@code ForStRsListStateV2}.
      *
      * <p>The {@code classifier} must have been initialised for new-kind buffers via {@link
@@ -207,20 +221,22 @@ public class ForStRsListStateV2<V> {
         if (values == null) {
             throw new NullPointerException("ForStRsListStateV2.encode() values is null");
         }
-        DataOutputSerializer out = new DataOutputSerializer(64);
+        // C-R8-NEW-H1 sister: reuse pooled serializer (same single-thread-per-slot
+        // invariant as `encodeOneElement`).
+        reusableOut.clear();
         try {
-            out.writeInt(values.size());
+            reusableOut.writeInt(values.size());
             for (V v : values) {
                 if (v == null) {
                     throw new NullPointerException(
                             "ForStRsListStateV2.encode() null element in list");
                 }
-                elementSerializer.serialize(v, out);
+                elementSerializer.serialize(v, reusableOut);
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to encode list", e);
         }
-        return out.getCopyOfBuffer();
+        return reusableOut.getCopyOfBuffer();
     }
 
     /**
@@ -241,14 +257,14 @@ public class ForStRsListStateV2<V> {
      * {@link org.apache.flink.state.forstrs.VectorizedExecutor#dispatchAppendMerge}.
      */
     private MemorySegment encodeOneElement(V value) {
-        DataOutputSerializer out = new DataOutputSerializer(64);
+        reusableOut.clear();
         try {
-            out.writeInt(1); // count prefix: one element per operand
-            elementSerializer.serialize(value, out);
+            reusableOut.writeInt(1); // count prefix: one element per operand
+            elementSerializer.serialize(value, reusableOut);
         } catch (IOException e) {
             throw new RuntimeException("Failed to encode list element", e);
         }
-        return MemorySegment.ofArray(out.getCopyOfBuffer());
+        return MemorySegment.ofArray(reusableOut.getCopyOfBuffer());
     }
 
     public String getStateName() {

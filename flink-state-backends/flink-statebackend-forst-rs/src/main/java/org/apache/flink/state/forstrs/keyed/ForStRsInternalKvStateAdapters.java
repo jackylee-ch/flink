@@ -22,6 +22,7 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
+import org.apache.flink.core.memory.DataOutputSerializer;
 import org.apache.flink.runtime.state.internal.InternalAggregatingState;
 import org.apache.flink.runtime.state.internal.InternalListState;
 import org.apache.flink.runtime.state.internal.InternalMapState;
@@ -105,6 +106,25 @@ final class ForStRsInternalKvStateAdapters {
             this.currentNamespace = namespace;
         }
 
+        /**
+         * FRS-NAMESPACE (2026-05-30): serialize a namespace to bytes for the per-state key
+         * suffix, so (key, namespace) addressing is honoured. Cached buffer; returns a copy
+         * safe to retain. Used by the merging-window adapters (Reducing/Aggregating/List) to
+         * partition window state per namespace and to implement mergeNamespaces — the fix for
+         * session-window (q11/q15) correctness.
+         */
+        private final DataOutputSerializer nsBuffer = new DataOutputSerializer(16);
+
+        final byte[] serializeNamespace(N ns) {
+            try {
+                nsBuffer.clear();
+                namespaceSerializer.serialize(ns, nsBuffer);
+                return nsBuffer.getCopyOfBuffer();
+            } catch (java.io.IOException e) {
+                throw new RuntimeException("ForStRs namespace serialize failed", e);
+            }
+        }
+
         @Override
         public final byte[] getSerializedValue(
                 byte[] serializedKeyAndNamespace,
@@ -160,20 +180,27 @@ final class ForStRsInternalKvStateAdapters {
             return cachedState;
         }
 
+        // FRS-NAMESPACE: bind + set the key suffix to the CURRENT namespace before each op.
+        private ForStRsValueState<V> bindNs() {
+            ForStRsValueState<V> s = bind();
+            s.setNamespaceSuffix(serializeNamespace(currentNamespace));
+            return s;
+        }
+
         @Override
         public V value() throws java.io.IOException {
-            return bind().value();
+            return bindNs().value();
         }
 
         @Override
         public void update(V value) throws java.io.IOException {
-            bind().update(value);
+            bindNs().update(value);
         }
 
         @Override
         public void clear() {
             try {
-                bind().clear();
+                bindNs().clear();
             } catch (RuntimeException re) {
                 throw re;
             }
@@ -220,34 +247,41 @@ final class ForStRsInternalKvStateAdapters {
             return cachedState;
         }
 
+        // FRS-NAMESPACE: bind + set the key suffix to the CURRENT namespace before each op.
+        private ForStRsListState<T> bindNs() {
+            ForStRsListState<T> s = bind();
+            s.setNamespaceSuffix(serializeNamespace(currentNamespace));
+            return s;
+        }
+
         @Override
         public Iterable<T> get() throws Exception {
-            return bind().get();
+            return bindNs().get();
         }
 
         @Override
         public void add(T value) throws Exception {
-            bind().add(value);
+            bindNs().add(value);
         }
 
         @Override
         public void update(List<T> values) throws Exception {
-            bind().update(values);
+            bindNs().update(values);
         }
 
         @Override
         public void addAll(List<T> values) throws Exception {
-            bind().addAll(values);
+            bindNs().addAll(values);
         }
 
         @Override
         public void clear() {
-            bind().clear();
+            bindNs().clear();
         }
 
         @Override
         public List<T> getInternal() throws Exception {
-            Iterable<T> raw = bind().get();
+            Iterable<T> raw = bindNs().get();
             java.util.ArrayList<T> out = new java.util.ArrayList<>();
             if (raw != null) {
                 for (T t : raw) {
@@ -259,14 +293,32 @@ final class ForStRsInternalKvStateAdapters {
 
         @Override
         public void updateInternal(List<T> valueToStore) throws Exception {
-            bind().update(valueToStore);
+            bindNs().update(valueToStore);
         }
 
         @Override
-        public void mergeNamespaces(N target, Collection<N> sources) {
-            // Single-namespace model: merging is a no-op because all entries already share the
-            // implicit namespace. When real namespace partitioning is wired this becomes
-            // copy-target-into-source-prefix + delete-source.
+        public void mergeNamespaces(N target, Collection<N> sources) throws Exception {
+            // FRS-NAMESPACE: concat all source-namespace lists into the target namespace, then
+            // clear the sources. Each get/add/clear is keyed by the per-namespace suffix.
+            if (sources == null || sources.isEmpty()) {
+                return;
+            }
+            ForStRsListState<T> s = bind();
+            java.util.ArrayList<T> merged = new java.util.ArrayList<>();
+            for (N src : sources) {
+                s.setNamespaceSuffix(serializeNamespace(src));
+                Iterable<T> raw = s.get();
+                if (raw != null) {
+                    for (T t : raw) {
+                        merged.add(t);
+                    }
+                    s.clear();
+                }
+            }
+            if (!merged.isEmpty()) {
+                s.setNamespaceSuffix(serializeNamespace(target));
+                s.addAll(merged);
+            }
         }
     }
 
@@ -399,31 +451,38 @@ final class ForStRsInternalKvStateAdapters {
             return cachedState;
         }
 
+        // FRS-NAMESPACE: bind + set the key suffix to the CURRENT namespace before each op.
+        private ForStRsReducingState<T> bindNs() {
+            ForStRsReducingState<T> s = bind();
+            s.setNamespaceSuffix(serializeNamespace(currentNamespace));
+            return s;
+        }
+
         @Override
         public T get() throws Exception {
-            return bind().get();
+            return bindNs().get();
         }
 
         @Override
         public void add(T value) throws Exception {
-            bind().add(value);
+            bindNs().add(value);
         }
 
         @Override
         public void clear() {
-            bind().clear();
+            bindNs().clear();
         }
 
         @Override
         public T getInternal() throws Exception {
-            return bind().get();
+            return bindNs().get();
         }
 
         @Override
         public void updateInternal(T valueToStore) throws Exception {
             // Reducing state has no direct "set" semantics in the public API; we round-trip
             // via clear+add which matches what TTL state restoration does.
-            ForStRsReducingState<T> s = bind();
+            ForStRsReducingState<T> s = bindNs();
             s.clear();
             if (valueToStore != null) {
                 s.add(valueToStore);
@@ -431,8 +490,31 @@ final class ForStRsInternalKvStateAdapters {
         }
 
         @Override
-        public void mergeNamespaces(N target, Collection<N> sources) {
-            // Single-namespace: no-op (see ListAdapter).
+        public void mergeNamespaces(N target, Collection<N> sources) throws Exception {
+            // FRS-NAMESPACE: real merge. Combine every source namespace's reduced value into
+            // `merged` (via reduceFunction) and clear the source; then fold `merged` into the
+            // target namespace. Each get/clear/add is keyed by the per-namespace suffix.
+            // Pre-fix this was a no-op → session windows lost merged-away state and the
+            // MergingWindowSet diverged (q11/q15 crash). Mirrors RocksDB's merging semantics.
+            if (sources == null || sources.isEmpty()) {
+                return;
+            }
+            ForStRsReducingState<T> s = bind();
+            T merged = null;
+            for (N src : sources) {
+                s.setNamespaceSuffix(serializeNamespace(src));
+                T v = s.get();
+                if (v != null) {
+                    merged = (merged == null) ? v : reduceFunction.reduce(merged, v);
+                    s.clear();
+                }
+            }
+            if (merged != null) {
+                s.setNamespaceSuffix(serializeNamespace(target));
+                T cur = s.get();
+                s.clear();
+                s.add(cur == null ? merged : reduceFunction.reduce(cur, merged));
+            }
         }
     }
 
@@ -471,39 +553,63 @@ final class ForStRsInternalKvStateAdapters {
             return cachedState;
         }
 
+        // FRS-NAMESPACE: bind + set the key suffix to the CURRENT namespace before each op.
+        private ForStRsAggregatingState<IN, ACC, OUT> bindNs() {
+            ForStRsAggregatingState<IN, ACC, OUT> s = bind();
+            s.setNamespaceSuffix(serializeNamespace(currentNamespace));
+            return s;
+        }
+
         @Override
         public OUT get() throws Exception {
-            return bind().get();
+            return bindNs().get();
         }
 
         @Override
         public void add(IN value) throws Exception {
-            bind().add(value);
+            bindNs().add(value);
         }
 
         @Override
         public void clear() {
-            bind().clear();
+            bindNs().clear();
         }
 
         @Override
         public ACC getInternal() throws Exception {
-            // The underlying state exposes get() returning OUT; we expose the accumulator type
-            // through the unchecked cast that AbstractTtlState-style callers expect. For
-            // single-namespace this is fine because the adapter doesn't engage in TTL flow.
-            throw new UnsupportedOperationException(
-                    "ForStRs backend does not expose AggregatingState accumulator yet");
+            // FRS-NAMESPACE: expose the raw accumulator (needed by mergeNamespaces + TTL).
+            return bindNs().getAccumulator();
         }
 
         @Override
-        public void updateInternal(ACC valueToStore) {
-            throw new UnsupportedOperationException(
-                    "ForStRs backend does not expose AggregatingState accumulator yet");
+        public void updateInternal(ACC valueToStore) throws Exception {
+            bindNs().setAccumulator(valueToStore);
         }
 
         @Override
-        public void mergeNamespaces(N target, Collection<N> sources) {
-            // Single-namespace: no-op (see ListAdapter).
+        public void mergeNamespaces(N target, Collection<N> sources) throws Exception {
+            // FRS-NAMESPACE: merge source-namespace ACCUMULATORS into the target via the
+            // AggregateFunction's merge(), then clear sources. Each get/set is keyed per
+            // namespace. Pre-fix this was a no-op → session-window aggregates lost merged-away
+            // state and the MergingWindowSet diverged (q11/q15 crash + wrong results).
+            if (sources == null || sources.isEmpty()) {
+                return;
+            }
+            ForStRsAggregatingState<IN, ACC, OUT> s = bind();
+            ACC merged = null;
+            for (N src : sources) {
+                s.setNamespaceSuffix(serializeNamespace(src));
+                ACC acc = s.getAccumulator();
+                if (acc != null) {
+                    merged = (merged == null) ? acc : aggregateFunction.merge(merged, acc);
+                    s.clear();
+                }
+            }
+            if (merged != null) {
+                s.setNamespaceSuffix(serializeNamespace(target));
+                ACC cur = s.getAccumulator();
+                s.setAccumulator(cur == null ? merged : aggregateFunction.merge(cur, merged));
+            }
         }
     }
 }

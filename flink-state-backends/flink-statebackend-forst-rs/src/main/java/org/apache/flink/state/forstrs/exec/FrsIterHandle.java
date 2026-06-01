@@ -115,6 +115,24 @@ public final class FrsIterHandle implements AutoCloseable {
 
     private final MemorySegment scratchOutBu;
 
+    /**
+     * D-R14-H2 + D-R16-H3: a SHARED per-iter Arena owned by THIS handle, used
+     * to back {@link #scratchOutRc} / {@link #scratchOutBu} regardless of
+     * whether the outer {@code perIterArena} is borrowed (ownsArena=false).
+     *
+     * <p>Originally allocated as {@code Arena.ofConfined()} (D-R14-H2). D-R16-H3
+     * upgraded to {@code Arena.ofShared()} because {@link #close()} can run via
+     * {@link SlotArenaScope#closeSlot()}'s {@code forceClose} path, which is
+     * invoked from {@code backend.close() / dispose()} on the task-canceler
+     * thread — a DIFFERENT thread from the original constructor (operator/
+     * mailbox thread under PR-E3). {@code Arena.ofConfined().close()} from a
+     * non-owner thread throws {@code WrongThreadException}, defeating the
+     * idempotent-close contract. Shared arena adds a small JDK 25 thread-
+     * handshake on close (waits for safepoint polls); 16 bytes per handle
+     * is bounded.
+     */
+    private final Arena scratchArena;
+
     public FrsIterHandle(
             long handleId,
             long nativeHandleId,
@@ -145,12 +163,15 @@ public final class FrsIterHandle implements AutoCloseable {
         this.slotScope = slotScope;
         this.lastNextNs = new AtomicLong(System.nanoTime());
         this.openedAtMs = System.currentTimeMillis();
-        // R14-M1 / R15-M4: allocate the scratch out-param segments ONCE per handle. Reused
-        // across every {@link #next} call so we do not pay an Arena bump per FFI invocation
-        // (and, under ownsArena=false, do not accumulate 8 bytes/call on the long-lived
-        // executor Arena).
-        this.scratchOutRc = perIterArena.allocate(ValueLayout.JAVA_INT);
-        this.scratchOutBu = perIterArena.allocate(ValueLayout.JAVA_INT);
+        // D-R14-H2 + D-R16-H3: always allocate scratch from a HANDLE-OWNED
+        // SHARED arena rather than the (possibly borrowed) perIterArena.
+        // close() unconditionally closes this scratchArena, so segments cannot
+        // outlive the handle. Shared (vs. confined) so closeSlot's forceClose
+        // path — invoked from the task-canceler thread, not the original
+        // constructor thread — can legally close it.
+        this.scratchArena = Arena.ofShared();
+        this.scratchOutRc = scratchArena.allocate(ValueLayout.JAVA_INT);
+        this.scratchOutBu = scratchArena.allocate(ValueLayout.JAVA_INT);
     }
 
     /** Returns the stable Java-side handle ID (used as registry key). */
@@ -231,9 +252,18 @@ public final class FrsIterHandle implements AutoCloseable {
                             scratchOutRc,
                             scratchOutBu);
         } finally {
+            // D-R16-H1: bump lastNextNs BEFORE clearing inCall. The watchdog's
+            // sweep reads `if (h.isInCall()) skip; else idleMs = nowNs - lastNextNs;`
+            // — so once isInCall() observes false, lastNextNs MUST already
+            // reflect call completion. Pre-fix the inCall.set(false) ran
+            // first, then lastNextNs.set; a watchdog sweep between the two
+            // observed inCall=false AND a stale pre-call timestamp, and if
+            // the FFI took longer than idleTimeoutMs, falsely tripped
+            // requestClose() on a just-completed call. Ordering is
+            // load-bearing for R31-H3.
+            lastNextNs.set(System.nanoTime());
             inCall.set(false);
         }
-        lastNextNs.set(System.nanoTime());
         if (rc != FrsErrorCode.OK.code()) {
             FrsErrorCode code = FrsErrorCode.fromU32(rc);
             if (code == FrsErrorCode.ITER_EXPIRED || code == FrsErrorCode.ITER_CURSOR_INVALID) {
@@ -285,13 +315,48 @@ public final class FrsIterHandle implements AutoCloseable {
             }
             // ownsArena == false: borrowed long-lived Arena (PR-E3); do not close —
             // the executor closes it at its own lifecycle boundary.
+            // D-R14-H2: ALWAYS close the handle-owned scratchArena (16 bytes total),
+            // regardless of ownsArena. Without this the scratch segments would
+            // be tied to the borrowed perIterArena's lifetime and remain valid
+            // past handle close() under ownsArena=false — a subtle leak that
+            // breaks the invariant "after close() the handle owns no native
+            // memory".
+            try {
+                scratchArena.close();
+            } catch (Throwable ignored) {
+                // Best-effort; confined Arena close on the owning thread should
+                // always succeed.
+            }
             slotScope.unregisterIter(handleId);
         }
     }
 
     /**
+     * E-R6-H1 / D-R6-H1: concurrent-safe abort. Invokes ONLY
+     * {@code frs_vec_iter_prefix_abort} (which is designed to be called
+     * from any thread — it sets a Rust-side flag that the next read
+     * observes). Does NOT touch the per-iter Arena or close the native
+     * handle; those must run on the operator thread via {@link #close()}.
+     *
+     * <p>Used by the watchdog when a long-running iter must be cancelled
+     * without racing the operator thread's in-flight FFI call.
+     */
+    public void requestAbort() {
+        if (closed.get()) {
+            return;
+        }
+        try {
+            linker.frsVecIterPrefixAbort(nativeHandleId);
+        } catch (Throwable ignored) {
+            // Best-effort; the operator-thread `next()` will also observe
+            // closeRequested and exit terminally on its own schedule.
+        }
+    }
+
+    /**
      * Force-closes this handle, bypassing the request-then-observe watchdog protocol. Used on slot
-     * teardown ({@link SlotArenaScope#closeSlot()}) and turn-boundary leak recovery.
+     * teardown ({@link SlotArenaScope#closeSlot()}) and turn-boundary leak recovery — ALWAYS
+     * called from the operator thread; never from the watchdog scheduled executor.
      *
      * <p>Best-effort: calls {@code frs_vec_iter_prefix_abort} first to unblock any in-progress
      * native reads, then delegates to {@link #close()}.

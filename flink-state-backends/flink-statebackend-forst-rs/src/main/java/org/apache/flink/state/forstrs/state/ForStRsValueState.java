@@ -27,6 +27,7 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
+import java.lang.foreign.MemorySegment;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -394,12 +395,16 @@ public class ForStRsValueState<T> implements ValueState<T> {
             // Immediate path: the engine consumes the value bytes synchronously inside the
             // critical-mode FFM call, so we can reuse the serializer's internal buffer
             // without copying (PR-B3 — eliminates ~64-byte alloc per update).
-            linker.put(
+            // R0C-NEW-H1 Tier-2: segment FFI surface.
+            byte[] valShared = outputBuffer.getSharedBuffer();
+            linker.putSegment(
                     db,
                     cf,
-                    key,
-                    outputBuffer.getSharedBuffer(),
-                    0,
+                    MemorySegment.ofArray(key),
+                    0L,
+                    key.length,
+                    MemorySegment.ofArray(valShared),
+                    0L,
                     outputBuffer.length());
         }
         lastValueKey = null; // consumed
@@ -426,7 +431,8 @@ public class ForStRsValueState<T> implements ValueState<T> {
         if (writeBufferDelete != null) {
             writeBufferDelete.accept(key);
         } else {
-            linker.delete(db, cf, key);
+            // R0C-NEW-H1 Tier-2: segment FFI surface.
+            linker.deleteSegment(db, cf, MemorySegment.ofArray(key), 0L, key.length);
         }
         lastValueKey = null;
     }
@@ -481,10 +487,20 @@ public class ForStRsValueState<T> implements ValueState<T> {
      * construction-time prefix verbatim; in kg-prefixed mode it is freshly built by invoking the
      * key-computer (typically wired to {@code ForStRsKeyGroupedSerializer.encodeForState}).
      */
+    /** FRS-NAMESPACE (2026-05-30): optional per-op namespace suffix (default null = unchanged). */
+    private byte[] namespaceSuffix = null;
+
+    public void setNamespaceSuffix(byte[] ns) {
+        this.namespaceSuffix = ns;
+    }
+
     private byte[] computeKey() {
-        if (keyComputer != null) {
-            return keyComputer.get();
+        byte[] base = (keyComputer != null) ? keyComputer.get() : keyPrefix;
+        if (namespaceSuffix == null || namespaceSuffix.length == 0) {
+            return base;
         }
-        return keyPrefix;
+        byte[] out = java.util.Arrays.copyOf(base, base.length + namespaceSuffix.length);
+        System.arraycopy(namespaceSuffix, 0, out, base.length, namespaceSuffix.length);
+        return out;
     }
 }

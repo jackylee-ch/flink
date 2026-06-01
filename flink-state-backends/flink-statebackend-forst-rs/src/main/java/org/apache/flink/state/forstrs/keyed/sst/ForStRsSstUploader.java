@@ -63,7 +63,16 @@ import java.util.concurrent.Semaphore;
 @Internal
 public final class ForStRsSstUploader {
 
-    private static final int IO_BUFFER_BYTES = 8 * 1024;
+    // GOAL-CKPT-PERF: 1 MiB copy buffer. The prior 8 KiB buffer turned a 171 MiB
+    // incremental checkpoint (q8 windowed-join new-SST volume per 30 s interval)
+    // into ~21,000 read/write syscall pairs per file, measured at ~10 MiB/s to a
+    // LOCAL checkpoint dir — anomalously slow for SSD and the dominant residual
+    // cost of the checkpoint async phase (engine sync phase is ~2 s; barrier
+    // alignment was ruled out via unaligned-checkpoint A/B). 1 MiB cuts the syscall
+    // count ~128x; worst-case memory is MAX_CONCURRENT_UPLOADS (<=32) * 1 MiB = 32
+    // MiB, acceptable. SSTs are routinely >64 MiB so we still stream (never load
+    // the whole file), preserving the large-SST safety the 8 KiB buffer provided.
+    private static final int IO_BUFFER_BYTES = 1024 * 1024;
 
     /**
      * D-R4-NEW-H3: cap concurrent in-flight uploads to prevent FD / connection

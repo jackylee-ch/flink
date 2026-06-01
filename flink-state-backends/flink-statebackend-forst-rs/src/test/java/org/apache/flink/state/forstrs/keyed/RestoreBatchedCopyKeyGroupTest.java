@@ -188,7 +188,7 @@ class RestoreBatchedCopyKeyGroupTest {
         // with range != targetRange), so we no longer need duplicate handles.
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
-            ForStRsIncrementalKeyedStateHandle h1 =
+            org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle h1 =
                     ForStRsRestoreOperationTest.takeSnapshot(linker, arena, tmp.resolve("src1"), 16);
 
             // Build the restore op with a flushCopyKeyGroupBatch counter. Target range = [0,1]

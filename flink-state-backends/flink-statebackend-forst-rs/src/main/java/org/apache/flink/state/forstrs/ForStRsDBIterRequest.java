@@ -200,35 +200,45 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
     public void process(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         // MAP_IS_EMPTY: single open + close with a small chunk; emptiness == 0 rows returned.
         if (originalRequestType == StateRequestType.MAP_IS_EMPTY) {
-            MemorySegment chunkBuf = arena.allocate(IS_EMPTY_CHUNK_BUF_CAP);
-            MemorySegment outHandle = arena.allocate(ValueLayout.JAVA_LONG);
-            MemorySegment outRowCount = arena.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
+            // FRS-ITER-LEAK-FIX: these are all TRANSIENT — consumed before this
+            // method returns. Allocate them from a per-call confined Arena that
+            // is freed on close, NOT from the long-lived executor `arena`. The
+            // pre-fix `arena.allocate` per probe never freed, so the executor
+            // arena's segment list grew O(n_probes) → each subsequent allocate
+            // got slower (the q7 join open crept 2µs→12µs and the native heap
+            // ballooned). MAP_IS_EMPTY returns no views, so nothing here needs
+            // the long-lived arena.
+            try (Arena scratch = Arena.ofConfined()) {
+                MemorySegment chunkBuf = scratch.allocate(IS_EMPTY_CHUNK_BUF_CAP);
+                MemorySegment outHandle = scratch.allocate(ValueLayout.JAVA_LONG);
+                MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
+                MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
 
-            MemorySegment prefixSeg = allocPrefixSegment(arena);
-            int rc =
-                    linker.frsVecIterPrefixOpen(
-                            db.handle(),
-                            cf.handle(),
-                            prefixSeg,
-                            prefix == null ? 0 : prefix.length,
-                            chunkBuf,
-                            IS_EMPTY_CHUNK_BUF_CAP,
-                            outHandle,
-                            outRowCount,
-                            outBytesUsed);
-            if (rc != FrsStatus.OK.code()) {
-                throwIfFatal(rc, "frs_vec_iter_prefix_open");
-                throw new FrsBackendException(
-                        statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
+                MemorySegment prefixSeg = allocPrefixSegment(scratch);
+                int rc =
+                        linker.frsVecIterPrefixOpen(
+                                db.handle(),
+                                cf.handle(),
+                                prefixSeg,
+                                prefix == null ? 0 : prefix.length,
+                                chunkBuf,
+                                IS_EMPTY_CHUNK_BUF_CAP,
+                                outHandle,
+                                outRowCount,
+                                outBytesUsed);
+                if (rc != FrsStatus.OK.code()) {
+                    throwIfFatal(rc, "frs_vec_iter_prefix_open");
+                    throw new FrsBackendException(
+                            statusOrPanic(rc), "frs_vec_iter_prefix_open rc=" + rc);
+                }
+                long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
+                int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                linker.frsVecIterPrefixClose(handle);
+                boolean isEmpty = (rowCount == 0);
+                ((InternalAsyncFuture<Boolean>) (InternalAsyncFuture<?>) request.getFuture())
+                        .complete(isEmpty);
+                return;
             }
-            long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
-            int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
-            linker.frsVecIterPrefixClose(handle);
-            boolean isEmpty = (rowCount == 0);
-            ((InternalAsyncFuture<Boolean>) (InternalAsyncFuture<?>) request.getFuture())
-                    .complete(isEmpty);
-            return;
         }
 
         // MAP_ITER / MAP_ITER_KEY / MAP_ITER_VALUE drain via chunked vec iter.
@@ -242,9 +252,19 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         //     accumulated >= CACHE_SIZE_LIMIT entries (soft cap; the rest goes in continuation).
         //   - The continuation path (existingVecHandle != 0) skips the open and goes straight
         //     into the drain loop.
-        MemorySegment chunkBuf = arena.allocate(CHUNK_BUF_CAP);
-        MemorySegment outRowCount = arena.allocate(ValueLayout.JAVA_INT);
-        MemorySegment outBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
+        // FRS-ITER-LEAK-FIX: chunkBuf + out-params are TRANSIENT — consumed
+        // within this method (views are copied into the long-lived `arena` by
+        // parseChunkInto, which is what the join keeps). Allocate them from a
+        // per-call confined Arena freed on close, NOT the long-lived executor
+        // `arena`. The pre-fix per-probe `arena.allocate` never freed, so the
+        // executor arena's segment list grew O(n_probes) → each subsequent
+        // allocate got slower (q7 join open crept 2µs→12µs) + native heap
+        // ballooned. The continuation handle (existingVecHandle) is a native
+        // iterator id, not an arena segment, so it safely spans process() calls.
+        try (Arena scratch = Arena.ofConfined()) {
+        MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
+        MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
+        MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
 
         long handle;
         boolean firstChunkFromOpen;
@@ -252,7 +272,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             handle = existingVecHandle;
             firstChunkFromOpen = false;
         } else {
-            handle = openVecIterIntoBuf(linker, db, cf, arena, chunkBuf, outRowCount, outBytesUsed);
+            handle = openVecIterIntoBuf(linker, db, cf, scratch, chunkBuf, outRowCount, outBytesUsed);
             firstChunkFromOpen = true;
         }
 
@@ -327,6 +347,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         // arena, which the caller closes only after this method returns. So views from
         // earlier chunks survive subsequent next() calls without corruption.
         completeWithEntries(drained, encounterEnd, null);
+        } // end try(scratch): frees the transient chunkBuf + out-params per probe
     }
 
     /**

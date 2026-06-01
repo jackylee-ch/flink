@@ -27,6 +27,7 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
@@ -313,8 +314,9 @@ public class ForStRsStateExecutor implements StateExecutor {
         linker.batchPut(db, cf, keys, values);
     }
 
-    /** Delegates to {@link ForStRsLinker#delete}. Test override point only. */
+    /** Delegates to {@link ForStRsLinker#deleteSegment}. Test override point only. */
     protected void invokeDelete(byte[] key) {
-        linker.delete(db, cf, key);
+        // R0C-NEW-H1 Tier-2: segment FFI surface.
+        linker.deleteSegment(db, cf, MemorySegment.ofArray(key), 0L, key.length);
     }
 }

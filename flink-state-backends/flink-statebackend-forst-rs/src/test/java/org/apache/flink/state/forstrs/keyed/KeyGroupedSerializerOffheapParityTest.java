@@ -59,6 +59,55 @@ class KeyGroupedSerializerOffheapParityTest {
     }
 
     @Test
+    void encodeForStateIsBytePrefixOfMapOffheapComposite() {
+        // FRS-Q11-FIX regression guard. The off-heap MapState stores composite keys via
+        // encodeForMapOffheap = [kg(2 BE) | key | SEP | stateName | SEP | mapKey]. Every off-heap
+        // prefix operation (forEachEntry / isEmpty / clear / entries) strips the prefix produced by
+        // ForStRsKeyedStateBackend.getMapState's prefix-computer to recover the mapKey. That
+        // prefix-computer MUST produce encodeForState = [kg(2 BE) | key | SEP | stateName | SEP],
+        // i.e. a byte-PREFIX of the composite. A prior bug wired it to buildPrefix
+        // (["k/" | key | "/" | stateName | "/"], a DIFFERENT layout) so every off-heap prefix scan
+        // matched zero rows → empty MergingWindowSet reload → q11/q15 "Window not in in-flight set".
+        ForStRsKeyGroupedSerializer<Long> ser =
+                new ForStRsKeyGroupedSerializer<>(LongSerializer.INSTANCE);
+        String stateName = "myMap";
+        byte[] stateNameBytes = stateName.getBytes(StandardCharsets.UTF_8);
+        long userKey = 12345L;
+        int keyGroup = 7;
+        long mapKey = 999L;
+
+        byte[] prefix = ser.encodeForState(keyGroup, userKey, stateName);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment scratch = arena.allocate(256);
+            long packed =
+                    ser.encodeForMapOffheap(
+                            keyGroup,
+                            userKey,
+                            stateNameBytes,
+                            LongSerializer.INSTANCE,
+                            mapKey,
+                            scratch,
+                            0);
+            int offset = (int) (packed >>> 32);
+            int length = (int) (packed & 0xFFFFFFFFL);
+            byte[] composite = new byte[length];
+            MemorySegment.copy(scratch, ValueLayout.JAVA_BYTE, offset, composite, 0, length);
+
+            org.junit.jupiter.api.Assertions.assertTrue(
+                    composite.length > prefix.length,
+                    "composite must be longer than the prefix (it carries the mapKey)");
+            byte[] head = new byte[prefix.length];
+            System.arraycopy(composite, 0, head, 0, prefix.length);
+            assertArrayEquals(
+                    prefix,
+                    head,
+                    "encodeForState must be a byte-prefix of encodeForMapOffheap — the off-heap "
+                            + "MapState prefix-computer relies on this for prefix scans");
+        }
+    }
+
+    @Test
     void offheapPreservesStartOffset() {
         ForStRsKeyGroupedSerializer<Long> ser =
                 new ForStRsKeyGroupedSerializer<>(LongSerializer.INSTANCE);

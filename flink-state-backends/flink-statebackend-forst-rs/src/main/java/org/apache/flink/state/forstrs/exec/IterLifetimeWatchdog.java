@@ -147,11 +147,27 @@ public final class IterLifetimeWatchdog {
                         maxLifetimeAborts.incrementAndGet();
                         LOG.warn(
                                 "Forst-RS iter handle {} held for {}ms (max={}ms) while in-call"
-                                        + " — force-closing (abort + release)",
+                                        + " — aborting + requesting close on operator thread",
                                 h.handleId(),
                                 lifetimeMs,
                                 maxLifetimeMs);
-                        h.forceClose();
+                        // E-R6-H1 / D-R6-H1: forceClose() is unsafe on
+                        // the watchdog thread — it runs
+                        // `frsVecIterPrefixClose` + `perIterArena.close()`
+                        // while the operator's `next()` is still inside
+                        // FFI, racing native UAF and segment invalidation.
+                        // The fix splits responsibilities:
+                        //   * `frsVecIterPrefixAbort` is designed
+                        //     concurrent (it just sets a Rust-side flag
+                        //     that the next read observes) — safe to call
+                        //     here.
+                        //   * `requestClose()` sets the operator-thread-
+                        //     observed flag; the next `next()` returns
+                        //     terminal and the operator self-closes.
+                        // No native close / arena close runs on the
+                        // watchdog thread.
+                        h.requestAbort();
+                        h.requestClose();
                     }
                     continue;
                 }

@@ -19,20 +19,19 @@
 package org.apache.flink.state.forstrs;
 
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.memory.ByteStreamStateHandle;
 import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
-import org.apache.flink.state.forstrs.keyed.ForStRsIncrementalKeyedStateHandle;
 import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
 
 import org.junit.jupiter.api.Test;
 
 import java.lang.foreign.Arena;
 import java.util.Collections;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -68,7 +67,7 @@ class ForStRsRound9FixesTest {
     void v1SyncRestoreInheritsBackendIdentifier() {
         UUID sourceId = UUID.fromString("11111111-2222-3333-4444-555555555555");
         KeyGroupRange target = new KeyGroupRange(0, 127);
-        ForStRsIncrementalKeyedStateHandle handle =
+        IncrementalRemoteKeyedStateHandle handle =
                 makeHandle(sourceId, target, /* checkpointId= */ 42L);
 
         UUID inherited =
@@ -100,9 +99,9 @@ class ForStRsRound9FixesTest {
         UUID sourceA = UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
         UUID sourceB = UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb");
         KeyGroupRange targetUnion = new KeyGroupRange(0, 127);
-        ForStRsIncrementalKeyedStateHandle a =
+        IncrementalRemoteKeyedStateHandle a =
                 makeHandle(sourceA, new KeyGroupRange(0, 63), /* checkpointId= */ 1L);
-        ForStRsIncrementalKeyedStateHandle b =
+        IncrementalRemoteKeyedStateHandle b =
                 makeHandle(sourceB, new KeyGroupRange(64, 127), /* checkpointId= */ 1L);
 
         UUID inherited =
@@ -117,7 +116,7 @@ class ForStRsRound9FixesTest {
         // Single handle but its range differs from the target — also a rescaling boundary, so a
         // fresh identifier is required.
         UUID sourceId = UUID.fromString("cccccccc-cccc-cccc-cccc-cccccccccccc");
-        ForStRsIncrementalKeyedStateHandle handle =
+        IncrementalRemoteKeyedStateHandle handle =
                 makeHandle(sourceId, new KeyGroupRange(0, 63), /* checkpointId= */ 7L);
         UUID inherited =
                 ForStRsStateBackend.inheritBackendIdentifier(
@@ -135,20 +134,18 @@ class ForStRsRound9FixesTest {
         assertNotNull(inherited);
     }
 
-    private static ForStRsIncrementalKeyedStateHandle makeHandle(
+    private static IncrementalRemoteKeyedStateHandle makeHandle(
             UUID backendId, KeyGroupRange range, long checkpointId) {
         // Minimal handle suitable for the inheritBackendIdentifier predicate — only
-        // backendId + keyGroupRange are inspected. cfMap is empty and the metaStateHandle is a
-        // trivial in-memory placeholder.
-        return new ForStRsIncrementalKeyedStateHandle(
+        // backendId + keyGroupRange are inspected. The metaStateHandle is a trivial in-memory
+        // placeholder.
+        return new IncrementalRemoteKeyedStateHandle(
                 backendId,
                 range,
                 checkpointId,
-                /* baseCheckpointId= */ 0L,
                 /* sharedState= */ List.of(),
                 /* privateState= */ List.of(),
-                new ByteStreamStateHandle("meta", new byte[] {0}),
-                /* cfMap= */ new LinkedHashMap<>());
+                new ByteStreamStateHandle("meta", new byte[] {0}));
     }
 
     // -------------------------------------------------------------------------------------------

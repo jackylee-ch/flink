@@ -23,6 +23,7 @@ import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.runtime.execution.Environment;
 import org.apache.flink.runtime.state.CheckpointableKeyedStateBackend;
 import org.apache.flink.runtime.state.DefaultOperatorStateBackendBuilder;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.OperatorStateBackend;
@@ -31,7 +32,6 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 import org.apache.flink.state.forstrs.keyed.ForStRsAbstractKeyedStateBackend;
-import org.apache.flink.state.forstrs.keyed.ForStRsIncrementalKeyedStateHandle;
 import org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend;
 import org.apache.flink.state.forstrs.keyed.ForStRsRestoreOperation;
 import org.apache.flink.state.forstrs.keyed.ForStRsSnapshotStrategy;
@@ -173,6 +173,22 @@ public class ForStRsStateBackend implements StateBackend {
         try {
             String storageUri = options.storageUri();
             if (storageUri != null && !storageUri.isEmpty()) {
+                // FRS-S3-SST-COLLISION-FIX: every operator-subtask backend
+                // shares one configured storageUri, but each opens its own
+                // engine whose SST file-number counter starts at 1. The Rust
+                // FFI derives the remote dir from hash(storageUri), so without
+                // a per-instance suffix ALL backends write SSTs into the SAME
+                // remote directory and collide on 000001.sst, 000002.sst, …
+                // — concurrent flushes clobber each other's objects on S3,
+                // corrupting the SST footer ("missing trailing magic") and
+                // crash-looping flush-heavy joins (q4/q7/q9). The local db path
+                // is already uniquified (opId + UUID); mirror that suffix onto
+                // the remote URI so each backend instance gets its own subtree.
+                String instanceTag = localDbPath.getFileName().toString();
+                String uniqueStorageUri =
+                        storageUri.endsWith("/")
+                                ? storageUri + instanceTag
+                                : storageUri + "/" + instanceTag;
                 String cacheDir = options.cacheDir();
                 if (cacheDir == null || cacheDir.isEmpty()) {
                     cacheDir = localDbPath.resolveSibling("cache").toString();
@@ -181,7 +197,7 @@ public class ForStRsStateBackend implements StateBackend {
                 db =
                         linker.dbOpenRemoteWithOptions(
                                 arena,
-                                storageUri,
+                                uniqueStorageUri,
                                 options.opendalConfigJson(),
                                 cacheDir,
                                 options.cacheCapacityBytes(),
@@ -312,6 +328,15 @@ public class ForStRsStateBackend implements StateBackend {
                 db = restored.getDb();
                 cf = restored.getDefaultCf();
             } else if (storageUri != null && !storageUri.isEmpty()) {
+                // FRS-S3-SST-COLLISION-FIX (sister to the no-restore open path):
+                // give each backend instance its own remote subtree so the
+                // per-engine SST file-number counters don't collide on a shared
+                // remote directory. See the detailed rationale above.
+                String instanceTag = localDbPath.getFileName().toString();
+                String uniqueStorageUri =
+                        storageUri.endsWith("/")
+                                ? storageUri + instanceTag
+                                : storageUri + "/" + instanceTag;
                 String cacheDir = options.cacheDir();
                 if (cacheDir == null || cacheDir.isEmpty()) {
                     // Fall back to a per-backend cache subdirectory next to the local DB path.
@@ -321,7 +346,7 @@ public class ForStRsStateBackend implements StateBackend {
                 db =
                         linker.dbOpenRemoteWithOptions(
                                 arena,
-                                storageUri,
+                                uniqueStorageUri,
                                 options.opendalConfigJson(),
                                 cacheDir,
                                 options.cacheCapacityBytes(),
@@ -493,7 +518,7 @@ public class ForStRsStateBackend implements StateBackend {
 
     /**
      * E9-H3 (V1-sync parity): returns the source backend identifier when {@code handles} is a
-     * single {@link ForStRsIncrementalKeyedStateHandle} whose key-group range exactly matches the
+     * single {@link IncrementalRemoteKeyedStateHandle} whose key-group range exactly matches the
      * target — i.e. the no-rescaling fast path. Otherwise mints a fresh UUID so the rescaled or
      * empty-restore lineage is treated as a new shared-state namespace.
      *
@@ -515,10 +540,10 @@ public class ForStRsStateBackend implements StateBackend {
             return UUID.randomUUID();
         }
         KeyedStateHandle only = handles.iterator().next();
-        if (!(only instanceof ForStRsIncrementalKeyedStateHandle)) {
+        if (!(only instanceof IncrementalRemoteKeyedStateHandle)) {
             return UUID.randomUUID();
         }
-        ForStRsIncrementalKeyedStateHandle inc = (ForStRsIncrementalKeyedStateHandle) only;
+        IncrementalRemoteKeyedStateHandle inc = (IncrementalRemoteKeyedStateHandle) only;
         if (!inc.getKeyGroupRange().equals(target)) {
             return UUID.randomUUID();
         }

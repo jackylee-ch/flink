@@ -258,32 +258,8 @@ class ForStRsLinkerExtendedTest {
         }
     }
 
-    @Test
-    void iteratorSeekRepositionsCursor() {
-        try (Arena arena = Arena.ofShared()) {
-            ForStRsLinker linker = new ForStRsLinker(arena);
-            try (FrsDb db = linker.dbOpenMemory(arena);
-                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-
-                linker.put(db, cf, utf8("a"), utf8("1"));
-                linker.put(db, cf, utf8("b"), utf8("2"));
-                linker.put(db, cf, utf8("c"), utf8("3"));
-
-                try (FrsIterator iter = linker.iteratorOpen(db, cf, arena)) {
-                    linker.iteratorSeek(iter, utf8("b"));
-                    IteratorEntry first = linker.iteratorNext(iter);
-                    assertNotNull(first);
-                    assertArrayEquals(utf8("b"), first.key());
-
-                    IteratorEntry second = linker.iteratorNext(iter);
-                    assertNotNull(second);
-                    assertArrayEquals(utf8("c"), second.key());
-
-                    assertNull(linker.iteratorNext(iter));
-                }
-            }
-        }
-    }
+    // R0C-NEW-H1 Tier-1: test for legacy `iteratorSeek(byte[])` removed alongside the
+    // FFI method itself.
 
     @Test
     void createAndOpenNamedColumnFamily() {
@@ -465,32 +441,9 @@ class ForStRsLinkerExtendedTest {
         }
     }
 
-    /**
-     * MVCC end-to-end across the FFM hop: write v1 → snapshot → write v2; getAt(snap, k) sees v1
-     * while normal get sees v2. Covers Task 2.6 (linker bindings for getAt) plus the snapshot
-     * lifetime contract in {@link FrsSnapshot}.
-     */
-    @Test
-    void snapshotIsolationAcrossFfmHop() {
-        try (Arena arena = Arena.ofShared()) {
-            ForStRsLinker linker = new ForStRsLinker(arena);
-            try (FrsDb db = linker.dbOpenMemory(arena);
-                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-
-                byte[] key = utf8("k");
-                linker.put(db, cf, key, utf8("v1"));
-
-                try (FrsSnapshot snap = linker.dbSnapshot(db, arena)) {
-                    // Write v2 AFTER the snapshot — normal get sees v2.
-                    linker.put(db, cf, key, utf8("v2"));
-                    assertArrayEquals(utf8("v2"), linker.get(db, cf, key));
-
-                    // getAt at the captured snapshot still sees v1.
-                    assertArrayEquals(utf8("v1"), linker.getAt(db, cf, snap, key));
-                }
-            }
-        }
-    }
+    // R0C-NEW-H1 Tier-1: test for legacy `getAt(byte[])` removed alongside the FFI
+    // method itself. Snapshot isolation is covered by `iteratorOpenAtFiltersBySnapshotSeq`
+    // below which exercises the snapshot lifetime contract end-to-end.
 
     /**
      * iteratorOpenAt across the FFM hop: 3 keys before snapshot + 1 after. The snapshot iterator
@@ -524,41 +477,9 @@ class ForStRsLinkerExtendedTest {
         }
     }
 
-    @Test
-    void batchGetReturnsCorrectValuesAndNulls() {
-        try (Arena arena = Arena.ofShared()) {
-            ForStRsLinker linker = new ForStRsLinker(arena);
-            try (FrsDb db = linker.dbOpenMemory(arena);
-                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-
-                linker.put(db, cf, utf8("k1"), utf8("v1"));
-                linker.put(db, cf, utf8("k2"), utf8("v2"));
-                linker.put(db, cf, utf8("k3"), utf8("v3"));
-
-                byte[][] keys = {utf8("k1"), utf8("k2"), utf8("missing"), utf8("k3")};
-                byte[][] results = linker.batchGet(db, cf, keys);
-
-                assertEquals(4, results.length);
-                assertArrayEquals(utf8("v1"), results[0]);
-                assertArrayEquals(utf8("v2"), results[1]);
-                assertNull(results[2]);
-                assertArrayEquals(utf8("v3"), results[3]);
-            }
-        }
-    }
-
-    @Test
-    void batchGetEmptyKeysReturnsEmptyArray() {
-        try (Arena arena = Arena.ofShared()) {
-            ForStRsLinker linker = new ForStRsLinker(arena);
-            try (FrsDb db = linker.dbOpenMemory(arena);
-                    FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
-
-                byte[][] results = linker.batchGet(db, cf, new byte[0][]);
-                assertEquals(0, results.length);
-            }
-        }
-    }
+    // R0C-NEW-H1 Tier-1: tests for legacy `batchGet(byte[][])` removed alongside the
+    // FFI method itself. The vectorizedBatchGet (off-heap segment-based) path is the
+    // covered alternative and has its own dedicated tests.
 
     @Test
     void getPinnedReturnsInlineValue() {

@@ -21,13 +21,13 @@ package org.apache.flink.state.forstrs.state;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.functions.ReduceFunction;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
-import org.apache.flink.core.memory.DataOutputSerializer;
+// import org.apache.flink.core.memory.DataOutputSerializer; // removed under E4-R3-H2 fail-loud stub
 import org.apache.flink.state.forstrs.VectorizedClassifier;
 import org.apache.flink.state.forstrs.cache.PendingMissTable;
 import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
 
-import java.io.IOException;
+// import java.io.IOException; // removed under E4-R3-H2 fail-loud stub
 
 /**
  * V2 ReducingState using cache-mediated read-modify-write (umbrella spec §2 component 12 + §3 Trace
@@ -201,26 +201,21 @@ public class ForStRsReducingStateV2<T> {
      * @param acc accumulator to flush (null means DELETE)
      */
     private void flushEntry(byte[] keyBytes, T acc) {
-        if (acc == null) {
-            // DELETE path — wired in P11
-            return;
-        }
-        // PUT path — serialize accumulator
-        byte[] valBytes;
-        try {
-            DataOutputSerializer dos = new DataOutputSerializer(64);
-            valueSerializer.serialize(acc, dos);
-            valBytes = dos.getCopyOfBuffer();
-        } catch (IOException e) {
-            throw new RuntimeException(
-                    "ForStRsReducingStateV2: failed to serialize accumulator for state="
-                            + stateName,
-                    e);
-        }
-        // V1 structural placeholder: real PUT submission via classifier wired in P11.
-        // Full path: build a PutRequest with keyBytes + valBytes and call
-        // classifier.submitVectorized(putReq). Deferred because the sealed
-        // VectorizedStateRequest hierarchy needs a new PUT subtype for off-heap RMW PUTs.
-        // For now, drop the serialized bytes — they are computed correctly.
+        // E4-R3-H2: fail-loud foot-gun guard. The entire flushEntry body was a
+        // P11-placeholder — both PUT and DELETE paths silently drop work
+        // (DELETE returned, PUT computed `valBytes` then discarded it). Any
+        // production wiring of this class today would cause silent state
+        // loss on barrier-drain. Throw instead so a future re-introduction
+        // surfaces as an obvious failure rather than corrupting state.
+        // The sole production reducing-state path is
+        // {@code ForStRsAsyncReducingStateV2}; this class is retained only
+        // for structural smoke tests (ReducingStateV2DispatchTest) and the
+        // SnapshotDrainBestEffortTest test-double which overrides
+        // {@link #flushOnBarrier()} entirely.
+        throw new UnsupportedOperationException(
+                "ForStRsReducingStateV2.flushEntry is a structural placeholder"
+                        + " — use ForStRsAsyncReducingStateV2 for production wiring."
+                        + " state="
+                        + stateName);
     }
 }

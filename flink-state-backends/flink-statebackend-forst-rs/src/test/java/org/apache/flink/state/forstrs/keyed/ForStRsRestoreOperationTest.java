@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.core.fs.CloseableRegistry;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.SnapshotResult;
@@ -57,7 +58,7 @@ class ForStRsRestoreOperationTest {
     void snapshotThenRestoreRoundTrip(@TempDir Path tmp) throws Exception {
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
-            ForStRsIncrementalKeyedStateHandle handle =
+            IncrementalRemoteKeyedStateHandle handle =
                     takeSnapshot(linker, arena, tmp.resolve("src"), 8);
 
             // Restore into a fresh target directory using the same kgRange (no rescaling).
@@ -104,20 +105,18 @@ class ForStRsRestoreOperationTest {
     void strictRestoreMissingMetadataThrows(@TempDir Path tmp) throws Exception {
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
-            ForStRsIncrementalKeyedStateHandle handle =
+            IncrementalRemoteKeyedStateHandle handle =
                     takeSnapshot(linker, arena, tmp.resolve("src"), 4);
 
             // Build a corrupted handle by replacing the metadata handle with a 0-byte stub.
-            ForStRsIncrementalKeyedStateHandle bad =
-                    new ForStRsIncrementalKeyedStateHandle(
+            IncrementalRemoteKeyedStateHandle bad =
+                    new IncrementalRemoteKeyedStateHandle(
                             handle.getBackendIdentifier(),
                             handle.getKeyGroupRange(),
                             handle.getCheckpointId(),
-                            handle.getBaseCheckpointId(),
                             handle.getSharedState(),
                             handle.getPrivateState(),
-                            new EmptyStreamHandle(),
-                            handle.getCfMap());
+                            new EmptyStreamHandle());
 
             ForStRsRestoreOperation op =
                     new ForStRsRestoreOperation(
@@ -161,7 +160,7 @@ class ForStRsRestoreOperationTest {
 
     @Test
     void restoreRejectsEscapingSstLocalPath(@TempDir Path tmp) {
-        ForStRsIncrementalKeyedStateHandle owner = emptyOwner(44L);
+        IncrementalRemoteKeyedStateHandle owner = emptyOwner(44L);
         ForStRsCheckpointRestoreException thrown =
                 assertThrows(
                         ForStRsCheckpointRestoreException.class,
@@ -173,7 +172,7 @@ class ForStRsRestoreOperationTest {
 
     @Test
     void restoreAcceptsSingleSstFileName(@TempDir Path tmp) throws Exception {
-        ForStRsIncrementalKeyedStateHandle owner = emptyOwner(45L);
+        IncrementalRemoteKeyedStateHandle owner = emptyOwner(45L);
         Path downloadDir = tmp.resolve("dl");
         Path resolved =
                 ForStRsRestoreOperation.resolveSafeRestoreLocalPath(
@@ -183,16 +182,14 @@ class ForStRsRestoreOperationTest {
 
     @Test
     void rescalingRestoreRejectsTimerPrefixCollisionKeyGroup(@TempDir Path tmp) {
-        ForStRsIncrementalKeyedStateHandle owner =
-                new ForStRsIncrementalKeyedStateHandle(
+        IncrementalRemoteKeyedStateHandle owner =
+                new IncrementalRemoteKeyedStateHandle(
                         UUID.randomUUID(),
                         new KeyGroupRange(0x712F, 0x712F),
                         46L,
-                        /* baseCheckpointId= */ 0L,
                         List.of(),
                         List.of(),
-                        new EmptyStreamHandle(),
-                        Map.of("default", 0L));
+                        new EmptyStreamHandle());
         ForStRsRestoreOperation op =
                 new ForStRsRestoreOperation(
                         null,
@@ -211,16 +208,14 @@ class ForStRsRestoreOperationTest {
 
     @Test
     void rescalingRestoreRejectsAsyncV2PrefixCollisionKeyGroup(@TempDir Path tmp) {
-        ForStRsIncrementalKeyedStateHandle owner =
-                new ForStRsIncrementalKeyedStateHandle(
+        IncrementalRemoteKeyedStateHandle owner =
+                new IncrementalRemoteKeyedStateHandle(
                         UUID.randomUUID(),
                         new KeyGroupRange(0x6B2F, 0x6B2F),
                         47L,
-                        /* baseCheckpointId= */ 0L,
                         List.of(),
                         List.of(),
-                        new EmptyStreamHandle(),
-                        Map.of("default", 0L));
+                        new EmptyStreamHandle());
         ForStRsRestoreOperation op =
                 new ForStRsRestoreOperation(
                         null,
@@ -274,7 +269,7 @@ class ForStRsRestoreOperationTest {
     }
 
     /** Helper: opens a DB at {@code srcDir}, writes N keys, takes an incremental snapshot. */
-    static ForStRsIncrementalKeyedStateHandle takeSnapshot(
+    static IncrementalRemoteKeyedStateHandle takeSnapshot(
             ForStRsLinker linker, Arena arena, Path srcDir, int n) throws Exception {
         java.nio.file.Files.createDirectories(srcDir);
         FrsDb db = linker.dbOpen(arena, srcDir.toString());
@@ -299,23 +294,21 @@ class ForStRsRestoreOperationTest {
             ForStRsSnapshotResources res = strategy.syncPrepareResources(1L);
             SnapshotResult<?> result =
                     strategy.asyncSnapshot(res, 1L, 0L, factory, null).get(new CloseableRegistry());
-            return (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+            return (IncrementalRemoteKeyedStateHandle) result.getJobManagerOwnedSnapshot();
         } finally {
             cf.close();
             db.close();
         }
     }
 
-    private static ForStRsIncrementalKeyedStateHandle emptyOwner(long checkpointId) {
-        return new ForStRsIncrementalKeyedStateHandle(
+    private static IncrementalRemoteKeyedStateHandle emptyOwner(long checkpointId) {
+        return new IncrementalRemoteKeyedStateHandle(
                 UUID.randomUUID(),
                 new KeyGroupRange(0, 0),
                 checkpointId,
-                /* baseCheckpointId= */ 0L,
                 List.of(),
                 List.of(),
-                new EmptyStreamHandle(),
-                Map.of("default", 0L));
+                new EmptyStreamHandle());
     }
 
     /** Test double — a StreamStateHandle whose openInputStream() yields zero bytes. */

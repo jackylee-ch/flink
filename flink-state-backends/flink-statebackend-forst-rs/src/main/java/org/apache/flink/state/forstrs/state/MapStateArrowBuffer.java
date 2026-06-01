@@ -195,10 +195,22 @@ public final class MapStateArrowBuffer implements AutoCloseable {
      * tombstone bitmap (no HashSet probe, no per-call BytesKey allocation).
      */
     public Lookup lookup(byte[] compositeKey) {
+        return lookup(compositeKey, 0, compositeKey.length);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): zero-alloc probe against a (buf, off, len) slice. The
+     * ForStRsMapStateV2 hot path (asyncGet/asyncContains) passes its per-state shared
+     * {@code keyOut.getSharedBuffer()} + length here so no {@code getCopyOfBuffer()} runs per row.
+     * {@link MemorySegment#ofArray} produces a heap-backed segment escape-eliminated by C2.
+     */
+    public Lookup lookup(byte[] compositeKey, int keyOff, int keyLen) {
         ensureClosed();
-        ensureStagingCapacity(compositeKey.length);
-        MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
-        int row = buf.findOrTombstone(staging, 0, compositeKey.length);
+        // C-R10-NEW-H1: the lookup probe is read-only — `findOrTombstone`
+        // only invokes `hash()` and `keysEqual()`, both of which accept a
+        // heap MemorySegment view identically.
+        int row = buf.findOrTombstone(
+                MemorySegment.ofArray(compositeKey), (long) keyOff, keyLen);
         if (row == ArrowBinaryBuffer.TOMBSTONE_FOUND) {
             // Match the pre-C1 observeRead semantics: tombstones short-circuit before the live-hit
             // path, so they did not feed the AutoTuner's hit-rate signal. Preserve that.
@@ -238,13 +250,26 @@ public final class MapStateArrowBuffer implements AutoCloseable {
      * bitmap. No HashSet, no BytesKey allocation.
      */
     public void remove(byte[] compositeKey, ForStRsLinker linker, FrsDb db, FrsCfHandle cf) {
+        remove(compositeKey, 0, compositeKey.length, linker, db, cf);
+    }
+
+    /**
+     * V2-violation V2 (slice variant): tombstone against a (buf, off, len) slice. The underlying
+     * {@code buf.tombstone} call consumes the key bytes into its own off-heap {@code keyData}
+     * region during {@code insert()} so the source byte[] can be reused after this returns.
+     */
+    public void remove(
+            byte[] compositeKey,
+            int keyOff,
+            int keyLen,
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf) {
         ensureClosed();
-        ensureStagingCapacity(compositeKey.length);
-        MemorySegment.copy(compositeKey, 0, staging, ValueLayout.JAVA_BYTE, 0, compositeKey.length);
         if (buf.needsFlush() || buf.shouldAutoFlush()) {
             flushTo(linker, db, cf);
         }
-        buf.tombstone(staging, 0, compositeKey.length);
+        buf.tombstone(MemorySegment.ofArray(compositeKey), (long) keyOff, keyLen);
     }
 
     /**
