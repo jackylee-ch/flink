@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.functions.AggregateFunction;
 import org.apache.flink.api.common.functions.ReduceFunction;
@@ -75,6 +76,7 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RunnableFuture;
@@ -171,6 +173,38 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             engineTimerQueues = new java.util.concurrent.CopyOnWriteArrayList<>();
 
     /**
+     * E10-HIGH-1 + E-R11-H1 + E-R11-H2: synchronization for snapshot worker
+     * lifecycle vs close().
+     *
+     * <p>The V1-sync snapshot path returns a SnapshotStrategyRunner-produced
+     * future that runs on Flink's checkpoint executor (not this backend's
+     * asyncExecutor). Without coordination, {@link #close()} could call
+     * {@link ForStRsKeyedStateBackend#close delegate.close()} → linker.dbClose
+     * / arena.close while a snapshot worker is still inside an FFI downcall,
+     * UAF'ing freed native memory.
+     *
+     * <p>The full guard now mirrors V2's R17-H1 + R17-H2 pattern:
+     * <ul>
+     *   <li>{@code closing} flag — set by close() under {@code closeLock};
+     *     snapshot() checks it INSIDE the same lock before doing any native
+     *     work, throws IOException if already closing.
+     *   <li>{@code outstandingSnapshots} — tracks the WRAPPER (not the
+     *     inner SnapshotStrategyRunner future), so cancel() on a tracked
+     *     entry invokes the wrapper's auto-remove hook. E-R11-H2 caught the
+     *     pre-fix where we stored the inner and called {@code snap.cancel}
+     *     bypassing the wrapper — outstandingSnapshots never emptied,
+     *     close's 5s deadline always fired, and delegate.close() raced
+     *     with in-flight FFI.
+     * </ul>
+     */
+    private final Object snapshotCloseLock = new Object();
+    private volatile boolean closing = false;
+    private final java.util.Set<java.util.concurrent.RunnableFuture<?>>
+            outstandingSnapshots =
+                    java.util.Collections.newSetFromMap(
+                            new java.util.concurrent.ConcurrentHashMap<>());
+
+    /**
      * Per-key futures chain shared by all {@code getAsync*State} factories on this backend (spec
      * §6e). Lazily initialised on first call so backends used purely synchronously do not pay the
      * cost of a virtual-thread executor.
@@ -203,6 +237,39 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
      * Lazily created via {@link #ensureAsyncChain()}.
      */
     private volatile java.util.concurrent.ExecutorService asyncExecutor;
+
+    /**
+     * 2026-05-28 CORRECTNESS FIX (q11 SESSION-window state-loss):
+     *
+     * <p>{@link org.apache.flink.streaming.api.operators.StreamTaskStateInitializerImpl#keyedStatedBackend}
+     * (lines 457, 475, 491-494) intentionally creates {@code cancelStreamRegistryForRestore} —
+     * a RESTORE-TIME-only registry — and closes it via {@code IOUtils.closeQuietly} in the
+     * {@code finally} block immediately after {@code backendRestorer.createAndRestore(...)}.
+     * That same registry is what {@code parameters.getCancelStreamRegistry()} returns and what
+     * was previously stored in {@link AbstractKeyedStateBackend}'s parent field.
+     *
+     * <p>If the V1-sync backend used that registry for in-flight async checkpoint cancellation,
+     * the very first {@code snapshot()} would observe {@code isClosed() == true} (because
+     * restore already finished and Flink closed the restore registry) → returns
+     * {@code SnapshotResult.empty()} → state silently lost → MergingWindowSet inconsistent on
+     * next timer fire → q11 "Window is not in in-flight window set" failure.
+     *
+     * <p>Mirror the V2-async {@link ForStRsAsyncKeyedStateBackend#cancelStreamRegistry} pattern:
+     * own a backend-lifetime registry, closed in {@link #close()}. The Flink-provided
+     * restore-time registry stays untouched on the parent (used only during restore).
+     */
+    private final CloseableRegistry backendCancelStreamRegistry = new CloseableRegistry();
+
+    /**
+     * FRS-CKPT-CANCEL (2026-06-01): test-only accessor for the backend-owned cancel-stream
+     * registry. Tests use this to simulate "backend teardown in progress" (close it, then assert
+     * {@link #snapshot} declines via {@link CancellationException} rather than emitting an empty,
+     * state-losing snapshot result). Not part of any public contract.
+     */
+    @VisibleForTesting
+    CloseableRegistry backendCancelStreamRegistryForTesting() {
+        return backendCancelStreamRegistry;
+    }
 
     // ------------------------------------------------------------------
     // Phase B1+B3: Cached encoded key per current-key (avoids re-encoding
@@ -479,6 +546,15 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // Flush all buffered writes before capturing the snapshot — correctness requirement:
         // the engine snapshot must include all state mutations up to this barrier.
         delegate.flushWriteBuffer();
+        // E-R12-H2: also drain off-heap ValueState buffers. Each
+        // ForStRsValueState writes through an ArrowBinaryBuffer that
+        // is only flushed to the engine via flushAllOffHeapValueStateBuffers().
+        // The L5-internal snapshot path drains all three phases; the
+        // Flink-SPI snapshot was missing this one. Without it, every
+        // ValueState.update() that hasn't tripped the buffer's
+        // auto-flush threshold is silently dropped from the checkpoint
+        // — restore reads stale or absent values for those keys.
+        delegate.flushAllOffHeapValueStateBuffers();
         delegate.flushAllMapStates();
         // Spec invariant #4 — every engine-backed priority queue's pending buffer must be
         // drained to the engine BEFORE the snapshot is captured.
@@ -493,12 +569,112 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
         // Execution type ASYNCHRONOUS = the returned future is not pre-run; Flink's coordinator
         // schedules .run() on its async snapshot executor.
         try {
-            return new SnapshotStrategyRunner<>(
-                            "ForStRs-incremental-snapshot",
-                            snapshotStrategy,
-                            cancelStreamRegistry,
-                            SnapshotExecutionType.ASYNCHRONOUS)
-                    .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
+            // E-R11-H1: refuse if close() has started. The check is under
+            // `snapshotCloseLock` so the (closing-check, set-add) is
+            // atomic against close()'s (set-closing, isEmpty-check)
+            // sequence — close cannot miss this snapshot's
+            // outstanding entry.
+            java.util.concurrent.RunnableFuture<SnapshotResult<KeyedStateHandle>> snap;
+            // Holder used to bind the wrapper into the tracker set BEFORE
+            // the inner future exists so close() observes non-empty across
+            // the entire snapshot lifetime.
+            final java.util.concurrent.RunnableFuture<SnapshotResult<KeyedStateHandle>>[] holder =
+                    new java.util.concurrent.RunnableFuture[1];
+            // E-R12-H1: the wrapper construction + outstandingSnapshots.add()
+            // must happen INSIDE the same synchronized block as the closing
+            // check. Pre-fix the add() ran AFTER the lock was released, so
+            // close() could observe closing=false → snapshot proceeds → lock
+            // released → close() sets closing=true and iterates an empty set
+            // → engineTimerQueues teardown races the still-active inner snap.
+            // Wrapper alloc is pure object construction (no IO, no engine
+            // call) so holding the lock across it is safe.
+            final java.util.concurrent.RunnableFuture<SnapshotResult<KeyedStateHandle>> tracked;
+            synchronized (snapshotCloseLock) {
+                if (closing) {
+                    throw new IOException(
+                            "ForStRsAbstractKeyedStateBackend is closing; refusing snapshot "
+                                    + checkpointId);
+                }
+                // 2026-05-28 CORRECTNESS FIX: use backend-owned registry rather than the
+                // restore-only cancelStreamRegistry passed by Flink (which Flink closes
+                // immediately after restore — see backendCancelStreamRegistry javadoc).
+                snap = new SnapshotStrategyRunner<>(
+                                "ForStRs-incremental-snapshot",
+                                snapshotStrategy,
+                                backendCancelStreamRegistry,
+                                SnapshotExecutionType.ASYNCHRONOUS)
+                        .snapshot(checkpointId, timestamp, streamFactory, checkpointOptions);
+                final java.util.concurrent.RunnableFuture<SnapshotResult<KeyedStateHandle>> innerSnap = snap;
+                tracked =
+                        new java.util.concurrent.RunnableFuture<SnapshotResult<KeyedStateHandle>>() {
+                            @Override
+                            public void run() {
+                                try {
+                                    innerSnap.run();
+                                } finally {
+                                    outstandingSnapshots.remove(holder[0]);
+                                }
+                            }
+
+                            @Override
+                            public boolean cancel(boolean mayInterruptIfRunning) {
+                                boolean r = innerSnap.cancel(mayInterruptIfRunning);
+                                // E-R13-H2: do NOT eagerly remove from
+                                // outstandingSnapshots until the inner
+                                // RunnableFuture has actually finished
+                                // unwinding. cancel(true) sets the FutureTask
+                                // interrupt flag but a worker inside an FFM
+                                // downcall observes the interrupt only at
+                                // the next interruption point — possibly
+                                // AFTER another FFI call returns. Pre-fix
+                                // close()'s `isEmpty()` poll exited the
+                                // 5s await as soon as cancel() returned
+                                // (because each cancel self-removed),
+                                // then engineTimerQueues.close() and
+                                // delegate.close() raced the still-active
+                                // FFI worker — same UAF class V2's R17-H1
+                                // closed. Keep the entry in the set until
+                                // inner.isDone() so the poll loop awaits
+                                // genuine worker unwind.
+                                if (innerSnap.isDone()) {
+                                    outstandingSnapshots.remove(holder[0]);
+                                }
+                                return r;
+                            }
+
+                            @Override
+                            public boolean isCancelled() {
+                                return innerSnap.isCancelled();
+                            }
+
+                            @Override
+                            public boolean isDone() {
+                                return innerSnap.isDone();
+                            }
+
+                            @Override
+                            public SnapshotResult<KeyedStateHandle> get()
+                                    throws InterruptedException,
+                                            java.util.concurrent.ExecutionException {
+                                return innerSnap.get();
+                            }
+
+                            @Override
+                            public SnapshotResult<KeyedStateHandle> get(
+                                    long timeout, java.util.concurrent.TimeUnit unit)
+                                    throws InterruptedException,
+                                            java.util.concurrent.ExecutionException,
+                                            java.util.concurrent.TimeoutException {
+                                return innerSnap.get(timeout, unit);
+                            }
+                        };
+                // E-R11-H2 + E-R12-H1: store the WRAPPER under the same lock
+                // as the closing-check so close()'s iteration sees this
+                // wrapper across the entire snapshot lifetime.
+                holder[0] = tracked;
+                outstandingSnapshots.add(tracked);
+            }
+            return tracked;
         } catch (IOException e) {
             // E6-HIGH-2 (mirrors E5-HIGH-3 on the async path): the cancelStreamRegistry may
             // already be closed if a prior checkpoint's async phase failed or the task is being
@@ -515,12 +691,46 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
             // translated locale) would have silently flipped real failures into {@code
             // SnapshotResult.empty()} and bypassed checkpoint-failure accounting. {@code
             // isClosed()} is stable across Flink versions.
-            if (cancelStreamRegistry.isClosed()) {
+            // 2026-05-28 CORRECTNESS FIX: check the backend-owned registry, not the
+            // Flink-provided restore-only one. The restore-only registry is always closed
+            // by this point (Flink's StreamTaskStateInitializerImpl#keyedStatedBackend
+            // line 491-494 closes it after createAndRestore), so checking it would always
+            // skip the checkpoint and silently lose state (q11 root cause).
+            if (backendCancelStreamRegistry.isClosed()) {
+                // FRS-CKPT-CANCEL (2026-06-01): the backend-owned cancelStreamRegistry is closed,
+                // which only happens once the backend is being torn down (dispose()/close()), so
+                // the SnapshotStrategyRunner cannot register its cancellation hook.
+                //
+                // The PRIOR behaviour returned {@code DoneFuture.of(SnapshotResult.empty())} — but
+                // reporting an EMPTY SUCCESS to the checkpoint coordinator silently drops this
+                // operator's keyed state from the checkpoint: the checkpoint commits
+                // "successfully" with no state, and a later restore brings the operator back EMPTY
+                // (the q11 MergingWindowSet-inconsistency class of bug, just relocated to teardown
+                // time). That is a silent state-loss footgun.
+                //
+                // DECLINE the snapshot instead by throwing {@link CancellationException}. Flink's
+                // checkpoint machinery treats a cancelled snapshot as a DECLINED checkpoint (the
+                // checkpoint is aborted/retried, NOT recorded as a successful empty one), which is
+                // exactly the upstream convention for "the backend is shutting down, so cancel the
+                // in-flight snapshot rather than completing it empty." This realigns with Flink's
+                // native backends, where a closed cancelStreamRegistry propagates the registration
+                // failure out of {@code snapshot()} and declines the checkpoint. Note this branch
+                // is NOT reached during normal operation: after the 2026-05-28 registry-decoupling
+                // fix the backend-owned registry stays open for the backend's whole live lifetime,
+                // so steady-state snapshots never see {@code isClosed() == true}.
                 LOG.info(
-                        "Checkpoint {} skipped — cancelStreamRegistry already closed"
-                                + " (prior checkpoint failure or task cancellation).",
+                        "Checkpoint {} cancelled — backend-owned cancelStreamRegistry closed"
+                                + " (backend teardown in progress); declining rather than emitting"
+                                + " an empty (state-losing) snapshot result.",
                         checkpointId);
-                return DoneFuture.of(SnapshotResult.empty());
+                CancellationException ce =
+                        new CancellationException(
+                                "ForSt-RS checkpoint "
+                                        + checkpointId
+                                        + " cancelled: backend cancelStreamRegistry is closed"
+                                        + " (backend teardown in progress)");
+                ce.initCause(e);
+                throw ce;
             }
             throw e;
         }
@@ -997,23 +1207,134 @@ public class ForStRsAbstractKeyedStateBackend<K> extends AbstractKeyedStateBacke
 
     @Override
     public void close() throws IOException {
+        // E-R11-H1: set `closing` BEFORE doing any teardown work. The
+        // flag is read under the same lock by snapshot() so the
+        // (set-flag, isEmpty-check) is atomic against any concurrent
+        // snapshot() entry — a snapshot that has not yet added its
+        // wrapper to outstandingSnapshots will see `closing=true` and
+        // throw; a snapshot that already added its wrapper guarantees
+        // outstandingSnapshots is non-empty when we check below.
+        synchronized (snapshotCloseLock) {
+            closing = true;
+        }
         try {
             super.close();
         } finally {
-            // Flush + close each engine-backed priority queue's pending buffer before tearing
-            // down the delegate (engine handles).
+            // D-R5R-H1: await async executor termination BEFORE delegate.close().
+            // `shutdownNow()` only sets the interrupt flag; JDK 25 virtual threads
+            // inside FFM downcalls do NOT observe interrupt and run to native
+            // completion. Pre-fix, delegate.close() would race those in-flight
+            // FFI calls: arena.close() on an `Arena.ofShared()` performs a global
+            // thread-handshake that invalidates every MemorySegment derived from
+            // it, while linker.cfClose / linker.dbClose tear down the engine
+            // pointers. An in-flight `frsPut` / `frsGet` returning at that
+            // moment touches freed native memory — JVM crash. Award a bounded
+            // deadline (5s) so a stuck virtual thread cannot block shutdown
+            // indefinitely; matching the pattern used by the restore executor.
+            if (asyncExecutor != null) {
+                asyncExecutor.shutdownNow();
+                try {
+                    if (!asyncExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                        LOG.warn(
+                                "Async executor did not terminate within 5s; "
+                                        + "proceeding with delegate.close() — in-flight FFI calls"
+                                        + " may UAF freed engine pointers");
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    LOG.warn("Interrupted while awaiting async executor termination", ie);
+                }
+            }
+            // E10-HIGH-1: await any snapshot RunnableFutures still being
+            // driven by Flink's checkpoint executor BEFORE delegate.close()
+            // touches the native engine. Each snapshot worker may be in an
+            // FFI downcall against `db` / `nativeArena`; tearing those down
+            // mid-call is the same UAF class V2 closed in R17-H1. Cancel
+            // each tracked future first (best-effort interrupt), then poll
+            // with a 5s deadline so a stuck native call doesn't block
+            // shutdown indefinitely.
+            boolean snapshotsTimedOut = false;
+            if (!outstandingSnapshots.isEmpty()) {
+                for (java.util.concurrent.RunnableFuture<?> snap :
+                        new java.util.ArrayList<>(outstandingSnapshots)) {
+                    snap.cancel(true);
+                }
+                long deadlineNs = System.nanoTime()
+                        + java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
+                while (!outstandingSnapshots.isEmpty()
+                        && System.nanoTime() < deadlineNs) {
+                    // E-R13-H2: cancel()'s wrapper now only self-removes once
+                    // innerSnap.isDone(). A cancelled FutureTask whose worker
+                    // never started running won't have a run()-finally path to
+                    // remove either, so scan for any isDone() wrapper here to
+                    // drain stragglers (the run()-finally still removes the
+                    // happy path quickly).
+                    outstandingSnapshots.removeIf(java.util.concurrent.Future::isDone);
+                    if (outstandingSnapshots.isEmpty()) {
+                        break;
+                    }
+                    try {
+                        Thread.sleep(10);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+                if (!outstandingSnapshots.isEmpty()) {
+                    snapshotsTimedOut = true;
+                    LOG.warn(
+                            "{} snapshot worker(s) did not terminate within 5s of cancel; "
+                                    + "proceeding with delegate.close() — in-flight FFI calls"
+                                    + " may UAF freed engine pointers",
+                            outstandingSnapshots.size());
+                }
+            }
+            // E-R12-H3: flush + close engine-backed priority queues AFTER
+            // awaiting outstanding snapshots. Pre-fix the queues were
+            // closed first — but their close() drains a pending-buffer
+            // into the same CF handle a snapshot worker may still be
+            // holding in an FFI downcall, racing engine state. Moving it
+            // here ensures snapshot workers have either completed or
+            // been forcibly cancelled before timer-queue mutation runs.
+            // Still BEFORE delegate.close() so the engine pointer is
+            // valid when q.close() flushes its pending buffer.
+            //
+            // E-R13-H1: on the snapshot-timeout branch we MUST skip the
+            // flush-on-close. The queue's close() runs
+            // flushPendingToEngine() which issues vectorizedBatchDelete
+            // + batchPut against the SAME db/cf handles a stuck snapshot
+            // worker is still holding in an FFI downcall. The flush
+            // would race engine state and risk the UAF class the warn
+            // above documents. Trade-off: dropped pending-buffer rows
+            // on an already-unclean shutdown are acceptable; data loss
+            // is bounded to ADD/REMOVE timer events post-last-checkpoint.
             for (ForStRsKeyGroupedInternalPriorityQueue<?> q : engineTimerQueues) {
                 try {
-                    q.close();
+                    // A-C4R6-H1: pass skipDrain to release arenas even when the
+                    // snapshot timed out. Pre-fix `continue` skipped close()
+                    // entirely → pendingBuffer/scratchArena/flushArena leaked
+                    // (~3 off-heap arenas per queue per unclean shutdown).
+                    // close(true) flips closed=true + skips the FFI drain
+                    // (the original E-R13-H1 UAF guard) but still runs the
+                    // finally block that closes all three arenas.
+                    q.close(snapshotsTimedOut);
                 } catch (Exception ignored) {
                 }
             }
             engineTimerQueues.clear();
-            // Best-effort shutdown of the async executor — long-running async ops are interrupted.
-            if (asyncExecutor != null) {
-                asyncExecutor.shutdownNow();
-            }
             delegate.close();
+            // 2026-05-28 CORRECTNESS FIX: close the backend-owned cancelStreamRegistry
+            // so any in-flight async snapshot streams are aborted on backend teardown.
+            // Mirrors ForStRsAsyncKeyedStateBackend's pattern (line 1844). Best-effort
+            // so a registry-close exception never blocks the path-invariant cleanup.
+            try {
+                backendCancelStreamRegistry.close();
+            } catch (IOException ignored) {
+                // best-effort close on dispose
+            } catch (Throwable ignored) {
+                // belt-and-suspenders: defend against non-IOException unchecked throws
+                // so the slot-release below is never skipped.
+            }
             // E8-H4: release the path-invariant slot so a subsequent job redeploy / restart on
             // the same (jobId, operatorIdentifier) can re-register without a false-positive
             // cross-path block. Best-effort — never throws to the caller.

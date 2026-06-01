@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
+
 import org.apache.flink.api.common.ExecutionConfig;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
@@ -48,6 +50,7 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.RunnableFuture;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -162,17 +165,31 @@ class V1SyncSchemaDriftTest {
     }
 
     /**
-     * E6-HIGH-2: a closed cancelStreamRegistry causes the V1-sync snapshot path to fall back to a
-     * pre-completed empty future without depending on the IOException message substring.
+     * E6-HIGH-2 (FRS-CKPT-CANCEL 2026-06-01): a closed BACKEND-OWNED cancelStreamRegistry (i.e. the
+     * backend is being torn down) must cause the V1-sync snapshot path to DECLINE the checkpoint by
+     * throwing {@link CancellationException} — NOT to return a pre-completed {@code
+     * SnapshotResult.empty()}.
+     *
+     * <p>The previous contract (empty-success) was a silent state-loss footgun: reporting an empty
+     * success to the checkpoint coordinator commits a checkpoint that carries none of this
+     * operator's keyed state, so a later restore brings the operator back empty (the q11
+     * MergingWindowSet-inconsistency class, relocated to teardown time). Flink's checkpoint
+     * machinery treats a cancelled snapshot as a DECLINED (aborted/retried) checkpoint rather than a
+     * successful one, which is the correct "backend shutting down → cancel the in-flight snapshot"
+     * behaviour and matches Flink's native backends (a closed cancelStreamRegistry propagates the
+     * registration failure out of {@code snapshot()}).
+     *
+     * <p>Note we close the BACKEND-OWNED registry (via the test accessor), not the Flink-provided
+     * restore-only one: after the 2026-05-28 registry-decoupling fix only the backend-owned
+     * registry gates snapshots, and it is closed solely during backend teardown.
      */
     @Test
-    void closedCancelStreamRegistryYieldsEmptyResultStructurally(@TempDir Path tmp)
-            throws Exception {
+    void closedBackendCancelStreamRegistryDeclinesSnapshot(@TempDir Path tmp) throws Exception {
         V1Pair pair = openV1Pair(tmp.resolve("db"));
         try {
-            // Close the registry BEFORE snapshot — mimics a prior checkpoint's abort sequence.
-            pair.cancelStreamRegistry.close();
-            assertTrue(pair.cancelStreamRegistry.isClosed());
+            // Close the BACKEND-OWNED registry — mimics backend teardown in progress.
+            pair.backend.backendCancelStreamRegistryForTesting().close();
+            assertTrue(pair.backend.backendCancelStreamRegistryForTesting().isClosed());
 
             MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
             CheckpointOptions opts =
@@ -180,18 +197,22 @@ class V1SyncSchemaDriftTest {
                             CheckpointType.CHECKPOINT,
                             CheckpointStorageLocationReference.getDefault());
 
-            RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
-                    pair.backend.snapshot(7L, 0L, factory, opts);
-            assertTrue(
-                    fut.isDone(),
-                    "E6-HIGH-2: closed cancel registry → DoneFuture is pre-completed");
-            SnapshotResult<KeyedStateHandle> res = fut.get();
-            assertNotNull(res, "result non-null");
-            // SnapshotResult.empty() — JM handle should be null.
-            assertEquals(
-                    null,
-                    res.getJobManagerOwnedSnapshot(),
-                    "E6-HIGH-2: SnapshotResult.empty() carries no JM handle");
+            // The snapshot must DECLINE (CancellationException), NOT emit an empty success. The
+            // cancellation may be thrown synchronously from snapshot() or surfaced from the
+            // returned future's run()/get(); accept either to stay robust to where the
+            // SnapshotStrategyRunner detects the closed registry.
+            CancellationException ce =
+                    assertThrows(
+                            CancellationException.class,
+                            () -> {
+                                RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                                        pair.backend.snapshot(7L, 0L, factory, opts);
+                                fut.run();
+                                fut.get();
+                            },
+                            "E6-HIGH-2: closed backend cancelStreamRegistry → snapshot must be"
+                                    + " declined via CancellationException, not empty-success");
+            assertNotNull(ce, "cancellation thrown");
         } finally {
             pair.backend.close();
         }
@@ -234,8 +255,8 @@ class V1SyncSchemaDriftTest {
                 fut.run();
             }
             SnapshotResult<KeyedStateHandle> result = fut.get();
-            ForStRsIncrementalKeyedStateHandle handle =
-                    (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+            IncrementalRemoteKeyedStateHandle handle =
+                    (IncrementalRemoteKeyedStateHandle) result.getJobManagerOwnedSnapshot();
             assertNotNull(handle, "V1-sync snapshot produced an incremental handle");
 
             // The registry blob is present in privateState.
