@@ -49,7 +49,18 @@ import static org.assertj.core.api.Assertions.assertThat;
 class VectorizedExecutorOrderingHazardTest {
 
     @Test
-    void sameKeyGetThenPutExecutesInOfferOrderInsteadOfTypeBucketOrder() {
+    void sameKeyGetThenPutStaysVectorizedWhenNoDeleteOrMergeHazard() {
+        // PERF-RESTORE-#1b (2026-05-29): a pure GET+PUT batch (no DELETE, no append-merge) must
+        // NOT be routed to ordered per-row dispatch. The AsyncExecutionController already
+        // serializes same-(key,namespace) requests across batches via its per-key future chains,
+        // so a GET and a PUT that land in ONE batch are for DIFFERENT logical state cells even
+        // when their composite-key bytes collide on the prefix. Forcing offer-order here would
+        // collapse the vectorized batch into per-row FFI crossings — the q4/q7 100x-1000x
+        // amplification that turned ~50s into a >600s timeout. So the executor runs the
+        // vectorized passes (executePuts -> executeGets), i.e. bucket order ["PUT","GET"], NOT
+        // offer order. Correctness is gated empirically (q3/q4/q7 byte-identical to rocksdb).
+        // The genuine same-key hazards — DELETE-vs-write and append-merge chains — DO trigger
+        // ordered dispatch (see listAppendThenGetUsesHeapOrderedFallbackByDefault).
         try (Arena arena = Arena.ofConfined()) {
             ForStRsLinker linker = BatchedFailurePropagationTestHelpers.stubLinker(arena);
             FrsDb db = BatchedFailurePropagationTestHelpers.stubDb();
@@ -75,7 +86,8 @@ class VectorizedExecutorOrderingHazardTest {
                             new RecordingFuture<>()));
 
             assertThat(exec.executeBatchRequests(container)).isCompleted();
-            assertThat(exec.calls).containsExactly("GET", "PUT");
+            // Vectorized passes ran (PUT bucket before GET bucket); NOT collapsed to offer order.
+            assertThat(exec.calls).containsExactly("PUT", "GET");
         }
     }
 

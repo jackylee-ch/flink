@@ -482,15 +482,23 @@ class ForStRsLinkerExtendedTest {
     // covered alternative and has its own dedicated tests.
 
     @Test
-    void getPinnedReturnsInlineValue() {
+    void getPinnedSignalsFallbackAndCopyPathReturnsValue() {
+        // C-R7-H1: frs_get_pinned now ALWAYS returns FALLBACK (so getPinned returns null) to
+        // eliminate a use-after-free — the prior zero-copy pinned pointer into the memtable's
+        // inline box could be freed by a background flush between the FFI return and the Java
+        // copy. Callers must therefore use the allocate-and-copy get()/getFast() path (which is
+        // exactly what production ValueState/MapState do on a null getPinned). Verify the
+        // contract: getPinned signals fallback (null), and getFast returns the stored value.
         try (Arena arena = Arena.ofShared()) {
             ForStRsLinker linker = new ForStRsLinker(arena);
             try (FrsDb db = linker.dbOpenMemory(arena);
                     FrsCfHandle cf = linker.dbDefaultCf(db, arena)) {
                 linker.put(db, cf, utf8("k"), utf8("small-value"));
-                byte[] pinned = linker.getPinned(db, cf, utf8("k"));
-                assertNotNull(pinned);
-                assertArrayEquals(utf8("small-value"), pinned);
+                assertNull(
+                        linker.getPinned(db, cf, utf8("k")),
+                        "C-R7-H1: getPinned always signals FALLBACK (null); callers fall back to"
+                                + " the copy path");
+                assertArrayEquals(utf8("small-value"), linker.getFast(db, cf, utf8("k")));
             }
         }
     }
