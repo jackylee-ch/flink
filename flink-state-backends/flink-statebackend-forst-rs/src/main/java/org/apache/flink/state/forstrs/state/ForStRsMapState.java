@@ -671,37 +671,33 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                     statebuf.tombstoneRow(row);
                 }
             }
+            // FRS-V1-VEC (2026-06-01): enumerate engine-resident keys via the chunked vectorized
+            // drain (N keys per FFM crossing) and delete them in a SINGLE vectorizedBatchDelete
+            // crossing — replaces the per-entry iteratorNext loop + per-key deleteSegment loop
+            // (2N crossings) with O(N/chunk) read crossings + 1 batched delete.
             List<byte[]> compositeKeys = new ArrayList<>();
-            // D-R3-H3: confined arena (single-threaded prefix-iter).
-            try (Arena arena = Arena.ofConfined();
-                    FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
-                ForStRsLinker.IteratorEntry entry;
-                while ((entry = linker.iteratorNext(iter)) != null) {
-                    compositeKeys.add(entry.key());
-                }
+            try {
+                forEachEngineEntryVectorized(prefix, false, (k, v) -> compositeKeys.add(k));
+            } catch (IOException e) {
+                throw new RuntimeException(
+                        "Failed to enumerate MapState engine keys during clear()", e);
             }
-            for (byte[] k : compositeKeys) {
-                // R0C-NEW-H1 Tier-2: segment FFI surface.
-                linker.deleteSegment(db, cf, MemorySegment.ofArray(k), 0L, k.length);
-            }
+            batchDeleteCompositeKeys(compositeKeys);
             return;
         }
         flushMapWriteCache();
         byte[] prefix = currentPrefix();
         writeCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
         readCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
+        // FRS-V1-VEC: chunked vectorized enumerate + single batched delete (see off-heap branch).
         List<byte[]> compositeKeys = new ArrayList<>();
-        // D-R3-H3: confined arena (single-threaded prefix-iter).
-        try (Arena arena = Arena.ofConfined();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
-            ForStRsLinker.IteratorEntry entry;
-            while ((entry = linker.iteratorNext(iter)) != null) {
-                compositeKeys.add(entry.key());
-            }
+        try {
+            forEachEngineEntryVectorized(prefix, false, (k, v) -> compositeKeys.add(k));
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "Failed to enumerate MapState engine keys during clear()", e);
         }
-        for (byte[] k : compositeKeys) {
-            linker.delete(db, cf, k);
-        }
+        batchDeleteCompositeKeys(compositeKeys);
     }
 
     /**
@@ -1032,6 +1028,41 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         writeCacheCount = 0;
         // Reset off-heap staging cursor for the next batch — writeCache offsets are all gone.
         valueStagingPos = 0;
+    }
+
+    /**
+     * FRS-V1-VEC (2026-06-01): delete a batch of engine-resident composite keys in a SINGLE FFM
+     * crossing via {@link ForStRsLinker#vectorizedBatchDelete}, instead of the prior per-key
+     * {@code linker.delete(...)} / {@code deleteSegment(...)} loop (one crossing per key). Keys are
+     * staged once into a contiguous off-heap Arrow-style {@code [keyOffsets][keyData]} layout —
+     * mirrors {@link #flushMapWriteCache}'s {@code vectorizedBatchPut} staging — so the whole
+     * delete set crosses the boundary once. No-op on an empty list.
+     */
+    private void batchDeleteCompositeKeys(List<byte[]> keys) {
+        int count = keys.size();
+        if (count == 0) {
+            return;
+        }
+        long totalKeyBytes = 0L;
+        for (byte[] k : keys) {
+            totalKeyBytes += k.length;
+        }
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keyOffsets = local.allocate((long) (count + 1) * Integer.BYTES, 4L);
+            MemorySegment keyData = local.allocate(Math.max(1L, totalKeyBytes));
+            keyOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+            long kPos = 0L;
+            int idx = 0;
+            for (byte[] k : keys) {
+                if (k.length > 0) {
+                    MemorySegment.copy(k, 0, keyData, ValueLayout.JAVA_BYTE, kPos, k.length);
+                }
+                kPos += k.length;
+                idx++;
+                keyOffsets.set(ValueLayout.JAVA_INT, (long) idx * Integer.BYTES, (int) kPos);
+            }
+            linker.vectorizedBatchDelete(db, cf, keyOffsets, keyData, count);
+        }
     }
 
     public void flush() {
