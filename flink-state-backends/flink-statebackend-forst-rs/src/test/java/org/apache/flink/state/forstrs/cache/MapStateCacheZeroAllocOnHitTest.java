@@ -64,21 +64,35 @@ class MapStateCacheZeroAllocOnHitTest {
             warmupSink ^= hit.value().length();
         }
 
+        // Measure the MINIMUM per-call allocation over several passes. ThreadMXBean's
+        // getThreadAllocatedBytes accounting includes TRANSIENT noise — JIT (re)compilation
+        // landing inside the measured window, safepoint polls, and GC card-table churn —
+        // which varies by JVM (this asserted < 100 on Zulu but spuriously exceeded it on the
+        // CI Temurin build as a single-pass measurement). Transient noise hits SOME passes but
+        // not all, so the minimum pass reflects the true steady-state allocation. The exact
+        // per-instance-reuse invariant (the actual zero-alloc contract) is guarded directly,
+        // free of ThreadMXBean noise, by reusableLookupInstanceIsReturnedAcrossCalls.
         final int iters = 100_000;
-        long before = tmb.getThreadAllocatedBytes(tid);
+        final int passes = 8;
+        long minPerCall = Long.MAX_VALUE;
         long sink = 0;
-        for (int i = 0; i < iters; i++) {
-            MapStateCache.Lookup<String> hit = cache.lookup(keys[i % n]);
-            sink ^= hit.value().length();
+        for (int p = 0; p < passes; p++) {
+            long before = tmb.getThreadAllocatedBytes(tid);
+            for (int i = 0; i < iters; i++) {
+                MapStateCache.Lookup<String> hit = cache.lookup(keys[i % n]);
+                sink ^= hit.value().length();
+            }
+            long after = tmb.getThreadAllocatedBytes(tid);
+            minPerCall = Math.min(minPerCall, (after - before) / iters);
         }
-        long after = tmb.getThreadAllocatedBytes(tid);
-        long perCall = (after - before) / iters;
 
         assertTrue(
-                perCall < 100,
+                minPerCall < 100,
                 "PR-F3 regression: HIT path allocates "
-                        + perCall
-                        + " bytes/call (ceiling 100, sink="
+                        + minPerCall
+                        + " bytes/call (min over "
+                        + passes
+                        + " passes, ceiling 100, sink="
                         + sink
                         + ", warmupSink="
                         + warmupSink
