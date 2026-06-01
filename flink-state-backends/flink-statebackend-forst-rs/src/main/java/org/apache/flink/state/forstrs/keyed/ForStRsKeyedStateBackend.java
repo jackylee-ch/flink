@@ -321,13 +321,79 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     private final java.util.List<Arena> threadLocalArenas =
             java.util.Collections.synchronizedList(new java.util.ArrayList<>());
 
-    private final ThreadLocal<MemorySegment> scratchArenaTL =
+    /**
+     * D-R5R-H2: virtual-thread aware scratch arena allocation.
+     *
+     * <p>Pre-fix, the ThreadLocal initializer always allocated an {@link Arena#ofShared()} and
+     * added it to {@link #threadLocalArenas} for cleanup at backend close. That design assumed
+     * platform threads (bounded). JDK 25 virtual threads spawned per task via
+     * {@code Executors.newVirtualThreadPerTaskExecutor()} caused a permanent off-heap leak:
+     * every distinct virtual thread that touched a V1-sync path allocated a fresh 64 KiB arena
+     * AND a strong reference in {@code threadLocalArenas} that survived the virtual thread's
+     * death. A high-throughput async job that touched N distinct virtual threads accumulated
+     * N × 64 KiB native plus N JVM handshake-table entries.
+     *
+     * <p>The fix routes platform threads through the original tracked-arena path (so backend
+     * close() still reclaims them) and virtual threads through a {@code Cleaner.register} hook
+     * keyed on the per-thread {@code ThreadLocal} value, so the arena closes when the virtual
+     * thread (and its ThreadLocal entry) becomes unreachable. Backend close still drains
+     * platform-thread arenas eagerly.
+     */
+    private static final java.lang.ref.Cleaner VT_ARENA_CLEANER = java.lang.ref.Cleaner.create();
+
+    /**
+     * E-R6-H3: holder that ties Cleaner cleanup to the ThreadLocal entry's
+     * lifetime. The ThreadLocal stores instances of this class (NOT the raw
+     * {@link MemorySegment}) so the holder stays reachable for the lifetime
+     * of the virtual thread that owns the ThreadLocal map entry. When the
+     * virtual thread terminates and the entry is GC'd, the Cleaner fires
+     * {@code arena.close()} — reclaiming the off-heap segment without
+     * leaking it via {@link #threadLocalArenas}.
+     *
+     * <p>Pre-fix the holder was a local variable inside the ThreadLocal
+     * lambda — it became GC-eligible immediately after the lambda returned,
+     * so the Cleaner fired on the next GC cycle and invalidated the segment
+     * while the ThreadLocal still handed it out, producing
+     * {@code IllegalStateException} on the next state op.
+     */
+    private static final class CleanableScratch {
+        final MemorySegment segment;
+
+        CleanableScratch(MemorySegment segment) {
+            this.segment = segment;
+        }
+    }
+
+    private final ThreadLocal<CleanableScratch> scratchArenaTL =
             ThreadLocal.withInitial(
                     () -> {
                         Arena a = Arena.ofShared();
-                        threadLocalArenas.add(a);
-                        return a.allocate(65536);
+                        MemorySegment seg = a.allocate(65536);
+                        CleanableScratch holder = new CleanableScratch(seg);
+                        if (Thread.currentThread().isVirtual()) {
+                            // Cleaner is keyed on `holder`; the ThreadLocal
+                            // anchors `holder` for the virtual thread's
+                            // lifetime, so the Cleaner only fires after the
+                            // thread (and its TL entry) become unreachable.
+                            VT_ARENA_CLEANER.register(holder, a::close);
+                        } else {
+                            // Platform-thread path keeps the original
+                            // tracked-arena lifecycle so backend.close()
+                            // reclaims eagerly.
+                            threadLocalArenas.add(a);
+                        }
+                        return holder;
                     });
+
+    /**
+     * Returns the per-thread scratch {@link MemorySegment}. Indirection through
+     * {@link CleanableScratch} keeps the holder reachable for the lifetime of
+     * the ThreadLocal entry — see {@link CleanableScratch} javadoc for the
+     * E-R6-H3 rationale.
+     */
+    private MemorySegment scratchSegment() {
+        return scratchArenaTL.get().segment;
+    }
 
     /**
      * Supplier passed to off-heap ForStRsValueState that resolves the current key's key-group.
@@ -563,8 +629,21 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             String stateName, TypeSerializer<T> valueSerializer) {
         ensureCurrentKey();
         @SuppressWarnings("unchecked")
-        ForStRsValueState<T> existing =
-                (ForStRsValueState<T>) stateCache.get(valueStateCacheKey(stateName));
+        ForStRsValueState<T> existing;
+        // E-C4R8-H3/H4: stateCache + ownedBuffers reads/writes synchronized on stateCache.
+        // close() iterates+clears stateCache (line ~1721) and ownedBuffers (line ~1631) — a
+        // mailbox-thread factory call that races a task-canceler-thread close could observe
+        // closed=false at ensureCurrentKey(), publish into stateCache after close()'s clear,
+        // and return a state bound to a soon-to-be-freed db/cf handle (UAF). Mirror the
+        // A-C4R7-H1 fix already in place for getMapState.
+        synchronized (stateCache) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot access ValueState: "
+                                + stateName);
+            }
+            existing = (ForStRsValueState<T>) stateCache.get(valueStateCacheKey(stateName));
+        }
         if (existing != null) {
             return existing;
         }
@@ -582,21 +661,35 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         ArrowBinaryBuffer buf =
                 new ArrowBinaryBuffer(
                         ArrowBinaryBuffer.MIN_CAPACITY, ArrowBinaryBuffer.MAX_CAPACITY, tuner);
-        ownedBuffers.add(buf);
         ForStRsValueState<T> created =
                 new ForStRsValueState<>(
                         linker,
                         db,
                         defaultCf,
                         valueSerializer,
-                        scratchArenaTL::get,
+                        this::scratchSegment,
                         kgSer,
                         stateName,
                         offheapKeyGroupSupplier,
                         offheapKeySupplier,
                         buf,
                         tuner);
-        stateCache.put(valueStateCacheKey(stateName), created);
+        // E-C4R8-H1/H4: publish + buffer-register under stateCache monitor. Re-check closed
+        // — close() may have flipped it between our read above and the publish below.
+        synchronized (stateCache) {
+            if (closed) {
+                try {
+                    buf.close();
+                } catch (Throwable ignore) {
+                    // best-effort — the just-allocated buffer was never published.
+                }
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot register ValueState: "
+                                + stateName);
+            }
+            ownedBuffers.add(buf);
+            stateCache.put(valueStateCacheKey(stateName), created);
+        }
         return created;
     }
 
@@ -605,15 +698,30 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             String stateName, TypeSerializer<T> elementSerializer) {
         ensureCurrentKey();
         @SuppressWarnings("unchecked")
-        ForStRsListState<T> existing =
-                (ForStRsListState<T>) stateCache.get(listStateCacheKey(stateName));
+        ForStRsListState<T> existing;
+        // E-C4R8-H3/H4: see getValueState — same close-race rationale.
+        synchronized (stateCache) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot access ListState: "
+                                + stateName);
+            }
+            existing = (ForStRsListState<T>) stateCache.get(listStateCacheKey(stateName));
+        }
         if (existing != null) {
             return existing;
         }
         byte[] prefix = buildPrefix(stateName);
         ForStRsListState<T> created =
                 new ForStRsListState<>(linker, db, defaultCf, prefix, elementSerializer);
-        stateCache.put(listStateCacheKey(stateName), created);
+        synchronized (stateCache) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot register ListState: "
+                                + stateName);
+            }
+            stateCache.put(listStateCacheKey(stateName), created);
+        }
         return created;
     }
 
@@ -626,10 +734,55 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     public <UK, UV> ForStRsMapState<UK, UV> getMapState(
             String stateName, TypeSerializer<UK> keySer, TypeSerializer<UV> valueSer) {
         ensureCurrentKey();
-        ForStRsMapState<UK, UV> existing =
-                (ForStRsMapState<UK, UV>) mapStateRegistry.get(stateName);
+        ForStRsMapState<UK, UV> existing;
+        // D-R5-H4: registry reads/writes synchronized on the registry monitor.
+        // close() iterates via the same monitor (line ~1640) so a mailbox put
+        // can't race a canceler-thread close iteration and corrupt the table.
+        //
+        // A-C4R7-H1: re-check `closed` UNDER the registry monitor for the
+        // existing-branch too. The A-C4R6-H2 fix only protected the publish
+        // branch; the existing-branch could still observe closed=false at
+        // ensureCurrentKey(), then close() flips closed=true and starts
+        // clearing the registry — but T1 still acquires the monitor BEFORE
+        // close()'s snapshot+clear at line ~1659 and returns a non-null
+        // `existing`. The returned state's subsequent FFI calls then race
+        // db.close() / defaultCf.close() — UAF.
+        synchronized (mapStateRegistry) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot access MapState: "
+                                + stateName);
+            }
+            existing = (ForStRsMapState<UK, UV>) mapStateRegistry.get(stateName);
+        }
         if (existing != null) {
             return existing;
+        }
+        // FRS-Q11-DIAG (2026-05-30, gated by -Dforst.rs.mapstate.legacy=true): force the LEGACY
+        // (non-statebuf) MapState constructor to test whether the off-heap statebuf forEachEntry
+        // merge/dedup is the cause of the q11 MergingWindowSet "not in in-flight set" crash. If
+        // q11 runs clean with this flag, the off-heap MapState statebuf path is confirmed.
+        if (Boolean.getBoolean("forst.rs.mapstate.legacy")) {
+            ForStRsMapState<UK, UV> legacy =
+                    new ForStRsMapState<>(
+                            linker,
+                            db,
+                            defaultCf,
+                            keySer,
+                            valueSer,
+                            () -> buildPrefix(stateName),
+                            (uk) -> buildCompositeMapKey(stateName, keySer, uk));
+            synchronized (stateCache) {
+                synchronized (mapStateRegistry) {
+                    if (closed) {
+                        throw new IllegalStateException(
+                                "ForStRsKeyedStateBackend already closed; cannot register MapState: "
+                                        + stateName);
+                    }
+                    mapStateRegistry.put(stateName, legacy);
+                }
+            }
+            return legacy;
         }
         // 1c.1: wire the off-heap ForStRsMapState constructor with a per-instance
         // ArrowBinaryBuffer + ArrowBinaryBufferAutoTuner. Composite-key encoder uses the per-
@@ -649,7 +802,6 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                         ArrowBinaryBuffer.MIN_CAPACITY,
                         ArrowBinaryBuffer.MAX_CAPACITY_MAP_STATE,
                         tuner);
-        ownedBuffers.add(buf);
         ForStRsMapState<UK, UV> created =
                 new ForStRsMapState<>(
                         linker,
@@ -657,15 +809,60 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                         defaultCf,
                         keySer,
                         valueSer,
-                        scratchArenaTL::get,
+                        this::scratchSegment,
                         kgSer,
                         stateName,
                         offheapKeyGroupSupplier,
                         offheapKeySupplier,
                         buf,
                         tuner,
-                        () -> buildPrefix(stateName));
-        mapStateRegistry.put(stateName, created);
+                        // FRS-Q11-FIX (2026-05-31): the off-heap statebuf + engine keys are stored
+                        // in the encodeForMapOffheap layout [kg(2 BE) | key | SEP | stateName | SEP
+                        // | mapKey]. The prefix-computer MUST produce the matching prefix
+                        // [kg(2 BE) | key | SEP | stateName | SEP] so forEachEntry / isEmpty /
+                        // clear / entries can prefix-match. The previous wiring used
+                        // buildPrefix(stateName) = ["k/" | key | "/" | stateName | "/"], a DIFFERENT
+                        // layout (KEYED_NS_MARKER "k/" vs 2-byte keyGroup) — so every off-heap
+                        // prefix scan matched ZERO rows: isEmpty()==true always, clear()==no-op,
+                        // entries()/forEachEntry()==empty. That empty reload made MergingWindowSet
+                        // (q11/q15 session windows) throw "Window not in the in-flight window set".
+                        // get/put/remove were unaffected (they use the off-heap encoder directly).
+                        () ->
+                                kgSer.encodeForState(
+                                        offheapKeyGroupSupplier.getAsInt(),
+                                        (K) offheapKeySupplier.get(),
+                                        stateName));
+        // A-C4R10-H1: ownedBuffers.add + mapStateRegistry.put must be atomic
+        // with the closed re-check. Pre-fix split them across two monitors —
+        // `ownedBuffers.add` succeeded under stateCache, close() then ran
+        // its F-C4R9-H1 snapshot + arena.close(), then T1 acquired
+        // mapStateRegistry, observed closed=true, threw — but the buf was
+        // already in `ownedBuffers` AFTER close()'s snapshot, never closed
+        // → its MemorySegments reference a now-closed arena → IllegalState
+        // / UAF when the buf is touched later.
+        //
+        // Hold BOTH monitors during the publish: stateCache to register the
+        // buf so close()'s snapshot will see it AND see closed=true here, plus
+        // mapStateRegistry for the state publish itself. Lock acquisition
+        // order: stateCache OUTER, mapStateRegistry INNER (matches close()'s
+        // order — stateCache snapshot at line ~1738 → mapStateRegistry snapshot
+        // at line ~1754).
+        synchronized (stateCache) {
+            synchronized (mapStateRegistry) {
+                if (closed) {
+                    try {
+                        buf.close();
+                    } catch (Throwable ignore) {
+                        // best-effort — buf was never published.
+                    }
+                    throw new IllegalStateException(
+                            "ForStRsKeyedStateBackend already closed; cannot register MapState: "
+                                    + stateName);
+                }
+                ownedBuffers.add(buf);
+                mapStateRegistry.put(stateName, created);
+            }
+        }
         return created;
     }
 
@@ -680,16 +877,54 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             ReduceFunction<T> reduceFunction) {
         ensureCurrentKey();
         @SuppressWarnings("unchecked")
-        ForStRsReducingState<T> existing =
-                (ForStRsReducingState<T>) stateCache.get(reducingStateCacheKey(stateName));
+        ForStRsReducingState<T> existing;
+        // E-C4R8-H3/H4: see getValueState.
+        synchronized (stateCache) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot access ReducingState: "
+                                + stateName);
+            }
+            existing =
+                    (ForStRsReducingState<T>) stateCache.get(reducingStateCacheKey(stateName));
+        }
         if (existing != null) {
             return existing;
         }
         byte[] prefix = buildPrefix(stateName);
+        // FRS-V1-VEC (2026-06-01): off-heap Arrow batch-execution statebuf (mirrors
+        // ValueState). add()=read-(off-heap)-reduce-insert; drains in one batch via the
+        // checkpoint hook (flushAllOffHeapValueStateBuffers handles ReducingState below).
+        ArrowBinaryBufferAutoTuner tuner =
+                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+        ArrowBinaryBuffer buf =
+                new ArrowBinaryBuffer(
+                        ArrowBinaryBuffer.MIN_CAPACITY, ArrowBinaryBuffer.MAX_CAPACITY, tuner);
         ForStRsReducingState<T> created =
                 new ForStRsReducingState<>(
-                        linker, db, defaultCf, prefix, elementSerializer, reduceFunction);
-        stateCache.put(reducingStateCacheKey(stateName), created);
+                        linker,
+                        db,
+                        defaultCf,
+                        prefix,
+                        elementSerializer,
+                        reduceFunction,
+                        this::scratchSegment,
+                        buf,
+                        tuner);
+        synchronized (stateCache) {
+            if (closed) {
+                try {
+                    buf.close();
+                } catch (Throwable ignore) {
+                    // best-effort: buffer never published.
+                }
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot register ReducingState: "
+                                + stateName);
+            }
+            ownedBuffers.add(buf);
+            stateCache.put(reducingStateCacheKey(stateName), created);
+        }
         return created;
     }
 
@@ -704,17 +939,54 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             AggregateFunction<IN, ACC, OUT> aggregateFunction) {
         ensureCurrentKey();
         @SuppressWarnings("unchecked")
-        ForStRsAggregatingState<IN, ACC, OUT> existing =
-                (ForStRsAggregatingState<IN, ACC, OUT>)
-                        stateCache.get(aggregatingStateCacheKey(stateName));
+        ForStRsAggregatingState<IN, ACC, OUT> existing;
+        // E-C4R8-H3/H4: see getValueState.
+        synchronized (stateCache) {
+            if (closed) {
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot access AggregatingState: "
+                                + stateName);
+            }
+            existing =
+                    (ForStRsAggregatingState<IN, ACC, OUT>)
+                            stateCache.get(aggregatingStateCacheKey(stateName));
+        }
         if (existing != null) {
             return existing;
         }
         byte[] prefix = buildPrefix(stateName);
+        // FRS-V1-VEC (2026-06-01): off-heap Arrow batch-execution statebuf (drained at
+        // checkpoint via flushAllOffHeapValueStateBuffers).
+        ArrowBinaryBufferAutoTuner aggTuner =
+                new ArrowBinaryBufferAutoTuner(ArrowBinaryBuffer.MIN_CAPACITY);
+        ArrowBinaryBuffer aggBuf =
+                new ArrowBinaryBuffer(
+                        ArrowBinaryBuffer.MIN_CAPACITY, ArrowBinaryBuffer.MAX_CAPACITY, aggTuner);
         ForStRsAggregatingState<IN, ACC, OUT> created =
                 new ForStRsAggregatingState<>(
-                        linker, db, defaultCf, prefix, accSerializer, aggregateFunction);
-        stateCache.put(aggregatingStateCacheKey(stateName), created);
+                        linker,
+                        db,
+                        defaultCf,
+                        prefix,
+                        accSerializer,
+                        aggregateFunction,
+                        this::scratchSegment,
+                        aggBuf,
+                        aggTuner);
+        synchronized (stateCache) {
+            if (closed) {
+                try {
+                    aggBuf.close();
+                } catch (Throwable ignore) {
+                    // best-effort: buffer never published.
+                }
+                throw new IllegalStateException(
+                        "ForStRsKeyedStateBackend already closed; cannot register AggregatingState: "
+                                + stateName);
+            }
+            ownedBuffers.add(aggBuf);
+            stateCache.put(aggregatingStateCacheKey(stateName), created);
+        }
         return created;
     }
 
@@ -1132,7 +1404,16 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         if (!bufferEnabled) {
             // Slice-based native put: pass the slice directly to ForStRsLinker. The single
             // overload that accepts (key, value, valueOff, valueLen) avoids the per-update copy.
-            linker.put(db, defaultCf, key, valBuf, valOff, valLen);
+            // R0C-NEW-H1 Tier-2: segment FFI surface.
+            linker.putSegment(
+                    db,
+                    defaultCf,
+                    java.lang.foreign.MemorySegment.ofArray(key),
+                    0L,
+                    key.length,
+                    java.lang.foreign.MemorySegment.ofArray(valBuf),
+                    valOff,
+                    valLen);
             return;
         }
         // Grow arena if needed (doubling). Steady-state Q11 hits the high-water mark once and
@@ -1214,11 +1495,17 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
     public void deleteFromWriteBuffer(byte[] key) {
         // B9-H1: primitive-keyed map → no ByteArrayWrapper alloc.
         writeBuffer.remove(key);
-        // E-R4-H3: drain any prior PUTs so the engine sees them strictly
-        // before this DELETE. The flush is a no-op when the buffer is
-        // empty (which is the typical fast path in pure-delete workloads).
-        flushWriteBuffer();
-        linker.delete(db, defaultCf, key);
+        // 2026-05-29 PERF-RESTORE-#2 (v3.8 parity): the per-delete flushWriteBuffer()
+        // (originally E-R4-H3) was costing q4/q5/q7/q9/q15-q19 their 5×-15× wins —
+        // windowed-join CLEARs at window close each forced a full buffer drain.
+        // The correctness invariant ("all PUTs land before this DELETE") is preserved
+        // at the SNAPSHOT BOUNDARY via ForStRsAbstractKeyedStateBackend.snapshot()'s
+        // pre-snapshot flushWriteBuffer() call, which is where v3.8 enforced it. We
+        // additionally drain in flushWriteBuffer()-on-close so terminal state is
+        // consistent. Per-record CLEAR pays only the native delete FFI hop.
+        // R0C-NEW-H1 Tier-2: segment FFI surface.
+        linker.deleteSegment(
+                db, defaultCf, java.lang.foreign.MemorySegment.ofArray(key), 0L, key.length);
     }
 
     /**
@@ -1458,16 +1745,24 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // throwing ConcurrentModificationException on the live values() view.
         java.util.List<Object> snapshot = new java.util.ArrayList<>(stateCache.values());
         for (Object v : snapshot) {
-            if (v instanceof ForStRsValueState<?> vs) {
-                try {
+            try {
+                // FRS-V1-VEC (2026-06-01): drain the off-heap Arrow statebuf of every
+                // off-heap-backed V1 state (ValueState + now ReducingState/AggregatingState)
+                // to the engine in one batch before the checkpoint snapshot.
+                if (v instanceof ForStRsValueState<?> vs) {
                     vs.flushStateBuffer();
-                } catch (Throwable t) {
-                    LOG.warn("ValueState flush failed", t);
-                    if (firstFailure == null) {
-                        firstFailure = t;
-                    } else {
-                        firstFailure.addSuppressed(t);
-                    }
+                } else if (v instanceof org.apache.flink.state.forstrs.state.ForStRsReducingState<?> rs) {
+                    rs.flushStateBuffer();
+                } else if (v
+                        instanceof org.apache.flink.state.forstrs.state.ForStRsAggregatingState<?, ?, ?> as) {
+                    as.flushStateBuffer();
+                }
+            } catch (Throwable t) {
+                LOG.warn("Off-heap state-buffer flush failed", t);
+                if (firstFailure == null) {
+                    firstFailure = t;
+                } else {
+                    firstFailure.addSuppressed(t);
                 }
             }
         }
@@ -1541,14 +1836,46 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
             // sharing-bug symptom) until later allocations corrupt unrelated native
             // memory. Logging keeps close() best-effort while preserving diagnostic
             // visibility for sharing-bug regressions.
-            for (ArrowBinaryBuffer b : ownedBuffers) {
+            // F-C4R9-H1: snapshot ownedBuffers under stateCache monitor. A
+            // publisher inside the same monitor in get{Value,List,Reducing,
+            // Aggregating,Map}State that read closed=false BEFORE close()
+            // flipped it can still be adding a buffer concurrent with this
+            // iteration. Snapshot+clear under the monitor; close the
+            // snapshot outside it (b.close() can be slow on shared-arena).
+            java.util.List<ArrowBinaryBuffer> buffersToClose;
+            synchronized (stateCache) {
+                buffersToClose = new java.util.ArrayList<>(ownedBuffers);
+                ownedBuffers.clear();
+            }
+            for (ArrowBinaryBuffer b : buffersToClose) {
                 try {
                     b.close();
                 } catch (Throwable t) {
                     LOG.warn("ArrowBinaryBuffer close failed during backend close", t);
                 }
             }
-            ownedBuffers.clear();
+            // D-R3-H1: release each ForStRsMapState's lazily-allocated offHeapArena.
+            // Pre-fix this arena leaked for the JVM lifetime once any put() ran on a
+            // state instance — silent native-memory growth bounded only by JVM exit.
+            //
+            // D-R5-H4: snapshot the registry under the backend's monitor before
+            // iteration. `mapStateRegistry` is a plain HashMap and `getMapState` at
+            // line ~734 inserts new entries from the mailbox thread; if close() runs
+            // on a task-canceler thread (per the D-R4-H1 cross-thread invariant), a
+            // concurrent put could corrupt the iteration. We already use the same
+            // synchronized-snapshot pattern at line ~1497 for flushAllMapStates.
+            java.util.List<ForStRsMapState<?, ?>> closeSnapshot;
+            synchronized (mapStateRegistry) {
+                closeSnapshot = new java.util.ArrayList<>(mapStateRegistry.values());
+                mapStateRegistry.clear();
+            }
+            for (ForStRsMapState<?, ?> ms : closeSnapshot) {
+                try {
+                    ms.close();
+                } catch (Throwable t) {
+                    LOG.warn("ForStRsMapState close failed during backend close", t);
+                }
+            }
             // PR-M1 (D-R2-5): close all per-thread scratch Arenas so their 64 KB allocations
             // are reclaimed instead of leaking until JVM shutdown.
             synchronized (threadLocalArenas) {
@@ -1576,7 +1903,12 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
                 flushError.addSuppressed(t);
             }
         } finally {
-            stateCache.clear();
+            // F-C4R9-H1: clear under stateCache monitor to avoid racing a
+            // publisher mid-`stateCache.put(...)` (see ownedBuffers snapshot
+            // above for the rationale).
+            synchronized (stateCache) {
+                stateCache.clear();
+            }
             if (iterWatchdog != null) {
                 try {
                     iterWatchdog.stop();

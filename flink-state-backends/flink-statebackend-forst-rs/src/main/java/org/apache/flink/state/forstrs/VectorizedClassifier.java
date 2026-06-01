@@ -381,8 +381,20 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         if (request == null) {
             return;
         }
-        // Mark first so even if the completion call throws, the outer catch still skips.
-        classifierCompletedExceptionally.add(request);
+        // R20-M1/R20-H1 (double-fire fix): completion is idempotent via set membership. The
+        // production {@code AsyncFutureImpl.completeExceptionally} routes to the framework
+        // {@code AsyncFrameworkExceptionHandler.handleException} on EVERY call (it never mutates
+        // the internal completableFuture, so there is no built-in once-only guard) — a second
+        // call therefore double-fires the task-failure handler. {@code Set.add} returns
+        // {@code false} when the request was already drained (by {@link #recordDelete}'s own
+        // onClear-throw handler, by an earlier drain pass, or — for the single-row sync path —
+        // by {@code recordDelete} before {@link #offer}'s outer catch re-enters here). Skip the
+        // duplicate completion in that case. The entry stays in the set so the executor's outer
+        // catch still observes it via {@link #takeClassifierCompletedExceptionally} and likewise
+        // skips re-completion.
+        if (!classifierCompletedExceptionally.add(request)) {
+            return;
+        }
         try {
             ((org.apache.flink.core.asyncprocessing.InternalAsyncFuture<Object>)
                             request.getFuture())

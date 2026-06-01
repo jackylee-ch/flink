@@ -413,21 +413,109 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     }
 
     private void ensureOffHeapStaging() {
+        // A-C4R5-H2 + D-R5-H3: consult stateClosed BEFORE allocating. Pre-fix
+        // a concurrent close() racing with mailbox put() could observe
+        // offHeapArena=null after close set stateClosed=true, re-allocate a
+        // fresh shared arena, and end up with both stateClosed=true AND a
+        // non-null offHeapArena — close() is idempotent and won't release it,
+        // so the freshly-allocated arena leaks for the JVM lifetime. Fail
+        // loud instead so the offending caller surfaces rather than silently
+        // leaking. The check + assignment are NOT atomic on their own; the
+        // backend's lifecycle invariant + the volatile semantics on
+        // stateClosed below give us the needed happens-before edge.
+        if (stateClosed) {
+            throw new IllegalStateException("ForStRsMapState already closed");
+        }
         if (offHeapArena == null) {
-            offHeapArena = Arena.ofShared();
+            // D-R4-H1: SHARED arena (not confined). Reverted from the cycle-3 ofConfined
+            // attempt because the per-instance offHeapArena outlives the call that creates
+            // it — close() runs from {@link
+            // org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend#close()} which
+            // Flink may invoke from a thread OTHER than the keyed-state mailbox (Task
+            // canceler / disposer / executor service). Arena.ofConfined.close() throws
+            // {@link WrongThreadException} from a non-owner thread; the previous code's
+            // best-effort `catch (Throwable ignore)` then SILENTLY LEAKED the entire
+            // valueStaging segment (multi-MB after grows) for the JVM lifetime — a real
+            // native-memory leak on every job cancel/recovery. ofShared's close-handshake
+            // is paid once per state-instance lifetime — irrelevant compared to the put/get
+            // hot path.
+            // D-R4-H3: assign `offHeapArena` LAST so a partial init (allocate throw,
+            // Thread.interrupt between Arena.ofShared() and allocate) doesn't leave the
+            // field non-null pointing at an arena with no backing segment.
+            Arena tmp = Arena.ofShared();
+            MemorySegment seg;
+            try {
+                seg = tmp.allocate(VALUE_STAGING_INITIAL);
+            } catch (Throwable t) {
+                tmp.close();
+                throw t;
+            }
+            valueStaging = seg;
             valueStagingCap = VALUE_STAGING_INITIAL;
-            valueStaging = offHeapArena.allocate(valueStagingCap);
             valueOutputView = new MemorySegmentDataOutputView();
             valueInputView = new MemorySegmentDataInputView();
+            offHeapArena = tmp;
         }
     }
 
     private void growValueStaging() {
+        // D-R3-H2 + D-R4-H2: rotate the arena so the prior (now-orphaned) segment is
+        // actually freed. Pre-fix every grow leaked the previous allocation until
+        // close() (which didn't even exist). Lifecycle:
+        //   1) allocate a fresh arena + segment at the new cap (try/catch so a
+        //      throw from allocate/copy closes the new arena instead of leaking it
+        //      — D-R4-H2)
+        //   2) bulk-copy live bytes (offsets are stable — OffHeapSlice holds
+        //      (offset, length), not segment refs, so all in-flight slices remain
+        //      valid against the new valueStaging)
+        //   3) reassign valueStaging, then close the old arena
+        // ofShared mirrors ensureOffHeapStaging (see D-R4-H1 reasoning).
         int newCap = Math.max(valueStagingCap * 2, valueStagingCap + VALUE_STAGING_INITIAL);
-        MemorySegment grown = offHeapArena.allocate(newCap);
-        MemorySegment.copy(valueStaging, 0L, grown, 0L, valueStagingPos);
+        Arena newArena = Arena.ofShared();
+        MemorySegment grown;
+        try {
+            grown = newArena.allocate(newCap);
+            MemorySegment.copy(valueStaging, 0L, grown, 0L, valueStagingPos);
+        } catch (Throwable t) {
+            newArena.close();
+            throw t;
+        }
+        Arena oldArena = offHeapArena;
         valueStaging = grown;
         valueStagingCap = newCap;
+        offHeapArena = newArena;
+        oldArena.close();
+    }
+
+    // D-R4-H4 + D-R5-H3 + A-C4R5-H3: track explicit closed state so post-close put/get
+    // from a stale state reference fails loud instead of NPE'ing on valueStaging=null
+    // or silently re-allocating a new arena that's never cleaned up. Volatile so a
+    // close()-thread store happens-before a mailbox-thread ensureOffHeapStaging read
+    // — without it the JMM allows the put-path to never observe the close.
+    private volatile boolean stateClosed = false;
+
+    /**
+     * D-R3-H1: release the off-heap arena. Invoked from {@link
+     * org.apache.flink.state.forstrs.keyed.ForStRsKeyedStateBackend#close()} when the backend
+     * disposes each registered MapState. Idempotent.
+     */
+    public void close() {
+        if (stateClosed) {
+            return;
+        }
+        stateClosed = true;
+        if (offHeapArena != null) {
+            try {
+                offHeapArena.close();
+            } catch (Throwable ignore) {
+                // best-effort — already-closed or pinned-segment failures are
+                // dispatcher-side issues; backend close() must continue.
+            }
+            offHeapArena = null;
+            valueStaging = null;
+            valueStagingCap = 0;
+            valueStagingPos = 0;
+        }
     }
 
     @Override
@@ -464,7 +552,9 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         ByteArrayKey cacheKey = new ByteArrayKey(compositeKey);
         writeCache.remove(cacheKey);
         readCache.remove(cacheKey);
-        linker.delete(db, cf, compositeKey);
+        // R0C-NEW-H1 Tier-2: segment FFI surface.
+        linker.deleteSegment(
+                db, cf, MemorySegment.ofArray(compositeKey), 0L, compositeKey.length);
     }
 
     @Override
@@ -541,7 +631,10 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             if (statebufHasPrefix(prefix)) {
                 return false;
             }
-            try (Arena arena = Arena.ofShared();
+            // D-R3-H3: confined (operator-thread) arena. Shared arenas trigger
+            // a global safepoint handshake on close — measurably slower and
+            // unnecessary for a single-threaded prefix-iter lifetime.
+            try (Arena arena = Arena.ofConfined();
                     FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
                 return linker.iteratorNext(iter) == null;
             }
@@ -555,7 +648,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             }
         }
         flushMapWriteCache();
-        try (Arena arena = Arena.ofShared();
+        // D-R3-H3: confined arena (see isEmpty's 1c.1 site).
+        try (Arena arena = Arena.ofConfined();
                 FrsIterator iter = linker.prefixLookupOpen(db, cf, currentPrefix(), arena)) {
             return linker.iteratorNext(iter) == null;
         }
@@ -578,7 +672,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                 }
             }
             List<byte[]> compositeKeys = new ArrayList<>();
-            try (Arena arena = Arena.ofShared();
+            // D-R3-H3: confined arena (single-threaded prefix-iter).
+            try (Arena arena = Arena.ofConfined();
                     FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
                 ForStRsLinker.IteratorEntry entry;
                 while ((entry = linker.iteratorNext(iter)) != null) {
@@ -586,7 +681,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                 }
             }
             for (byte[] k : compositeKeys) {
-                linker.delete(db, cf, k);
+                // R0C-NEW-H1 Tier-2: segment FFI surface.
+                linker.deleteSegment(db, cf, MemorySegment.ofArray(k), 0L, k.length);
             }
             return;
         }
@@ -595,7 +691,8 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         writeCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
         readCache.keySet().removeIf(k -> startsWith(k.bytes, prefix));
         List<byte[]> compositeKeys = new ArrayList<>();
-        try (Arena arena = Arena.ofShared();
+        // D-R3-H3: confined arena (single-threaded prefix-iter).
+        try (Arena arena = Arena.ofConfined();
                 FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
             ForStRsLinker.IteratorEntry entry;
             while ((entry = linker.iteratorNext(iter)) != null) {
@@ -682,52 +779,135 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                 }
                 visitor.accept(uk, uv);
             }
-            try (Arena arena = Arena.ofShared();
-                    FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
-                ForStRsLinker.IteratorEntry entry;
-                while ((entry = linker.iteratorNext(iter)) != null) {
-                    byte[] composite = entry.key();
-                    if (composite.length < prefix.length) {
-                        throw new IOException(
-                                "Encountered composite key shorter than prefix during MapState scan");
-                    }
-                    int mapKeyLen = composite.length - prefix.length;
-                    byte[] mapKeyBytes = new byte[mapKeyLen];
-                    System.arraycopy(composite, prefix.length, mapKeyBytes, 0, mapKeyLen);
-                    if (seenMapKeys.contains(new ByteArrayKey(mapKeyBytes))) {
-                        continue;
-                    }
-                    inputBuffer.setBuffer(mapKeyBytes, 0, mapKeyLen);
-                    UK uk = keySerializer.deserialize(inputBuffer);
-                    UV uv = null;
-                    if (loadValues) {
-                        inputBuffer.setBuffer(entry.value());
-                        uv = valueSerializer.deserialize(inputBuffer);
-                    }
-                    visitor.accept(uk, uv);
-                }
-            }
+            // FRS-V1-VEC: chunked/vectorized engine drain (was a per-entry iteratorNext
+            // loop), with the statebuf-shadow dedup applied per row.
+            forEachEngineEntryVectorized(
+                    prefix,
+                    loadValues,
+                    (composite, value) -> {
+                        if (composite.length < prefix.length) {
+                            throw new IOException(
+                                    "Encountered composite key shorter than prefix during MapState scan");
+                        }
+                        int mapKeyLen = composite.length - prefix.length;
+                        byte[] mapKeyBytes = new byte[mapKeyLen];
+                        System.arraycopy(composite, prefix.length, mapKeyBytes, 0, mapKeyLen);
+                        if (seenMapKeys.contains(new ByteArrayKey(mapKeyBytes))) {
+                            return; // shadowed by a newer statebuf entry
+                        }
+                        inputBuffer.setBuffer(mapKeyBytes, 0, mapKeyLen);
+                        UK uk = keySerializer.deserialize(inputBuffer);
+                        UV uv = null;
+                        if (loadValues) {
+                            inputBuffer.setBuffer(value);
+                            uv = valueSerializer.deserialize(inputBuffer);
+                        }
+                        visitor.accept(uk, uv);
+                    });
             return;
         }
         flushMapWriteCache();
         byte[] prefix = currentPrefix();
-        try (Arena arena = Arena.ofShared();
-                FrsIterator iter = linker.prefixLookupOpen(db, cf, prefix, arena)) {
-            ForStRsLinker.IteratorEntry entry;
-            while ((entry = linker.iteratorNext(iter)) != null) {
-                byte[] composite = entry.key();
-                if (composite.length < prefix.length) {
-                    throw new IOException(
-                            "Encountered composite key shorter than prefix during MapState scan");
+        // FRS-V1-VEC: chunked/vectorized engine drain (was a per-entry iteratorNext loop).
+        forEachEngineEntryVectorized(
+                prefix,
+                loadValues,
+                (composite, value) -> {
+                    if (composite.length < prefix.length) {
+                        throw new IOException(
+                                "Encountered composite key shorter than prefix during MapState scan");
+                    }
+                    inputBuffer.setBuffer(
+                            composite, prefix.length, composite.length - prefix.length);
+                    UK uk = keySerializer.deserialize(inputBuffer);
+                    UV uv = null;
+                    if (loadValues) {
+                        inputBuffer.setBuffer(value);
+                        uv = valueSerializer.deserialize(inputBuffer);
+                    }
+                    visitor.accept(uk, uv);
+                });
+    }
+
+    /**
+     * FRS-V1-VEC (2026-06-01): VECTORIZED engine prefix scan for the V1-sync MapState
+     * iteration path. Replaces the per-entry {@code linker.iteratorNext} loop (ONE FFM
+     * crossing + ONE heap byte[] alloc per entry) with the chunked
+     * {@code frsVecIterPrefixOpen/Next} drain that the V2 path already uses: each FFM
+     * crossing returns up to a 64 KiB chunk of rows — layout per row
+     * {@code [u32 klen LE][u32 vlen LE][key bytes][value bytes]} — cutting crossings
+     * from O(entries) to O(entries / chunk). The Flink operator still invokes the
+     * iteration once per record (the sync operator model is immutable), but the
+     * per-ENTRY FFM crossings WITHIN one scan are now batched/vectorized. Row bytes are
+     * copied out of {@code chunkBuf} before the next {@code _next} overwrites it, so no
+     * snapshot arena is needed. {@code rowVisitor} receives (compositeKeyBytes,
+     * valueBytes-or-null).
+     */
+    @FunctionalInterface
+    private interface RawRowConsumer {
+        void accept(byte[] compositeKey, byte[] value) throws IOException;
+    }
+
+    private void forEachEngineEntryVectorized(
+            byte[] prefix, boolean loadValues, RawRowConsumer rowVisitor) throws IOException {
+        final int CHUNK_CAP = 64 * 1024;
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment chunkBuf = arena.allocate(CHUNK_CAP);
+            MemorySegment prefixSeg = arena.allocate(Math.max(1, prefix.length));
+            if (prefix.length > 0) {
+                MemorySegment.copy(prefix, 0, prefixSeg, ValueLayout.JAVA_BYTE, 0, prefix.length);
+            }
+            MemorySegment outHandle = arena.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment outRowCount = arena.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
+            int rc =
+                    linker.frsVecIterPrefixOpen(
+                            db.handle(),
+                            cf.handle(),
+                            prefixSeg,
+                            prefix.length,
+                            chunkBuf,
+                            CHUNK_CAP,
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
+            if (rc != 0) {
+                throw new IOException("frs_vec_iter_prefix_open rc=" + rc);
+            }
+            long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
+            try {
+                int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                while (true) {
+                    int off = 0;
+                    for (int i = 0; i < rowCount; i++) {
+                        int klen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+                        off += 4;
+                        int vlen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+                        off += 4;
+                        byte[] k = new byte[klen];
+                        MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, k, 0, klen);
+                        off += klen;
+                        byte[] v = null;
+                        if (loadValues) {
+                            v = new byte[vlen];
+                            MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, v, 0, vlen);
+                        }
+                        off += vlen;
+                        rowVisitor.accept(k, v);
+                    }
+                    if (rowCount == 0) {
+                        break;
+                    }
+                    rc =
+                            linker.frsVecIterPrefixNext(
+                                    handle, chunkBuf, CHUNK_CAP, outRowCount, outBytesUsed);
+                    if (rc != 0) {
+                        throw new IOException("frs_vec_iter_prefix_next rc=" + rc);
+                    }
+                    rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
                 }
-                inputBuffer.setBuffer(composite, prefix.length, composite.length - prefix.length);
-                UK uk = keySerializer.deserialize(inputBuffer);
-                UV uv = null;
-                if (loadValues) {
-                    inputBuffer.setBuffer(entry.value());
-                    uv = valueSerializer.deserialize(inputBuffer);
-                }
-                visitor.accept(uk, uv);
+            } finally {
+                linker.frsVecIterPrefixClose(handle);
             }
         }
     }
@@ -801,27 +981,53 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             return;
         }
         int count = writeCache.size();
-        byte[][] keys = new byte[count][];
-        byte[][] values = new byte[count][];
-        int i = 0;
+        // R0C-NEW-H2 (Tier 6): direct off-heap Arrow-style staging + vectorizedBatchPut.
+        // Pre-fix built `byte[][] keys`/`byte[][] values` and called legacy
+        // `linker.batchPut(byte[][])` which internally did per-row `Arena.allocate`
+        // + `MemorySegment.copy` + pointer-array sets. Post-fix: ONE off-heap
+        // contiguous stage + one FFM call, zero per-row pointer materialization.
+        // Values are already in `valueStaging` at sparse `slice.offset` positions
+        // — compacted into the contiguous `valData` segment via off-heap → off-heap
+        // copy. Keys live in heap `ByteArrayKey.bytes` (intrinsic source) and copy
+        // heap → off-heap once into `keyData`.
+        long totalKeyBytes = 0L;
+        long totalValBytes = 0L;
         for (Map.Entry<ByteArrayKey, OffHeapSlice> entry : writeCache.entrySet()) {
-            keys[i] = entry.getKey().bytes;
-            // Extract from off-heap staging into a heap byte[] for the legacy batchPut FFI.
-            // Future optimization (SP6 Phase 6.3.2): stage keys+values directly into a
-            // ColumnarBatchBuffer pair and call linker.vectorizedBatchPut to avoid this copy.
-            OffHeapSlice slice = entry.getValue();
-            byte[] v = new byte[slice.length];
-            MemorySegment.copy(
-                    valueStaging,
-                    java.lang.foreign.ValueLayout.JAVA_BYTE,
-                    slice.offset,
-                    v,
-                    0,
-                    slice.length);
-            values[i] = v;
-            i++;
+            totalKeyBytes += entry.getKey().bytes.length;
+            totalValBytes += entry.getValue().length;
         }
-        linker.batchPut(db, cf, keys, values);
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keyOffsets =
+                    local.allocate((long) (count + 1) * Integer.BYTES, 4L);
+            MemorySegment keyData = local.allocate(Math.max(1L, totalKeyBytes));
+            MemorySegment valOffsets =
+                    local.allocate((long) (count + 1) * Integer.BYTES, 4L);
+            MemorySegment valData = local.allocate(Math.max(1L, totalValBytes));
+            keyOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+            valOffsets.set(ValueLayout.JAVA_INT, 0L, 0);
+            long kPos = 0L;
+            long vPos = 0L;
+            int idx = 0;
+            for (Map.Entry<ByteArrayKey, OffHeapSlice> entry : writeCache.entrySet()) {
+                byte[] kBytes = entry.getKey().bytes;
+                OffHeapSlice slice = entry.getValue();
+                if (kBytes.length > 0) {
+                    MemorySegment.copy(
+                            kBytes, 0, keyData, ValueLayout.JAVA_BYTE, kPos, kBytes.length);
+                }
+                kPos += kBytes.length;
+                // valueStaging → valData direct off-heap copy (compaction).
+                MemorySegment.copy(valueStaging, slice.offset, valData, vPos, slice.length);
+                vPos += slice.length;
+                idx++;
+                keyOffsets.set(
+                        ValueLayout.JAVA_INT, (long) idx * Integer.BYTES, (int) kPos);
+                valOffsets.set(
+                        ValueLayout.JAVA_INT, (long) idx * Integer.BYTES, (int) vPos);
+            }
+            linker.vectorizedBatchPut(
+                    db, cf, keyOffsets, keyData, valOffsets, valData, count);
+        }
         writeCache.clear();
         writeCacheCount = 0;
         // Reset off-heap staging cursor for the next batch — writeCache offsets are all gone.

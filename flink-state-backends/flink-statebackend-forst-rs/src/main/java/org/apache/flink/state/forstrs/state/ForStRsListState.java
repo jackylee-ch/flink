@@ -27,6 +27,9 @@ import org.apache.flink.state.forstrs.ffm.ForStRsLinker;
 import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
+import java.lang.foreign.Arena;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -107,12 +110,18 @@ public class ForStRsListState<T> implements ListState<T> {
         if (value == null) {
             throw new NullPointerException("ForStRsListState.add does not accept null values");
         }
-        List<T> current = readList();
-        if (current == null) {
-            current = new ArrayList<>(1);
-        }
-        current.add(value);
-        writeList(current);
+        // FRS-V1-VEC (2026-06-01): APPEND-MERGE instead of read-modify-write. The prior
+        // path did `readList()` (sync engine GET → byte[]) + append + `writeList()` (sync
+        // PUT of the WHOLE list) on EVERY add — O(list) bytes per element, O(list^2) over
+        // the list, plus a per-record sync GET+PUT. The default CF is configured with the
+        // engine's RawConcatMergeOperator (ffi lib.rs:131), so an add is now a single
+        // merge-append of one `[count=1][elem]` operand — NO read, NO whole-list rewrite —
+        // exactly like the V2 ListState APPEND_MERGE path. `get` resolves the concatenated
+        // operands (RawConcat) and decodeMerged below sums the per-chunk counts.
+        outputBuffer.clear();
+        outputBuffer.writeInt(1);
+        serializer.serialize(value, outputBuffer);
+        appendMergeOperand(outputBuffer.getSharedBuffer(), outputBuffer.length());
     }
 
     @Override
@@ -141,17 +150,46 @@ public class ForStRsListState<T> implements ListState<T> {
                         "ForStRsListState.addAll does not accept null elements");
             }
         }
-        List<T> current = readList();
-        if (current == null) {
-            current = new ArrayList<>(values.size());
+        // FRS-V1-VEC: APPEND-MERGE one `[count=N][elems]` operand (no read-modify-write).
+        outputBuffer.clear();
+        outputBuffer.writeInt(values.size());
+        for (T v : values) {
+            serializer.serialize(v, outputBuffer);
         }
-        current.addAll(values);
-        writeList(current);
+        appendMergeOperand(outputBuffer.getSharedBuffer(), outputBuffer.length());
+    }
+
+    /**
+     * FRS-V1-VEC (2026-06-01): append a single raw merge operand to this list's key via
+     * {@code frs_vec_merge_append}. The default CF's RawConcatMergeOperator concatenates
+     * operand bytes, so each operand is a self-describing `[count:i32 BE][elems]` chunk and
+     * {@link #readList} decodes the concatenation. No read of the existing list is needed.
+     */
+    private void appendMergeOperand(byte[] operand, int operandLen) throws IOException {
+        byte[] ck = computeKey();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment keySeg = arena.allocate(Math.max(1, ck.length));
+            MemorySegment.copy(ck, 0, keySeg, ValueLayout.JAVA_BYTE, 0, ck.length);
+            MemorySegment opData = arena.allocate(Math.max(1, operandLen));
+            MemorySegment.copy(operand, 0, opData, ValueLayout.JAVA_BYTE, 0, operandLen);
+            MemorySegment ptrs = arena.allocate(ValueLayout.ADDRESS, 1);
+            MemorySegment lens = arena.allocate(ValueLayout.JAVA_INT, 1);
+            ptrs.setAtIndex(ValueLayout.ADDRESS, 0, opData);
+            lens.setAtIndex(ValueLayout.JAVA_INT, 0, operandLen);
+            int rc =
+                    linker.frsVecMergeAppend(
+                            db.handle(), cf.handle(), keySeg, ck.length, ptrs, lens, 1);
+            if (rc != 0) {
+                throw new IOException("frs_vec_merge_append rc=" + rc);
+            }
+        }
     }
 
     @Override
     public void clear() {
-        linker.delete(db, cf, computeKey());
+        // R0C-NEW-H1 Tier-2: segment FFI surface.
+        byte[] ck = computeKey();
+        linker.deleteSegment(db, cf, MemorySegment.ofArray(ck), 0L, ck.length);
     }
 
     private List<T> readList() throws IOException {
@@ -159,14 +197,23 @@ public class ForStRsListState<T> implements ListState<T> {
         if (raw == null) {
             return null;
         }
+        // FRS-V1-VEC (2026-06-01): the stored value is now a CONCATENATION of merge
+        // operands (RawConcatMergeOperator), each a self-describing `[count:i32 BE][elems]`
+        // chunk — plus, if `update()` did a Put base, that base as the first chunk. Decode
+        // every chunk until the buffer is exhausted (mirrors ForStRsListStateV2.get). A
+        // legacy single-Put value (pre-change) decodes as exactly one chunk — backward
+        // compatible.
         inputBuffer.setBuffer(raw);
-        int count = inputBuffer.readInt();
-        if (count < 0) {
-            throw new IOException("Negative element count in encoded ListState payload: " + count);
-        }
-        List<T> out = new ArrayList<>(count);
-        for (int i = 0; i < count; i++) {
-            out.add(serializer.deserialize(inputBuffer));
+        List<T> out = new ArrayList<>();
+        while (inputBuffer.available() > 0) {
+            int count = inputBuffer.readInt();
+            if (count < 0) {
+                throw new IOException(
+                        "Negative element count in encoded ListState payload: " + count);
+            }
+            for (int i = 0; i < count; i++) {
+                out.add(serializer.deserialize(inputBuffer));
+            }
         }
         return out;
     }
@@ -180,19 +227,34 @@ public class ForStRsListState<T> implements ListState<T> {
         // PR-E4: reuse the serializer's internal buffer; the engine consumes the value
         // bytes synchronously inside the critical-mode FFM call, so no defensive copy is
         // required. Eliminates one byte[] allocation per writeList.
-        linker.put(
+        // R0C-NEW-H1 Tier-2: segment FFI surface.
+        byte[] ck = computeKey();
+        byte[] vs = outputBuffer.getSharedBuffer();
+        linker.putSegment(
                 db,
                 cf,
-                computeKey(),
-                outputBuffer.getSharedBuffer(),
-                0,
+                MemorySegment.ofArray(ck),
+                0L,
+                ck.length,
+                MemorySegment.ofArray(vs),
+                0L,
                 outputBuffer.length());
     }
 
+    /** FRS-NAMESPACE (2026-05-30): optional per-op namespace suffix (default null = unchanged). */
+    private byte[] namespaceSuffix = null;
+
+    public void setNamespaceSuffix(byte[] ns) {
+        this.namespaceSuffix = ns;
+    }
+
     private byte[] computeKey() {
-        if (keyComputer != null) {
-            return keyComputer.get();
+        byte[] base = (keyComputer != null) ? keyComputer.get() : keyPrefix;
+        if (namespaceSuffix == null || namespaceSuffix.length == 0) {
+            return base;
         }
-        return keyPrefix;
+        byte[] out = java.util.Arrays.copyOf(base, base.length + namespaceSuffix.length);
+        System.arraycopy(namespaceSuffix, 0, out, base.length, namespaceSuffix.length);
+        return out;
     }
 }
