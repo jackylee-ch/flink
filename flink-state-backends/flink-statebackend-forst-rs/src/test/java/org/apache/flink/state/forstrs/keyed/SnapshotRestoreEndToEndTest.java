@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
+
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.api.common.typeutils.base.LongSerializer;
@@ -60,7 +62,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *   <li>Open an async backend on a fresh local DB; seed 1024 key/value pairs through the engine's
  *       FFI surface.
  *   <li>Take an incremental snapshot via {@link ForStRsAsyncKeyedStateBackend#snapshot} →
- *       materialise the {@link ForStRsIncrementalKeyedStateHandle}.
+ *       materialise the {@link IncrementalRemoteKeyedStateHandle}.
  *   <li>Close the source backend.
  *   <li>Open a NEW async backend via {@link ForStRsAsyncKeyedStateBackend#restoreFromHandles}
  *       handing back the snapshot's handle.
@@ -111,8 +113,8 @@ class SnapshotRestoreEndToEndTest {
         if (!fut.isDone()) {
             fut.run();
         }
-        ForStRsIncrementalKeyedStateHandle handle =
-                (ForStRsIncrementalKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
+        IncrementalRemoteKeyedStateHandle handle =
+                (IncrementalRemoteKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
         assertNotNull(handle, "snapshot returned a non-null incremental handle");
         UUID sourceBackendId = handle.getBackendIdentifier();
         assertNotNull(sourceBackendId, "snapshot backend identifier is populated");
@@ -242,8 +244,8 @@ class SnapshotRestoreEndToEndTest {
         if (!fut.isDone()) {
             fut.run();
         }
-        ForStRsIncrementalKeyedStateHandle handle =
-                (ForStRsIncrementalKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
+        IncrementalRemoteKeyedStateHandle handle =
+                (IncrementalRemoteKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
         assertNotNull(handle);
         // Sanity: the privateState list now carries the registry blob entry.
         assertTrue(

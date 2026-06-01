@@ -18,6 +18,9 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
+
 import org.apache.flink.api.common.typeutils.base.IntSerializer;
 import org.apache.flink.runtime.checkpoint.CheckpointOptions;
 import org.apache.flink.runtime.checkpoint.CheckpointType;
@@ -57,7 +60,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * <ul>
  *   <li>PR-A1: {@link RunnableFuture} returned from {@code snapshot()} is no longer a {@code
  *       DoneFuture.of(SnapshotResult.empty())} — it now carries a {@link
- *       ForStRsIncrementalKeyedStateHandle} produced by the engine's incremental-checkpoint FFI.
+ *       IncrementalRemoteKeyedStateHandle} produced by the engine's incremental-checkpoint FFI.
  *   <li>PR-A1: pre-snapshot drain runs in order — {@link VectorizedExecutor#flushDirty} now folds
  *       the memtable to L0 SSTs so the strategy's enumeration includes recent writes.
  *   <li>PR-A1: lazy snapshot-strategy construction — {@code snapshotStrategyForTesting()} is null
@@ -66,7 +69,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       SavepointType#isSynchronous() synchronous}, the returned future is pre-run before {@code
  *       snapshot()} returns. We verify {@code isDone() == true} immediately.
  *   <li>PR-A9: CheckpointOptions branching — periodic CHECKPOINT and stop-savepoint both produce
- *       valid handles; the strategy emits an {@link ForStRsIncrementalKeyedStateHandle} either
+ *       valid handles; the strategy emits an {@link IncrementalRemoteKeyedStateHandle} either
  *       way (canonical-format savepoint emission is deferred to a follow-on PR per the PR-A9
  *       TODO documented in the snapshot() Javadoc).
  *   <li>PR-A1: successive checkpoints exercise the incremental-base path — the second snapshot
@@ -149,12 +152,12 @@ class AsyncBackendSnapshotPathTest {
                     "PR-A1: snapshot() no longer returns SnapshotResult.empty() — must carry"
                             + " a KeyedStateHandle");
             assertTrue(
-                    handle instanceof ForStRsIncrementalKeyedStateHandle,
-                    "PR-A1: strategy emits ForStRsIncrementalKeyedStateHandle, got "
+                    handle instanceof IncrementalRemoteKeyedStateHandle,
+                    "PR-A1: strategy emits IncrementalRemoteKeyedStateHandle, got "
                             + handle.getClass().getSimpleName());
-            ForStRsIncrementalKeyedStateHandle inc = (ForStRsIncrementalKeyedStateHandle) handle;
+            IncrementalRemoteKeyedStateHandle inc = (IncrementalRemoteKeyedStateHandle) handle;
             assertEquals(1L, inc.getCheckpointId(), "checkpoint id round-trips");
-            assertEquals(0L, inc.getBaseCheckpointId(), "first checkpoint base is 0");
+            // FRS-CKPT-HANDLE-MIGRATION: base id no longer carried on the standard handle.
             assertNotNull(inc.getMetaDataStateHandle(), "manifest stream handle is populated");
 
             // Lazy initialization assertion: strategy must now exist.
@@ -185,11 +188,17 @@ class AsyncBackendSnapshotPathTest {
             if (!fut1.isDone()) {
                 fut1.run();
             }
-            ForStRsIncrementalKeyedStateHandle h1 =
-                    (ForStRsIncrementalKeyedStateHandle)
+            IncrementalRemoteKeyedStateHandle h1 =
+                    (IncrementalRemoteKeyedStateHandle)
                             fut1.get().getJobManagerOwnedSnapshot();
             assertNotNull(h1);
-            assertEquals(0L, h1.getBaseCheckpointId());
+            // FRS-CKPT-HANDLE-MIGRATION: the standard handle no longer carries a base id. Capture
+            // ckpt 1's shared-SST local paths so we can prove ckpt 2 incrementally REUSES them
+            // (a stronger check than the removed base-id field — it verifies actual file sharing).
+            java.util.Set<String> ckpt1SharedPaths = new java.util.HashSet<>();
+            for (HandleAndLocalPath hlp : h1.getSharedState()) {
+                ckpt1SharedPaths.add(hlp.getLocalPath());
+            }
 
             // ---- Notify completion + add more keys ----
             backend.notifyCheckpointComplete(1L);
@@ -201,14 +210,28 @@ class AsyncBackendSnapshotPathTest {
             if (!fut2.isDone()) {
                 fut2.run();
             }
-            ForStRsIncrementalKeyedStateHandle h2 =
-                    (ForStRsIncrementalKeyedStateHandle)
+            IncrementalRemoteKeyedStateHandle h2 =
+                    (IncrementalRemoteKeyedStateHandle)
                             fut2.get().getJobManagerOwnedSnapshot();
             assertEquals(2L, h2.getCheckpointId());
-            assertEquals(
-                    1L,
-                    h2.getBaseCheckpointId(),
-                    "PR-A1: notifyCheckpointComplete plumbed prior checkpoint id");
+            // FRS-CKPT-HANDLE-MIGRATION: instead of the removed base-id field, prove the
+            // notifyCheckpointComplete(1L) plumbing made ckpt 2 incremental on ckpt 1 by showing
+            // ckpt 2 re-shares at least one of ckpt 1's SSTs (the engine reused an unchanged file
+            // rather than re-uploading everything as a full snapshot).
+            boolean reusesCkpt1Sst = false;
+            for (HandleAndLocalPath hlp : h2.getSharedState()) {
+                if (ckpt1SharedPaths.contains(hlp.getLocalPath())) {
+                    reusesCkpt1Sst = true;
+                    break;
+                }
+            }
+            assertTrue(
+                    reusesCkpt1Sst,
+                    "PR-A1: notifyCheckpointComplete plumbed the prior checkpoint so ckpt 2 reuses"
+                            + " ≥1 of ckpt 1's shared SSTs (incremental). ckpt1 paths="
+                            + ckpt1SharedPaths
+                            + ", ckpt2 shared="
+                            + h2.getSharedState());
         } finally {
             backend.close();
         }
@@ -339,8 +362,8 @@ class AsyncBackendSnapshotPathTest {
             if (!fut.isDone()) {
                 fut.run();
             }
-            ForStRsIncrementalKeyedStateHandle h =
-                    (ForStRsIncrementalKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
+            IncrementalRemoteKeyedStateHandle h =
+                    (IncrementalRemoteKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
             assertNotNull(h);
 
             int beforeAbort = backend.sstRegistryForTesting().size();

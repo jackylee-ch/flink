@@ -43,6 +43,7 @@ import org.apache.flink.runtime.state.DoneFuture;
 import org.apache.flink.runtime.state.InternalKeyContext;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyGroupedInternalPriorityQueue;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.Keyed;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.PriorityComparable;
@@ -624,10 +625,10 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             return null;
         }
         KeyedStateHandle only = handles.iterator().next();
-        if (!(only instanceof ForStRsIncrementalKeyedStateHandle)) {
+        if (!(only instanceof IncrementalRemoteKeyedStateHandle)) {
             return null;
         }
-        ForStRsIncrementalKeyedStateHandle inc = (ForStRsIncrementalKeyedStateHandle) only;
+        IncrementalRemoteKeyedStateHandle inc = (IncrementalRemoteKeyedStateHandle) only;
         if (!inc.getKeyGroupRange().equals(target)) {
             return null;
         }
@@ -1261,11 +1262,18 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             // ============================================================
             // PHASE 1 — drain in-flight V2 dispatch + state buffers + timers
             // ============================================================
-            // PHASE 1.a: flush all in-flight batches already queued in managed executors. After
-            // this call returns the engine's memtable has been folded to an L0 SST (PR-A1 made
-            // flushDirty call linker.flush) so the snapshot strategy's file enumeration is
-            // complete.
-            managedExecutors.forEach(VectorizedExecutor::flushDirty);
+            // PHASE 1.a: FRS-CKPT-NOFLUSH (2026-06-01) — DO NOT fold the memtable
+            // to an L0 SST here. The strategy's async phase now captures the live
+            // memtable as a seq-bounded Arrow-IPC artifact (no-flush incremental
+            // checkpoint), keeping it RAM-resident + unfragmented for reads (the
+            // ckpt-ON heavy-join fix). V2 dispatch has already applied every
+            // in-flight batch to the engine memtable synchronously (see
+            // VectorizedExecutor.flushDirty's contract note), so there is nothing
+            // to drain on the Java side here; the state-buffer drains below
+            // (PHASE 1.b/1.c/timers) put all remaining mutations into the memtable
+            // BEFORE the snapshot pin in PHASE 3, so the seq-bounded artifact
+            // captures them. (dispose() still flushes on shutdown — that path is
+            // unchanged.)
 
             // R28-H2: every drain loop wraps the per-state flush in try/Throwable so a throw
             // from one state instance cannot strand the remaining states' buffers in the
@@ -1427,9 +1435,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             }
 
             // ============================================================
-            // PHASE 2 — second flushDirty to drain the PUTs enqueued by RMW cache flushes
+            // PHASE 2 — FRS-CKPT-NOFLUSH: no second flush either. The PUTs
+            // enqueued by the PHASE 1.b/1.c RMW/state-buffer drains are already in
+            // the engine memtable (V2 dispatch applies synchronously); they are
+            // captured by the seq-bounded memtable artifact in PHASE 3, not folded
+            // to an SST.
             // ============================================================
-            managedExecutors.forEach(VectorizedExecutor::flushDirty);
 
             // ============================================================
             // PHASE 3 — engine snapshot via FFI through ForStRsSnapshotStrategy

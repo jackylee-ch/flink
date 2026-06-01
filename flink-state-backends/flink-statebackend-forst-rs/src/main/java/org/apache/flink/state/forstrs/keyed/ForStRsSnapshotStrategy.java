@@ -25,6 +25,7 @@ import org.apache.flink.runtime.state.CheckpointStateOutputStream;
 import org.apache.flink.runtime.state.CheckpointStreamFactory;
 import org.apache.flink.runtime.state.CheckpointedStateScope;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.SnapshotResult;
@@ -885,24 +886,28 @@ public class ForStRsSnapshotStrategy
         // engine writes a single manifest file per checkpoint, distinct from the serializer
         // registry blob now carried under privateState (E5-HIGH-2).
         //
-        // R35-H2: record the EFFECTIVE base checkpoint id on the handle (0L for NO_SHARING /
-        // FULL_CHECKPOINT) so any handle consumer (restore, SharedStateRegistry registration,
-        // retention bookkeeping) sees a self-consistent "full snapshot" rather than a "depends
-        // on prior checkpoint" descriptor.
-        // R36-L2: re-snapshot the CF map at handle-build time so any CF added after strategy
-        // construction is captured. The supplier copies on each call, so the resulting handle
-        // owns an immutable snapshot.
-        Map<String, Long> cfMapSnapshot = cfMapSupplier.get();
-        ForStRsIncrementalKeyedStateHandle handle =
-                new ForStRsIncrementalKeyedStateHandle(
+        // FRS-CKPT-HANDLE-MIGRATION (2026-06-01): emit the STANDARD Flink {@link
+        // IncrementalRemoteKeyedStateHandle} rather than the custom {@code
+        // ForStRsIncrementalKeyedStateHandle}. {@link ForStRsRestoreOperation} was already
+        // migrated to accept only the standard handle; producing the custom subtype here left a
+        // snapshot→restore round-trip break (restore rejected the type at its instanceof gate).
+        // The two custom-only fields are intentionally dropped:
+        //   - baseCheckpointId: incremental file-sharing across checkpoints is driven by Flink's
+        //     SharedStateRegistry (shared SSTs are registered by local path and de-duplicated
+        //     against prior checkpoints), so the explicit base-id descriptor is redundant. The
+        //     `effectiveBaseCheckpointId` computed above still gates the strict full-vs-incremental
+        //     sharing logic; it simply is not persisted on the handle.
+        //   - cfMap: the engine recovers all column-family info FROM THE MANIFEST at restore time
+        //     (see ForStRsRestoreOperation), so the CF map is no longer carried on the wire — no
+        //     production consumer of it remains.
+        IncrementalRemoteKeyedStateHandle handle =
+                new IncrementalRemoteKeyedStateHandle(
                         backendIdentifier,
                         keyGroupRange,
                         resources.getCheckpointId(),
-                        effectiveBaseCheckpointId,
                         /* sharedState= */ sharedHandles,
                         /* privateState= */ privateStateEntries,
-                        metaHandle,
-                        cfMapSnapshot);
+                        metaHandle);
         return SnapshotResult.of(handle);
     }
 

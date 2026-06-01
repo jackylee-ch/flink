@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.keyed;
 
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
+
 import org.apache.flink.core.fs.CloseableRegistry;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
 import org.apache.flink.runtime.state.KeyGroupRange;
@@ -47,7 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  *
  * <p>Drives the snapshot strategy end-to-end against a filesystem-backed ForSt-RS engine: writes a
  * batch of keys, runs a full incremental checkpoint, asserts a valid {@link
- * ForStRsIncrementalKeyedStateHandle} comes out, then writes more keys and runs a second checkpoint
+ * IncrementalRemoteKeyedStateHandle} comes out, then writes more keys and runs a second checkpoint
  * with the first as base — the second's {@code sharedState} list must be non-empty (engine reports
  * SSTs from ckpt 1 as shared with ckpt 2 because compaction has not run between).
  */
@@ -91,11 +93,13 @@ class ForStRsSnapshotStrategyTest {
                         strategy.asyncSnapshot(res1, 1L, 0L, factory, null)
                                 .get(new CloseableRegistry());
                 assertNotNull(result1);
-                ForStRsIncrementalKeyedStateHandle h1 =
-                        (ForStRsIncrementalKeyedStateHandle) result1.getJobManagerOwnedSnapshot();
+                IncrementalRemoteKeyedStateHandle h1 =
+                        (IncrementalRemoteKeyedStateHandle) result1.getJobManagerOwnedSnapshot();
                 assertNotNull(h1);
                 assertEquals(1L, h1.getCheckpointId());
-                assertEquals(0L, h1.getBaseCheckpointId());
+                // FRS-CKPT-HANDLE-MIGRATION: base-checkpoint-id is no longer carried on the
+                // (standard) handle — incremental file-sharing is driven by the SharedStateRegistry.
+                // The strategy-internal base is still asserted via res1.getBaseCheckpointId() above.
                 assertNotNull(h1.getMetaDataStateHandle());
                 int sharedSize1 = h1.getSharedState().size();
                 assertTrue(sharedSize1 >= 1, "ckpt 1 shared state contains the new SSTs");
@@ -118,10 +122,11 @@ class ForStRsSnapshotStrategyTest {
                 SnapshotResult<?> result2 =
                         strategy.asyncSnapshot(res2, 2L, 0L, factory, null)
                                 .get(new CloseableRegistry());
-                ForStRsIncrementalKeyedStateHandle h2 =
-                        (ForStRsIncrementalKeyedStateHandle) result2.getJobManagerOwnedSnapshot();
+                IncrementalRemoteKeyedStateHandle h2 =
+                        (IncrementalRemoteKeyedStateHandle) result2.getJobManagerOwnedSnapshot();
                 assertEquals(2L, h2.getCheckpointId());
-                assertEquals(1L, h2.getBaseCheckpointId());
+                // FRS-CKPT-HANDLE-MIGRATION: handle no longer carries base id (res2 above asserts
+                // the strategy computed base=1). Incremental reuse is verified by sharedState below.
                 assertTrue(
                         h2.getSharedState().size() >= 1,
                         "ckpt 2 sharedState non-empty (engine reuses ckpt 1's SSTs)");
@@ -352,9 +357,9 @@ class ForStRsSnapshotStrategyTest {
                                         org.apache.flink.runtime.checkpoint.CheckpointOptions
                                                 .forCheckpointWithDefaultLocation())
                                 .get(new CloseableRegistry());
-                ForStRsIncrementalKeyedStateHandle h1 =
-                        (ForStRsIncrementalKeyedStateHandle) result1.getJobManagerOwnedSnapshot();
-                assertEquals(0L, h1.getBaseCheckpointId(), "ckpt 1 base is 0 (first ckpt)");
+                IncrementalRemoteKeyedStateHandle h1 =
+                        (IncrementalRemoteKeyedStateHandle) result1.getJobManagerOwnedSnapshot();
+                // FRS-CKPT-HANDLE-MIGRATION: base id no longer on the handle (full = first ckpt).
                 strategy.recordCompletedCheckpoint(1L);
                 strategy.takePendingRegistrations(1L);
                 // Capture ckpt 1's per-local-path StreamStateHandle identity. The pre-R35-H2 bug
@@ -388,14 +393,12 @@ class ForStRsSnapshotStrategyTest {
                 SnapshotResult<?> result2 =
                         strategy.asyncSnapshot(res2, 2L, 0L, factory, fullOpts)
                                 .get(new CloseableRegistry());
-                ForStRsIncrementalKeyedStateHandle h2 =
-                        (ForStRsIncrementalKeyedStateHandle) result2.getJobManagerOwnedSnapshot();
+                IncrementalRemoteKeyedStateHandle h2 =
+                        (IncrementalRemoteKeyedStateHandle) result2.getJobManagerOwnedSnapshot();
 
-                assertEquals(
-                        0L,
-                        h2.getBaseCheckpointId(),
-                        "R35-H2: FULL_CHECKPOINT handle must report baseCheckpointId=0,"
-                                + " not the last-completed ckpt id");
+                // FRS-CKPT-HANDLE-MIGRATION: base id no longer on the handle. The R35-H2 contract
+                // (FULL_CHECKPOINT re-uploads every SST rather than reusing prior handles) is still
+                // verified below via the StreamStateHandle-identity check on getSharedState().
 
                 // Every entry in h2.getSharedState() that shares a local-path with a ckpt 1
                 // entry MUST carry a DIFFERENT StreamStateHandle object — proving the FULL
@@ -504,13 +507,11 @@ class ForStRsSnapshotStrategyTest {
                 SnapshotResult<?> result =
                         strategy.asyncSnapshot(res, 1L, 0L, factory, canonicalOpts)
                                 .get(new CloseableRegistry());
-                ForStRsIncrementalKeyedStateHandle h =
-                        (ForStRsIncrementalKeyedStateHandle) result.getJobManagerOwnedSnapshot();
+                IncrementalRemoteKeyedStateHandle h =
+                        (IncrementalRemoteKeyedStateHandle) result.getJobManagerOwnedSnapshot();
 
-                assertEquals(
-                        0L,
-                        h.getBaseCheckpointId(),
-                        "R36-H1: NO_SHARING handle reports baseCheckpointId=0");
+                // FRS-CKPT-HANDLE-MIGRATION: base id no longer on the handle. The R36-H1 contract
+                // (NO_SHARING handle has empty sharedState) is asserted directly below.
                 assertEquals(
                         0,
                         h.getSharedState().size(),

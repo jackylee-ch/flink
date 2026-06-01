@@ -20,6 +20,7 @@ package org.apache.flink.state.forstrs.keyed;
 
 import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.PhysicalStateHandleID;
 import org.apache.flink.runtime.state.StreamStateHandle;
@@ -86,16 +87,14 @@ class RestoreParallelSstTest {
             // Tiny metadata handle so the path through downloadHandleStrict succeeds quickly.
             StreamStateHandle meta = new InMemoryHandle("metadata-stub".getBytes());
 
-            ForStRsIncrementalKeyedStateHandle handle =
-                    new ForStRsIncrementalKeyedStateHandle(
+            IncrementalRemoteKeyedStateHandle handle =
+                    new IncrementalRemoteKeyedStateHandle(
                             UUID.randomUUID(),
                             new KeyGroupRange(0, 0),
                             /* checkpointId= */ 17L,
-                            /* baseCheckpointId= */ 0L,
                             shared,
                             /* privateState= */ new ArrayList<>(),
-                            meta,
-                            java.util.Map.of("default", 0L));
+                            meta);
 
             Path targetDir = tmp.resolve("restored");
 

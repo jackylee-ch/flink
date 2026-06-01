@@ -21,6 +21,7 @@ package org.apache.flink.state.forstrs.keyed;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.core.fs.FSDataInputStream;
 import org.apache.flink.runtime.state.IncrementalKeyedStateHandle.HandleAndLocalPath;
+import org.apache.flink.runtime.state.IncrementalRemoteKeyedStateHandle;
 import org.apache.flink.runtime.state.KeyGroupRange;
 import org.apache.flink.runtime.state.KeyedStateHandle;
 import org.apache.flink.runtime.state.StateHandleID;
@@ -71,7 +72,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * <ol>
  *   <li><b>No-rescaling fast path</b> ({@code handles.size() == 1 &amp;&amp; handle.kgRange ==
  *       target}) — download manifest + each SST listed in the {@link
- *       ForStRsIncrementalKeyedStateHandle}, then call {@link ForStRsLinker#dbOpenFromIncremental}
+ *       IncrementalRemoteKeyedStateHandle}, then call {@link ForStRsLinker#dbOpenFromIncremental}
  *       to materialize the engine state directly from those local files. (Tasks 4.1 + 4.2.)
  *   <li><b>Strict-SST-presence check</b> — every {@link HandleAndLocalPath} entry in the handle's
  *       shared + private state lists must download successfully. A missing or unopenable handle
@@ -201,9 +202,9 @@ public class ForStRsRestoreOperation {
 
         // Filter out non-ForSt-RS handles defensively (e.g. a savepoint handle from another
         // backend — for now we treat that as unsupported by failing fast).
-        List<ForStRsIncrementalKeyedStateHandle> incHandles = new ArrayList<>(handles.size());
+        List<IncrementalRemoteKeyedStateHandle> incHandles = new ArrayList<>(handles.size());
         for (KeyedStateHandle h : handles) {
-            if (!(h instanceof ForStRsIncrementalKeyedStateHandle)) {
+            if (!(h instanceof IncrementalRemoteKeyedStateHandle)) {
                 // R28-L1: surface the EXPECTED handle type alongside the actual one so an
                 // operator triaging a savepoint-restore failure sees the mismatch at a
                 // glance and can decide whether to (a) re-checkpoint from the source
@@ -216,12 +217,12 @@ public class ForStRsRestoreOperation {
                         "Unsupported keyed-state handle type for ForStRs restore: "
                                 + (h == null ? "null" : h.getClass().getName())
                                 + " (expected "
-                                + ForStRsIncrementalKeyedStateHandle.class.getName()
+                                + IncrementalRemoteKeyedStateHandle.class.getName()
                                 + "; cross-backend handle types are not yet supported —"
                                 + " re-checkpoint from a ForStRs-backed job or convert the"
                                 + " handle before restore)");
             }
-            incHandles.add((ForStRsIncrementalKeyedStateHandle) h);
+            incHandles.add((IncrementalRemoteKeyedStateHandle) h);
         }
 
         boolean fastPath =
@@ -237,7 +238,7 @@ public class ForStRsRestoreOperation {
     // 4.1 + 4.2: download + open path with strict-SST check
     // ------------------------------------------------------------------
 
-    private RestoreResult restoreNoRescaling(ForStRsIncrementalKeyedStateHandle handle)
+    private RestoreResult restoreNoRescaling(IncrementalRemoteKeyedStateHandle handle)
             throws IOException {
         Path downloadDir = targetDir.resolve("_restore_dl");
         Files.createDirectories(downloadDir);
@@ -263,11 +264,19 @@ public class ForStRsRestoreOperation {
         // an empty privateState list, so {@code restoredSerializerMetadata} stays empty and the
         // restore-side {@code seedFromRestore(empty)} is a no-op.
         HandleAndLocalPath registryEntry = null;
+        // FRS-CKPT-NOFLUSH: memtable artifacts ("memtable-cf<id>.arrow") are
+        // private state but are NOT SSTs — they must be kept out of the engine
+        // SST list (dbOpenFromIncremental would mis-handle them) and instead
+        // replayed into the engine after open.
+        List<HandleAndLocalPath> memtableArtifacts = new ArrayList<>();
         List<HandleAndLocalPath> sstPrivateState =
                 new ArrayList<>(handle.getPrivateState().size());
         for (HandleAndLocalPath hlp : handle.getPrivateState()) {
-            if (ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH.equals(hlp.getLocalPath())) {
+            String lp = hlp.getLocalPath();
+            if (ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH.equals(lp)) {
                 registryEntry = hlp;
+            } else if (lp.startsWith("memtable-cf") && lp.endsWith(".arrow")) {
+                memtableArtifacts.add(hlp);
             } else {
                 sstPrivateState.add(hlp);
             }
@@ -312,6 +321,31 @@ public class ForStRsRestoreOperation {
                     re);
         }
 
+        // FRS-CKPT-NOFLUSH: download the memtable artifacts locally and replay
+        // them into the just-opened engine (preserving sequence + op_type),
+        // rebuilding the in-RAM state that was checkpointed WITHOUT flushing. A
+        // pre-feature / flush-based checkpoint carries no such artifacts → the
+        // loop is a no-op and the replay scan finds nothing.
+        if (!memtableArtifacts.isEmpty()) {
+            try {
+                for (HandleAndLocalPath hlp : memtableArtifacts) {
+                    downloadHandleStrict(
+                            hlp.getHandle(),
+                            downloadDir.resolve(hlp.getLocalPath()),
+                            hlp.getLocalPath(),
+                            handle);
+                }
+                linker.replayMemtableArtifacts(db, downloadDir.toString());
+            } catch (RuntimeException re) {
+                db.close();
+                throw new ForStRsCheckpointRestoreException(
+                        targetDir.toString(),
+                        handle.getCheckpointId(),
+                        "ForSt-RS memtable-artifact replay failed: " + re.getMessage(),
+                        re);
+            }
+        }
+
         // 4. Re-populate the SST registry from the restored handles so the next incremental
         //    checkpoint can reuse them as shared state without re-uploading.
         if (sstRegistry != null) {
@@ -320,10 +354,15 @@ public class ForStRsRestoreOperation {
             }
         }
 
+        // cfMap is intentionally empty: the engine recovers all column-family info FROM THE
+        // MANIFEST (CHECKPOINT.blob, the metaStateHandle) inside dbOpenFromIncremental above. The
+        // standard Flink IncrementalRemoteKeyedStateHandle does not carry a CF map on the wire (it
+        // was an artifact of the now-removed custom ForStRsIncrementalKeyedStateHandle), and no
+        // production consumer of RestoreResult.getCfMap() exists.
         return new RestoreResult(
                 db,
                 defaultCf,
-                new LinkedHashMap<>(handle.getCfMap()),
+                new LinkedHashMap<>(),
                 handle.getCheckpointId(),
                 restoredSerializerMetadata);
     }
@@ -338,7 +377,7 @@ public class ForStRsRestoreOperation {
      * restore failure paths.
      */
     private Map<String, StateSerializerMetadata> downloadAndParseRegistryBlob(
-            HandleAndLocalPath entry, ForStRsIncrementalKeyedStateHandle owner)
+            HandleAndLocalPath entry, IncrementalRemoteKeyedStateHandle owner)
             throws ForStRsCheckpointRestoreException {
         StreamStateHandle h = entry.getHandle();
         if (h == null) {
@@ -404,7 +443,7 @@ public class ForStRsRestoreOperation {
             StreamStateHandle handle,
             Path localTarget,
             String logicalPath,
-            ForStRsIncrementalKeyedStateHandle owner)
+            IncrementalRemoteKeyedStateHandle owner)
             throws ForStRsCheckpointRestoreException {
         if (handle == null) {
             throw new ForStRsCheckpointRestoreException(
@@ -514,7 +553,7 @@ public class ForStRsRestoreOperation {
     }
 
     static Path resolveSafeRestoreLocalPath(
-            Path downloadDir, String logicalPath, ForStRsIncrementalKeyedStateHandle owner)
+            Path downloadDir, String logicalPath, IncrementalRemoteKeyedStateHandle owner)
             throws ForStRsCheckpointRestoreException {
         if (logicalPath == null || logicalPath.isBlank()) {
             throw new ForStRsCheckpointRestoreException(
@@ -562,9 +601,9 @@ public class ForStRsRestoreOperation {
     }
 
     private static void rejectTimerPrefixCollisionOnRescale(
-            List<ForStRsIncrementalKeyedStateHandle> handles)
+            List<IncrementalRemoteKeyedStateHandle> handles)
             throws ForStRsCheckpointRestoreException {
-        for (ForStRsIncrementalKeyedStateHandle handle : handles) {
+        for (IncrementalRemoteKeyedStateHandle handle : handles) {
             if (handle.getKeyGroupRange().contains(TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP)) {
                 throw new ForStRsCheckpointRestoreException(
                         "key-group-" + TIMER_QUEUE_PREFIX_COLLISION_KEY_GROUP,
@@ -580,9 +619,9 @@ public class ForStRsRestoreOperation {
     }
 
     private static void rejectV2PrefixCollisionOnRescale(
-            List<ForStRsIncrementalKeyedStateHandle> handles)
+            List<IncrementalRemoteKeyedStateHandle> handles)
             throws ForStRsCheckpointRestoreException {
-        for (ForStRsIncrementalKeyedStateHandle handle : handles) {
+        for (IncrementalRemoteKeyedStateHandle handle : handles) {
             if (handle.getKeyGroupRange().contains(V2_STATE_PREFIX_COLLISION_KEY_GROUP)) {
                 throw new ForStRsCheckpointRestoreException(
                         "key-group-" + V2_STATE_PREFIX_COLLISION_KEY_GROUP,
@@ -616,7 +655,7 @@ public class ForStRsRestoreOperation {
     // 4.3: rescaling path (kg redistribution)
     // ------------------------------------------------------------------
 
-    private RestoreResult restoreWithRescaling(List<ForStRsIncrementalKeyedStateHandle> handles)
+    private RestoreResult restoreWithRescaling(List<IncrementalRemoteKeyedStateHandle> handles)
             throws IOException {
         rejectTimerPrefixCollisionOnRescale(handles);
         rejectV2PrefixCollisionOnRescale(handles);
@@ -625,9 +664,7 @@ public class ForStRsRestoreOperation {
         //    PR-E1 (F5-6 / E-HIGH-2): handles materialize in parallel via a bounded thread
         //    pool — each handle's S3/blob download + dbOpenFromIncremental is fully
         //    independent. We preserve insertion order of the `sources` list so the
-        //    `findSourceFor(kg)` lookup remains deterministic. The CF-map merge runs on the
-        //    caller thread AFTER all sources finish to preserve "first writer wins" semantics
-        //    based on the original handle order, NOT scheduling order.
+        //    `findSourceFor(kg)` lookup remains deterministic.
         long maxRestoredCkpt = 0L;
         Map<String, Long> mergedCfMap = new LinkedHashMap<>();
         OpenSourceDb[] sourcesArr = new OpenSourceDb[handles.size()];
@@ -650,7 +687,7 @@ public class ForStRsRestoreOperation {
         try {
             List<Future<OpenSourceDb>> futures = futuresOuter;
             for (int i = 0; i < handles.size(); i++) {
-                final ForStRsIncrementalKeyedStateHandle h = handles.get(i);
+                final IncrementalRemoteKeyedStateHandle h = handles.get(i);
                 final Path subDir = targetDir.resolve("_restore_src_" + i);
                 futures.add(
                         restoreExec.submit(
@@ -662,9 +699,10 @@ public class ForStRsRestoreOperation {
                 if (h.getCheckpointId() > maxRestoredCkpt) {
                     maxRestoredCkpt = h.getCheckpointId();
                 }
-                for (Map.Entry<String, Long> e : h.getCfMap().entrySet()) {
-                    mergedCfMap.putIfAbsent(e.getKey(), e.getValue());
-                }
+                // No CF-map merge: Flink's built-in IncrementalRemoteKeyedStateHandle does not
+                // carry a CF map, and the engine recovers all column-family info per source from
+                // each source's manifest inside openSingleHandleAt -> dbOpenFromIncremental.
+                // mergedCfMap stays empty (non-load-bearing, surfaced only via RestoreResult).
             }
             for (int i = 0; i < futures.size(); i++) {
                 try {
@@ -953,7 +991,7 @@ public class ForStRsRestoreOperation {
         }
     }
 
-    private OpenSourceDb openSingleHandleAt(ForStRsIncrementalKeyedStateHandle handle, Path subDir)
+    private OpenSourceDb openSingleHandleAt(IncrementalRemoteKeyedStateHandle handle, Path subDir)
             throws IOException {
         // Reuse the no-rescaling path by temporarily pointing targetDir at subDir.
         ForStRsRestoreOperation singleOp =
@@ -1384,7 +1422,7 @@ public class ForStRsRestoreOperation {
     private List<String> parallelDownloadSsts(
             List<HandleAndLocalPath> hlps,
             Path downloadDir,
-            ForStRsIncrementalKeyedStateHandle owner)
+            IncrementalRemoteKeyedStateHandle owner)
             throws IOException {
         if (hlps.isEmpty()) {
             return new ArrayList<>();
