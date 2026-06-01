@@ -846,9 +846,9 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
 
     private void forEachEngineEntryVectorized(
             byte[] prefix, boolean loadValues, RawRowConsumer rowVisitor) throws IOException {
-        final int CHUNK_CAP = 64 * 1024;
+        final int chunkCap = 64 * 1024;
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment chunkBuf = arena.allocate(CHUNK_CAP);
+            MemorySegment chunkBuf = arena.allocate(chunkCap);
             MemorySegment prefixSeg = arena.allocate(Math.max(1, prefix.length));
             if (prefix.length > 0) {
                 MemorySegment.copy(prefix, 0, prefixSeg, ValueLayout.JAVA_BYTE, 0, prefix.length);
@@ -863,7 +863,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                             prefixSeg,
                             prefix.length,
                             chunkBuf,
-                            CHUNK_CAP,
+                            chunkCap,
                             outHandle,
                             outRowCount,
                             outBytesUsed);
@@ -896,7 +896,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                     }
                     rc =
                             linker.frsVecIterPrefixNext(
-                                    handle, chunkBuf, CHUNK_CAP, outRowCount, outBytesUsed);
+                                    handle, chunkBuf, chunkCap, outRowCount, outBytesUsed);
                     if (rc != 0) {
                         throw new IOException("frs_vec_iter_prefix_next rc=" + rc);
                     }

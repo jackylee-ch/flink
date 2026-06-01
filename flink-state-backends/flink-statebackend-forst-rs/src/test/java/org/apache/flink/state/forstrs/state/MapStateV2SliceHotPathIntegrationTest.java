@@ -146,8 +146,8 @@ class MapStateV2SliceHotPathIntegrationTest {
             // buffer paths both fire repeatedly on the same composite key (the shared buffer is
             // reused across every op).
             Random rng = new Random(1234567L);
-            final int OPS = 10_000;
-            for (int i = 0; i < OPS; i++) {
+            final int ops = 10_000;
+            for (int i = 0; i < ops; i++) {
                 long userKey = rng.nextInt(256); // small key space → many revisits
                 int op = rng.nextInt(4); // 0=put, 1=get, 2=remove, 3=contains
                 int keyLen = writeComposite(keyOut, operatorKey, stateName, namespace, userKey);

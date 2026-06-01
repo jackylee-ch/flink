@@ -219,7 +219,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * per kg in `keyGroupRange` on EVERY call (and invalidated the cache
      * afterwards), giving N×FFM-iterator-reopens per fired timer on
      * subtasks owning N≥2 key groups. The new cache amortises the FFM
-     * cost: each kg's head is read once into its own ArrayDeque<Entry>,
+     * cost: each kg's head is read once into its own {@code ArrayDeque<Entry>},
      * polls consume from the cached head, and only the kg whose head was
      * just consumed is refilled. Refill uses the same REFILL_BATCH=128
      * pre-fetch as the single-kg pollCache so a burst-poll workload pays
@@ -816,7 +816,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             // SAME 128 rows → pop → refill, forever. Cap retries and on
             // exhaustion call `flushPendingToEngine()` so REMOVEs actually
             // hit the engine; then refill picks up the post-delete tail.
-            final int MAX_MASKED_REFILLS = 4;
+            final int maxMaskedRefills = 4;
             int refills = 0;
             // Skip cached entries that have a pending REMOVE (peek path only).
             while (!cache.isEmpty()) {
@@ -824,7 +824,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 if (suppressRemoved && isRemovePendingFor(head.composite)) {
                     cache.pollFirst();
                     if (cache.isEmpty()) {
-                        if (refills++ >= MAX_MASKED_REFILLS) {
+                        if (refills++ >= maxMaskedRefills) {
                             // E-R33-NEW-H1: flush, invalidate cache,
                             // refill once more with fresh state.
                             // flushPendingToEngine invalidates the
@@ -1152,7 +1152,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // REMOVE batch actually lands and the next refill reads the post-
         // delete tail of the kg range. After the flush the cache is also
         // invalidated, so we restart the search with fresh state.
-        final int MAX_MASKED_REFILLS = 4;
+        final int maxMaskedRefills = 4;
         int refillsThisCall = 0;
         // Skip entries that have a matching pending REMOVE in the buffer.
         while (!pollCache.isEmpty()) {
@@ -1162,7 +1162,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             }
             pollCache.pollFirst();
             if (pollCache.isEmpty()) {
-                if (refillsThisCall++ >= MAX_MASKED_REFILLS) {
+                if (refillsThisCall++ >= maxMaskedRefills) {
                     // E-R18-H1: flush the pending REMOVEs to the engine so the
                     // next refill reads the post-delete view. Then re-attempt.
                     // flushPendingToEngine() invalidates the cache so we must

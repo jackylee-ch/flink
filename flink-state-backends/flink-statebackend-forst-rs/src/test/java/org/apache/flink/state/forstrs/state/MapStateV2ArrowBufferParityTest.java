@@ -107,15 +107,15 @@ class MapStateV2ArrowBufferParityTest {
 
         // Bounded universe of distinct (op, ns, uk) composites keeps the working set small enough
         // that hits, removes, and overwrites all happen with high probability.
-        final int OPS = 2_000;
-        final int OP_KEYS = 8;
-        final int NS = 4;
-        final int USER_KEYS = 32;
+        final int ops = 2_000;
+        final int opKeys = 8;
+        final int nsCount = 4;
+        final int userKeys = 32;
 
-        for (int step = 0; step < OPS; step++) {
-            long opKey = rnd.nextInt(OP_KEYS);
-            int ns = rnd.nextInt(NS);
-            long uk = rnd.nextInt(USER_KEYS);
+        for (int step = 0; step < ops; step++) {
+            long opKey = rnd.nextInt(opKeys);
+            int ns = rnd.nextInt(nsCount);
+            long uk = rnd.nextInt(userKeys);
             byte[] composite = composite(opKey, ns, uk);
             String oracleKey = java.util.Arrays.toString(composite);
 

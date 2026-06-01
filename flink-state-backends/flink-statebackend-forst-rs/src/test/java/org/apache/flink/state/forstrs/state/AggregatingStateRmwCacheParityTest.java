@@ -125,13 +125,13 @@ class AggregatingStateRmwCacheParityTest {
                         (acc, in) -> AVG.add(in, acc),
                         (k, v) -> flushed.put(byteKey(k), v));
 
-        int N = 4000;
+        int n = 4000;
         long[] keys = new long[12];
         for (int i = 0; i < keys.length; i++) {
             keys[i] = rnd.nextLong();
         }
 
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < n; i++) {
             long key = keys[rnd.nextInt(keys.length)];
             long value = rnd.nextInt(1_000_000);
             byte[] composite = compositeKey(key);

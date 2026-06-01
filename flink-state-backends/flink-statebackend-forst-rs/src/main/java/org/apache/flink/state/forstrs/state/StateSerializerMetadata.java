@@ -155,8 +155,12 @@ public final class StateSerializerMetadata {
 
     @Override
     public boolean equals(Object o) {
-        if (this == o) return true;
-        if (!(o instanceof StateSerializerMetadata)) return false;
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof StateSerializerMetadata)) {
+            return false;
+        }
         StateSerializerMetadata that = (StateSerializerMetadata) o;
         return stateKindOrdinal == that.stateKindOrdinal
                 && formatVersion == that.formatVersion

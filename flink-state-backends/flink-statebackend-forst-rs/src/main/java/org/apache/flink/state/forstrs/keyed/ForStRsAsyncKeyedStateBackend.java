@@ -2023,7 +2023,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     }
 
     /**
-     * R16-H1: thin {@link RunnableFuture} wrapper around a {@link CompletableFuture<Void>} used as
+     * R16-H1: thin {@link RunnableFuture} wrapper around a {@code CompletableFuture<Void>} used as
      * an eager placeholder in {@link #outstandingSnapshots}. The placeholder is added under
      * {@link #closeLock} BEFORE the long sync prep (SnapshotStrategyRunner.snapshot) runs, so
      * any concurrent {@link #close()} observes the placeholder in the set and awaits it. The

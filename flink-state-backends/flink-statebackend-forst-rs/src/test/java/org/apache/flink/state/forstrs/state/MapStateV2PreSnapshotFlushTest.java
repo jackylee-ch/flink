@@ -102,23 +102,23 @@ class MapStateV2PreSnapshotFlushTest {
     @Test
     void flushOf1000EntriesLandsAllInEngine() {
         MapStateArrowBuffer buf = new MapStateArrowBuffer();
-        final int N = 1000;
+        final int n = 1000;
 
         // Fill 1000 entries.
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < n; i++) {
             buf.put(composite(i), value(i), linker, db, cf);
         }
         // The buffer may auto-flush internally (shouldAutoFlush at half-capacity) — that's fine,
         // it just means some rows already landed in the engine. The post-flush assertion below is
-        // what matters: after the final flushTo, ALL N rows must be in the engine.
+        // what matters: after the final flushTo, ALL n rows must be in the engine.
         buf.flushTo(linker, db, cf);
 
         // Buffer must be empty after flush (size + tombstones).
         assertEquals(0, buf.underlying().size(), "buffer size must be 0 after flush");
         assertEquals(0, buf.tombstoneCount(), "tombstone set must be empty after flush");
 
-        // Engine must hold all N entries.
-        for (int i = 0; i < N; i++) {
+        // Engine must hold all n entries.
+        for (int i = 0; i < n; i++) {
             byte[] retrieved = linker.getFast(db, cf, composite(i));
             assertNotNull(retrieved, "entry " + i + " missing in engine after flush");
             assertArrayEquals(value(i), retrieved, "value mismatch for entry " + i);

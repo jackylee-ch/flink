@@ -762,7 +762,8 @@ public class ForStRsKeyedStateBackend<K> implements Closeable {
         // (non-statebuf) MapState constructor to test whether the off-heap statebuf forEachEntry
         // merge/dedup is the cause of the q11 MergingWindowSet "not in in-flight set" crash. If
         // q11 runs clean with this flag, the off-heap MapState statebuf path is confirmed.
-        if (Boolean.getBoolean("forst.rs.mapstate.legacy")) {
+        if (Boolean.parseBoolean(
+                System.getProperties().getProperty("forst.rs.mapstate.legacy"))) {
             ForStRsMapState<UK, UV> legacy =
                     new ForStRsMapState<>(
                             linker,

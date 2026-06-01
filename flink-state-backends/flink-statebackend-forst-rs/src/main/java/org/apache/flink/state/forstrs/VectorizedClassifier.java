@@ -68,7 +68,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private static final int INIT_SLOTS = 256;
 
     private static final boolean ENABLE_OFF_HEAP_APPEND_MERGE =
-            Boolean.getBoolean("state.backend.forst-rs.list.offheap-append.enabled");
+            Boolean.parseBoolean(
+                    System.getProperties()
+                            .getProperty("state.backend.forst-rs.list.offheap-append.enabled"));
 
     private final ColumnarBatchBuffer getKeys;
     private final ColumnarBatchBuffer putKeys;

@@ -115,13 +115,13 @@ class ReducingStateRmwCacheParityTest {
                         },
                         (keyBytes, acc) -> flushed.put(byteKey(keyBytes), acc));
 
-        int N = 5000;
+        int n = 5000;
         long[] keys = new long[16];
         for (int i = 0; i < keys.length; i++) {
             keys[i] = rnd.nextLong();
         }
 
-        for (int i = 0; i < N; i++) {
+        for (int i = 0; i < n; i++) {
             long key = keys[rnd.nextInt(keys.length)];
             long value = rnd.nextInt(1000) - 500;
             byte[] composite = compositeKey(key);

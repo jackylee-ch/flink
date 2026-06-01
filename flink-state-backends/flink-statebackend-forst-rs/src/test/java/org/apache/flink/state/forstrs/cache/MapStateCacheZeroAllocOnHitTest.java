@@ -45,9 +45,9 @@ class MapStateCacheZeroAllocOnHitTest {
     void hitPathAllocatesUnderHundredBytesPerCall() {
         MapStateCache<String> cache = new MapStateCache<>(8192);
         // Populate ~1000 keys; sampled HIT path will round-robin through them.
-        final int N = 1000;
-        byte[][] keys = new byte[N][];
-        for (int i = 0; i < N; i++) {
+        final int n = 1000;
+        byte[][] keys = new byte[n][];
+        for (int i = 0; i < n; i++) {
             keys[i] = keyOf(i);
             cache.put(keys[i], "v" + i);
         }
@@ -59,7 +59,7 @@ class MapStateCacheZeroAllocOnHitTest {
         // Warm-up: ensure the JIT has compiled lookup() and reusableHit is plumbed.
         long warmupSink = 0;
         for (int i = 0; i < 10_000; i++) {
-            MapStateCache.Lookup<String> hit = cache.lookup(keys[i % N]);
+            MapStateCache.Lookup<String> hit = cache.lookup(keys[i % n]);
             assertNotNull(hit);
             warmupSink ^= hit.value().length();
         }
@@ -68,7 +68,7 @@ class MapStateCacheZeroAllocOnHitTest {
         long before = tmb.getThreadAllocatedBytes(tid);
         long sink = 0;
         for (int i = 0; i < iters; i++) {
-            MapStateCache.Lookup<String> hit = cache.lookup(keys[i % N]);
+            MapStateCache.Lookup<String> hit = cache.lookup(keys[i % n]);
             sink ^= hit.value().length();
         }
         long after = tmb.getThreadAllocatedBytes(tid);
