@@ -1507,16 +1507,30 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // valid across this flush. (One pass over the buffer; the kg is 2 bytes BE
         // at offset queuePrefix.length in each composite — see encode().)
         final java.util.Set<Integer> touchedKgs = new java.util.HashSet<>();
+        final java.util.Map<Integer, Long> minAddTsByKg = new java.util.HashMap<>();
+        final java.util.Set<Integer> removedKgs = new java.util.HashSet<>();
         {
             MemorySegment kds = pendingBuffer.keyDataSegment();
             for (int i = 0; i < n; i++) {
                 int kOff = pendingBuffer.keyOffsetAt(i);
                 int kLen = pendingBuffer.keyLenAt(i);
-                if (kLen >= queuePrefix.length + 2) {
-                    int kgOff = kOff + queuePrefix.length;
-                    int hi = kds.get(ValueLayout.JAVA_BYTE, kgOff) & 0xFF;
-                    int lo = kds.get(ValueLayout.JAVA_BYTE, kgOff + 1) & 0xFF;
-                    touchedKgs.add((hi << 8) | lo);
+                if (kLen < queuePrefix.length + 2) {
+                    continue;
+                }
+                int kgOff = kOff + queuePrefix.length;
+                int kg =
+                        ((kds.get(ValueLayout.JAVA_BYTE, kgOff) & 0xFF) << 8)
+                                | (kds.get(ValueLayout.JAVA_BYTE, kgOff + 1) & 0xFF);
+                touchedKgs.add(kg);
+                int op = pendingBuffer.opAt(i);
+                if (op == ArrowTimerBuffer.OP_ADD) {
+                    long ts = pendingBuffer.tsAt(i);
+                    Long cur = minAddTsByKg.get(kg);
+                    if (cur == null || ts < cur) {
+                        minAddTsByKg.put(kg, ts);
+                    }
+                } else if (op == ArrowTimerBuffer.OP_REMOVE) {
+                    removedKgs.add(kg);
                 }
             }
         }
@@ -1724,15 +1738,38 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             // watermark advance.
             if (enginePossiblyMutated) {
                 if (drainCleanSuccess) {
-                    // E-PERF: SELECTIVE invalidation — only the kgs this flush
-                    // touched have stale caches; untouched kgs' engine prefixes are
-                    // unchanged so their cached heads stay valid (no per-poll
-                    // re-open). The single-kg pollCache covers exactly one kg and is
-                    // cheap to always refresh.
+                    // E-PERF: invalidate the MINIMUM cache needed. The single-kg
+                    // pollCache covers one kg and is cheap to always refresh.
                     pollCache.clear();
                     cachedKg = -1;
                     for (Integer kg : touchedKgs) {
-                        multiKgPollCache.remove(kg);
+                        boolean invalidate;
+                        if (removedKgs.contains(kg)) {
+                            // A remove may delete a cached entry → must refresh.
+                            invalidate = true;
+                        } else {
+                            ArrayDeque<Entry> dq = multiKgPollCache.get(kg);
+                            if (dq == null || dq.isEmpty()) {
+                                // No live cache → must refill to observe the add
+                                // (also re-checks a previously-exhausted kg).
+                                invalidate = true;
+                            } else {
+                                // KEEP the cached prefix iff every add to this kg is
+                                // BEYOND the cached tail: such an add lands in the
+                                // engine tail and is read on the next refill (after
+                                // the cached prefix drains+deletes), so the prefix
+                                // stays valid and we avoid a per-poll re-open — the
+                                // q5 chained-window "fire near + register far" case.
+                                // Invalidate only if an add falls WITHIN the cached
+                                // window (it would otherwise be skipped).
+                                long tailTs = decodeTimestamp(dq.peekLast().composite);
+                                Long minAdd = minAddTsByKg.get(kg);
+                                invalidate = (minAdd != null && minAdd <= tailTs);
+                            }
+                        }
+                        if (invalidate) {
+                            multiKgPollCache.remove(kg);
+                        }
                     }
                 } else {
                     // Partial/failed flush: fall back to full invalidation (safe).

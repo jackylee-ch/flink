@@ -356,6 +356,110 @@ class MultiKeygroupTimerFireTest {
     }
 
     /**
+     * E-PERF regression for the q5 chained-window pattern: an operator fires near-future timers
+     * (poll) while registering FAR-future timers (add) on the same poll — exactly what
+     * GlobalWindowAggregate→LocalWindowAggregate does during advanceWatermark. A far-future add
+     * (beyond the cached tail) lands in the engine tail and is read on the next refill, so it must
+     * NOT invalidate the cached prefix / trigger a per-poll prefix-iterator re-open.
+     */
+    @Test
+    void farFutureAddsWhileFiringDoNotReopen() {
+        Integer key = pickKeysInDistinctKeyGroups(1).get(0);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "chainadd");
+        ctx.setCurrentKey(key);
+        // Warm: near-future timers ts 1..200 (the ones being fired).
+        for (int i = 1; i <= 200; i++) {
+            assertTrue(q.add(new TestElement(i, i)));
+        }
+        q.flushPendingToEngine();
+        q.multiKgRefillCount = 0;
+
+        long far = 1_000_000L;
+        long prev = Long.MIN_VALUE;
+        for (int i = 0; i < 150; i++) {
+            TestElement e = q.poll(); // consume a near-future timer
+            assertNotEquals(null, e);
+            assertTrue(e.ts > prev, "near-future timers fire ascending");
+            prev = e.ts;
+            ctx.setCurrentKey(key);
+            assertTrue(q.add(new TestElement(far++, 0))); // register a FAR-future timer
+        }
+        int numKgs = SHARD_END - SHARD_START + 1;
+        assertTrue(
+                q.multiKgRefillCount < 2 * numKgs,
+                "far-future adds while firing must NOT re-open the prefix iterator every poll;"
+                        + " observed refills="
+                        + q.multiKgRefillCount
+                        + " (bound < "
+                        + (2 * numKgs)
+                        + ")");
+        q.close();
+    }
+
+    /**
+     * Correctness: timers spread across MANY distinct key groups (the keyed-join pattern, q4/q8)
+     * all fire in strict global-ts order with bounded refills.
+     */
+    @Test
+    void manyActiveKeyGroupsFireInGlobalOrder() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(20);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "manykg");
+        // Interleave: kg i gets timers ts = i, i+20, i+40, i+60, i+80 (5 each → 100 total).
+        for (int i = 0; i < keys.size(); i++) {
+            ctx.setCurrentKey(keys.get(i));
+            for (int j = 0; j < 5; j++) {
+                long ts = 1L + i + 20L * j;
+                assertTrue(q.add(new TestElement(ts, (int) ts)));
+            }
+        }
+        q.flushPendingToEngine();
+        q.multiKgRefillCount = 0;
+        long prev = Long.MIN_VALUE;
+        int count = 0;
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            assertTrue(e.ts > prev, "global-min order across 20 kgs: " + e.ts + " after " + prev);
+            prev = e.ts;
+            count++;
+        }
+        assertEquals(100, count, "all 100 timers across 20 kgs fire exactly once");
+        // 20 active kgs warm once + the empties skipped; far below per-poll re-open.
+        assertTrue(q.multiKgRefillCount < 5 * 64, "refills bounded; observed=" + q.multiKgRefillCount);
+        q.close();
+    }
+
+    /**
+     * Correctness: an add that falls WITHIN the cached window (ts <= cached tail) must fire at its
+     * correct position — this is the invalidation path the beyond-tail optimization must NOT skip.
+     */
+    @Test
+    void inWindowAddFiresAtCorrectPosition() {
+        Integer key = pickKeysInDistinctKeyGroups(1).get(0);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "inwindow");
+        ctx.setCurrentKey(key);
+        for (long ts : new long[] {10L, 20L, 30L}) {
+            assertTrue(q.add(new TestElement(ts, (int) ts)));
+        }
+        q.flushPendingToEngine();
+        assertEquals(10L, q.poll().ts); // warms+consumes head; cache now [20,30], tail=30
+        // Add ts=15 (WITHIN the cached window) → must invalidate + fire between 15<20.
+        ctx.setCurrentKey(key);
+        assertTrue(q.add(new TestElement(15L, 15)));
+        q.flushPendingToEngine();
+        assertEquals(15L, q.poll().ts, "in-window add must fire at its position");
+        assertEquals(20L, q.poll().ts);
+        assertEquals(30L, q.poll().ts);
+        assertEquals(null, q.poll());
+        q.close();
+    }
+
+    /**
      * Null-currentKey edge case: before any record arrives, peek/poll fall back to {@code
      * keyGroupRange.getStartKeyGroup()} (same as legacy constant supplier). The queue does not
      * NPE and returns {@code null}/no-op cleanly.
