@@ -310,6 +310,121 @@ class SnapshotRestoreEndToEndTest {
         }
     }
 
+    /**
+     * FRS-CKPT-NOFLUSH: with {@code forst.rs.checkpoint.noflush=true} the snapshot strategy must
+     * capture the LIVE memtable as Arrow-IPC private-state artifacts ({@code memtable-cf<id>.arrow})
+     * instead of force-flushing it to an L0 SST, and restore must replay those artifacts so every
+     * key seeded into the still-RAM-resident memtable round-trips.
+     *
+     * <p>Why this test: the 30s checkpoint force-flush mints a new L0 SST every interval, faster
+     * than size-only compaction drains it — driving the q7 join-probe fan-out wall. The no-flush
+     * path stops minting L0 by checkpointing the memtable as a side artifact. The RESTORE half was
+     * already built (ForStRsRestoreOperation recognizes + replays {@code memtable-cf*.arrow}); this
+     * test pins the SNAPSHOT half (strategy emit). Pre-wiring it FAILS at the private-state
+     * assertion because {@code doAsyncSnapshot} always calls the flushing checkpoint variant and
+     * never emits memtable artifacts.
+     */
+    @Test
+    void noFlushCheckpointEmitsMemtableArtifactsAndRestores(@TempDir Path tmp) throws Exception {
+        String prevProp = System.getProperty("forst.rs.checkpoint.noflush");
+        System.setProperty("forst.rs.checkpoint.noflush", "true");
+        try {
+            // Step 1: open a source backend + seed entries into the LIVE memtable (no flush).
+            Arena srcArena = Arena.ofShared();
+            ForStRsLinker srcLinker = new ForStRsLinker(srcArena);
+            Path srcDbPath = tmp.resolve("src-db");
+            java.nio.file.Files.createDirectories(srcDbPath);
+            FrsDb srcDb = srcLinker.dbOpen(srcArena, srcDbPath.toString());
+            FrsCfHandle srcCf = srcLinker.dbDefaultCf(srcDb, srcArena);
+            ForStRsAsyncKeyedStateBackend<Integer> srcBackend =
+                    new ForStRsAsyncKeyedStateBackend<>(
+                            srcArena,
+                            srcLinker,
+                            srcDb,
+                            srcCf,
+                            IntSerializer.INSTANCE,
+                            new KeyGroupRange(0, 0),
+                            /* totalKeyGroups= */ 1,
+                            /* ownsResources= */ true);
+
+            for (int i = 0; i < ENTRY_COUNT; i++) {
+                srcLinker.put(srcDb, srcCf, key(i), value(i));
+            }
+
+            // Step 2: snapshot under the no-flush flag.
+            MemCheckpointStreamFactory factory = new MemCheckpointStreamFactory(64 * 1024 * 1024);
+            CheckpointOptions opts =
+                    CheckpointOptions.alignedNoTimeout(
+                            CheckpointType.CHECKPOINT,
+                            CheckpointStorageLocationReference.getDefault());
+            RunnableFuture<SnapshotResult<KeyedStateHandle>> fut =
+                    srcBackend.snapshot(99L, 0L, factory, opts);
+            if (!fut.isDone()) {
+                fut.run();
+            }
+            IncrementalRemoteKeyedStateHandle handle =
+                    (IncrementalRemoteKeyedStateHandle) fut.get().getJobManagerOwnedSnapshot();
+            assertNotNull(handle, "no-flush snapshot returned a non-null incremental handle");
+
+            // RED gate: the snapshot must carry the live memtable as private-state Arrow artifacts.
+            assertTrue(
+                    handle.getPrivateState().stream()
+                            .anyMatch(
+                                    hlp ->
+                                            hlp.getLocalPath().startsWith("memtable-cf")
+                                                    && hlp.getLocalPath().endsWith(".arrow")),
+                    "no-flush checkpoint must emit the live memtable as memtable-cf<id>.arrow"
+                            + " private-state artifacts (snapshot-side emission)");
+
+            srcBackend.close();
+
+            // Step 3: restore into a fresh backend and assert every key round-trips. With no flush,
+            // the keys live ONLY in the replayed memtable artifact — not in any SST.
+            Arena restoreArena = Arena.ofShared();
+            boolean restoredClosedOk = false;
+            try {
+                ForStRsLinker restoreLinker = new ForStRsLinker(restoreArena);
+                Path restoreDbPath = tmp.resolve("restored-db");
+                ForStRsAsyncKeyedStateBackend<Integer> restored =
+                        ForStRsAsyncKeyedStateBackend.restoreFromHandles(
+                                restoreArena,
+                                restoreLinker,
+                                IntSerializer.INSTANCE,
+                                new KeyGroupRange(0, 0),
+                                /* totalKeyGroups= */ 1,
+                                restoreDbPath,
+                                List.<KeyedStateHandle>of(handle));
+                try {
+                    FrsDb restoredDb = fieldDb(restored);
+                    FrsCfHandle restoredCf = fieldCf(restored);
+                    for (int i = 0; i < ENTRY_COUNT; i++) {
+                        byte[] got = restoreLinker.get(restoredDb, restoredCf, key(i));
+                        assertArrayEquals(
+                                value(i),
+                                got,
+                                "no-flush restore must round-trip memtable-resident key " + i);
+                    }
+                } finally {
+                    restored.close();
+                    restoredClosedOk = true;
+                }
+            } finally {
+                if (!restoredClosedOk) {
+                    try {
+                        restoreArena.close();
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        } finally {
+            if (prevProp == null) {
+                System.clearProperty("forst.rs.checkpoint.noflush");
+            } else {
+                System.setProperty("forst.rs.checkpoint.noflush", prevProp);
+            }
+        }
+    }
+
     private static byte[] key(int i) {
         return ("k-" + i).getBytes();
     }

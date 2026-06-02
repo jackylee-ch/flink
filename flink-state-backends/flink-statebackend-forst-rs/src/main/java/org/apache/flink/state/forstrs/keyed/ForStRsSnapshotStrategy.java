@@ -141,6 +141,55 @@ public class ForStRsSnapshotStrategy
     }
 
     /**
+     * FRS-CKPT-NOFLUSH: when enabled, {@link #doAsyncSnapshot} captures the LIVE memtable as
+     * per-CF Arrow-IPC private-state artifacts ({@code memtable-cf<id>.arrow}) and uses the
+     * non-flushing checkpoint variant, instead of force-flushing the memtable into a fresh L0 SST
+     * on every checkpoint. The force-flush path mints an L0 SST each interval faster than
+     * size-only compaction drains it, so on heavy-join workloads (q7) the per-probe L0 fan-out
+     * grows unbounded and throughput decays. Capturing the memtable as a side artifact stops the
+     * L0 minting; {@link ForStRsRestoreOperation} already recognizes + replays these artifacts.
+     *
+     * <p>Read live per snapshot from the system property {@code forst.rs.checkpoint.noflush}
+     * (default off, so behavior is byte-identical to the flushing path unless explicitly opted
+     * in). A non-null {@link #noFlushOverride} (set by tests) takes precedence.
+     */
+    private volatile Boolean noFlushOverride = null;
+
+    /**
+     * Test hook: force the no-flush checkpoint mode on ({@code true}) or off ({@code false}),
+     * bypassing the {@code forst.rs.checkpoint.noflush} system property. {@code null} restores
+     * property-driven behavior.
+     */
+    public void setNoFlushCheckpointForTesting(Boolean noFlush) {
+        this.noFlushOverride = noFlush;
+    }
+
+    private boolean isNoFlushCheckpoint() {
+        Boolean override = this.noFlushOverride;
+        return override != null ? override : Boolean.getBoolean("forst.rs.checkpoint.noflush");
+    }
+
+    /** Best-effort recursive delete of a local staging directory; never throws. */
+    private static void deleteDirQuietly(Path dir) {
+        if (dir == null) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> walk = java.nio.file.Files.walk(dir)) {
+            walk.sorted(java.util.Comparator.reverseOrder())
+                    .forEach(
+                            p -> {
+                                try {
+                                    java.nio.file.Files.deleteIfExists(p);
+                                } catch (IOException ignored) {
+                                    // best-effort
+                                }
+                            });
+        } catch (IOException | RuntimeException ignored) {
+            // best-effort: staging dir lives under the OS temp dir and is bounded per checkpoint.
+        }
+    }
+
+    /**
      * The previous successfully-completed checkpoint id. Updated by {@link
      * #recordCompletedCheckpoint(long)} when notifyCheckpointComplete fires; used as {@code
      * base_checkpoint_id} for the next sync-phase capture.
@@ -651,19 +700,45 @@ public class ForStRsSnapshotStrategy
         long effectiveBaseCheckpointId =
                 noPriorDependence ? 0L : resources.getBaseCheckpointId();
 
-        // ---- Compute the incremental checkpoint (flush + SST enumeration). ----
+        // ---- FRS-CKPT-NOFLUSH: optionally capture the LIVE memtable as Arrow artifacts. ----
+        // MVCC ordering: capture the memtable BEFORE the checkpoint enumerates the SST set — both
+        // pinned at resources.getSnapshot()'s sequence. If a background flush fires in the window,
+        // the flushed rows land in BOTH the artifact and a new L0 SST; replay preserves (key, seq)
+        // so the duplicate is idempotent (newest-seq-wins) — a dup, never a loss. The reverse
+        // order would risk losing rows that flushed out of the memtable after enumeration.
+        boolean noFlush = isNoFlushCheckpoint();
+        Path memtableStagingDir = null;
+        if (noFlush) {
+            memtableStagingDir =
+                    java.nio.file.Files.createTempDirectory(
+                            "frs-ckpt-memtable-" + resources.getCheckpointId() + "-");
+            linker.snapshotMemtablesToDir(
+                    db, resources.getSnapshot(), memtableStagingDir.toString());
+        }
+
+        // ---- Compute the incremental checkpoint (SST enumeration; flush only when !noFlush). ----
         // This was moved out of the sync phase to avoid blocking the task thread
         // during checkpoint barriers. The snapshot pins all versions at the captured
         // seq so concurrent writes do not affect correctness.
         MemorySegment result = nativeArena.allocate(32);
         try {
-            linker.createIncrementalCheckpointAt(
-                    db,
-                    resources.getSnapshot(),
-                    resources.getCheckpointId(),
-                    effectiveBaseCheckpointId,
-                    result);
+            if (noFlush) {
+                linker.createIncrementalCheckpointAtNoflush(
+                        db,
+                        resources.getSnapshot(),
+                        resources.getCheckpointId(),
+                        effectiveBaseCheckpointId,
+                        result);
+            } else {
+                linker.createIncrementalCheckpointAt(
+                        db,
+                        resources.getSnapshot(),
+                        resources.getCheckpointId(),
+                        effectiveBaseCheckpointId,
+                        result);
+            }
         } catch (RuntimeException re) {
+            deleteDirQuietly(memtableStagingDir);
             throw re;
         }
 
@@ -733,6 +808,40 @@ public class ForStRsSnapshotStrategy
                     trackedUpload(p, streamFactory, newSstScope, uploadTracker)
                             .thenApply(h -> HandleAndLocalPath.of(h, localPath));
             newSstFuts.add(f);
+        }
+
+        // ---- FRS-CKPT-NOFLUSH: upload the captured memtable artifacts under EXCLUSIVE scope. ----
+        // Memtable artifacts are checkpoint-local (each checkpoint captures its own live memtable;
+        // they are never shared across checkpoints), so they belong on privateState under
+        // EXCLUSIVE scope — exactly like the manifest + registry blob. The restore side filters
+        // them by the memtable-cf<id>.arrow local-path convention and replays them after open.
+        List<CompletableFuture<HandleAndLocalPath>> memtableArtFuts = new ArrayList<>();
+        if (noFlush && memtableStagingDir != null) {
+            try (java.util.stream.Stream<Path> arts =
+                    java.nio.file.Files.list(memtableStagingDir)) {
+                List<Path> artFiles =
+                        arts.filter(
+                                        p -> {
+                                            String n = p.getFileName().toString();
+                                            return n.startsWith("memtable-cf")
+                                                    && n.endsWith(".arrow");
+                                        })
+                                .sorted()
+                                .collect(java.util.stream.Collectors.toList());
+                for (Path art : artFiles) {
+                    String localPath = art.getFileName().toString();
+                    memtableArtFuts.add(
+                            trackedUpload(
+                                            art,
+                                            streamFactory,
+                                            CheckpointedStateScope.EXCLUSIVE,
+                                            uploadTracker)
+                                    .thenApply(h -> HandleAndLocalPath.of(h, localPath)));
+                }
+            } catch (IOException ioe) {
+                deleteDirQuietly(memtableStagingDir);
+                throw ioe;
+            }
         }
 
         // ---- E8-H2: install the per-checkpoint rollback list in pendingRegistrations BEFORE
@@ -879,6 +988,22 @@ public class ForStRsSnapshotStrategy
             uploadTracker.trackHandle(registryHandle);
             privateStateEntries.add(
                     HandleAndLocalPath.of(registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
+        }
+
+        // ---- FRS-CKPT-NOFLUSH: resolve + attach memtable artifacts, then clean up staging. ----
+        // f.get() blocks until each artifact is fully uploaded by the uploader; only then is it
+        // safe to delete the local staging dir the engine wrote them into. The artifacts join
+        // privateState alongside the registry blob and any NO_SHARING SSTs.
+        if (!memtableArtFuts.isEmpty()) {
+            try {
+                for (CompletableFuture<HandleAndLocalPath> f : memtableArtFuts) {
+                    privateStateEntries.add(f.get());
+                }
+            } finally {
+                deleteDirQuietly(memtableStagingDir);
+            }
+        } else {
+            deleteDirQuietly(memtableStagingDir);
         }
 
         // ---- Build the keyed state handle. ----
