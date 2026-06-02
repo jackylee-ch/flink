@@ -237,13 +237,12 @@ class ForStRsRestoreOperationTest {
         byte[] marker =
                 org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
                         .QUEUE_NS_MARKER;
-        byte[] malformed = "q/state-without-separator".getBytes(StandardCharsets.UTF_8);
+        // Marker present but no room for snLen(2B) + stateName + kg(2B) + ts(8B).
+        byte[] malformed = "q/x".getBytes(StandardCharsets.UTF_8);
 
         assertThrows(
                 IllegalArgumentException.class,
-                () ->
-                        ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(
-                                malformed, marker, -1));
+                () -> ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(malformed, marker));
     }
 
     @Test
@@ -251,21 +250,40 @@ class ForStRsRestoreOperationTest {
         byte[] marker =
                 org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
                         .QUEUE_NS_MARKER;
-        byte[] stateName = "timer-state".getBytes(StandardCharsets.UTF_8);
-        byte[] key = new byte[marker.length + stateName.length + 1 + 2 + Long.BYTES];
-        int pos = 0;
-        System.arraycopy(marker, 0, key, pos, marker.length);
-        pos += marker.length;
-        System.arraycopy(stateName, 0, key, pos, stateName.length);
-        pos += stateName.length;
-        int sepIdx = pos;
-        key[pos++] = (byte) '/';
-        key[pos++] = 0;
-        key[pos++] = 7;
+        // Build the prefix via the SAME producer the queue uses (length-prefixed),
+        // then append kg(2B BE) + ts(8B) for a well-formed row.
+        byte[] prefix =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .buildQueuePrefixForTesting("timer-state");
+        byte[] key = new byte[prefix.length + 2 + Long.BYTES];
+        System.arraycopy(prefix, 0, key, 0, prefix.length);
+        key[prefix.length] = 0;
+        key[prefix.length + 1] = 7;
 
-        assertEquals(
-                7,
-                ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(key, marker, sepIdx));
+        assertEquals(7, ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(key, marker));
+    }
+
+    /**
+     * FORSTRS-timer '/' fix: Flink's standard timer state names contain '/'
+     * (e.g. {@code "_timer_state/processing_user-timers"}). The restore scan must still locate
+     * the embedded kg correctly — via the length prefix, NOT by scanning for the first '/'
+     * (which would land inside the state name and read a wrong kg, silently misrouting timers
+     * on rescale). This builds the key with the real producer and asserts the real consumer.
+     */
+    @Test
+    void timerRowKeyParserReadsKeyGroupForStateNameContainingSlash() {
+        byte[] marker =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .QUEUE_NS_MARKER;
+        byte[] prefix =
+                org.apache.flink.state.forstrs.timer.ForStRsKeyGroupedInternalPriorityQueue
+                        .buildQueuePrefixForTesting("_timer_state/processing_user-timers");
+        byte[] key = new byte[prefix.length + 2 + Long.BYTES];
+        System.arraycopy(prefix, 0, key, 0, prefix.length);
+        key[prefix.length] = (byte) ((300 >>> 8) & 0xFF);
+        key[prefix.length + 1] = (byte) (300 & 0xFF);
+
+        assertEquals(300, ForStRsRestoreOperation.extractTimerRowKeyGroupOrThrow(key, marker));
     }
 
     /** Helper: opens a DB at {@code srcDir}, writes N keys, takes an incremental snapshot. */

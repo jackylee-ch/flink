@@ -210,6 +210,30 @@ class ForStRsKeyGroupedInternalPriorityQueueBatchedTest {
                 range);
     }
 
+    /**
+     * Regression (FORSTRS-timer '/' fix): Flink's standard timer state names contain '/'
+     * (e.g. {@code "_timer_state/processing_user-timers"}), so the queue MUST accept them and
+     * round-trip timers through the engine. Previously an E-H4 guard rejected any '/'-containing
+     * name, failing every windowed/join NexMark query at job init when the timer service is
+     * FORSTRS. kg=7 (non-zero) exercises the embedded-key-group encoding too.
+     */
+    @Test
+    void acceptsStateNameContainingSlashAndRoundTripsThroughEngine() {
+        try (ForStRsKeyGroupedInternalPriorityQueue<TestElement> q =
+                newQueue("_timer_state/processing_user-timers", 7, new KeyGroupRange(7, 7))) {
+            q.add(new TestElement(500L, 0));
+            q.add(new TestElement(100L, 1));
+            q.add(new TestElement(300L, 2));
+            q.flushPendingToEngine(); // force the engine write/read round-trip
+            assertEquals(3, q.size());
+            assertEquals(100L, q.poll().ts);
+            assertEquals(300L, q.poll().ts);
+            assertEquals(500L, q.poll().ts);
+            assertNull(q.poll());
+            assertTrue(q.isEmpty());
+        }
+    }
+
     // ------------------------------------------------------------------
     // Spec invariants
     // ------------------------------------------------------------------

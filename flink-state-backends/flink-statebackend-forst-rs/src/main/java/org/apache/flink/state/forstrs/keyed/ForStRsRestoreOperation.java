@@ -1128,14 +1128,7 @@ public class ForStRsRestoreOperation {
                     break;
                 }
                 byte[] key = entry.key();
-                int sepIdx = -1;
-                for (int i = marker.length; i < key.length; i++) {
-                    if (key[i] == (byte) '/') {
-                        sepIdx = i;
-                        break;
-                    }
-                }
-                int rowKg = extractTimerRowKeyGroupOrThrow(key, marker, sepIdx);
+                int rowKg = extractTimerRowKeyGroupOrThrow(key, marker);
                 if (!src.range.contains(rowKg)) {
                     throw new ForStRsCheckpointRestoreException(
                             "timer-row-key-group",
@@ -1161,22 +1154,35 @@ public class ForStRsRestoreOperation {
         }
     }
 
-    static int extractTimerRowKeyGroupOrThrow(byte[] key, byte[] marker, int sepIdx) {
-        if (sepIdx <= marker.length || sepIdx + 1 + 2 + Long.BYTES > key.length) {
+    static int extractTimerRowKeyGroupOrThrow(byte[] key, byte[] marker) {
+        // Wire layout (length-prefixed state name, 2026-06-02):
+        //   marker || snLen(2B BE) || stateName(snLen) || kg(2B BE) || ts(8B) || elem
+        // The kg offset is derived from snLen — NOT by scanning for the first '/'
+        // — so state names containing '/' (Flink's _timer_state/* names) parse
+        // unambiguously. See ForStRsKeyGroupedInternalPriorityQueue#buildQueuePrefix.
+        int snLenOff = marker.length;
+        if (key.length < snLenOff + 2) {
             throw new IllegalArgumentException(
-                    "Malformed ForSt-RS timer key under q/ prefix: missing state-name separator,"
-                            + " key-group, or timestamp bytes; length="
-                            + key.length
-                            + ", sepIdx="
-                            + sepIdx);
+                    "Malformed ForSt-RS timer key under q/ prefix: missing state-name length;"
+                            + " length="
+                            + key.length);
         }
         for (int i = 0; i < marker.length; i++) {
             if (key[i] != marker[i]) {
                 throw new IllegalArgumentException("Malformed ForSt-RS timer key prefix");
             }
         }
-        int rowHi = key[sepIdx + 1] & 0xFF;
-        int rowLo = key[sepIdx + 2] & 0xFF;
+        int snLen = ((key[snLenOff] & 0xFF) << 8) | (key[snLenOff + 1] & 0xFF);
+        int kgOff = snLenOff + 2 + snLen;
+        if (kgOff + 2 + Long.BYTES > key.length) {
+            throw new IllegalArgumentException(
+                    "Malformed ForSt-RS timer key under q/ prefix: state-name length "
+                            + snLen
+                            + " leaves no room for key-group + timestamp; length="
+                            + key.length);
+        }
+        int rowHi = key[kgOff] & 0xFF;
+        int rowLo = key[kgOff + 1] & 0xFF;
         return (rowHi << 8) | rowLo;
     }
 

@@ -86,7 +86,7 @@ import java.util.function.ToLongFunction;
  * <p><b>Key encoding.</b> Each entry is stored under a composite ForSt key:
  *
  * <pre>
- *   composite = QUEUE_NS_MARKER || stateName.bytes(UTF-8) || '/'
+ *   composite = QUEUE_NS_MARKER || snLen(2B BE) || stateName.bytes(UTF-8)
  *            || kg(2B BE) || ts(8B BE, sign-flipped) || serialize(T)
  * </pre>
  *
@@ -126,8 +126,6 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * for this fix because it would orphan existing checkpoints).
      */
     private static final int MAX_TOTAL_KEY_GROUPS_FOR_COLLISION_SAFETY = 28975;
-
-    private static final byte SEP = (byte) '/';
 
     /**
      * XOR mask that flips the sign bit of a {@code long} so that big-endian lexicographic byte
@@ -293,23 +291,16 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             java.util.function.IntSupplier currentKeyGroupSupplier,
             KeyGroupRange keyGroupRange,
             LongFunction<T> rebinder) {
-        // E-H4: reject state names containing the SEP byte ('/'). The
-        // rescaling-restore path locates the embedded kg by scanning
-        // forward from QUEUE_NS_MARKER for the first '/', so a name
-        // containing '/' would put the kg lookup at the wrong offset
-        // and silently drop every timer for this queue on rescale.
-        // Validating at construction is the least-invasive defense
-        // (vs. wire-format change to length-prefix the name). The
-        // default Flink StateDescriptor names never contain '/', so
-        // this only rejects deliberately pathological inputs.
+        // E-H4 (resolved 2026-06-02): the wire format now LENGTH-PREFIXES the
+        // state name (see buildQueuePrefix + the rescaling-restore scan in
+        // ForStRsRestoreOperation), so the embedded kg is located from the
+        // 2-byte length, NOT by scanning for the first '/'. State names may
+        // therefore contain ANY bytes — including '/', which Flink's standard
+        // timer names DO ("_timer_state/processing_*" / "_timer_state/event_*").
+        // The old indexOf('/') guard rejected those, failing every windowed/
+        // join query at job init when the timer service is FORSTRS.
         if (stateName == null) {
             throw new IllegalArgumentException("stateName must not be null");
-        }
-        if (stateName.indexOf('/') >= 0) {
-            throw new IllegalArgumentException(
-                    "stateName must not contain '/' (rescaling-restore parses the kg by"
-                            + " scanning to the first '/' after QUEUE_NS_MARKER): "
-                            + stateName);
         }
         this.linker = linker;
         this.db = db;
@@ -443,11 +434,35 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     private static byte[] buildQueuePrefix(String stateName) {
         byte[] sn = stateName.getBytes(StandardCharsets.UTF_8);
-        byte[] out = new byte[QUEUE_NS_MARKER.length + sn.length + 1];
+        // Layout: QUEUE_NS_MARKER || snLen(2B BE) || stateName.bytes
+        // The 2-byte length prefix (replacing the old trailing '/' delimiter)
+        // lets the rescaling-restore scan locate the embedded kg from the length
+        // alone, so state names containing '/' (Flink's _timer_state/* names)
+        // are unambiguous. kg(2B BE) is written immediately after this prefix
+        // (see encode), so decodeKeyGroupFromComposite/keyGroupPrefix — which
+        // index at queuePrefix.length — need no change.
+        if (sn.length > 0xFFFF) {
+            throw new IllegalArgumentException(
+                    "timer stateName UTF-8 length " + sn.length + " exceeds 65535: " + stateName);
+        }
+        byte[] out = new byte[QUEUE_NS_MARKER.length + 2 + sn.length];
         System.arraycopy(QUEUE_NS_MARKER, 0, out, 0, QUEUE_NS_MARKER.length);
-        System.arraycopy(sn, 0, out, QUEUE_NS_MARKER.length, sn.length);
-        out[out.length - 1] = SEP;
+        out[QUEUE_NS_MARKER.length] = (byte) ((sn.length >>> 8) & 0xFF);
+        out[QUEUE_NS_MARKER.length + 1] = (byte) (sn.length & 0xFF);
+        System.arraycopy(sn, 0, out, QUEUE_NS_MARKER.length + 2, sn.length);
         return out;
+    }
+
+    /**
+     * Test seam: exposes the encoded queue prefix ({@code QUEUE_NS_MARKER ||
+     * snLen(2B BE) || stateName}) so restore-side tests can build a wire-format
+     * key via the SAME producer the queue uses and assert the restore scan
+     * extracts the embedded kg — proving producer/consumer agreement across a
+     * state name that contains '/'.
+     */
+    @VisibleForTesting
+    public static byte[] buildQueuePrefixForTesting(String stateName) {
+        return buildQueuePrefix(stateName);
     }
 
     /**
