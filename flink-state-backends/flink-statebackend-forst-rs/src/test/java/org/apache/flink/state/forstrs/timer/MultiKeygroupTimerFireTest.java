@@ -170,6 +170,191 @@ class MultiKeygroupTimerFireTest {
         q.close();
     }
 
+    private ForStRsKeyGroupedInternalPriorityQueue<TestElement> newMkgQueue(
+            MutableKeyContext<Integer> ctx, String name) {
+        return new ForStRsKeyGroupedInternalPriorityQueue<>(
+                linker, db, cf, arena, name,
+                TestElementSerializer.INSTANCE, e -> e.ts, ctx,
+                TOTAL_KEY_GROUPS, new KeyGroupRange(SHARD_START, SHARD_END));
+    }
+
+    /**
+     * E-PERF regression: with timers in ONE of the 64 owned key groups, poll() must NOT re-open
+     * a prefix iterator for the 63 EMPTY key groups on every call. Pre-fix every poll re-opened
+     * all empty kgs (≈ polls × 63 ≈ 9450 iterator opens) — the CPU spin that stalled q4/q5/q7.
+     * After the fix, empty kgs are detected once and skipped → refills bounded by ≈ numKgs.
+     */
+    @Test
+    void pollDoesNotReopenEmptyKeyGroupsEveryCall() {
+        Integer key = pickKeysInDistinctKeyGroups(1).get(0);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "perf");
+        ctx.setCurrentKey(key);
+        final int numTimers = 200;
+        for (int i = 0; i < numTimers; i++) {
+            assertTrue(q.add(new TestElement(1L + i, i)));
+        }
+        q.flushPendingToEngine();
+        q.multiKgRefillCount = 0; // isolate the poll-loop cost from setup
+
+        final int polls = 150;
+        long prevTs = Long.MIN_VALUE;
+        for (int i = 0; i < polls; i++) {
+            TestElement e = q.poll();
+            assertNotEquals(null, e, "poll " + i + " must return a timer");
+            assertTrue(e.ts > prevTs, "timers must fire in ascending ts order");
+            prevTs = e.ts;
+        }
+        int numKgs = SHARD_END - SHARD_START + 1; // 64
+        assertTrue(
+                q.multiKgRefillCount < 2 * numKgs,
+                "poll() must NOT re-open empty-kg prefix iterators every call; observed refills="
+                        + q.multiKgRefillCount
+                        + " (fixed bound < "
+                        + (2 * numKgs)
+                        + "; pre-fix would be ≈ "
+                        + (polls * (numKgs - 1))
+                        + ")");
+        q.close();
+    }
+
+    /**
+     * E-PERF correctness: a timer ADDED to a previously-empty (exhausted) key group MUST still
+     * fire — the exhaustion-skip must be cleared on add, else the new timer is silently skipped.
+     */
+    @Test
+    void addToPreviouslyExhaustedKeyGroupStillFires() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(2);
+        Integer keyA = keys.get(0);
+        Integer keyB = keys.get(1);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "unexhaust");
+        // Put a few timers in kg(A), drain them ALL — now every kg in range is exhausted.
+        ctx.setCurrentKey(keyA);
+        for (int i = 0; i < 3; i++) {
+            assertTrue(q.add(new TestElement(10L + i, i)));
+        }
+        q.flushPendingToEngine();
+        while (q.poll() != null) {
+            // drain
+        }
+        assertTrue(q.isEmpty(), "all kg(A) timers drained");
+        // Now add a timer to a DIFFERENT (previously-empty/exhausted) kg(B).
+        ctx.setCurrentKey(keyB);
+        assertTrue(q.add(new TestElement(999L, 0)));
+        q.flushPendingToEngine();
+        // The fix must un-exhaust kg(B) so poll sees it.
+        TestElement fired = q.poll();
+        assertNotEquals(null, fired, "timer added to a previously-exhausted kg MUST still fire");
+        assertEquals(999L, fired.ts);
+        q.close();
+    }
+
+    /**
+     * E-PERF correctness: poll() returns the GLOBAL minimum-ts timer across key groups even as
+     * individual kgs exhaust and get skipped — interleaved timestamps across 3 kgs come out
+     * strictly ascending.
+     */
+    @Test
+    void pollReturnsGlobalMinAcrossKeyGroupsWithExhaustionSkip() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(3);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "globalmin");
+        // Interleave timestamps across the 3 kgs: kgA gets 1,4,7; kgB gets 2,5,8; kgC gets 3,6,9.
+        for (int i = 0; i < 3; i++) {
+            ctx.setCurrentKey(keys.get(i));
+            for (int j = 0; j < 3; j++) {
+                long ts = 1L + i + 3L * j; // i in {0,1,2}, j in {0,1,2}
+                assertTrue(q.add(new TestElement(ts, (int) ts)));
+            }
+        }
+        q.flushPendingToEngine();
+        long prev = Long.MIN_VALUE;
+        int count = 0;
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            assertTrue(e.ts > prev, "global-min order violated: " + e.ts + " after " + prev);
+            prev = e.ts;
+            count++;
+        }
+        assertEquals(9, count, "all 9 timers across 3 kgs must fire");
+        assertEquals(9L, prev, "last fired must be the max ts");
+        q.close();
+    }
+
+    /**
+     * E-PERF correctness: peek() must see a PENDING (un-flushed) timer added to a kg whose engine
+     * prefix is exhausted — peekMultiKg merges the pending buffer with engine heads, so the
+     * exhaustion-skip (which only affects the engine scan) must not hide a buffered timer.
+     */
+    @Test
+    void peekSeesPendingTimerInExhaustedKeyGroup() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(2);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "peekpending");
+        // Drain kg(A) → all kgs become exhausted.
+        ctx.setCurrentKey(keys.get(0));
+        assertTrue(q.add(new TestElement(5L, 0)));
+        q.flushPendingToEngine();
+        assertEquals(5L, q.poll().ts);
+        assertTrue(q.isEmpty());
+        // Add a PENDING (un-flushed) timer to kg(B); peek WITHOUT flushing.
+        ctx.setCurrentKey(keys.get(1));
+        assertTrue(q.add(new TestElement(42L, 0)));
+        TestElement p = q.peek();
+        assertNotEquals(null, p, "peek must see a pending timer even in an exhausted kg");
+        assertEquals(42L, p.ts);
+        assertEquals(42L, q.poll().ts, "poll fires the pending timer");
+        q.close();
+    }
+
+    /**
+     * E-PERF correctness: interleaving add() and poll() across kgs (the steady-state regime where
+     * each poll flushes pending and invalidates the deque cache) still yields strict global-min
+     * order with every timer fired exactly once, and refills stay far below the pre-fix
+     * O(polls × emptyKgs) blowup.
+     */
+    @Test
+    void interleavedAddPollMaintainsGlobalOrder() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(3);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "interleave");
+        q.multiKgRefillCount = 0;
+        long prev = Long.MIN_VALUE;
+        int fired = 0;
+        long tsSeq = 1;
+        for (int round = 0; round < 20; round++) {
+            for (int i = 0; i < 3; i++) {
+                ctx.setCurrentKey(keys.get(i));
+                assertTrue(q.add(new TestElement(tsSeq++, 0)));
+            }
+            for (int p = 0; p < 2; p++) {
+                TestElement e = q.poll();
+                assertNotEquals(null, e);
+                assertTrue(e.ts > prev, "interleaved global-min order: " + e.ts + " after " + prev);
+                prev = e.ts;
+                fired++;
+            }
+        }
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            assertTrue(e.ts > prev, "drain order: " + e.ts + " after " + prev);
+            prev = e.ts;
+            fired++;
+        }
+        assertEquals(60, fired, "all 60 timers fire exactly once in ascending order");
+        // Pre-fix this interleave would be ≈ 60 polls × 61 empty kgs ≈ 3660 refills.
+        assertTrue(
+                q.multiKgRefillCount < 1000,
+                "interleaved refills must stay bounded; observed=" + q.multiKgRefillCount);
+        q.close();
+    }
+
     /**
      * Null-currentKey edge case: before any record arrives, peek/poll fall back to {@code
      * keyGroupRange.getStartKeyGroup()} (same as legacy constant supplier). The queue does not

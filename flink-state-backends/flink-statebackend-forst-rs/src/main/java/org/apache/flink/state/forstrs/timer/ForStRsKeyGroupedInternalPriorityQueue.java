@@ -226,6 +226,29 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     private final java.util.Map<Integer, ArrayDeque<Entry>> multiKgPollCache = new java.util.HashMap<>();
 
     /**
+     * E-PERF (2026-06-02): key groups whose engine prefix is EMPTY (a refill read
+     * 0 rows). {@link #findGlobalEngineHeadInRangeCached} SKIPS re-opening a prefix
+     * iterator for an exhausted kg. This is the fix for the q4/q5/q7 window-query
+     * collapse: with maxParallelism 128 / parallelism 4 a subtask owns ~32 kgs, but
+     * window timers concentrate in a FEW kgs (e.g. a global aggregate has few keys),
+     * so pre-fix EVERY poll re-opened the prefix iterator ({@code prefixLookupOpen})
+     * for the ~30 empty kgs, found nothing, and the cache stayed empty → re-open next
+     * poll. A watermark-fire burst issues thousands of polls → the empty-kg re-opens
+     * saturate CPU (thread dump: RUNNABLE in prefixLookupOpen) → record processing
+     * starves → full backpressure → stall/decay. A kg is UN-exhausted only when a
+     * flush actually ADDs a timer to it (see drainPendingBufferInternal ADD pass), so
+     * a gained timer is never skipped; removes only make a kg emptier.
+     */
+    private final java.util.Set<Integer> exhaustedKgs = new java.util.HashSet<>();
+
+    /**
+     * Test seam: counts {@link #refillMultiKgCache} calls (== {@code prefixLookupOpen}
+     * engine-iterator opens on the multi-kg poll path) so a UT can assert poll() does
+     * NOT re-open empty-kg iterators on every call.
+     */
+    @VisibleForTesting int multiKgRefillCount = 0;
+
+    /**
      * R29-M3: idempotency gate for {@link #close()}. PHASE 1.e of the backend's
      * dispose chain calls {@link #flushPendingToEngine()} via {@code
      * ForStRsAsyncKeyedStateBackend#snapshot} pre-snapshot drain, then dispose's
@@ -820,6 +843,12 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 multiKgPollCache.put(kg, cache);
             }
             if (cache.isEmpty()) {
+                // E-PERF: a kg whose engine prefix is empty (exhausted) is SKIPPED —
+                // do NOT re-open its prefix iterator every poll. Un-exhausted only when
+                // a flush adds a timer to it (drainPendingBufferInternal ADD pass).
+                if (exhaustedKgs.contains(kg)) {
+                    continue;
+                }
                 refillMultiKgCache(kg, cache);
             }
             // E-R33-NEW-H1: bound the suppress-removed refill loop. Mirrors
@@ -876,6 +905,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * (mirrors the single-kg {@link #refillCache} pattern).
      */
     private void refillMultiKgCache(int kg, ArrayDeque<Entry> dest) {
+        multiKgRefillCount++;
         try (Arena perKgArena = Arena.ofConfined();
                 FrsIterator iter =
                         linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perKgArena)) {
@@ -887,6 +917,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 }
                 dest.addLast(new Entry(e.key(), decodeElement(e.key())));
                 read++;
+            }
+            if (read == 0) {
+                // E-PERF: engine prefix for this kg is empty — mark exhausted so
+                // findGlobalEngineHeadInRangeCached stops re-opening it every poll.
+                exhaustedKgs.add(kg);
             }
         }
     }
@@ -1462,6 +1497,30 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (n == 0) {
             return;
         }
+        // E-PERF (2026-06-02): collect the key groups this flush touches (ADD or
+        // REMOVE) so we can SELECTIVELY invalidate only their multi-kg caches on
+        // success instead of clearing the WHOLE multiKgPollCache. Pre-fix, poll()
+        // flushed every call and the trailing invalidateCache() wiped all kgs'
+        // caches → every poll re-opened a prefix iterator for every active kg
+        // (the cache never survived the hot path) — the q4/q5/q7 CPU spin.
+        // Untouched kgs' engine prefixes are unchanged, so their cached heads stay
+        // valid across this flush. (One pass over the buffer; the kg is 2 bytes BE
+        // at offset queuePrefix.length in each composite — see encode().)
+        final java.util.Set<Integer> touchedKgs = new java.util.HashSet<>();
+        {
+            MemorySegment kds = pendingBuffer.keyDataSegment();
+            for (int i = 0; i < n; i++) {
+                int kOff = pendingBuffer.keyOffsetAt(i);
+                int kLen = pendingBuffer.keyLenAt(i);
+                if (kLen >= queuePrefix.length + 2) {
+                    int kgOff = kOff + queuePrefix.length;
+                    int hi = kds.get(ValueLayout.JAVA_BYTE, kgOff) & 0xFF;
+                    int lo = kds.get(ValueLayout.JAVA_BYTE, kgOff + 1) & 0xFF;
+                    touchedKgs.add((hi << 8) | lo);
+                }
+            }
+        }
+        boolean drainCleanSuccess = false;
         // E-R23-H1: track whether any engine-mutating FFI call ran so we can
         // unconditionally invalidate the poll cache if anything throws past
         // pass A. Pre-fix, a Pass B throw after Pass A's vectorizedBatchDelete
@@ -1607,6 +1666,16 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 outIdx++;
                 flushAddKeyOffsets.set(
                         ValueLayout.JAVA_INT, (long) outIdx * Integer.BYTES, (int) pos);
+                // E-PERF: this kg now has a timer in the engine → un-exhaust it so the
+                // next poll re-checks it (else findGlobalEngineHeadInRangeCached would
+                // skip it forever and the timer would never fire). The composite kg is
+                // 2 bytes BE at offset queuePrefix.length (see encode()/keyGroupPrefix).
+                if (!exhaustedKgs.isEmpty() && kLen >= queuePrefix.length + 2) {
+                    int kgOff = kOff + queuePrefix.length;
+                    int hi = keyDataSeg.get(ValueLayout.JAVA_BYTE, kgOff) & 0xFF;
+                    int lo = keyDataSeg.get(ValueLayout.JAVA_BYTE, kgOff + 1) & 0xFF;
+                    exhaustedKgs.remove((hi << 8) | lo);
+                }
             }
             // E-R13-H3: tie the in-buffer ADD-drop atomically to batchPut
             // success. Pre-fix the ADD rows lived in the pendingBuffer
@@ -1645,6 +1714,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // drop loop above already emptied the buffer; defensive against
         // future code that leaves non-ADD non-REMOVE rows).
         pendingBuffer.clear();
+        drainCleanSuccess = true;
         } finally {
             // E-R23-H1: invalidate pollCache whenever Pass A or Pass B
             // potentially mutated engine state, EVEN ON THE THROW PATH.
@@ -1653,7 +1723,21 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             // already removed from the engine, firing phantom timers on
             // watermark advance.
             if (enginePossiblyMutated) {
-                invalidateCache();
+                if (drainCleanSuccess) {
+                    // E-PERF: SELECTIVE invalidation — only the kgs this flush
+                    // touched have stale caches; untouched kgs' engine prefixes are
+                    // unchanged so their cached heads stay valid (no per-poll
+                    // re-open). The single-kg pollCache covers exactly one kg and is
+                    // cheap to always refresh.
+                    pollCache.clear();
+                    cachedKg = -1;
+                    for (Integer kg : touchedKgs) {
+                        multiKgPollCache.remove(kg);
+                    }
+                } else {
+                    // Partial/failed flush: fall back to full invalidation (safe).
+                    invalidateCache();
+                }
             }
         }
     }
