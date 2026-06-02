@@ -166,7 +166,11 @@ public class ForStRsSnapshotStrategy
 
     private boolean isNoFlushCheckpoint() {
         Boolean override = this.noFlushOverride;
-        return override != null ? override : Boolean.getBoolean("forst.rs.checkpoint.noflush");
+        // Parse the system property directly; the boxed-type property accessors
+        // are disallowed by Flink checkstyle (see tools/maven/checkstyle.xml).
+        return override != null
+                ? override
+                : Boolean.parseBoolean(System.getProperty("forst.rs.checkpoint.noflush"));
     }
 
     /** Best-effort recursive delete of a local staging directory; never throws. */
