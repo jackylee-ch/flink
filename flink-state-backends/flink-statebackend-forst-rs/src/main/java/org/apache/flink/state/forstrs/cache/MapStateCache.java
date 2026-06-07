@@ -457,6 +457,18 @@ public final class MapStateCache<V> implements AutoCloseable {
     // Internals
     // -------------------------------------------------------------------
 
+    /**
+     * FRS-ADAPTIVE-MAPSTATE-CACHE (2026-06-04): is the cache at capacity (every
+     * further insert now evicts)? Used by {@link
+     * org.apache.flink.state.forstrs.state.ForStRsMapStateV2} to decide whether
+     * a low hit rate reflects genuine THRASHING (full + churning, e.g. q4's
+     * interval-join working set) — in which case the per-record probe cost
+     * outweighs the cache — versus a merely cold cache that has not filled.
+     */
+    public boolean isFull() {
+        return size >= maxEntries;
+    }
+
     /** Returns the row id for the given key, or -1 if not present. */
     private int findRow(byte[] key) {
         return findRow(key, 0, key.length);

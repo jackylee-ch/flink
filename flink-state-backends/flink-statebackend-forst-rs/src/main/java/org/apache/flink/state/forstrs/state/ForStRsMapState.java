@@ -89,6 +89,11 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final DataOutputSerializer valueOutBuffer;
     private final DataInputDeserializer inputBuffer;
 
+    // FRS-MAPITER-ZEROCOPY: reused, grow-on-demand scratch for forEachEngineEntryVectorized so the
+    // hot iteration deserializes each row from one buffer instead of two fresh byte[] per row.
+    // Single-threaded per state instance (Flink keyed-state contract), so a plain field is safe.
+    private byte[] iterRowScratch = new byte[256];
+
     // ------------------------------------------------------------------
     // Off-heap (Arrow) mode fields (1c.1). All null in legacy modes.
     // ------------------------------------------------------------------
@@ -677,7 +682,11 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             // (2N crossings) with O(N/chunk) read crossings + 1 batched delete.
             List<byte[]> compositeKeys = new ArrayList<>();
             try {
-                forEachEngineEntryVectorized(prefix, false, (k, v) -> compositeKeys.add(k));
+                forEachEngineEntryVectorized(
+                        prefix,
+                        false,
+                        (buf, kOff, kLen, vOff, vLen) ->
+                                compositeKeys.add(java.util.Arrays.copyOfRange(buf, kOff, kOff + kLen)));
             } catch (IOException e) {
                 throw new RuntimeException(
                         "Failed to enumerate MapState engine keys during clear()", e);
@@ -692,7 +701,11 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         // FRS-V1-VEC: chunked vectorized enumerate + single batched delete (see off-heap branch).
         List<byte[]> compositeKeys = new ArrayList<>();
         try {
-            forEachEngineEntryVectorized(prefix, false, (k, v) -> compositeKeys.add(k));
+            forEachEngineEntryVectorized(
+                    prefix,
+                    false,
+                    (buf, kOff, kLen, vOff, vLen) ->
+                            compositeKeys.add(java.util.Arrays.copyOfRange(buf, kOff, kOff + kLen)));
         } catch (IOException e) {
             throw new RuntimeException(
                     "Failed to enumerate MapState engine keys during clear()", e);
@@ -780,14 +793,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
             forEachEngineEntryVectorized(
                     prefix,
                     loadValues,
-                    (composite, value) -> {
-                        if (composite.length < prefix.length) {
+                    (buf, kOff, kLen, vOff, vLen) -> {
+                        if (kLen < prefix.length) {
                             throw new IOException(
                                     "Encountered composite key shorter than prefix during MapState scan");
                         }
-                        int mapKeyLen = composite.length - prefix.length;
+                        int mapKeyLen = kLen - prefix.length;
+                        // dedup set RETAINS the key → must copy out of the reused buffer.
                         byte[] mapKeyBytes = new byte[mapKeyLen];
-                        System.arraycopy(composite, prefix.length, mapKeyBytes, 0, mapKeyLen);
+                        System.arraycopy(buf, prefix.length, mapKeyBytes, 0, mapKeyLen);
                         if (seenMapKeys.contains(new ByteArrayKey(mapKeyBytes))) {
                             return; // shadowed by a newer statebuf entry
                         }
@@ -795,7 +809,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                         UK uk = keySerializer.deserialize(inputBuffer);
                         UV uv = null;
                         if (loadValues) {
-                            inputBuffer.setBuffer(value);
+                            inputBuffer.setBuffer(buf, vOff, vLen);
                             uv = valueSerializer.deserialize(inputBuffer);
                         }
                         visitor.accept(uk, uv);
@@ -808,17 +822,17 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         forEachEngineEntryVectorized(
                 prefix,
                 loadValues,
-                (composite, value) -> {
-                    if (composite.length < prefix.length) {
+                (buf, kOff, kLen, vOff, vLen) -> {
+                    if (kLen < prefix.length) {
                         throw new IOException(
                                 "Encountered composite key shorter than prefix during MapState scan");
                     }
-                    inputBuffer.setBuffer(
-                            composite, prefix.length, composite.length - prefix.length);
+                    // kOff==0: buf[prefix.length..kLen] is the user mapKey.
+                    inputBuffer.setBuffer(buf, prefix.length, kLen - prefix.length);
                     UK uk = keySerializer.deserialize(inputBuffer);
                     UV uv = null;
                     if (loadValues) {
-                        inputBuffer.setBuffer(value);
+                        inputBuffer.setBuffer(buf, vOff, vLen);
                         uv = valueSerializer.deserialize(inputBuffer);
                     }
                     visitor.accept(uk, uv);
@@ -840,8 +854,15 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
      * valueBytes-or-null).
      */
     @FunctionalInterface
+    // FRS-MAPITER-ZEROCOPY (2026-06-07, arch upgrade #1): the consumer receives a REUSED scratch
+    // buffer + offsets instead of a fresh byte[] per row, so the hot entries/keys/values iteration
+    // (q9/q19 TopN, ~100M rows) deserializes with ZERO per-entry allocation. `buf[kOff..kOff+kLen]`
+    // is the full composite key (prefix included); `buf[vOff..vOff+vLen]` the value (vLen=0 when
+    // values not loaded). The buffer is overwritten on the next row — consumers that RETAIN the key
+    // (e.g. compositeKeys.add) MUST copy it out explicitly. See
+    // 2026-06-07-mapstate-iter-zerocopy-decode-design.md.
     private interface RawRowConsumer {
-        void accept(byte[] compositeKey, byte[] value) throws IOException;
+        void accept(byte[] buf, int kOff, int kLen, int vOff, int vLen) throws IOException;
     }
 
     private void forEachEngineEntryVectorized(
@@ -880,16 +901,21 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
                         off += 4;
                         int vlen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
                         off += 4;
-                        byte[] k = new byte[klen];
-                        MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, k, 0, klen);
+                        // FRS-MAPITER-ZEROCOPY: copy key (+ value) into ONE reused, grow-on-demand
+                        // scratch instead of two fresh byte[] per row. kOff=0, vOff=klen.
+                        int need = klen + (loadValues ? vlen : 0);
+                        if (iterRowScratch.length < need) {
+                            iterRowScratch = new byte[Math.max(need, iterRowScratch.length * 2)];
+                        }
+                        byte[] buf = iterRowScratch;
+                        MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, buf, 0, klen);
                         off += klen;
-                        byte[] v = null;
+                        int vOff = klen;
                         if (loadValues) {
-                            v = new byte[vlen];
-                            MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, v, 0, vlen);
+                            MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, buf, vOff, vlen);
                         }
                         off += vlen;
-                        rowVisitor.accept(k, v);
+                        rowVisitor.accept(buf, 0, klen, vOff, loadValues ? vlen : 0);
                     }
                     if (rowCount == 0) {
                         break;

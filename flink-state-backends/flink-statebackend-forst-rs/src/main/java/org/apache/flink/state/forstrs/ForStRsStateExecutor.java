@@ -293,6 +293,9 @@ public class ForStRsStateExecutor implements StateExecutor {
         // completes rows [k, size) exceptionally. Rows [0, k) are already completed inside
         // process. progressOut[0] is updated AFTER each successful process() so a throw
         // leaves the counter precise.
+        if (OPCOUNT) {
+            OC_ITERS.addAndGet(iters.size());
+        }
         for (int i = 0; i < iters.size(); i++) {
             iters.get(i).process(linker, db, cf, arena);
             progressOut[0] = i + 1;
@@ -304,18 +307,68 @@ public class ForStRsStateExecutor implements StateExecutor {
     // wiring delegates directly to {@link ForStRsLinker}. These seams add no overhead — the
     // JIT inlines them after class-loading because there are no production subclasses.
 
+    // FRS-OPCOUNT (2026-06-07): gated op-count instrumentation to measure ops/record
+    // for the backend-layer gap investigation (q9/q19/q20). -Dforst.rs.opcount=1.
+    // Counts engine ops (get keys, put keys, deletes, iter requests, and batch calls)
+    // so ops/record = (counter / src_out) reveals redundancy vs the theoretical minimum.
+    private static final boolean OPCOUNT = "1".equals(System.getProperty("forst.rs.opcount"));
+    private static final java.util.concurrent.atomic.AtomicLong OC_GET_KEYS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_GET_BATCHES =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_PUT_KEYS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_PUT_BATCHES =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_DELETES =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_ITERS =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_NEXT_DUMP =
+            new java.util.concurrent.atomic.AtomicLong(5_000_000L);
+
+    private static void ocMaybeDump() {
+        // Trigger on TOTAL ops (gets+puts+deletes+iters), not just gets — q19/q20 may be
+        // iter- or put-heavy with few gets, so a get-only threshold never fires.
+        long total = OC_GET_KEYS.get() + OC_PUT_KEYS.get() + OC_DELETES.get() + OC_ITERS.get();
+        long threshold = OC_NEXT_DUMP.get();
+        if (total >= threshold && OC_NEXT_DUMP.compareAndSet(threshold, threshold + 5_000_000L)) {
+            System.err.println(
+                    "[FRS_OPCOUNT] getKeys=" + OC_GET_KEYS.get()
+                            + " getBatches=" + OC_GET_BATCHES.get()
+                            + " putKeys=" + OC_PUT_KEYS.get()
+                            + " putBatches=" + OC_PUT_BATCHES.get()
+                            + " deletes=" + OC_DELETES.get()
+                            + " iters=" + OC_ITERS.get());
+        }
+    }
+
     /** Delegates to {@link ForStRsLinker#batchGetArrow}. Test override point only. */
     protected byte[][] invokeBatchGet(byte[][] keys) {
+        if (OPCOUNT) {
+            OC_GET_BATCHES.incrementAndGet();
+            OC_GET_KEYS.addAndGet(keys.length);
+            ocMaybeDump();
+        }
         return linker.batchGetArrow(db, cf, keys);
     }
 
     /** Delegates to {@link ForStRsLinker#batchPut}. Test override point only. */
     protected void invokeBatchPut(byte[][] keys, byte[][] values) {
+        if (OPCOUNT) {
+            OC_PUT_BATCHES.incrementAndGet();
+            OC_PUT_KEYS.addAndGet(keys.length);
+            ocMaybeDump();
+        }
         linker.batchPut(db, cf, keys, values);
     }
 
     /** Delegates to {@link ForStRsLinker#deleteSegment}. Test override point only. */
     protected void invokeDelete(byte[] key) {
+        if (OPCOUNT) {
+            OC_DELETES.incrementAndGet();
+            ocMaybeDump();
+        }
         // R0C-NEW-H1 Tier-2: segment FFI surface.
         linker.deleteSegment(db, cf, MemorySegment.ofArray(key), 0L, key.length);
     }

@@ -133,8 +133,28 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      */
     private static final long SIGN_FLIP = 0x8000_0000_0000_0000L;
 
-    /** Flush threshold — pending buffer size at which we proactively drain to the engine. */
-    @VisibleForTesting static final int FLUSH_THRESHOLD = 1024;
+    // FRS-TIMER-PERF (2026-06-03): pending buffer size at which add()/remove()
+    // proactively drain to the engine. RAISED 1024 → 1<<20. A watermark drain
+    // of an event-time window query (q5) registers a near-future cleanup timer
+    // on EVERY fire; at 1024 the buffer flushed thousands of times per drain,
+    // and each flush invalidated the multi-kg poll cache + resume cursor →
+    // the next refill restarted FROM the prefix start and re-walked all
+    // already-fired tombstones → the O(N²) watermark-drain wall (thread dump:
+    // window-agg threads pinned in add()→flushPendingToEngine→drain). The
+    // pending buffer is an off-heap min-heap explicitly built for "millions of
+    // timer ops" (ArrowTimerBuffer) with O(1) hashed find and O(log N) sift, and
+    // poll()/peek() MERGE it with the engine cache, so a large buffer is read
+    // efficiently and within-window adds are observed WITHOUT a flush. The
+    // snapshot pre-hook still flushes for checkpoint durability; flushes are
+    // now rare (every ~1M adds) so cursor-invalidating refills are rare. Memory
+    // is bounded by the buffer's own maxCapacity (ArrowTimerBuffer caps at
+    // 65536 entries and THROWS past it), so the threshold MUST sit below that
+    // cap — set to 32768 (32× fewer flushes than the prior 1024, leaving
+    // headroom under the 65536 cap). Each flush still invalidates the cursor →
+    // a from-start refill; making those rare is the bounded-risk mitigation
+    // here. The fully-O(1) fix (RocksDB-style in-place cache insert so flush
+    // never invalidates) is the follow-up if 32768 still walls.
+    @VisibleForTesting static final int FLUSH_THRESHOLD = 32768;
 
 
     /** Initial scratch-segment size for composing composite keys (grows on demand). */
@@ -174,6 +194,29 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     private final ArrowTimerBuffer pendingBuffer;
 
+    /**
+     * FRS-TIMER-DRAIN-BATCH (2026-06-07): fired engine-timer composite keys staged for ONE batched
+     * {@link ForStRsLinker#vectorizedBatchDelete} per refill window instead of one
+     * {@code deleteSegment} FFM crossing per fired timer. A watermark drain fires millions of
+     * session timers (q11), and the per-poll delete crossing was ~half the q11 wall (FORSTRS timer
+     * 508s ≈ 261s ingest + 247s drain). The {@link #multiKgResumeCursor} already skips
+     * fired-but-not-yet-deleted entries within a drain, so deferral is safe; correctness requires
+     * flushing these BEFORE any engine re-scan ({@link #refillMultiKgCache}) and before any
+     * snapshot/close/full-invalidate ({@link #drainPendingBufferInternal}, {@link #invalidateCache},
+     * {@link #invalidateMultiKgCache}). Only the multi-kg poll path stages here; the single-kg path
+     * (rare, non-benchmark) keeps its immediate delete.
+     */
+    private final java.util.ArrayList<byte[]> pendingPollDeletes = new java.util.ArrayList<>();
+
+    /** FRS_TIMER_DIAG: env-gated drain attribution (poll vs refill counts + refill nanos). */
+    private static final boolean TIMER_DIAG = "1".equals(System.getProperty("forst.rs.timer.diag"));
+
+    private long diagPollCount;
+    private long diagRefillNanos;
+    private long diagRefillEntries;
+    private long diagDeleteFlushCount;
+    private long diagDeleteKeyCount;
+
     /** Per-queue scratch segment for composing composite keys (single-threaded). */
     private final Arena scratchArena;
     private MemorySegment scratchSeg;
@@ -207,9 +250,65 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
     // Poll-ahead cache (vectorized perf path — SP3)
     // ------------------------------------------------------------------
 
-    private static final int REFILL_BATCH = 128;
+    // FRS-TIMER-PERF (2026-06-03): a watermark drain fires a huge burst of
+    // timers; with the resume-cursor refill each cache miss re-opens a lazy
+    // k-way-merge range iterator (O(memtable shards + overlapping SSTs) setup).
+    // A small batch (was 128) re-opened every 128 polls → thousands of opens
+    // per drain (thread dump: window-agg threads RUNNABLE in frsVecIterRangeOpen).
+    // A large batch amortises the open cost over many cheap next-chunk pulls
+    // from the SAME open handle, cutting opens ~128×. The cached entries are
+    // bounded by the live timer count per kg and decoded lazily.
+    //
+    // 2026-06-07: tried RAISING 1024 → 16384 to amortise the per-refill
+    // iterator-open. REFUTED — q11 got WORSE (stalled, did not finish in 900s
+    // vs ~457–518s at 1024). The refill cost is NOT (timers/batch) iterator
+    // opens; it is INVALIDATION/THRASH-driven: the poll cache is dropped (by
+    // flush / delete-flush) before its entries are consumed, so a bigger batch
+    // just loads 16× more entries that are then discarded each invalidation,
+    // worsening both ingest-phase polling and the final watermark drain. The
+    // real fix is a RocksDB-style in-place cache that survives flush (insert,
+    // don't invalidate) — see FLUSH_THRESHOLD note. Keep 1024 (known-good).
+    private static final int REFILL_BATCH = 1024;
     private final ArrayDeque<Entry> pollCache = new ArrayDeque<>();
     private int cachedKg = -1; // -1 = cache invalid / empty
+
+    /**
+     * FRS-TIMER-PERF (2026-06-03): per-key-group RESUME CURSOR — the max
+     * composite key already drained from each kg's engine prefix. The prior
+     * {@link #refillMultiKgCache}/{@link #refillCache} re-opened
+     * {@code frs_prefix_lookup_open} (which EAGERLY re-materialises the WHOLE
+     * kg prefix into a Vec) from the prefix START on every refill. Because
+     * {@link #poll} deletes each fired timer, a watermark drain leaves the
+     * prefix front full of tombstones, so each refill re-walked all
+     * already-fired keys → O(T²) per kg → the q5 "window-agg threads pinned
+     * 91% CPU in prefixLookupOpen / refillMultiKgCache" wall (thread dump
+     * 2026-06-03). The cursor lets refill RESUME via the lazy, index-seeking
+     * {@code frs_vec_iter_range_open} at {@code [cursor+0x00, prefixUpperBound)}
+     * — O(log n) seek past the tombstones, no re-materialisation. The cursor
+     * is trusted only across pure EXHAUSTION refills with no intervening
+     * mutation to that kg; it is dropped whenever the kg's poll cache is
+     * invalidated or the kg is un-exhausted by a flush ADD (a new add may be
+     * earlier than the cursor and must be re-seen) — see the clears in
+     * {@link #drainPendingBufferInternal}, {@link #invalidateCache},
+     * {@link #invalidateMultiKgCache}.
+     */
+    private final java.util.Map<Integer, byte[]> multiKgResumeCursor = new java.util.HashMap<>();
+
+    /** Single-kg sibling of {@link #multiKgResumeCursor} (the {@link #pollCache} path). */
+    private byte[] singleKgResumeCursor = null;
+
+    /**
+     * FRS-TIMER-PERF (2026-06-03): per-kg ONE-SHOT refill lower bound used after
+     * a flush invalidates a kg's cache. Instead of clearing the resume cursor
+     * (which forced the next refill to restart from the prefix start and re-walk
+     * every already-fired tombstone — the watermark-drain wall), the flush
+     * records a seek key at {@code min(cacheHeadTs, minAddTs)}. Fired timers all
+     * have {@code ts < cacheHead}, so seeking to this floor SKIPS every tombstone
+     * via the LSM index (O(log n)) and re-reads only the still-live entries
+     * (unconsumed cache + the new within-window/earlier add). Consumed (removed)
+     * on the next {@link #refillMultiKgCache}; the resume cursor then takes over.
+     */
+    private final java.util.Map<Integer, byte[]> multiKgRefillFloor = new java.util.HashMap<>();
 
     /**
      * E-R28-H1: per-key-group poll-ahead cache for the multi-kg path.
@@ -738,8 +837,29 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (closed.get()) {
             throw new IllegalStateException("timer queue closed");
         }
-        // Flush pending mutations so the engine view reflects all add/remove decisions.
-        flushPendingToEngine();
+        if (TIMER_DIAG && (++diagPollCount % 100_000L) == 0L) {
+            System.err.println(
+                    "[FRS_TIMER_DIAG] polls=" + diagPollCount
+                            + " refills=" + multiKgRefillCount
+                            + " refillMs=" + (diagRefillNanos / 1_000_000L)
+                            + " entriesPerRefill=" + (multiKgRefillCount > 0
+                                    ? diagRefillEntries / multiKgRefillCount : 0)
+                            + " delFlushes=" + diagDeleteFlushCount
+                            + " delKeys=" + diagDeleteKeyCount);
+        }
+        // FRS-TIMER-PERF (2026-06-03): do NOT flush pendingBuffer on every poll.
+        // The per-poll flush was the watermark-drain O(N²) wall — q5 registers a
+        // near-future cleanup timer on every window fire, so every poll flushed
+        // an ADD that fell within the cached window → multiKgPollCache.remove +
+        // resume-cursor clear → the next refill restarted FROM the prefix start,
+        // re-walking all already-fired (tombstoned) keys (measured: invalidations
+        // 51652 vs resumed-refills 388; refill ms climbing 3→68 as tombstones
+        // pile up). The multi-kg poll below now MERGES pendingBuffer ADDs with
+        // the engine cache head (mirroring peekMultiKg), observing pending adds
+        // WITHOUT a flush. The buffer stays bounded+flushed by add()'s
+        // FLUSH_THRESHOLD and by the snapshot pre-hook, so checkpoint
+        // consistency is preserved (unfired pending timers are flushed before a
+        // snapshot; fired ones are gone, which is correct).
         // E-H2: KeyGroupedInternalPriorityQueue.poll() must return the
         // GLOBAL minimum element across every key group in this subtask's
         // KeyGroupRange — Flink's InternalTimerServiceImpl.advanceWatermark
@@ -748,6 +868,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         // start kg's fallback, silently leaving timers in every other
         // kg undelivered (event-time stuck on rescaling-heavy jobs).
         if (keyGroupRange.getNumberOfKeyGroups() == 1) {
+            // Single-kg path keeps the flush-then-read contract: cachedHeadEntry
+            // reads the engine cache only (no pendingBuffer merge). This path is
+            // NOT the benchmark hot path (maxParallelism ≫ parallelism ⇒ each
+            // subtask owns many kgs ⇒ the multi-kg path runs).
+            flushPendingToEngine();
             int kg = keyGroupRange.getStartKeyGroup();
             Entry head = cachedHeadEntry(kg);
             if (head == null) {
@@ -774,38 +899,53 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             }
             return head.element;
         }
-        // Multi-kg path: E-R28-H1 — use the per-kg cached poll-ahead
-        // helper instead of opening N prefix iterators per call. The
-        // cache is populated lazily; subsequent polls consume cached
-        // entries until that kg's cache is exhausted, at which point
-        // one refill (REFILL_BATCH=128) re-warms it. Pre-fix every
-        // poll() opened ONE iter per kg → N FFM crossings per timer
-        // fired; new path amortises FFM cost over REFILL_BATCH timers.
-        Entry head = findGlobalEngineHeadInRangeCached(false);
-        if (head == null) {
+        // Multi-kg path: MERGE the min pending-ADD across the key-group range
+        // with the engine cache head (no flush). Mirrors peekMultiKg's
+        // candidate selection, then consumes the winner from the correct source.
+        // E-R28-H1 + FRS-TIMER-PERF: cached engine head, suppressing entries
+        // masked by a pending REMOVE (poll no longer flushes first, so REMOVEs
+        // can be outstanding — same contract peekMultiKg already uses).
+        // IMPORTANT: compute the engine head FIRST — findGlobalEngineHeadInRangeCached
+        // can internally flushPendingToEngine() (its masked-refill fallback),
+        // which mutates pendingBuffer; computing the buffer pos AFTER keeps the
+        // index valid for the removeAt() below.
+        Entry engineHead = findGlobalEngineHeadInRangeCached(true);
+        // FRS-TIMER-PERF: O(1) min-ADD via the off-heap min-heap root.
+        int bufferBestPos = bufferMinAddPos();
+        long bufferBestTs =
+                bufferBestPos >= 0 ? pendingBuffer.tsAt(bufferBestPos) : Long.MAX_VALUE;
+        if (bufferBestPos < 0 && engineHead == null) {
             return null;
         }
-        // Identify which kg owned `head` so we can drop only that kg's
-        // cached entry on success and refill it on the next call.
-        int winningKg = decodeKeyGroupFromComposite(head.composite);
-        // E-R24-H1: invalidate cache on engine-delete throw too. The
-        // success path drops only the consumed entry; the throw path
-        // invalidates the entire multi-kg cache to avoid stranding
-        // a partially-applied delete.
-        try {
-            // R0C-NEW-H1 Tier-2: segment-shaped FFI (zero-alloc heap view).
-            linker.deleteSegment(
-                    db, cf, MemorySegment.ofArray(head.composite), 0L, head.composite.length);
-        } catch (Throwable t) {
-            invalidateMultiKgCache();
-            invalidateCache();
-            throw t;
+        boolean takeBuffer;
+        if (bufferBestPos < 0) {
+            takeBuffer = false;
+        } else if (engineHead == null) {
+            takeBuffer = true;
+        } else {
+            takeBuffer = bufferBestTs <= decodeTimestamp(engineHead.composite);
         }
-        // E-R28-H1: drop only the consumed kg's head from the cache.
-        // Other kgs' caches survive and the next poll() returns the
-        // global min without reopening their iterators.
+        if (takeBuffer) {
+            // Winner is a pending ADD — NOT yet in the engine, so firing it just
+            // removes it from the buffer (no engine delete). add() guarantees the
+            // buffer never holds a contradictory ADD/REMOVE pair per key, so the
+            // ADD is live.
+            T elem = decodeElementFromBuffer(bufferBestPos);
+            pendingBuffer.removeAt(bufferBestPos);
+            return elem;
+        }
+        // Winner is an engine cache head — delete it from the engine and drop
+        // only that kg's cached entry (other kgs' caches + cursors survive).
+        int winningKg = decodeKeyGroupFromComposite(engineHead.composite);
+        // FRS-TIMER-DRAIN-BATCH: stage the fired timer's composite for a batched delete instead of
+        // one FFM deleteSegment crossing per timer (the q11 watermark-drain wall). The
+        // multiKgResumeCursor skips this consumed key on the next refill, and flushPollDeletes()
+        // runs before any engine re-scan / snapshot / full-invalidate, so the deferred delete can
+        // never resurrect a fired timer. composite is this Entry's own byte[] (distinct per cached
+        // row), so retaining the reference is safe.
+        pendingPollDeletes.add(engineHead.composite);
         consumeMultiKgHead(winningKg);
-        return head.element;
+        return engineHead.element;
     }
 
     /**
@@ -905,25 +1045,167 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * (mirrors the single-kg {@link #refillCache} pattern).
      */
     private void refillMultiKgCache(int kg, ArrayDeque<Entry> dest) {
+        // FRS-TIMER-DRAIN-BATCH: flush staged fired-timer deletes before re-scanning. A/B PROVEN
+        // (2026-06-07 diag): flushing here (deleting consumed entries) is BETTER (refillMs ~171s)
+        // than deferring (~246s) — undeleted consumed entries stay live and get re-walked by the
+        // range scan. The residual refillMs is LSM read-amplification of the timer-CF range scan
+        // over the growing timer state (the q4-class read-amp gap), NOT delete tombstones.
+        flushPollDeletes();
         multiKgRefillCount++;
-        try (Arena perKgArena = Arena.ofConfined();
-                FrsIterator iter =
-                        linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perKgArena)) {
-            int read = 0;
-            while (read < REFILL_BATCH) {
-                ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
-                if (e == null) {
-                    break;
-                }
-                dest.addLast(new Entry(e.key(), decodeElement(e.key())));
-                read++;
+        // FRS-TIMER-PERF: resume past the last-drained key (O(log n) index seek
+        // via the lazy range iterator) instead of re-opening the EAGER prefix
+        // scan from the kg-prefix start (which re-materialised the whole prefix
+        // and re-walked every already-fired tombstone → O(T²) per kg).
+        byte[] kgPrefix = keyGroupPrefix(kg);
+        // FRS-TIMER-PERF: a one-shot post-flush refill floor (seek past
+        // tombstones) takes precedence; otherwise resume past the last-drained
+        // key; otherwise scan from the kg prefix start (first refill only).
+        byte[] floor = multiKgRefillFloor.remove(kg);
+        byte[] resume = multiKgResumeCursor.get(kg);
+        byte[] lo = (floor != null) ? floor : (resume != null ? successorKey(resume) : kgPrefix);
+        byte[] hi = prefixUpperBound(kgPrefix);
+        long _diagT0 = TIMER_DIAG ? System.nanoTime() : 0L;
+        byte[] last = readRangeIntoCache(lo, hi, dest);
+        if (TIMER_DIAG) {
+            diagRefillNanos += System.nanoTime() - _diagT0;
+        }
+        if (last == null) {
+            // Engine prefix exhausted from `lo` onward — mark exhausted so
+            // findGlobalEngineHeadInRangeCached stops re-opening it every poll.
+            exhaustedKgs.add(kg);
+        } else {
+            // Next refill resumes strictly after this batch's tail.
+            multiKgResumeCursor.put(kg, last);
+        }
+    }
+
+    /**
+     * FRS-TIMER-PERF: read up to {@link #REFILL_BATCH} entries from the engine
+     * range {@code [lo, hi)} into {@code dest} via the LAZY, index-seeking,
+     * tombstone-skipping {@code frs_vec_iter_range_open} (NOT the eager
+     * {@code frs_prefix_lookup_open}, which re-materialises the whole prefix).
+     * Chunk layout per row: {@code [klen:i32][vlen:i32][key bytes][val bytes]}.
+     * Returns the composite key of the LAST row read (the resume cursor), or
+     * {@code null} if the range was empty.
+     */
+    private byte[] readRangeIntoCache(byte[] lo, byte[] hi, ArrayDeque<Entry> dest) {
+        final int chunkCap = 64 * 1024;
+        byte[] last = null;
+        int total = 0;
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment chunkBuf = a.allocate(chunkCap);
+            MemorySegment loSeg = a.allocate(Math.max(1, lo.length));
+            MemorySegment.copy(lo, 0, loSeg, ValueLayout.JAVA_BYTE, 0, lo.length);
+            int hiLen = (hi == null) ? 0 : hi.length;
+            MemorySegment hiSeg = a.allocate(Math.max(1, hiLen));
+            if (hiLen > 0) {
+                MemorySegment.copy(hi, 0, hiSeg, ValueLayout.JAVA_BYTE, 0, hiLen);
             }
-            if (read == 0) {
-                // E-PERF: engine prefix for this kg is empty — mark exhausted so
-                // findGlobalEngineHeadInRangeCached stops re-opening it every poll.
-                exhaustedKgs.add(kg);
+            MemorySegment outHandle = a.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment outRowCount = a.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = a.allocate(ValueLayout.JAVA_INT);
+            int rc =
+                    linker.frsVecIterRangeOpen(
+                            db.handle(),
+                            cf.handle(),
+                            loSeg,
+                            lo.length,
+                            hiSeg,
+                            hiLen,
+                            chunkBuf,
+                            chunkCap,
+                            outHandle,
+                            outRowCount,
+                            outBytesUsed);
+            if (rc != 0) {
+                throw new RuntimeException("frs_vec_iter_range_open rc=" + rc);
+            }
+            long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
+            try {
+                int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                while (total < REFILL_BATCH) {
+                    int off = 0;
+                    for (int i = 0; i < rowCount && total < REFILL_BATCH; i++) {
+                        int klen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+                        off += 4;
+                        int vlen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+                        off += 4;
+                        byte[] k = new byte[klen];
+                        MemorySegment.copy(chunkBuf, ValueLayout.JAVA_BYTE, off, k, 0, klen);
+                        off += klen + vlen; // skip the (sentinel) value payload
+                        dest.addLast(new Entry(k, decodeElement(k)));
+                        last = k;
+                        total++;
+                    }
+                    if (total >= REFILL_BATCH || rowCount == 0) {
+                        break;
+                    }
+                    rc =
+                            linker.frsVecIterRangeNext(
+                                    handle, chunkBuf, chunkCap, outRowCount, outBytesUsed);
+                    if (rc != 0) {
+                        throw new RuntimeException("frs_vec_iter_range_next rc=" + rc);
+                    }
+                    rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                }
+            } finally {
+                linker.frsVecIterRangeClose(handle);
             }
         }
+        if (TIMER_DIAG) {
+            diagRefillEntries += total;
+        }
+        return last;
+    }
+
+    /**
+     * FRS-TIMER-PERF: build a composite lower-bound key {@code queuePrefix ||
+     * kg(2B BE) || flipped_ts(8B BE)} (no element tail) for {@code (kg, ts)}.
+     * Every real timer at {@code (kg, ts)} is {@code seekKey || element}, which
+     * sorts at/after this key; every timer at {@code ts' > ts} sorts after it
+     * (flipped-ts is ascending). So a range scan from this key yields exactly
+     * the timers with {@code ts >= ts} in this kg, skipping earlier (fired,
+     * tombstoned) ones via the index.
+     */
+    private byte[] buildSeekKey(int kg, long ts) {
+        long flipped = ts ^ SIGN_FLIP;
+        byte[] out = new byte[queuePrefix.length + 2 + 8];
+        System.arraycopy(queuePrefix, 0, out, 0, queuePrefix.length);
+        out[queuePrefix.length] = (byte) ((kg >>> 8) & 0xFF);
+        out[queuePrefix.length + 1] = (byte) (kg & 0xFF);
+        for (int i = 0; i < 8; i++) {
+            out[queuePrefix.length + 2 + i] = (byte) ((flipped >>> (56 - 8 * i)) & 0xFF);
+        }
+        return out;
+    }
+
+    /** Smallest byte[] strictly greater than {@code k} (append a 0x00 byte). */
+    private static byte[] successorKey(byte[] k) {
+        byte[] out = new byte[k.length + 1];
+        System.arraycopy(k, 0, out, 0, k.length);
+        // trailing 0x00 sorts immediately after `k` and before any real successor
+        return out;
+    }
+
+    /**
+     * Smallest key strictly greater than EVERY key having {@code prefix} as a
+     * prefix — i.e. the exclusive upper bound that scopes a range scan to one
+     * key group. Increments the last byte {@code < 0xFF}, dropping trailing
+     * 0xFF bytes. Returns {@code null} only if every byte is 0xFF (unbounded);
+     * key-group prefixes never hit that (kg ≤ maxParallelism-1 ≤ 0x7FFF).
+     */
+    private static byte[] prefixUpperBound(byte[] prefix) {
+        int i = prefix.length - 1;
+        while (i >= 0 && (prefix[i] & 0xFF) == 0xFF) {
+            i--;
+        }
+        if (i < 0) {
+            return null;
+        }
+        byte[] out = new byte[i + 1];
+        System.arraycopy(prefix, 0, out, 0, i + 1);
+        out[i] = (byte) ((out[i] & 0xFF) + 1);
+        return out;
     }
 
     /**
@@ -945,7 +1227,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * pre-fetched). Cheap O(REFILL_BATCH) linear scan.
      */
     private void invalidateMultiKgCache() {
+        // FRS-TIMER-DRAIN-BATCH: flush staged fired-timer deletes before dropping the resume cursor.
+        flushPollDeletes();
         multiKgPollCache.clear();
+        multiKgResumeCursor.clear(); // FRS-TIMER-PERF: resume cursors are only valid with their cache
+        multiKgRefillFloor.clear();
     }
 
     private Entry findGlobalEngineHeadInRange(boolean suppressRemoved) {
@@ -1106,27 +1392,11 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * but correct path; single-kg deployments use the fast {@code peek()} branch.
      */
     private T peekMultiKg() {
-        int bufferBestPos = -1;
-        long bufferBestTs = Long.MAX_VALUE;
-        int n = pendingBuffer.size();
-        int start = keyGroupRange.getStartKeyGroup();
-        int end = keyGroupRange.getEndKeyGroup();
-        for (int i = 0; i < n; i++) {
-            if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
-                continue;
-            }
-            int kOff = pendingBuffer.keyOffsetAt(i);
-            int kLen = pendingBuffer.keyLenAt(i);
-            int entryKg = decodeKgFromBuffer(kOff, kLen);
-            if (entryKg < start || entryKg > end) {
-                continue;
-            }
-            long ts = pendingBuffer.tsAt(i);
-            if (ts < bufferBestTs) {
-                bufferBestTs = ts;
-                bufferBestPos = i;
-            }
-        }
+        // FRS-TIMER-PERF: O(1) min-ADD via the off-heap min-heap root (all
+        // buffer entries are in this queue's kg range — see bufferMinAddPos).
+        int bufferBestPos = bufferMinAddPos();
+        long bufferBestTs =
+                bufferBestPos >= 0 ? pendingBuffer.tsAt(bufferBestPos) : Long.MAX_VALUE;
         // E-H5: peek MUST suppress engine entries masked by a
         // pending REMOVE — Flink's tryAdvanceWatermark fires the
         // timer object peek() returns and discards poll()'s return
@@ -1151,6 +1421,41 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
             return decodeElementFromBuffer(bufferBestPos);
         }
         return engineHead.element;
+    }
+
+    /**
+     * FRS-TIMER-PERF: heap position of the minimum-ts pending ADD, or -1 if
+     * there is none. {@link #pendingBuffer} is an off-heap min-heap, so heap[0]
+     * is the global minimum-ts entry — O(1) when it is an ADD (the dominant
+     * case during a watermark drain). Every buffer entry belongs to THIS queue's
+     * key-group range ({@link #add} composes the key from
+     * {@code currentKeyGroupSupplier}, which is always in range), so no per-entry
+     * kg filter is needed. Falls back to a linear scan only when the heap root
+     * is a (rare) REMOVE. Used by the multi-kg {@link #poll}/{@link #peekMultiKg}
+     * merge so a large pending buffer (see {@link #FLUSH_THRESHOLD}) stays O(1)
+     * to read per call instead of O(buffer).
+     */
+    private int bufferMinAddPos() {
+        int n = pendingBuffer.size();
+        if (n == 0) {
+            return -1;
+        }
+        if (pendingBuffer.opAt(0) == ArrowTimerBuffer.OP_ADD) {
+            return 0;
+        }
+        int bestPos = -1;
+        long bestTs = Long.MAX_VALUE;
+        for (int i = 0; i < n; i++) {
+            if (pendingBuffer.opAt(i) != ArrowTimerBuffer.OP_ADD) {
+                continue;
+            }
+            long ts = pendingBuffer.tsAt(i);
+            if (ts < bestTs) {
+                bestTs = ts;
+                bestPos = i;
+            }
+        }
+        return bestPos;
     }
 
     /**
@@ -1188,6 +1493,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (cachedKg != kg) {
             pollCache.clear();
             cachedKg = kg;
+            singleKgResumeCursor = null; // FRS-TIMER-PERF: cursor belongs to old kg
         }
         if (pollCache.isEmpty()) {
             refillCache(kg);
@@ -1221,6 +1527,7 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                     if (cachedKg != kg) {
                         pollCache.clear();
                         cachedKg = kg;
+                        singleKgResumeCursor = null; // FRS-TIMER-PERF
                     }
                     refillCache(kg);
                     refillsThisCall = 0;
@@ -1493,6 +1800,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * calls this directly to drain pending entries before flipping the {@code closed} flag.
      */
     private void drainPendingBufferInternal() {
+        // FRS-TIMER-DRAIN-BATCH: persist staged fired-timer deletes before snapshot/close (this is
+        // the mandatory pre-snapshot hook) — BEFORE the early-return, since pendingPollDeletes may
+        // be non-empty even when the ADD/REMOVE pendingBuffer is empty.
+        flushPollDeletes();
         int n = pendingBuffer.size();
         if (n == 0) {
             return;
@@ -1743,33 +2054,59 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                     pollCache.clear();
                     cachedKg = -1;
                     for (Integer kg : touchedKgs) {
+                        ArrayDeque<Entry> dq = multiKgPollCache.get(kg);
+                        long headTs =
+                                (dq != null && !dq.isEmpty())
+                                        ? decodeTimestamp(dq.peekFirst().composite)
+                                        : Long.MAX_VALUE;
+                        Long minAdd = minAddTsByKg.get(kg);
                         boolean invalidate;
                         if (removedKgs.contains(kg)) {
                             // A remove may delete a cached entry → must refresh.
                             invalidate = true;
+                        } else if (dq == null || dq.isEmpty()) {
+                            // No live cache → must refill to observe the add
+                            // (also re-checks a previously-exhausted kg).
+                            invalidate = true;
                         } else {
-                            ArrayDeque<Entry> dq = multiKgPollCache.get(kg);
-                            if (dq == null || dq.isEmpty()) {
-                                // No live cache → must refill to observe the add
-                                // (also re-checks a previously-exhausted kg).
-                                invalidate = true;
-                            } else {
-                                // KEEP the cached prefix iff every add to this kg is
-                                // BEYOND the cached tail: such an add lands in the
-                                // engine tail and is read on the next refill (after
-                                // the cached prefix drains+deletes), so the prefix
-                                // stays valid and we avoid a per-poll re-open — the
-                                // q5 chained-window "fire near + register far" case.
-                                // Invalidate only if an add falls WITHIN the cached
-                                // window (it would otherwise be skipped).
-                                long tailTs = decodeTimestamp(dq.peekLast().composite);
-                                Long minAdd = minAddTsByKg.get(kg);
-                                invalidate = (minAdd != null && minAdd <= tailTs);
-                            }
+                            // KEEP the cached prefix iff every add to this kg is
+                            // BEYOND the cached tail: such an add lands in the
+                            // engine tail and is read on the next refill (after the
+                            // cached prefix drains), so the prefix stays valid.
+                            // Invalidate only if an add falls WITHIN the cached
+                            // window (it would otherwise be skipped).
+                            long tailTs = decodeTimestamp(dq.peekLast().composite);
+                            invalidate = (minAdd != null && minAdd <= tailTs);
                         }
-                        if (invalidate) {
+                        if (!invalidate) {
+                            continue;
+                        }
+                        // FRS-TIMER-PERF: instead of clearing the resume cursor
+                        // (→ the next refill restarts from the prefix start and
+                        // re-walks every fired tombstone — the watermark-drain
+                        // wall), record a one-shot refill FLOOR at
+                        // min(cacheHeadTs, minAddTs). Fired timers all have
+                        // ts < cacheHead, so the next refill SEEKS past them via
+                        // the index and re-reads only the still-live rows
+                        // (unconsumed cache + the new within-window/earlier add).
+                        long floorTs;
+                        if (headTs != Long.MAX_VALUE && minAdd != null) {
+                            floorTs = Math.min(headTs, minAdd);
+                        } else if (headTs != Long.MAX_VALUE) {
+                            floorTs = headTs;
+                        } else if (minAdd != null) {
+                            floorTs = minAdd;
+                        } else {
+                            // Remove on an empty cache, no add: nothing to re-read
+                            // here; the cursor-resumed refill's lazy scan filters
+                            // the deleted row. Keep the cursor, set no floor.
                             multiKgPollCache.remove(kg);
+                            continue;
                         }
+                        multiKgPollCache.remove(kg);
+                        multiKgRefillFloor.put(kg, buildSeekKey(kg, floorTs));
+                        // Keep the resume cursor: the one-shot floor overrides the
+                        // next refill, after which the cursor resumes normally.
                     }
                 } else {
                     // Partial/failed flush: fall back to full invalidation (safe).
@@ -1824,6 +2161,25 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * Issues a single vectorized batch delete for {@code count} keys via the linker. Stages keys
      * into the pre-allocated del staging segments.
      */
+    /**
+     * FRS-TIMER-DRAIN-BATCH: flush all staged fired-timer composites in ONE batched
+     * {@link ForStRsLinker#vectorizedBatchDelete} crossing. Idempotent / no-op when empty, so it is
+     * safe to call from every engine-read / snapshot / invalidate entry point. MUST run before any
+     * engine re-scan or snapshot so a deferred delete never resurrects a fired timer.
+     */
+    private void flushPollDeletes() {
+        int n = pendingPollDeletes.size();
+        if (n == 0) {
+            return;
+        }
+        vectorizedBatchDeleteKeys(pendingPollDeletes.toArray(new byte[0][]), n);
+        pendingPollDeletes.clear();
+        if (TIMER_DIAG) {
+            diagDeleteFlushCount++;
+            diagDeleteKeyCount += n;
+        }
+    }
+
     private void vectorizedBatchDeleteKeys(byte[][] keys, int count) {
         if (count <= 0) {
             return;
@@ -1937,6 +2293,9 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         if (cachedKg != kg) {
             pollCache.clear();
             cachedKg = kg;
+            // FRS-TIMER-PERF: switching key group invalidates the resume cursor
+            // (it belongs to the previously-cached kg).
+            singleKgResumeCursor = null;
         }
         if (pollCache.isEmpty()) {
             refillCache(kg);
@@ -1949,26 +2308,28 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * reading up to {@link #REFILL_BATCH} entries in one go.
      */
     private void refillCache(int kg) {
-        // E-H8: per-call confined arena to reclaim the iter handle.
-        try (Arena perCallArena = Arena.ofConfined();
-                FrsIterator iter =
-                        linker.prefixLookupOpen(db, cf, keyGroupPrefix(kg), perCallArena)) {
-            int read = 0;
-            while (read < REFILL_BATCH) {
-                ForStRsLinker.IteratorEntry e = linker.iteratorNext(iter);
-                if (e == null) {
-                    break;
-                }
-                pollCache.addLast(new Entry(e.key(), decodeElement(e.key())));
-                read++;
-            }
+        // FRS-TIMER-PERF: resume-cursor + lazy range scan (see refillMultiKgCache).
+        byte[] resume = singleKgResumeCursor;
+        byte[] kgPrefix = keyGroupPrefix(kg);
+        byte[] lo = (resume != null) ? successorKey(resume) : kgPrefix;
+        byte[] hi = prefixUpperBound(kgPrefix);
+        byte[] last = readRangeIntoCache(lo, hi, pollCache);
+        if (last != null) {
+            singleKgResumeCursor = last;
         }
     }
 
     /** Invalidates the poll-ahead cache. Cheap (just clears the deque). */
     private void invalidateCache() {
+        // FRS-TIMER-DRAIN-BATCH: flush staged fired-timer deletes before dropping the resume cursor
+        // (a subsequent from-start refill must not re-read them). No-op when nothing is staged.
+        flushPollDeletes();
         pollCache.clear();
         cachedKg = -1;
+        // FRS-TIMER-PERF: drop resume cursors + refill floors alongside their caches.
+        singleKgResumeCursor = null;
+        multiKgResumeCursor.clear();
+        multiKgRefillFloor.clear();
         // E-R28-H1: multi-kg pollCache is invalidated alongside the
         // single-kg one so any caller of invalidateCache() (e.g.
         // flushPendingToEngine, exception paths in poll()/peek())

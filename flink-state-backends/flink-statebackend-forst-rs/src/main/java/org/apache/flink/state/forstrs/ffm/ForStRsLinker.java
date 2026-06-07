@@ -1671,6 +1671,31 @@ public final class ForStRsLinker {
         return new FrsCfHandle(this, cfHandle);
     }
 
+    /**
+     * Returns the handle for the named column family, creating it if it does not yet exist.
+     *
+     * <p>This is the checkpoint-safe path for CFs that must survive a job restart. On a fresh DB the
+     * CF does not exist yet, so it is created ({@code frs_db_create_cf}). On a restore the engine's
+     * {@code open_from_checkpoint} has already re-registered every non-default CF from the manifest
+     * descriptors (preserving its {@code cf_id}, merge operator, and replayed memtable/SST state),
+     * so the CF is opened by name ({@code frs_db_open_cf}) instead — creating it again would fail
+     * with "column family '…' already exists". Idempotent within a single DB instance.
+     *
+     * <p>Distinguishing the two cases on the engine's {@link FrsStatus#NOT_FOUND} status (rather
+     * than racing a create) keeps the contract explicit; only a genuine "absent" is treated as
+     * fresh, any other failure propagates. Caller closes via {@link FrsCfHandle#close()}.
+     */
+    public FrsCfHandle dbOpenOrCreateCf(FrsDb db, Arena arena, String name) {
+        try {
+            return dbOpenCf(db, arena, name);
+        } catch (FrsBackendException e) {
+            if (e.status() == FrsStatus.NOT_FOUND) {
+                return dbCreateCf(db, arena, name);
+            }
+            throw e;
+        }
+    }
+
     // ------------------------------------------------------------------
     // 3. Point ops
     // ------------------------------------------------------------------
@@ -1787,6 +1812,7 @@ public final class ForStRsLinker {
      * thread other than the owning slot thread, and do NOT introduce concurrent flush paths.
      */
     public byte[] getPinned(FrsDb db, FrsCfHandle cf, byte[] key) {
+        if (OPCOUNT) oc(0);
         MemorySegment keySeg = MemorySegment.ofArray(key);
         byte[] outBuf = PINNED_OUT_BUF.get();
         MemorySegment outSeg = MemorySegment.ofArray(outBuf);
@@ -1845,6 +1871,7 @@ public final class ForStRsLinker {
             MemorySegment outSegment,
             long outOffset,
             int outMaxLen) {
+        if (OPCOUNT) oc(0);
         // ----- 1. frs_get_pinned: pass key slice directly, no byte[] copy.
         MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
         byte[] outBuf = PINNED_OUT_BUF.get();
@@ -1950,6 +1977,7 @@ public final class ForStRsLinker {
             MemorySegment valueSegment,
             long valueOffset,
             int valueLen) {
+        if (OPCOUNT) oc(1);
         // D-C5R1-NEW-H1: frs_put is plain-bound (not critical) per D-R4-NEW-H1
         // (write_controller.may_throttle can sleep — critical mode would suspend
         // safepoints). Plain downcall handles REJECT heap MemorySegments at
@@ -2033,6 +2061,7 @@ public final class ForStRsLinker {
             MemorySegment keySegment,
             long keyOffset,
             int keyLen) {
+        if (OPCOUNT) oc(1);
         // D-C5R1-NEW-H1 (sister): frs_delete is plain-bound; heap segments
         // must be staged to native. See putSegment for full rationale.
         if (!keySegment.isNative()) {
@@ -2093,6 +2122,7 @@ public final class ForStRsLinker {
             byte[] newValue,
             int newValueOffset,
             int newValueLength) {
+        if (OPCOUNT) oc(0); // RMW: one fused get+put FFM crossing
         if (newValueOffset < 0
                 || newValueLength < 0
                 || (long) newValueOffset + (long) newValueLength > newValue.length) {
@@ -2573,6 +2603,7 @@ public final class ForStRsLinker {
             MemorySegment valOffsetsSeg,
             MemorySegment valDataSeg,
             long count) {
+        if (OPCOUNT) oc(1);
         int rc;
         try {
             rc =
@@ -3004,6 +3035,7 @@ public final class ForStRsLinker {
      * TaskExecutor (the backend holds the db open until close).
      */
     public byte[] getFast(FrsDb db, FrsCfHandle cf, byte[] key) {
+        if (OPCOUNT) oc(0);
         try (Arena local = Arena.ofConfined()) {
             MemorySegment keySeg = copyBytesToNative(local, key);
             MemorySegment outBufSeg = local.allocate(GET_INTO_BUF_CAP);
@@ -3061,6 +3093,7 @@ public final class ForStRsLinker {
      * {@code frs_prefix_lookup_close} on {@link FrsIterator#close()}.
      */
     public FrsIterator prefixLookupOpen(FrsDb db, FrsCfHandle cf, byte[] prefix, Arena arena) {
+        if (OPCOUNT) oc(2);
         MemorySegment outIter = arena.allocate(ValueLayout.ADDRESS);
         try (Arena local = Arena.ofConfined()) {
             MemorySegment prefixSeg;
@@ -3105,6 +3138,7 @@ public final class ForStRsLinker {
      * Java heap and frees the native buffers via {@code frs_bytes_free}.
      */
     public IteratorEntry iteratorNext(FrsIterator iter) {
+        if (OPCOUNT) oc(3);
         // D-R3-H4: reuse the iterator's pre-allocated scratch segments
         // instead of opening a fresh Arena.ofConfined() per call. Pre-fix
         // a 1000-row scan paid 1000 arena lifecycles + 3000 native allocs;
@@ -3341,6 +3375,41 @@ public final class ForStRsLinker {
                             FrsStatus.PANIC, fn + "/free threw: " + t.getMessage()));
         }
         return copy;
+    }
+
+    // FRS-OPCOUNT (2026-06-07): universal op counter at the linker chokepoint (captures BOTH
+    // V1-sync and V2-async paths, since both funnel through ForStRsLinker). -Dforst.rs.opcount=1.
+    // Measures engine ops/record for the backend-layer gap investigation (q9/q19/q20). Kinds:
+    // 0=read 1=write/delete 2=iter-open 3=iter-next.
+    static final boolean OPCOUNT = "1".equals(System.getProperty("forst.rs.opcount"));
+    private static final java.util.concurrent.atomic.AtomicLong OC_READ =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_WRITE =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_ITEROPEN =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_ITERNEXT =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong OC_NEXT_DUMP =
+            new java.util.concurrent.atomic.AtomicLong(50_000L);
+    private static final long OC_DUMP_STEP = 2_000_000L;
+
+    static void oc(int kind) {
+        switch (kind) {
+            case 0 -> OC_READ.incrementAndGet();
+            case 1 -> OC_WRITE.incrementAndGet();
+            case 2 -> OC_ITEROPEN.incrementAndGet();
+            default -> OC_ITERNEXT.incrementAndGet();
+        }
+        long total = OC_READ.get() + OC_WRITE.get() + OC_ITEROPEN.get() + OC_ITERNEXT.get();
+        long threshold = OC_NEXT_DUMP.get();
+        if (total >= threshold && OC_NEXT_DUMP.compareAndSet(threshold, threshold + OC_DUMP_STEP)) {
+            System.err.println(
+                    "[FRS_OPCOUNT] reads=" + OC_READ.get()
+                            + " writes=" + OC_WRITE.get()
+                            + " iterOpens=" + OC_ITEROPEN.get()
+                            + " iterNexts=" + OC_ITERNEXT.get());
+        }
     }
 
     /** Rethrows the first failure with the rest attached as suppressed. */
@@ -3795,6 +3864,7 @@ public final class ForStRsLinker {
             MemorySegment outHandle,
             MemorySegment outRowCount,
             MemorySegment outBytesUsed) {
+        if (OPCOUNT) oc(2);
         try {
             return (int)
                     frsVecIterPrefixOpen.invokeExact(
@@ -3819,6 +3889,7 @@ public final class ForStRsLinker {
             int chunkBufCap,
             MemorySegment outRowCount,
             MemorySegment outBytesUsed) {
+        if (OPCOUNT) oc(3);
         try {
             return (int)
                     frsVecIterPrefixNext.invokeExact(

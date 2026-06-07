@@ -421,11 +421,28 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     }
 
     /**
-     * Returns true when {@code size} has reached the high-water mark (capacity / 2). Used as an
-     * opportunistic auto-flush trigger so the buffer stays half-empty during steady-state.
+     * FRS-Q15-FIX (2026-06-07): the value-data region is addressed by {@code int} offsets
+     * ({@link #valueOffsets} is int4 and {@link #appendValue} returns {@code (int) valueDataUsed}),
+     * but {@code valueDataUsed} is a {@code long} and grows append-only on every overwrite (old
+     * space is reclaimed only on flush). A state with FEW keys but MANY per-record overwrites —
+     * e.g. q15's {@code count(distinct)} accumulator: a handful of GROUP-BY-day keys updated across
+     * ~92M bids — appends value bytes without ever tripping the row-count gates below. Once
+     * {@code valueDataUsed} crosses {@code Integer.MAX_VALUE} the {@code (int)} offset cast wraps,
+     * corrupting {@link #valueOffsets}; the read path then frames a {@code MemorySegmentDataInputView}
+     * with a bogus offset/limit and fails with "underflow at position 2147483520" (~0x7FFFFF80),
+     * crash-looping the job. Bounding the data region at 1 GiB (well under the 2 GiB int limit)
+     * forces a flush that resets {@code valueDataUsed} to 0, keeping every offset representable.
+     */
+    static final long VALUE_DATA_FLUSH_BYTES = 1L << 30; // 1 GiB, safely &lt; Integer.MAX_VALUE
+
+    /**
+     * Returns true when {@code size} has reached the high-water mark (capacity / 2), OR the
+     * append-only value-data region has grown past {@link #VALUE_DATA_FLUSH_BYTES} (the int32
+     * offset-overflow guard — see field javadoc). Used as an opportunistic auto-flush trigger so
+     * the buffer stays half-empty during steady-state AND its value-data offsets stay int-safe.
      */
     public boolean shouldAutoFlush() {
-        return size >= flushHighWaterMark;
+        return size >= flushHighWaterMark || valueDataUsed >= VALUE_DATA_FLUSH_BYTES;
     }
 
     /**

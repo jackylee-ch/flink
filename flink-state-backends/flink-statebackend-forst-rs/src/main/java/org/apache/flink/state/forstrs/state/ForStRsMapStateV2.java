@@ -123,6 +123,62 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             "1".equals(System.getenv("FRS_DISABLE_MAPSTATE_CACHE"));
 
     /**
+     * FRS-ADAPTIVE-MAPSTATE-CACHE (2026-06-04): the per-record read cache is a
+     * pure read accelerator over the off-heap buffer + engine. It is a big win
+     * for HIGH-LOCALITY queries (q11/q12/q16 re-read the same keys) but a net
+     * LOSS for large LOW-LOCALITY working sets — the q4 interval join reads each
+     * {@code (joinKey, ts)} composite roughly once within its window, so once
+     * the 1M-entry cache FILLS, every lookup is a miss that still pays a
+     * {@code findRow} open-addressed probe + an eviction. A jstack during the
+     * q4 collapse showed {@code MapStateCache.findRow} as the #1 CPU frame, and
+     * an A/B run with the cache forced off held q4 at a STABLE ~120-170K/s where
+     * the cached path collapsed 600K→<10K/s.
+     *
+     * <p>Rather than a static global flag, auto-bypass the cache when (and only
+     * when) it is demonstrably THRASHING: the cache is FULL and the hit rate
+     * over the most recent window fell below {@link #CACHE_MIN_HIT_RATE}. A
+     * small-state / high-locality query never trips this (its cache either does
+     * not fill or keeps a high hit rate), so q11/q12/q16 keep the cache while q4
+     * sheds it. Bypassing is correctness-neutral (every write still goes to the
+     * off-heap buffer + engine). Sticky once tripped — a thrashing join does not
+     * regain locality, and re-probing to re-enable would reintroduce the cost we
+     * are removing.
+     */
+    private static final long CACHE_ADAPT_WINDOW = 1L << 16; // re-evaluate every 65536 lookups
+    private static final double CACHE_MIN_HIT_RATE = 0.20;
+
+    private boolean cacheBypassed = false;
+    private long cacheWindowLookups = 0L;
+    private long cacheWindowHits = 0L;
+
+    /** Whether the per-record read cache should be consulted on this op. */
+    private boolean useCache() {
+        return !DISABLE_MAPSTATE_CACHE && !cacheBypassed;
+    }
+
+    /**
+     * Records one cache-lookup outcome and, once per {@link #CACHE_ADAPT_WINDOW}
+     * lookups, trips {@link #cacheBypassed} if the cache is full AND the windowed
+     * hit rate is below threshold (genuine thrashing). On trip, clears the cache
+     * to release its off-heap arena immediately.
+     */
+    private void recordCacheLookup(boolean hit) {
+        cacheWindowLookups++;
+        if (hit) {
+            cacheWindowHits++;
+        }
+        if (cacheWindowLookups >= CACHE_ADAPT_WINDOW) {
+            if (cache.isFull()
+                    && (double) cacheWindowHits / (double) cacheWindowLookups < CACHE_MIN_HIT_RATE) {
+                cacheBypassed = true;
+                cache.clear();
+            }
+            cacheWindowLookups = 0L;
+            cacheWindowHits = 0L;
+        }
+    }
+
+    /**
      * PR-C1 (V2-8 / Z3-6 / C-H5): per-state off-heap staging buffer mirroring the V1-sync
      * {@code statebuf} path. Non-null only when the backend constructed this state with the
      * off-heap-aware constructor (i.e. when {@code linker/db/cf} are available — which is always
@@ -292,9 +348,12 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // V2-violation V2: zero-alloc composite key. Bytes live at keyOut.getSharedBuffer()[0..len).
         int keyLen = serializeMapEntryKeyShared(userKey);
         byte[] keyBuf = keyOut.getSharedBuffer();
-        if (!DISABLE_MAPSTATE_CACHE) {
+        if (useCache()) {
             MapStateCache.Lookup<UV> hit = cache.lookup(keyBuf, 0, keyLen);
-            if (hit != null && hit.cached()) {
+            boolean isHit = hit != null && hit.cached();
+            // FRS-ADAPTIVE-MAPSTATE-CACHE: account this lookup; may trip bypass.
+            recordCacheLookup(isHit);
+            if (isHit) {
                 // Cache hit (or known-missing tombstone) — return completed future immediately.
                 return StateFutureUtils.completedFuture(hit.value());
             }
@@ -305,7 +364,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);
             if (bufHit.cached) {
                 UV resolved = bufHit.tombstone ? null : deserializeFromBuffer(bufHit.row);
-                cache.put(keyBuf, 0, keyLen, resolved);
+                if (useCache()) {
+                    cache.put(keyBuf, 0, keyLen, resolved);
+                }
                 return StateFutureUtils.completedFuture(resolved);
             }
         }
@@ -323,7 +384,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         return super.asyncGet(userKey)
                 .thenApply(
                         value -> {
-                            if (!DISABLE_MAPSTATE_CACHE) {
+                            if (useCache()) {
                                 cache.putIfAbsent(keySnapshot, value);
                             }
                             return value;
@@ -335,7 +396,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // V2-violation V2: zero-alloc composite key. Bytes at keyOut.getSharedBuffer()[0..keyLen).
         int keyLen = serializeMapEntryKeyShared(userKey);
         byte[] keyBuf = keyOut.getSharedBuffer();
-        if (!DISABLE_MAPSTATE_CACHE) {
+        if (useCache()) {
             cache.put(keyBuf, 0, keyLen, value);
         }
         // PR-C1: stage the PUT off-heap. Bypasses the V2 columnar dispatch until the buffer's
@@ -377,7 +438,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // V2-violation V2: zero-alloc composite key.
         int keyLen = serializeMapEntryKeyShared(userKey);
         byte[] keyBuf = keyOut.getSharedBuffer();
-        cache.remove(keyBuf, 0, keyLen);
+        if (useCache()) {
+            cache.remove(keyBuf, 0, keyLen);
+        }
         if (offHeapBuf != null) {
             // Stage a buffer tombstone + drop any prior buffered PUT for this key. The engine
             // delete fires when the buffer is drained.
@@ -392,9 +455,13 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         // V2-violation V2: zero-alloc composite key.
         int keyLen = serializeMapEntryKeyShared(userKey);
         byte[] keyBuf = keyOut.getSharedBuffer();
-        MapStateCache.Lookup<UV> hit = cache.lookup(keyBuf, 0, keyLen);
-        if (hit != null && hit.cached()) {
-            return StateFutureUtils.completedFuture(hit.value() != null);
+        if (useCache()) {
+            MapStateCache.Lookup<UV> hit = cache.lookup(keyBuf, 0, keyLen);
+            boolean isHit = hit != null && hit.cached();
+            recordCacheLookup(isHit);
+            if (isHit) {
+                return StateFutureUtils.completedFuture(hit.value() != null);
+            }
         }
         if (offHeapBuf != null) {
             MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);

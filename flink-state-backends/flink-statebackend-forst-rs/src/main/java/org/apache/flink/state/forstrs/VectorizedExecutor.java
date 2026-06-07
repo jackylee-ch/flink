@@ -66,6 +66,56 @@ import java.util.concurrent.atomic.AtomicLong;
 @Internal
 public class VectorizedExecutor implements StateExecutor {
 
+    // FRS-OPCOUNT-DISPATCH (2026-06-07): is q19/q9's batch collapsing to per-row sync
+    // (executeBatchInOfferOrder) due to requiresOrderedDispatch? That path is the documented
+    // 100×-1000× amplification. -Dforst.rs.opcount=1 enables; prints ordered vs vectorized
+    // batch+row counts so we can see the ordered/vectorized ratio per query.
+    private static final boolean OC_DISPATCH = "1".equals(System.getProperty("forst.rs.opcount"));
+    private static final AtomicLong OC_ORDERED_BATCHES = new AtomicLong();
+    private static final AtomicLong OC_ORDERED_ROWS = new AtomicLong();
+    private static final AtomicLong OC_VEC_BATCHES = new AtomicLong();
+    private static final AtomicLong OC_VEC_ROWS = new AtomicLong();
+    private static final AtomicLong OC_DISPATCH_NEXT_DUMP = new AtomicLong(100_000L);
+    // FRS-OPCOUNT-ITERPREFIX: per-iteration cost breakdown for q9/q19 (the queries that lose to
+    // BOTH C++ engines). opens = #prefix opens; openNs = time in frsVecIterPrefixOpenBatch (FFI +
+    // engine build); totalNs = whole dispatchIterPrefix (open + per-row handle/register/future).
+    // Pinpoints the architectural target: if openNs dominates → engine/FFI; if (total-open)
+    // dominates → the Java handle/future machinery.
+    private static final AtomicLong OC_IP_OPENS = new AtomicLong();
+    private static final AtomicLong OC_IP_OPEN_NS = new AtomicLong();
+    private static final AtomicLong OC_IP_TOTAL_NS = new AtomicLong();
+    private static final AtomicLong OC_IP_NEXT_DUMP = new AtomicLong(1_000_000L);
+
+    private static void ocIterPrefixMaybeDump() {
+        long opens = OC_IP_OPENS.get();
+        long threshold = OC_IP_NEXT_DUMP.get();
+        if (opens >= threshold
+                && OC_IP_NEXT_DUMP.compareAndSet(threshold, threshold + 2_000_000L)) {
+            long o = OC_IP_OPENS.get();
+            long openMs = OC_IP_OPEN_NS.get() / 1_000_000L;
+            long totMs = OC_IP_TOTAL_NS.get() / 1_000_000L;
+            System.err.println(
+                    "[FRS_OPCOUNT_ITERPREFIX] opens=" + o
+                            + " openMs=" + openMs
+                            + " totalMs=" + totMs
+                            + " openNsPerOpen=" + (o > 0 ? OC_IP_OPEN_NS.get() / o : 0)
+                            + " totalNsPerOpen=" + (o > 0 ? OC_IP_TOTAL_NS.get() / o : 0));
+        }
+    }
+
+    private static void ocDispatchMaybeDump() {
+        long total = OC_ORDERED_ROWS.get() + OC_VEC_ROWS.get();
+        long threshold = OC_DISPATCH_NEXT_DUMP.get();
+        if (total >= threshold
+                && OC_DISPATCH_NEXT_DUMP.compareAndSet(threshold, threshold + 2_000_000L)) {
+            System.err.println(
+                    "[FRS_OPCOUNT_DISPATCH] orderedBatches=" + OC_ORDERED_BATCHES.get()
+                            + " orderedRows=" + OC_ORDERED_ROWS.get()
+                            + " vecBatches=" + OC_VEC_BATCHES.get()
+                            + " vecRows=" + OC_VEC_ROWS.get());
+        }
+    }
+
     /** Initial output buffer capacity for GET values. Grows on BUFFER_TOO_SMALL. */
     private static final int INITIAL_OUT_DATA_CAP = 64 * 1024;
 
@@ -382,7 +432,18 @@ public class VectorizedExecutor implements StateExecutor {
                 return CompletableFuture.failedFuture(poison);
             }
             if (requiresOrderedDispatch(classifier)) {
+                if (OC_DISPATCH) {
+                    OC_ORDERED_BATCHES.incrementAndGet();
+                    OC_ORDERED_ROWS.addAndGet(classifier.orderedCount());
+                    ocDispatchMaybeDump();
+                }
                 return executeBatchInOfferOrder(classifier);
+            }
+            if (OC_DISPATCH) {
+                OC_VEC_BATCHES.incrementAndGet();
+                OC_VEC_ROWS.addAndGet(
+                        classifier.getCount() + classifier.putCount() + classifier.deleteCount());
+                ocDispatchMaybeDump();
             }
             // Spec §Correctness Invariant 2: any deferred / cached writes must be
             // flushed BEFORE iterator ops. Within a single batch the natural
@@ -2042,6 +2103,7 @@ public class VectorizedExecutor implements StateExecutor {
         }
 
         // Single FFI crossing for N opens.  Critical mode: see linker bind comment.
+        long _openT0 = OC_DISPATCH ? System.nanoTime() : 0L;
         int rcBatch =
                 linker.frsVecIterPrefixOpenBatch(
                         db.handle(),
@@ -2052,6 +2114,10 @@ public class VectorizedExecutor implements StateExecutor {
                         outHandles,
                         outChunks,
                         chunkCap);
+        if (OC_DISPATCH) {
+            OC_IP_OPEN_NS.addAndGet(System.nanoTime() - _openT0);
+            OC_IP_OPENS.addAndGet(n);
+        }
 
         FrsErrorCode batchCode = FrsErrorCode.fromU32(rcBatch);
         // Even on batch-level non-Ok, per-row handles may be populated for the rows that
@@ -2129,6 +2195,10 @@ public class VectorizedExecutor implements StateExecutor {
                     rowsTotal,
                     bytesIn,
                     System.nanoTime() - t0);
+        }
+        if (OC_DISPATCH) {
+            OC_IP_TOTAL_NS.addAndGet(System.nanoTime() - t0);
+            ocIterPrefixMaybeDump();
         }
     }
 

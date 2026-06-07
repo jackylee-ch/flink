@@ -116,6 +116,44 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsCfHandle defaultCf;
+
+    /**
+     * FRS-TIMER-CF (2026-06-07): dedicated column family for engine-backed timers. DEFAULT OFF
+     * (enable with {@code -Dforst.rs.timer.cf=1}).
+     *
+     * <p>Timers (the {@link ForStRsKeyGroupedInternalPriorityQueue} backing store) can live in their
+     * own CF, named {@link #TIMER_CF_NAME}, instead of sharing {@code defaultCf} with window/join
+     * state. The hypothesis was that this removes q11/q12 timer read-amplification by avoiding
+     * interleaving with state SSTs.
+     *
+     * <p><b>REFUTED as a perf lever (2026-06-07).</b> An initial single A/B pair measured q11
+     * 529s→411s, but that was variance: a faithful default-on reproduction measured 518s and 457s
+     * (61s spread), and TIMER_DIAG showed the dedicated CF leaves the timer-scan access pattern
+     * unchanged — refills 5357 vs 5291, entriesPerRefill 989 vs 993 vs the shared-CF baseline. The
+     * q11/q12 cost is diffuse LSM range-scan read-amplification over the GROWING timer state (the
+     * same q4/q9-class engine gap, see {@link ForStRsKeyGroupedInternalPriorityQueue#readRangeIntoCache}),
+     * NOT timer/state interleaving or delete tombstones — so a separate CF removes nothing. The
+     * capability is retained behind the flag (it is correct and fully checkpoint-safe) for future
+     * timer-CF experiments such as targeted compaction; it is not on the production path.
+     *
+     * <p>The feature is checkpoint/restore-safe when enabled. The engine captures every non-default
+     * CF in a checkpoint
+     * — its SSTs (version is global, tagged by {@code cf_id}), its descriptor (carried in the
+     * manifest blob), and, under no-flush checkpoints, its live memtable as a per-CF Arrow-IPC
+     * artifact ({@code memtable-cf<id>.arrow}). On restore, {@code open_from_checkpoint}
+     * re-registers the CF preserving its {@code cf_id} and replays its memtable artifact, so the
+     * timer CF already exists when the timer queue is (re)created. We therefore resolve it via
+     * {@link ForStRsLinker#dbOpenOrCreateCf} — create on a fresh DB, open by name on restore.
+     *
+     * <p>Resolved lazily on the first {@link #create} call and cached so multiple timer services
+     * (e.g. event-time + processing-time) within one backend share the single CF handle. Closed in
+     * {@link #releaseNativeResources()}. Set {@code -Dforst.rs.timer.cf=0} to disable and fall back
+     * to the legacy shared {@code defaultCf} (e.g. to restore a pre-timer-CF snapshot whose timer
+     * rows live in the default CF).
+     */
+    private static final String TIMER_CF_NAME = "frs_timers";
+
+    private FrsCfHandle timerCf;
     private final TypeSerializer<K> keySerializer;
     private final KeyGroupRange keyGroupRange;
     private final int totalKeyGroups;
@@ -1696,11 +1734,27 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // it via {@link KeyGroupRangeAssignment#assignToKeyGroup}; if no current key is set (e.g.
         // before any record has arrived) it falls back to {@code keyGroupRange.getStartKeyGroup()}
         // — same as the legacy constant behaviour.
+        // FRS-TIMER-CF: optionally route engine timers to a dedicated, checkpoint-safe CF (see
+        // timerCf field). DEFAULT OFF — CF isolation was REFUTED as a perf lever (2026-06-07): with
+        // the dedicated CF on, TIMER_DIAG showed identical refills (5357 vs 5291) and entriesPerRefill
+        // (989 vs 993) to the shared-CF baseline, i.e. the timer-scan access pattern is unchanged. The
+        // q11/q12 cost is diffuse LSM range-scan read-amp over the GROWING timer state (the same
+        // q4/q9-class engine gap), not timer/state interleaving — so a separate CF removes nothing.
+        // The capability is kept behind -Dforst.rs.timer.cf=1 (fully checkpoint-safe, see field
+        // javadoc + the engine round-trip test) for future timer-CF experiments. Production uses the
+        // legacy shared defaultCf, matching the verified all-pass baseline.
+        FrsCfHandle queueCf = defaultCf;
+        if ("1".equals(System.getProperty("forst.rs.timer.cf", "0"))) {
+            if (timerCf == null) {
+                timerCf = linker.dbOpenOrCreateCf(db, arena, TIMER_CF_NAME);
+            }
+            queueCf = timerCf;
+        }
         ForStRsKeyGroupedInternalPriorityQueue<T> queue =
                 new ForStRsKeyGroupedInternalPriorityQueue<>(
                         linker,
                         db,
-                        defaultCf,
+                        queueCf,
                         arena,
                         n,
                         s,
@@ -1915,6 +1969,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         }
         try {
             defaultCf.close();
+        } catch (Exception ignored) {
+        }
+        // FRS-TIMER-CF: release the dedicated timer CF handle if one was opened/created. Guarded on
+        // null because a backend that never created a timer service (or ran with
+        // -Dforst.rs.timer.cf=0) leaves it unset. Closing the handle frees the FFM Box only; the CF
+        // itself stays in the DB and is captured by checkpoints like any other CF.
+        try {
+            if (timerCf != null) {
+                timerCf.close();
+            }
         } catch (Exception ignored) {
         }
         try {
