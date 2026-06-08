@@ -413,6 +413,10 @@ public class ForStFlinkFileSystem extends FileSystem implements Closeable {
         return fileMappingManager.mappingEntry(path.toString());
     }
 
+    public synchronized Path getLocalPath(Path path) {
+        return fileMappingManager.localPathFor(path);
+    }
+
     public synchronized void giveUpOwnership(Path path, StreamStateHandle stateHandle) {
         fileMappingManager.giveUpOwnership(path, stateHandle);
     }

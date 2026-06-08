@@ -55,7 +55,6 @@ public class FileMappingManager {
 
     private final String remoteBase;
     private final String localBase;
-
     public FileMappingManager(FileSystem fileSystem, String remoteBase, String localBase) {
         this.fileSystem = fileSystem;
         this.mappingTable = new HashMap<>();
@@ -309,6 +308,27 @@ public class FileMappingManager {
     @VisibleForTesting
     public @Nullable MappingEntry mappingEntry(String path) {
         return mappingTable.getOrDefault(path, null);
+    }
+
+    public Path localPathFor(Path filePath) {
+        String path = filePath.toString();
+        if (path.startsWith(localBase)) {
+            return filePath;
+        }
+
+        String relativePath;
+        if (path.startsWith(remoteBase)) {
+            relativePath = path.substring(remoteBase.length());
+            while (relativePath.startsWith("/")) {
+                relativePath = relativePath.substring(1);
+            }
+        } else {
+            relativePath = filePath.getName();
+        }
+
+        Path localPath =
+                relativePath.isEmpty() ? new Path(localBase) : new Path(localBase, relativePath);
+        return localPath;
     }
 
     public void giveUpOwnership(Path path, StreamStateHandle stateHandle) {

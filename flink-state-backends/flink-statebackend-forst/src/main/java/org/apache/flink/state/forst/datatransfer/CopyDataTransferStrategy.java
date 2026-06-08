@@ -50,7 +50,6 @@ import java.util.List;
 public class CopyDataTransferStrategy extends DataTransferStrategy {
 
     private static final int READ_BUFFER_SIZE = 64 * 1024;
-
     CopyDataTransferStrategy() {
         super(new LocalFileSystem());
     }
@@ -89,6 +88,7 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
             throws IOException {
         LOG.trace("Copy file from checkpoint: {}, {}, {}", sourceHandle, targetPath, dbFileSystem);
         copyFileFromCheckpoint(sourceHandle, targetPath, closeableRegistry);
+        materializeLocalFileFromCheckpointIfNeeded(sourceHandle, targetPath, closeableRegistry);
     }
 
     @Override
@@ -107,18 +107,22 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
 
         // Get State handle for the DB file
         StreamStateHandle sourceStateHandle;
+        FileSystem sourceFileSystem;
         if (dbFileSystem instanceof ForStFlinkFileSystem) {
-            // Obtain the state handle stored in MappingEntry
-            // or Construct a FileStateHandle base on the source file
+            // The forst-rs JNI compatibility path may write files directly to the local
+            // DB directory, so fall back to a concrete file handle if no mapping exists.
             MappingEntry mappingEntry =
                     ((ForStFlinkFileSystem) dbFileSystem).getMappingEntry(dbFilePath);
-            Preconditions.checkNotNull(mappingEntry, "dbFile not found: " + dbFilePath);
-            sourceStateHandle = mappingEntry.getSource().toStateHandle();
+            if (mappingEntry != null) {
+                sourceFileSystem = dbFileSystem;
+                sourceStateHandle = mappingEntry.getSource().toStateHandle();
+            } else {
+                sourceFileSystem = dbFilePath.getFileSystem();
+                sourceStateHandle = createFileStateHandle(dbFilePath, sourceFileSystem);
+            }
         } else {
-            // Construct a FileStateHandle base on the DB file
-            FileSystem sourceFileSystem = dbFilePath.getFileSystem();
-            long fileLength = sourceFileSystem.getFileStatus(dbFilePath).getLen();
-            sourceStateHandle = new FileStateHandle(dbFilePath, fileLength);
+            sourceFileSystem = dbFilePath.getFileSystem();
+            sourceStateHandle = createFileStateHandle(dbFilePath, sourceFileSystem);
         }
 
         // Try path-copying first. If failed, fallback to bytes-copying
@@ -134,6 +138,7 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
         } else {
             targetStateHandle =
                     bytesCopyingToCheckpoint(
+                            sourceFileSystem,
                             dbFilePath,
                             maxTransferBytes,
                             checkpointStreamFactory,
@@ -144,6 +149,66 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
         }
 
         return HandleAndLocalPath.of(targetStateHandle, dbFilePath.getName());
+    }
+
+    private StreamStateHandle createFileStateHandle(Path dbFilePath, FileSystem sourceFileSystem)
+            throws IOException {
+        long fileLength =
+                Preconditions.checkNotNull(
+                                sourceFileSystem.getFileStatus(dbFilePath),
+                                "dbFile not found: " + dbFilePath)
+                        .getLen();
+        return new FileStateHandle(dbFilePath, fileLength);
+    }
+
+    protected void materializeLocalFileFromCheckpointIfNeeded(
+            StreamStateHandle sourceHandle, Path targetPath, CloseableRegistry closeableRegistry)
+            throws IOException {
+        materializeFileFromCheckpointIfNeeded(
+                sourceHandle, targetPath, targetPath.getFileSystem(), closeableRegistry);
+
+        if (dbFileSystem instanceof ForStFlinkFileSystem) {
+            Path localTargetPath = ((ForStFlinkFileSystem) dbFileSystem).getLocalPath(targetPath);
+            if (!localTargetPath.equals(targetPath)) {
+                materializeFileFromCheckpointIfNeeded(
+                        sourceHandle,
+                        localTargetPath,
+                        localTargetPath.getFileSystem(),
+                        closeableRegistry);
+            }
+        }
+    }
+
+    private void materializeFileFromCheckpointIfNeeded(
+            StreamStateHandle sourceHandle,
+            Path targetPath,
+            FileSystem targetFileSystem,
+            CloseableRegistry closeableRegistry)
+            throws IOException {
+        if (!"file".equals(targetFileSystem.getUri().getScheme())
+                || targetFileSystem.exists(targetPath)) {
+            return;
+        }
+        try {
+            copyFileFromCheckpoint(
+                    sourceHandle, targetPath, targetFileSystem, closeableRegistry);
+        } catch (IOException ex) {
+            if (isFileAlreadyExists(ex) && targetFileSystem.exists(targetPath)) {
+                return;
+            }
+            throw ex;
+        }
+    }
+
+    private static boolean isFileAlreadyExists(Throwable ex) {
+        Throwable cause = ex;
+        while (cause != null) {
+            if (cause instanceof java.nio.file.FileAlreadyExistsException) {
+                return true;
+            }
+            cause = cause.getCause();
+        }
+        return false;
     }
 
     /**
@@ -191,6 +256,7 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
 
     /** Write file to checkpoint storage through {@link CheckpointStateOutputStream}. */
     private @Nullable StreamStateHandle bytesCopyingToCheckpoint(
+            FileSystem sourceFileSystem,
             Path filePath,
             long maxTransferBytes,
             CheckpointStreamFactory checkpointStreamFactory,
@@ -205,7 +271,7 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
         try {
             final byte[] buffer = new byte[READ_BUFFER_SIZE];
 
-            inputStream = dbFileSystem.open(filePath, READ_BUFFER_SIZE);
+            inputStream = sourceFileSystem.open(filePath, READ_BUFFER_SIZE);
             closeableRegistry.registerCloseable(inputStream);
 
             outputStream = checkpointStreamFactory.createCheckpointStateOutputStream(stateScope);
@@ -247,8 +313,17 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
         }
     }
 
-    private void copyFileFromCheckpoint(
+    protected void copyFileFromCheckpoint(
             StreamStateHandle sourceHandle, Path targetPath, CloseableRegistry closeableRegistry)
+            throws IOException {
+        copyFileFromCheckpoint(sourceHandle, targetPath, dbFileSystem, closeableRegistry);
+    }
+
+    protected void copyFileFromCheckpoint(
+            StreamStateHandle sourceHandle,
+            Path targetPath,
+            FileSystem targetFileSystem,
+            CloseableRegistry closeableRegistry)
             throws IOException {
 
         if (closeableRegistry.isClosed()) {
@@ -257,12 +332,17 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
             return;
         }
 
+        FSDataInputStream input = null;
+        FSDataOutputStream output = null;
         try {
-            FSDataInputStream input = sourceHandle.openInputStream();
+            input = sourceHandle.openInputStream();
             closeableRegistry.registerCloseable(input);
 
-            FSDataOutputStream output =
-                    dbFileSystem.create(targetPath, FileSystem.WriteMode.NO_OVERWRITE);
+            Path parent = targetPath.getParent();
+            if (parent != null) {
+                targetFileSystem.mkdirs(parent);
+            }
+            output = targetFileSystem.create(targetPath, FileSystem.WriteMode.NO_OVERWRITE);
             closeableRegistry.registerCloseable(output);
 
             byte[] buffer = new byte[READ_BUFFER_SIZE];
@@ -275,6 +355,11 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
             }
             closeableRegistry.unregisterAndCloseAll(output, input);
         } catch (Exception ex) {
+            if (isFileAlreadyExists(ex) && targetFileSystem.exists(targetPath)) {
+                closeableRegistry.unregisterAndCloseAll(output, input);
+                return;
+            }
+
             // Quickly close all open streams. This also stops all concurrent transfers because they
             // are registered with the same registry.
             LOG.info("closing: {}, {}, {}", sourceHandle, targetPath, ex);

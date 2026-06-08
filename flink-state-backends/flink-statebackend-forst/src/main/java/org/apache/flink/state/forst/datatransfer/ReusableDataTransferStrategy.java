@@ -129,6 +129,7 @@ public class ReusableDataTransferStrategy extends CopyDataTransferStrategy {
             return;
         }
         reuseFileFromCheckpoint(sourceHandle, targetPath);
+        materializeLocalFileFromCheckpointIfNeeded(sourceHandle, targetPath, closeableRegistry);
     }
 
     private void reuseFileFromCheckpoint(StreamStateHandle sourceHandle, Path targetPath)
