@@ -50,8 +50,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *   <li>{@code System.loadLibrary("forst_rs_ffi")} fallback
  * </ol>
  *
- * <p>Lifetime: the {@link Arena} given to the constructor owns the library handle's symbol lookup;
- * closing the Arena unloads the lib (and invalidates all returned MemorySegments).
+ * <p>Lifetime: native libraries are loaded through a JVM-global lookup cache. The {@link Arena}
+ * passed to the constructor still owns call-local/native object memory, but closing it must not
+ * unload the process-wide ForSt-RS cdylib while Rust background threads or TLS destructors may
+ * still run.
  *
  * <p>Reference: docs/design/2.5_ffm_bridge_design.md §3 and
  * docs/design/2.13_deltajoin_localization.md.
@@ -190,6 +192,9 @@ public final class ForStRsLinker {
     // used to read the FrsBytes out struct when it lives in a heap byte[24]
     // segment (which only guarantees 1-byte alignment). Strict-alignment reads
     // through ValueLayout.ADDRESS would throw on a heap-byte-array view.
+
+    private static final ConcurrentHashMap<String, SymbolLookup> LIBRARY_LOOKUPS =
+            new ConcurrentHashMap<>();
 
     private final Linker linker;
     private final SymbolLookup lookup;
@@ -378,17 +383,30 @@ public final class ForStRsLinker {
     private final MethodHandle frsVecIterRangeClose;
     private final MethodHandle frsVecIterRangeAbort;
 
+    private static SymbolLookup explicitLibraryLookup(String explicit) {
+        String absolutePath = Path.of(explicit).toAbsolutePath().toString();
+        return LIBRARY_LOOKUPS.computeIfAbsent(
+                absolutePath,
+                path -> SymbolLookup.libraryLookup(Path.of(path), Arena.global()));
+    }
+
+    private static SymbolLookup defaultLibraryLookup() {
+        return LIBRARY_LOOKUPS.computeIfAbsent(
+                "loader:forst_rs_ffi",
+                ignored -> {
+                    System.loadLibrary("forst_rs_ffi");
+                    return SymbolLookup.loaderLookup();
+                });
+    }
+
     public ForStRsLinker(Arena arena) {
         this.linker = Linker.nativeLinker();
 
         String explicit = System.getProperty("forstrs.native.libpath");
-        if (explicit != null && !explicit.isBlank()) {
-            this.lookup = SymbolLookup.libraryLookup(Path.of(explicit), arena);
-        } else {
-            // Falls back to OS lib loader path; libname forst_rs_ffi.
-            System.loadLibrary("forst_rs_ffi");
-            this.lookup = SymbolLookup.loaderLookup();
-        }
+        this.lookup =
+                explicit != null && !explicit.isBlank()
+                        ? explicitLibraryLookup(explicit)
+                        : defaultLibraryLookup();
 
         // 0. ABI version negotiation
         this.frsAbiVersion = bind("frs_abi_version", FunctionDescriptor.of(ValueLayout.JAVA_INT));
@@ -1812,7 +1830,11 @@ public final class ForStRsLinker {
      * thread other than the owning slot thread, and do NOT introduce concurrent flush paths.
      */
     public byte[] getPinned(FrsDb db, FrsCfHandle cf, byte[] key) {
-        if (OPCOUNT) oc(0);
+        if (OPCOUNT) {
+
+            oc(0);
+
+        }
         MemorySegment keySeg = MemorySegment.ofArray(key);
         byte[] outBuf = PINNED_OUT_BUF.get();
         MemorySegment outSeg = MemorySegment.ofArray(outBuf);
@@ -1871,7 +1893,11 @@ public final class ForStRsLinker {
             MemorySegment outSegment,
             long outOffset,
             int outMaxLen) {
-        if (OPCOUNT) oc(0);
+        if (OPCOUNT) {
+
+            oc(0);
+
+        }
         // ----- 1. frs_get_pinned: pass key slice directly, no byte[] copy.
         MemorySegment keySlice = keySegment.asSlice(keyOffset, keyLen);
         byte[] outBuf = PINNED_OUT_BUF.get();
@@ -1977,7 +2003,11 @@ public final class ForStRsLinker {
             MemorySegment valueSegment,
             long valueOffset,
             int valueLen) {
-        if (OPCOUNT) oc(1);
+        if (OPCOUNT) {
+
+            oc(1);
+
+        }
         // D-C5R1-NEW-H1: frs_put is plain-bound (not critical) per D-R4-NEW-H1
         // (write_controller.may_throttle can sleep — critical mode would suspend
         // safepoints). Plain downcall handles REJECT heap MemorySegments at
@@ -2061,7 +2091,11 @@ public final class ForStRsLinker {
             MemorySegment keySegment,
             long keyOffset,
             int keyLen) {
-        if (OPCOUNT) oc(1);
+        if (OPCOUNT) {
+
+            oc(1);
+
+        }
         // D-C5R1-NEW-H1 (sister): frs_delete is plain-bound; heap segments
         // must be staged to native. See putSegment for full rationale.
         if (!keySegment.isNative()) {
@@ -2122,7 +2156,11 @@ public final class ForStRsLinker {
             byte[] newValue,
             int newValueOffset,
             int newValueLength) {
-        if (OPCOUNT) oc(0); // RMW: one fused get+put FFM crossing
+        if (OPCOUNT) {
+
+            oc(0);
+
+        } // RMW: one fused get+put FFM crossing
         if (newValueOffset < 0
                 || newValueLength < 0
                 || (long) newValueOffset + (long) newValueLength > newValue.length) {
@@ -2603,7 +2641,11 @@ public final class ForStRsLinker {
             MemorySegment valOffsetsSeg,
             MemorySegment valDataSeg,
             long count) {
-        if (OPCOUNT) oc(1);
+        if (OPCOUNT) {
+
+            oc(1);
+
+        }
         int rc;
         try {
             rc =
@@ -3035,7 +3077,11 @@ public final class ForStRsLinker {
      * TaskExecutor (the backend holds the db open until close).
      */
     public byte[] getFast(FrsDb db, FrsCfHandle cf, byte[] key) {
-        if (OPCOUNT) oc(0);
+        if (OPCOUNT) {
+
+            oc(0);
+
+        }
         try (Arena local = Arena.ofConfined()) {
             MemorySegment keySeg = copyBytesToNative(local, key);
             MemorySegment outBufSeg = local.allocate(GET_INTO_BUF_CAP);
@@ -3093,7 +3139,11 @@ public final class ForStRsLinker {
      * {@code frs_prefix_lookup_close} on {@link FrsIterator#close()}.
      */
     public FrsIterator prefixLookupOpen(FrsDb db, FrsCfHandle cf, byte[] prefix, Arena arena) {
-        if (OPCOUNT) oc(2);
+        if (OPCOUNT) {
+
+            oc(2);
+
+        }
         MemorySegment outIter = arena.allocate(ValueLayout.ADDRESS);
         try (Arena local = Arena.ofConfined()) {
             MemorySegment prefixSeg;
@@ -3138,7 +3188,11 @@ public final class ForStRsLinker {
      * Java heap and frees the native buffers via {@code frs_bytes_free}.
      */
     public IteratorEntry iteratorNext(FrsIterator iter) {
-        if (OPCOUNT) oc(3);
+        if (OPCOUNT) {
+
+            oc(3);
+
+        }
         // D-R3-H4: reuse the iterator's pre-allocated scratch segments
         // instead of opening a fresh Arena.ofConfined() per call. Pre-fix
         // a 1000-row scan paid 1000 arena lifecycles + 3000 native allocs;
@@ -3864,7 +3918,11 @@ public final class ForStRsLinker {
             MemorySegment outHandle,
             MemorySegment outRowCount,
             MemorySegment outBytesUsed) {
-        if (OPCOUNT) oc(2);
+        if (OPCOUNT) {
+
+            oc(2);
+
+        }
         try {
             return (int)
                     frsVecIterPrefixOpen.invokeExact(
@@ -3889,7 +3947,11 @@ public final class ForStRsLinker {
             int chunkBufCap,
             MemorySegment outRowCount,
             MemorySegment outBytesUsed) {
-        if (OPCOUNT) oc(3);
+        if (OPCOUNT) {
+
+            oc(3);
+
+        }
         try {
             return (int)
                     frsVecIterPrefixNext.invokeExact(

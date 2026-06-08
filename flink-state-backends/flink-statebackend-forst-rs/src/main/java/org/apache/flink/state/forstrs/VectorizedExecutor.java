@@ -2103,7 +2103,7 @@ public class VectorizedExecutor implements StateExecutor {
         }
 
         // Single FFI crossing for N opens.  Critical mode: see linker bind comment.
-        long _openT0 = OC_DISPATCH ? System.nanoTime() : 0L;
+        long openT0 = OC_DISPATCH ? System.nanoTime() : 0L;
         int rcBatch =
                 linker.frsVecIterPrefixOpenBatch(
                         db.handle(),
@@ -2115,7 +2115,7 @@ public class VectorizedExecutor implements StateExecutor {
                         outChunks,
                         chunkCap);
         if (OC_DISPATCH) {
-            OC_IP_OPEN_NS.addAndGet(System.nanoTime() - _openT0);
+            OC_IP_OPEN_NS.addAndGet(System.nanoTime() - openT0);
             OC_IP_OPENS.addAndGet(n);
         }
 

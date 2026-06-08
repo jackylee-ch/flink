@@ -1064,10 +1064,10 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         byte[] resume = multiKgResumeCursor.get(kg);
         byte[] lo = (floor != null) ? floor : (resume != null ? successorKey(resume) : kgPrefix);
         byte[] hi = prefixUpperBound(kgPrefix);
-        long _diagT0 = TIMER_DIAG ? System.nanoTime() : 0L;
+        long diagT0 = TIMER_DIAG ? System.nanoTime() : 0L;
         byte[] last = readRangeIntoCache(lo, hi, dest);
         if (TIMER_DIAG) {
-            diagRefillNanos += System.nanoTime() - _diagT0;
+            diagRefillNanos += System.nanoTime() - diagT0;
         }
         if (last == null) {
             // Engine prefix exhausted from `lo` onward — mark exhausted so
