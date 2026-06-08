@@ -88,16 +88,9 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
     private final DataOutputSerializer valueOut = new DataOutputSerializer(64);
     private final DataInputDeserializer valueIn = new DataInputDeserializer();
 
-    /**
-     * V2-violation V2: per-state reusable iter-decode view. The iterator-path decode methods
-     * ({@link #deserializeUserKey(IteratorEntryView, int)} / {@link
-     * #deserializeUserValue(IteratorEntryView)}) rewind this view onto the slice handed in by
-     * the chunk MemorySegment, avoiding the previous per-row {@code byte[] buf = new
-     * byte[rangeLen]} allocation. Reused across rows of a single iteration and across iterations
-     * because the state is single-threaded per Flink slot.
-     */
-    private final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView iterView =
-            new org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView();
+    // (Removed the shared per-state `iterView` field 2026-06-09: it assumed "single-threaded per
+    // Flink slot", which the parallel RoutingStateExecutor breaks. The iterator-path decoders now
+    // use the per-thread VIEW_TL view instead — see deserializeUserKey/Value thread-safety notes.)
 
     /**
      * Per-state-instance LRU cache for (operatorKey, userKey) → value lookups. Eliminates engine
@@ -816,13 +809,19 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                             + userKeyPrefixOffset);
         }
         int rangeLen = kl - userKeyPrefixOffset;
-        // V2-violation V2: zero-alloc iter decode. Rewind the per-state MemorySegmentDataInputView
-        // onto the slice handed in by the chunk MemorySegment (FFI iter result lives off-heap
-        // already; no need to copy through a per-row byte[]). Pre-fix this allocated rangeLen
-        // bytes + made the JIT do a per-row arraycopy on the iter hot path (q3/q16/q19 map-iter).
+        // V2-violation V2: zero-alloc iter decode. Rewind a MemorySegmentDataInputView onto the
+        // slice handed in by the chunk MemorySegment (FFI iter result lives off-heap already; no
+        // need to copy through a per-row byte[]). Pre-fix this allocated rangeLen bytes + made the
+        // JIT do a per-row arraycopy on the iter hot path (q3/q16/q19 map-iter).
+        // THREAD-SAFETY (2026-06-09): use the per-thread VIEW_TL view, NOT a shared instance field.
+        // The parallel RoutingStateExecutor runs concurrent batches of the SAME subtask's MapState
+        // on different worker threads; a shared decode view gets re-pointed + read across threads →
+        // WrongThreadException + memory corruption (observed crash-looping q20). VIEW_TL gives each
+        // worker its own view, confined to its own thread.
+        final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView msdv = VIEW_TL.get();
         try {
-            iterView.rewind(view.chunkBuf(), view.keyOffset() + userKeyPrefixOffset, rangeLen);
-            return userKeySerializer.deserialize(iterView);
+            msdv.rewind(view.chunkBuf(), view.keyOffset() + userKeyPrefixOffset, rangeLen);
+            return userKeySerializer.deserialize(msdv);
         } catch (IOException e) {
             LOG.warn(
                     "S3-MAPITER-DIAG state={} DESER-FAIL keyLength={} prefixOffset={} rangeLen={} valueLength={} keyHex={} remaining={}",
@@ -832,7 +831,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                     rangeLen,
                     view.valueLength(),
                     hexOfKey(view, kl),
-                    iterView.remaining());
+                    msdv.remaining());
             throw new RuntimeException("Failed to deserialize user key from view", e);
         }
     }
@@ -861,9 +860,12 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         }
         try {
             int len = view.valueLength();
-            // V2-violation V2: zero-alloc iter decode. Same pattern as deserializeUserKey above.
-            iterView.rewind(view.chunkBuf(), view.valueOffset(), len);
-            return (UV) userValueSerializer.deserialize(iterView);
+            // V2-violation V2: zero-alloc iter decode. Same pattern as deserializeUserKey above —
+            // per-thread VIEW_TL view (NOT a shared field) so concurrent RoutingStateExecutor
+            // workers don't race the same decode view (see deserializeUserKey thread-safety note).
+            final org.apache.flink.state.forstrs.v1sync.MemorySegmentDataInputView msdv = VIEW_TL.get();
+            msdv.rewind(view.chunkBuf(), view.valueOffset(), len);
+            return (UV) userValueSerializer.deserialize(msdv);
         } catch (IOException e) {
             throw new RuntimeException("Failed to deserialize user value from view", e);
         }
