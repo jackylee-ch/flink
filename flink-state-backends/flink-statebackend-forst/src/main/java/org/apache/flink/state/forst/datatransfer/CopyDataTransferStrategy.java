@@ -50,6 +50,7 @@ import java.util.List;
 public class CopyDataTransferStrategy extends DataTransferStrategy {
 
     private static final int READ_BUFFER_SIZE = 64 * 1024;
+
     CopyDataTransferStrategy() {
         super(new LocalFileSystem());
     }
@@ -190,8 +191,7 @@ public class CopyDataTransferStrategy extends DataTransferStrategy {
             return;
         }
         try {
-            copyFileFromCheckpoint(
-                    sourceHandle, targetPath, targetFileSystem, closeableRegistry);
+            copyFileFromCheckpoint(sourceHandle, targetPath, targetFileSystem, closeableRegistry);
         } catch (IOException ex) {
             if (isFileAlreadyExists(ex) && targetFileSystem.exists(targetPath)) {
                 return;

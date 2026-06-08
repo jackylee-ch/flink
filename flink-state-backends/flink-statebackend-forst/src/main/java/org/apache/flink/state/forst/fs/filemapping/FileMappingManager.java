@@ -55,6 +55,7 @@ public class FileMappingManager {
 
     private final String remoteBase;
     private final String localBase;
+
     public FileMappingManager(FileSystem fileSystem, String remoteBase, String localBase) {
         this.fileSystem = fileSystem;
         this.mappingTable = new HashMap<>();
