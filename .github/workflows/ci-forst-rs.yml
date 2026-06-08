@@ -46,6 +46,12 @@ permissions: read-all
 env:
   FORST_RS_REPO: jackylee-ch/ForSt
   FORST_RS_BRANCH: forst-rs
+  # CI artifact portability: the ForSt repo enables target-cpu=native in
+  # .cargo/config.toml for local/production performance. GitHub hosted runners
+  # are CPU-heterogeneous, and the cdylib built in one job is loaded in another
+  # job; native codegen can therefore emit instructions that SIGILL on the test
+  # runner. Use a fixed x86-64-v2 baseline for GHA artifacts only.
+  RUSTFLAGS: "-C target-cpu=x86-64-v2"
 
 jobs:
   build-cdylib:
