@@ -136,56 +136,110 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public AsyncRequestContainer<StateRequest<?, ?, ?, ?>> createRequestContainer() {
-        int id = leaseWorker();
-        AsyncRequestContainer<StateRequest<?, ?, ?, ?>> c = workers[id].createRequestContainer();
-        synchronized (lock) {
-            leased.put(c, id);
-        }
-        return c;
+        // KEY-GROUP-AFFINE ROUTING: the returned container routes each offered request to a
+        // per-worker sub-container by keyGroup % N, so a given key-group's state always lands in ONE
+        // worker's MapStateCache (read-your-writes + per-key ordering — the windowed-join correctness
+        // fix). executeBatchRequests then runs the non-empty sub-containers in PARALLEL and completes
+        // SYNCHRONOUSLY (no incomplete-future / fullyLoaded coordination → deadlock-free).
+        return new RoutingRequestContainer();
     }
 
     @Override
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
-        final int id;
-        synchronized (lock) {
-            Integer w = leased.remove(container);
-            id = (w != null) ? w : 0; // defensive: a container we didn't lease runs on worker 0
+        // DEADLOCK-FREE SYNCHRONOUS design: the prior async-offload version (incomplete future +
+        // busyWorkers/fullyLoaded gate) deadlocked the AEC mailbox. Here we dispatch each non-empty
+        // per-worker sub-container to its worker thread, run them concurrently (intra-batch
+        // parallelism across disjoint key-groups), BLOCK until all finish, then return an
+        // already-completed future — the same contract as the inline VectorizedExecutor, so there is
+        // no async completion reordering to deadlock. Because we block until done, the per-worker
+        // pooled classifiers are free again before the next batch's createRequestContainer (no
+        // cross-batch reuse hazard). Cross-batch pipelining (depth>1) is a later optimization (OPT-02
+        // / double-buffering); this delivers correctness + intra-batch parallelism safely.
+        RoutingRequestContainer rc = (RoutingRequestContainer) container;
+        AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs = rc.subs;
+        java.util.List<Integer> busy = new java.util.ArrayList<>(workers.length);
+        for (int i = 0; i < subs.length; i++) {
+            if (subs[i] != null && !subs[i].isEmpty()) {
+                busy.add(i);
+            }
         }
-        VectorizedExecutor w = workers[id];
-        CompletableFuture<Void> result = new CompletableFuture<>();
-        inflight.add(result);
-        workerThreads[id].execute(
-                () -> {
-                    try {
-                        // worker.executeBatchRequests runs the (inline) dispatch on THIS worker
-                        // thread and returns an already-resolved future; flatten it.
-                        CompletableFuture<Void> inner = w.executeBatchRequests(container);
-                        inner.whenComplete(
-                                (v, t) -> {
-                                    if (t != null) {
-                                        result.completeExceptionally(t);
-                                    } else {
-                                        result.complete(null);
-                                    }
-                                });
-                    } catch (Throwable t) {
-                        result.completeExceptionally(t);
-                    } finally {
-                        releaseWorker(id);
-                    }
-                });
-        result.whenComplete((v, t) -> inflight.remove(result));
-        return result;
+        if (busy.isEmpty()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        final java.util.concurrent.atomic.AtomicReference<Throwable> err =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        if (busy.size() == 1) {
+            // Common case (batch touched one worker's key-groups): run inline-on-worker, no latch.
+            int id = busy.get(0);
+            runSubBatchAndWait(id, subs[id], err);
+        } else {
+            final java.util.concurrent.CountDownLatch latch =
+                    new java.util.concurrent.CountDownLatch(busy.size());
+            for (int wi : busy) {
+                final int id = wi;
+                final AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub = subs[id];
+                workerThreads[id].execute(
+                        () -> {
+                            try {
+                                CompletableFuture<Void> inner = workers[id].executeBatchRequests(sub);
+                                Throwable t = inner.handle((v, e) -> e).getNow(null);
+                                if (t != null) {
+                                    err.compareAndSet(null, t);
+                                }
+                            } catch (Throwable t) {
+                                err.compareAndSet(null, t);
+                            } finally {
+                                latch.countDown();
+                            }
+                        });
+            }
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                err.compareAndSet(null, e);
+            }
+        }
+        Throwable e = err.get();
+        return (e != null)
+                ? CompletableFuture.failedFuture(e)
+                : CompletableFuture.completedFuture(null);
+    }
+
+    /** Runs one worker's sub-batch on its worker thread and blocks until it completes. */
+    private void runSubBatchAndWait(
+            int id,
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub,
+            java.util.concurrent.atomic.AtomicReference<Throwable> err) {
+        try {
+            workerThreads[id]
+                    .submit(
+                            () -> {
+                                CompletableFuture<Void> inner = workers[id].executeBatchRequests(sub);
+                                Throwable t = inner.handle((v, e) -> e).getNow(null);
+                                if (t != null) {
+                                    err.compareAndSet(null, t);
+                                }
+                            })
+                    .get();
+        } catch (java.util.concurrent.ExecutionException ex) {
+            err.compareAndSet(null, ex.getCause() != null ? ex.getCause() : ex);
+        } catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            err.compareAndSet(null, ex);
+        }
     }
 
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
-        // Conservative correctness: drain all in-flight async batches so the sync read observes
-        // every prior write (preserves ordering vs concurrent workers), then run on worker 0.
-        drainInflight();
+        // Route the sync request to ITS key-group's worker so it observes that key-group's cached
+        // writes (read-your-writes). Batches complete synchronously (executeBatchRequests blocks), so
+        // there is no async in-flight batch to drain here.
+        int kg = request.getRecordContext().getKeyGroup();
+        int id = Math.floorMod(kg, workers.length);
         try {
-            workerThreads[0].submit(() -> workers[0].executeRequestSync(request)).get();
+            workerThreads[id].submit(() -> workers[id].executeRequestSync(request)).get();
         } catch (java.util.concurrent.ExecutionException e) {
             Throwable c = e.getCause();
             if (c instanceof RuntimeException re) {
@@ -203,8 +257,43 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public boolean fullyLoaded() {
-        synchronized (lock) {
-            return free.isEmpty();
+        // Synchronous design: executeBatchRequests blocks until the batch completes and returns an
+        // already-completed future, so there is never an outstanding async batch → never "loaded".
+        return false;
+    }
+
+    /**
+     * Container that routes each offered request to a per-worker sub-container by key-group, so a
+     * given key-group's requests always go to the same worker (consistent MapStateCache + per-key
+     * ordering — the windowed-join correctness fix). Sub-containers are the workers' pooled
+     * classifiers, acquired lazily on first offer; the worker arenas are {@link Arena#ofShared()} so
+     * cross-thread fill is safe.
+     */
+    private final class RoutingRequestContainer
+            implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
+        @SuppressWarnings("unchecked")
+        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs =
+                (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
+                        new AsyncRequestContainer<?>[workers.length];
+
+        @Override
+        public void offer(StateRequest<?, ?, ?, ?> request) {
+            int kg = request.getRecordContext().getKeyGroup();
+            int w = Math.floorMod(kg, workers.length);
+            if (subs[w] == null) {
+                subs[w] = workers[w].createRequestContainer();
+            }
+            subs[w].offer(request);
+        }
+
+        @Override
+        public boolean isEmpty() {
+            for (AsyncRequestContainer<StateRequest<?, ?, ?, ?>> s : subs) {
+                if (s != null && !s.isEmpty()) {
+                    return false;
+                }
+            }
+            return true;
         }
     }
 
