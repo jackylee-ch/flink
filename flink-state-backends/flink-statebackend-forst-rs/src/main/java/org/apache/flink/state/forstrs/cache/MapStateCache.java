@@ -219,7 +219,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      *     #remove})
      */
     @Nullable
-    public synchronized Lookup<V> lookup(byte[] key) {
+    public Lookup<V> lookup(byte[] key) {
         return lookup(key, 0, key.length);
     }
 
@@ -232,7 +232,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      */
     @Nullable
     @SuppressWarnings("unchecked")
-    public synchronized Lookup<V> lookup(byte[] keyBuf, int keyOff, int keyLen) {
+    public Lookup<V> lookup(byte[] keyBuf, int keyOff, int keyLen) {
         checkOpen();
         int row = findRow(keyBuf, keyOff, keyLen);
         if (row < 0) {
@@ -256,7 +256,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * <p>A {@code null} value is stored as a tombstone so that subsequent lookups return a
      * {@code cached=true} result and avoid hitting the engine.
      */
-    public synchronized void put(byte[] key, @Nullable V value) {
+    public void put(byte[] key, @Nullable V value) {
         put(key, 0, key.length, value);
     }
 
@@ -266,7 +266,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * allocation. The cache MISS path still copies the bytes into off-heap {@code keyData}; the
      * cache HIT path (key already present) does no key-bytes I/O at all.
      */
-    public synchronized void put(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
+    public void put(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
         checkOpen();
         Object stored = value == null ? TOMBSTONE : value;
         int row = findRow(keyBuf, keyOff, keyLen);
@@ -292,7 +292,7 @@ public final class MapStateCache<V> implements AutoCloseable {
     }
 
     /** Records a tombstone for {@code key}. Caller must subsequently dispatch the REMOVE. */
-    public synchronized void remove(byte[] key) {
+    public void remove(byte[] key) {
         remove(key, 0, key.length);
     }
 
@@ -300,7 +300,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * V2-violation V2 (slice variant): zero-alloc tombstone insertion against a (buf, off, len)
      * slice. Behaviour identical to {@link #remove(byte[])}.
      */
-    public synchronized void remove(byte[] keyBuf, int keyOff, int keyLen) {
+    public void remove(byte[] keyBuf, int keyOff, int keyLen) {
         checkOpen();
         put(keyBuf, keyOff, keyLen, null);
     }
@@ -314,7 +314,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * until eviction. This atomic insert-only operation eliminates that race; the put-on-write
      * still uses {@link #put} so it always wins against a previous miss-resolution.
      */
-    public synchronized boolean putIfAbsent(byte[] key, @Nullable V value) {
+    public boolean putIfAbsent(byte[] key, @Nullable V value) {
         return putIfAbsent(key, 0, key.length, value);
     }
 
@@ -323,7 +323,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * Used by the asyncGet thenApply continuation after a fresh-byte[] snapshot is taken so the
      * captured slice survives across the async boundary.
      */
-    public synchronized boolean putIfAbsent(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
+    public boolean putIfAbsent(byte[] keyBuf, int keyOff, int keyLen, @Nullable V value) {
         checkOpen();
         if (findRow(keyBuf, keyOff, keyLen) >= 0) {
             return false;
@@ -337,7 +337,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * conservatively nukes everything (the cache key includes the operator key, but a partial
      * invalidation would require a scan).
      */
-    public synchronized void clear() {
+    public void clear() {
         checkOpen();
         int prevSize = size;
         size = 0;
@@ -390,7 +390,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * rare relative to the per-record GET/PUT path that this cache exists to accelerate. Returns
      * the number of entries removed (visible for tests / observability).
      */
-    public synchronized int clearForPrefix(byte[] prefix) {
+    public int clearForPrefix(byte[] prefix) {
         return clearForPrefix(prefix, 0, prefix.length);
     }
 
@@ -399,7 +399,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * prefix from a (buf, off, len) slice so the V2 MapState onClear / buildDBPutRequest paths
      * can pass the shared {@code keyOut} buffer directly.
      */
-    public synchronized int clearForPrefix(byte[] prefixBuf, int prefixOff, int prefixLen) {
+    public int clearForPrefix(byte[] prefixBuf, int prefixOff, int prefixLen) {
         checkOpen();
         if (size == 0) {
             return 0;
@@ -424,7 +424,7 @@ public final class MapStateCache<V> implements AutoCloseable {
         return removed;
     }
 
-    public synchronized int size() {
+    public int size() {
         checkOpen();
         return size;
     }
@@ -443,7 +443,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * its 5 off-heap segments live until process exit (perma-leak).
      */
     @Override
-    public synchronized void close() {
+    public void close() {
         // R40-H1: flip the close-gate FIRST so any concurrent or late mutator call (e.g. a
         // straggling async callback) observes `closed == true` and bails out with a precise
         // IllegalStateException rather than touching a closed Arena and getting an opaque FFM
@@ -477,7 +477,7 @@ public final class MapStateCache<V> implements AutoCloseable {
      * interval-join working set) — in which case the per-record probe cost
      * outweighs the cache — versus a merely cold cache that has not filled.
      */
-    public synchronized boolean isFull() {
+    public boolean isFull() {
         return size >= maxEntries;
     }
 
