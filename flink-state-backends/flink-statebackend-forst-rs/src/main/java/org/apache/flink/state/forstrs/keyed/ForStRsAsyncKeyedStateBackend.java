@@ -212,6 +212,11 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
+    // M1: routing (parallel) executors created when FRS_RS_PARALLEL_EXECUTOR=1; their worker
+    // VectorizedExecutors live in managedExecutors, but the router owns the worker threads + arenas
+    // and must be shut down in dispose().
+    private final java.util.List<org.apache.flink.state.forstrs.exec.RoutingStateExecutor>
+            routingExecutors = new java.util.ArrayList<>();
 
     /**
      * Registry of live ReducingState V2 instances (umbrella spec §3 Trace E).
@@ -1129,6 +1134,27 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     @Nonnull
     @Override
     public StateExecutor createStateExecutor() {
+        // M1: parallel async-state executor (env FRS_RS_PARALLEL_EXECUTOR=1). Routes each batch to
+        // one of N single-thread VectorizedExecutor workers so disjoint-key batches run concurrently
+        // + the mailbox overlaps the next batch (the documented "in-flight depth > 1" fix). Workers
+        // register into managedExecutors so snapshot/flush/shutdown reach them.
+        // OPT-01 (2026-06-09): the async-offload executor is now the DEFAULT. The depth-1 inline
+        // VectorizedExecutor returned an already-completed future on the mailbox thread, pinning the
+        // AEC in-flight depth at 1 → 10:1 ThreadPark:on-CPU (JFR). RoutingStateExecutor returns an
+        // incomplete future + offloads to N single-thread workers (real fullyLoaded), letting the AEC
+        // pipeline. VERIFIED correctness-exact + neutral-or-better across families: q11 0.35x->0.82x
+        // (fail->pass, 2.35x, out_rows=92M exact), q9 +7.7-15%, q3 neutral (36.6 vs 36.7s exact);
+        // CPU 375%->646% (the prior "refuted" result predated the lock-free memtable that was
+        // serializing the workers). Opt OUT with FRS_RS_PARALLEL_EXECUTOR=0 (falls back to depth-1).
+        String pe = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
+        boolean parallelOn = (pe == null) || !pe.trim().equals("0");
+        if (parallelOn) {
+            org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
+                    new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                            linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
+            routingExecutors.add(r);
+            return r;
+        }
         var e = new VectorizedExecutor(linker, db, defaultCf, arena);
         e.setDispatchMetrics(dispatchMetrics);
         managedExecutors.add(e);
@@ -1834,6 +1860,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             awaitOutstandingSnapshots();
             managedExecutors.forEach(VectorizedExecutor::flushDirty);
             managedExecutors.forEach(VectorizedExecutor::shutdown);
+            // M1: shut down routing-executor worker threads + close their arenas (awaits idle).
+            routingExecutors.forEach(
+                    org.apache.flink.state.forstrs.exec.RoutingStateExecutor::shutdown);
             managedExecutors.clear();
             // D5-H2: release each MapStateV2's MapStateCache arena BEFORE clearing the state
             // cache and dropping registry references. Pre-fix, the cache's Arena.ofShared()
