@@ -74,16 +74,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-forst-rs-
 
-      - name: Build libforst_rs_ffi cdylib (release)
+      - name: Build libforst_rs_ffi cdylib (release, with compat JNI)
         working-directory: forst-rs-src
-        run: cargo build --release -p forst-rs-ffi
+        run: cargo build --release -p forst-rs-ffi --features compat-jni
 
       - name: Verify cdylib exists
         run: |
           set -e
           for ext in so dylib dll; do
-            if ls forst-rs-src/target/release/libforst_rs_ffi.${ext} >/dev/null 2>&1; then
+            LIB=$(ls forst-rs-src/target/release/libforst_rs_ffi.${ext} 2>/dev/null || true)
+            if [ -n "$LIB" ]; then
               echo "Found libforst_rs_ffi.${ext}"
+              if [ "${ext}" = "so" ] && ! nm -D "$LIB" | grep -q "Java_org_forstdb_"; then
+                echo "ERROR: libforst_rs_ffi.so missing compat-jni Java_org_forstdb_* symbols"
+                exit 1
+              fi
               exit 0
             fi
           done

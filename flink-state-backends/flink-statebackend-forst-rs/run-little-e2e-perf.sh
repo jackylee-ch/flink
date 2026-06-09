@@ -195,10 +195,13 @@ echo "[build] step 3: install forst-rs (JDK 25)"
     cd "$FLINK_ROOT"
     export JAVA_HOME="$JDK25_HOME"
     export PATH="$JDK25_HOME/bin:$PATH"
+    # The native cdylib is only needed by the runtime invocations below. Passing
+    # forstrs.native.libpath here activates the forst-rs-native-tests profile and
+    # turns this benchmark setup step into a full native test run.
     mvn -q -B \
         -pl flink-state-backends/flink-statebackend-forst-rs \
         -am install -DskipTests -Drat.skip=true \
-        -Dforstrs.native.libpath="$CDYLIB"
+        -Dforstrs.native.tests.skip=true
 )
 
 # ----------------------------------------------------------------------
@@ -216,8 +219,7 @@ echo "[classpath] resolving (cached at $CP_FILE)"
         dependency:build-classpath \
         -Dmdep.outputFile="$CP_FILE" \
         -DincludeScope=test \
-        -Drat.skip=true \
-        -Dforstrs.native.libpath="$CDYLIB"
+        -Drat.skip=true
 )
 DEP_CP="$(cat "$CP_FILE")"
 
