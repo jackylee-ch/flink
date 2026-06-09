@@ -49,13 +49,21 @@ under the License.
 		<target.java.version>25</target.java.version>
 		<maven.compiler.source>25</maven.compiler.source>
 		<maven.compiler.target>25</maven.compiler.target>
-		<forstrs.native.libpath>${user.home}/Code/stczwd/ForSt/target/release/libforst_rs_ffi.dylib</forstrs.native.libpath>
+		<!--
+			The tests in this module exercise the real ForSt-RS native engine. Generic
+			Flink CI JDK 25 lanes do not build/download libforst_rs_ffi, so they should
+			compile this module but not run the native tests. The dedicated ci-forst-rs
+			workflow passes -Dforstrs.native.libpath=<artifact> and activates the
+			forst-rs-native-tests profile below.
+		-->
+		<forstrs.native.tests.skip>true</forstrs.native.tests.skip>
+		<forstrs.native.libpath.arg/>
 		<surefire.module.config><!--
 			FFM API requires opt-in for native access in JDK 22+.
 			Vector API (jdk.incubator.vector) requires add-modules.
 			-->--enable-native-access=ALL-UNNAMED
 			--add-modules jdk.incubator.vector
-			-Dforstrs.native.libpath=${forstrs.native.libpath}
+			${forstrs.native.libpath.arg}
 		</surefire.module.config>
 	</properties>
 
@@ -203,6 +211,13 @@ under the License.
 					</compilerArgs>
 				</configuration>
 			</plugin>
+			<plugin>
+				<groupId>org.apache.maven.plugins</groupId>
+				<artifactId>maven-surefire-plugin</artifactId>
+				<configuration>
+					<skipTests>${forstrs.native.tests.skip}</skipTests>
+				</configuration>
+			</plugin>
 		</plugins>
 	</build>
 
@@ -249,6 +264,18 @@ under the License.
 					</plugin>
 				</plugins>
 			</build>
+		</profile>
+		<profile>
+			<id>forst-rs-native-tests</id>
+			<activation>
+				<property>
+					<name>forstrs.native.libpath</name>
+				</property>
+			</activation>
+			<properties>
+				<forstrs.native.tests.skip>false</forstrs.native.tests.skip>
+				<forstrs.native.libpath.arg>-Dforstrs.native.libpath=${forstrs.native.libpath}</forstrs.native.libpath.arg>
+			</properties>
 		</profile>
 	</profiles>
 
