@@ -427,10 +427,10 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
      * ({@code frs_vec_iter_prefix_open_batch_parallel}) — which built+drained the K probes across the
      * engine read pool — and hands back this probe's native {@code handle} plus its already-filled
      * first chunk ({@code firstChunkBuf}/{@code firstRowCount}/{@code firstBytesUsed}). This method
-     * does the SAME parse-first-chunk → {@code _next} drain → {@link #completeWithEntries} as
-     * {@link #process}'s MAP_ITER path; the only difference is the open is skipped (already done in the
-     * batch) and the first chunk is supplied rather than produced here. Decode is byte-identical to the
-     * serial path (same {@code parseChunkInto} + zero-copy {@code VIEW_TL} deserialize).
+     * does the SAME first-chunk decode → {@code _next} drain → result build as {@link #process}'s
+     * MAP_ITER path; the only difference is the open is skipped (already done in the batch) and the
+     * first chunk is supplied rather than produced here. Decode is byte-identical to the serial path
+     * (same in-place {@link #decodeChunkDirect} + zero-copy {@code VIEW_TL} deserialize).
      *
      * <p>Only valid for non-MAP_IS_EMPTY, fresh-open requests ({@code existingVecHandle == 0}); the
      * caller enforces this and routes everything else to {@link #process}.
@@ -448,14 +448,33 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
             MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
 
-            ArrayList<IteratorEntryView> drained = new ArrayList<>();
+            // FRS-ZERO-SNAPSHOT (2026-06-09): same in-place per-chunk decode as process() — no
+            // per-chunk snapshot, no view-accumulation list. firstChunkBuf is this probe's own
+            // slice (never overwritten by the _next chunkBuf, which is a distinct scratch buffer),
+            // so both are decoded to detached on-heap UK/UV in place before reuse.
+            final int prefixLen = prefix.length;
+            final ArrayList<Map.Entry<UK, UV>> mapEntries =
+                    originalRequestType == StateRequestType.MAP_ITER ? new ArrayList<>() : null;
+            final ArrayList<UK> keys =
+                    originalRequestType == StateRequestType.MAP_ITER_KEY ? new ArrayList<>() : null;
+            final ArrayList<UV> values =
+                    originalRequestType == StateRequestType.MAP_ITER_VALUE ? new ArrayList<>() : null;
+            int decodedCount = 0;
             boolean exhausted = false;
             try {
-                // Step 1: parse the first chunk the batched open already filled (its rows were
+                // Step 1: decode the first chunk the batched open already filled (its rows were
                 // popped from this probe's iterator during the parallel open — same as the
                 // single-open first-chunk consume in process()).
                 if (firstRowCount > 0) {
-                    parseChunkInto(firstChunkBuf, firstRowCount, firstBytesUsed, drained, scratch);
+                    decodedCount +=
+                            decodeChunkDirect(
+                                    firstChunkBuf,
+                                    firstRowCount,
+                                    firstBytesUsed,
+                                    prefixLen,
+                                    mapEntries,
+                                    keys,
+                                    values);
                 }
                 // Step 2: continue via frs_vec_iter_prefix_next (identical to process()'s drain
                 // loop). The batched open registered the handle (a light shell once exhausted),
@@ -475,8 +494,11 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                         exhausted = true;
                         break;
                     }
-                    parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, scratch);
-                } while (drained.size() < CACHE_SIZE_LIMIT);
+                    decodedCount +=
+                            decodeChunkDirect(
+                                    chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys,
+                                    values);
+                } while (decodedCount < CACHE_SIZE_LIMIT);
             } catch (Throwable t) {
                 try {
                     linker.frsVecIterPrefixClose(handle);
@@ -494,7 +516,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 continuationHandle = 0L;
             }
             this.existingVecHandle = continuationHandle;
-            completeWithEntries(drained, encounterEnd, null);
+            completeFromDecoded(mapEntries, keys, values, encounterEnd);
         }
     }
 
@@ -606,34 +628,6 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         if (code.isFailProcess()) {
             throw new FrsEnginePanicError(code, fn + " rc=" + rc);
         }
-    }
-
-    private static void parseChunkInto(
-            MemorySegment chunkBuf,
-            int rowCount,
-            int bytesUsed,
-            ArrayList<IteratorEntryView> out,
-            Arena arena) {
-        // Snapshot the chunk into a stable per-chunk arena segment. chunkBuf is reused as the
-        // destination of every frs_vec_iter_prefix_next call, so views referencing it directly
-        // would observe data corruption once the next() overwrites it.
-        MemorySegment chunkSnapshot = arena.allocate(bytesUsed);
-        MemorySegment.copy(chunkBuf, 0, chunkSnapshot, 0, bytesUsed);
-
-        int off = 0;
-        for (int i = 0; i < rowCount; i++) {
-            int klen = chunkSnapshot.get(ValueLayout.JAVA_INT_UNALIGNED, off);
-            off += 4;
-            int vlen = chunkSnapshot.get(ValueLayout.JAVA_INT_UNALIGNED, off);
-            off += 4;
-            int keyOff = off;
-            off += klen;
-            int valOff = off;
-            off += vlen;
-            out.add(new IteratorEntryView(chunkSnapshot, keyOff, klen, valOff, vlen));
-        }
-        // bytesUsed paranoia check (asserts only under -ea).
-        assert off == bytesUsed : "chunk parse off=" + off + " != bytesUsed=" + bytesUsed;
     }
 
     /**

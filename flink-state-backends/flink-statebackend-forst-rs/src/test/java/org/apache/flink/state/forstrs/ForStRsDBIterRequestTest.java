@@ -123,11 +123,13 @@ class ForStRsDBIterRequestTest {
      *
      * <p>This test mocks the drain to return two distinct chunks (60 × "aaa"/"111", then 60 ×
      * "bbb"/"222", then 0/0 exhaustion). The recording state stub captures the bytes each view
-     * yields at decode time (synchronously inside {@code completeWithEntries}, AFTER the drain loop
-     * has overwritten {@code chunkBuf} with chunk #2's data). The fix — per-chunk arena snapshot —
-     * makes the views reference an immutable copy of each chunk, so entries 0..59 must yield
-     * ("aaa", "111") and entries 60..119 must yield ("bbb", "222"). Without the fix, all 120
-     * entries would yield the same (corrupted) bytes.
+     * yields at decode time. The FRS-ZERO-SNAPSHOT fix decodes each chunk's entries to detached
+     * on-heap UK/UV IN PLACE over {@code chunkBuf} IMMEDIATELY after parsing it — BEFORE the next
+     * {@code frs_vec_iter_prefix_next} overwrites the buffer with chunk #2 — so entries 0..59 must
+     * yield ("aaa", "111") and entries 60..119 must yield ("bbb", "222"). The prior implementation
+     * snapshotted each chunk to a fresh arena segment; this version removes that per-chunk native
+     * alloc and instead relies on decode-before-overwrite ordering. Without correct ordering, all
+     * 120 entries would yield the same (corrupted) bytes.
      */
     @Test
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -214,6 +216,129 @@ class ForStRsDBIterRequestTest {
             assertThat(recState.observedValues.get(i))
                     .as("value at index %d (chunk #2)", i)
                     .containsExactly(valB);
+        }
+    }
+
+    /**
+     * Lever-2 batched-open drain (single chunk): {@link ForStRsDBIterRequest#processFromBatchedOpen}
+     * is handed a handle + an already-filled first chunk by the coalesced
+     * {@code frs_vec_iter_prefix_open_batch_parallel} crossing, then drains via {@code _next}. The
+     * supplied first chunk (60 × "aaa"/"111") must decode correctly; the single {@code next()} call
+     * returns 0/0 exhaustion. Verifies the batched-open path uses the SAME zero-snapshot in-place
+     * decode as the serial {@code process()} path.
+     */
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void processFromBatchedOpen_single_chunk_decodes_correctly() {
+        ForStRsLinker linker = mock(ForStRsLinker.class);
+        FrsDb db = mock(FrsDb.class);
+        FrsCfHandle cf = mock(FrsCfHandle.class);
+
+        final byte[] keyA = "aaa".getBytes();
+        final byte[] valA = "111".getBytes();
+        final int rows = 60;
+
+        // The batched open already filled this probe's first chunk; next() signals exhaustion.
+        when(linker.frsVecIterPrefixNext(anyLong(), any(), anyInt(), any(), any()))
+                .thenAnswer(
+                        inv -> {
+                            MemorySegment outRc = inv.getArgument(3);
+                            MemorySegment outBu = inv.getArgument(4);
+                            outRc.set(ValueLayout.JAVA_INT, 0, 0);
+                            outBu.set(ValueLayout.JAVA_INT, 0, 0);
+                            return 0;
+                        });
+        when(linker.frsVecIterPrefixClose(anyLong())).thenReturn(0);
+
+        RecordingIterableState recState = new RecordingIterableState();
+        StateRequest sr = mock(StateRequest.class);
+        InternalAsyncFuture future = mock(InternalAsyncFuture.class);
+        when(sr.getFuture()).thenReturn(future);
+        byte[] prefix = "k/test/".getBytes();
+
+        ForStRsDBIterRequest<?, ?, ?, ?> req =
+                new ForStRsDBIterRequest<>(prefix, sr, StateRequestType.MAP_ITER, recState, null);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment firstChunk = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+            int bytesUsed = writeRowsInto(firstChunk, rows, keyA, valA);
+            req.processFromBatchedOpen(linker, db, cf, 0xBEEFL, firstChunk, rows, bytesUsed);
+        }
+
+        // Exactly one next() drain call, and the supplied first chunk decoded to (aaa, 111).
+        verify(linker, times(1)).frsVecIterPrefixNext(anyLong(), any(), anyInt(), any(), any());
+        verify(linker, times(1)).frsVecIterPrefixClose(anyLong());
+        assertThat(recState.observedKeys).hasSize(rows);
+        assertThat(recState.observedValues).hasSize(rows);
+        for (int i = 0; i < rows; i++) {
+            assertThat(recState.observedKeys.get(i)).as("key %d", i).containsExactly(keyA);
+            assertThat(recState.observedValues.get(i)).as("value %d", i).containsExactly(valA);
+        }
+    }
+
+    /**
+     * Lever-2 batched-open drain (multi chunk): the supplied first chunk lives in its OWN slice (the
+     * batched open packs K probes into K distinct chunk slices) and is never overwritten by the
+     * {@code _next} buffer (a separate internal scratch segment). The first chunk (60 × "aaa"/"111")
+     * plus one {@code next()} chunk (60 × "bbb"/"222") must BOTH decode correctly with the
+     * zero-snapshot in-place decode — chunk #1 not corrupted by chunk #2.
+     */
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void processFromBatchedOpen_multi_chunk_no_corruption() {
+        ForStRsLinker linker = mock(ForStRsLinker.class);
+        FrsDb db = mock(FrsDb.class);
+        FrsCfHandle cf = mock(FrsCfHandle.class);
+
+        final byte[] keyA = "aaa".getBytes();
+        final byte[] valA = "111".getBytes();
+        final byte[] keyB = "bbb".getBytes();
+        final byte[] valB = "222".getBytes();
+        final int rows = 60;
+
+        final int[] nextCallCount = new int[1];
+        when(linker.frsVecIterPrefixNext(anyLong(), any(), anyInt(), any(), any()))
+                .thenAnswer(
+                        inv -> {
+                            MemorySegment chunkBuf = inv.getArgument(1);
+                            MemorySegment outRc = inv.getArgument(3);
+                            MemorySegment outBu = inv.getArgument(4);
+                            if (nextCallCount[0]++ == 0) {
+                                int written = writeRowsInto(chunkBuf, rows, keyB, valB);
+                                outRc.set(ValueLayout.JAVA_INT, 0, rows);
+                                outBu.set(ValueLayout.JAVA_INT, 0, written);
+                                return 0;
+                            }
+                            outRc.set(ValueLayout.JAVA_INT, 0, 0);
+                            outBu.set(ValueLayout.JAVA_INT, 0, 0);
+                            return 0;
+                        });
+        when(linker.frsVecIterPrefixClose(anyLong())).thenReturn(0);
+
+        RecordingIterableState recState = new RecordingIterableState();
+        StateRequest sr = mock(StateRequest.class);
+        InternalAsyncFuture future = mock(InternalAsyncFuture.class);
+        when(sr.getFuture()).thenReturn(future);
+        byte[] prefix = "k/test/".getBytes();
+
+        ForStRsDBIterRequest<?, ?, ?, ?> req =
+                new ForStRsDBIterRequest<>(prefix, sr, StateRequestType.MAP_ITER, recState, null);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment firstChunk = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+            int bytesUsed = writeRowsInto(firstChunk, rows, keyA, valA);
+            req.processFromBatchedOpen(linker, db, cf, 0xBEEFL, firstChunk, rows, bytesUsed);
+        }
+
+        assertThat(recState.observedKeys).hasSize(2 * rows);
+        assertThat(recState.observedValues).hasSize(2 * rows);
+        for (int i = 0; i < rows; i++) {
+            assertThat(recState.observedKeys.get(i)).as("chunk#1 key %d", i).containsExactly(keyA);
+            assertThat(recState.observedValues.get(i)).as("chunk#1 val %d", i).containsExactly(valA);
+        }
+        for (int i = rows; i < 2 * rows; i++) {
+            assertThat(recState.observedKeys.get(i)).as("chunk#2 key %d", i).containsExactly(keyB);
+            assertThat(recState.observedValues.get(i)).as("chunk#2 val %d", i).containsExactly(valB);
         }
     }
 
