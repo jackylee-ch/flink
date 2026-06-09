@@ -40,6 +40,10 @@ import java.lang.foreign.ValueLayout;
 @Internal
 public final class ArrowBinaryBuffer implements AutoCloseable {
 
+    /** True on little-endian hosts (arm64/x86), enabling the wide-stride byte-identical key hash. */
+    private static final boolean NATIVE_LITTLE_ENDIAN =
+            java.nio.ByteOrder.nativeOrder() == java.nio.ByteOrder.LITTLE_ENDIAN;
+
     public static final int MAX_CAPACITY = 1_048_576;
     public static final int MAX_CAPACITY_MAP_STATE = 524288; // matches legacy MAP_WRITE_BUFFER_THRESHOLD
     public static final int MIN_CAPACITY = 1024;
@@ -169,7 +173,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
 
     /** Returns the row id for the given key, or -1 if not present. */
     public int find(MemorySegment keySeg, long keyOffset, int keyLen) {
-        int h = hash(keySeg, keyOffset, keyLen);
+        int h = keyHash(keySeg, keyOffset, keyLen);
         int mask = (capacity * 2) - 1;
         int probe = h & mask;
         for (int i = 0; i < capacity * 2; i++) {
@@ -259,7 +263,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         valueOffsets.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, valStart);
         valueLengths.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, valueLen);
         size++;
-        insertHashIndex(row, hash(keySeg, keyOffset, keyLen));
+        insertHashIndex(row, keyHash(keySeg, keyOffset, keyLen));
         return row;
     }
 
@@ -370,7 +374,7 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
     }
 
     public void remove(MemorySegment keySeg, long keyOffset, int keyLen) {
-        int h = hash(keySeg, keyOffset, keyLen);
+        int h = keyHash(keySeg, keyOffset, keyLen);
         int mask = (capacity * 2) - 1;
         int probe = h & mask;
         for (int i = 0; i < capacity * 2; i++) {
@@ -631,7 +635,9 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         }
     }
 
-    private int hash(MemorySegment seg, long offset, int len) {
+    // Package-private + static so the byte-identity equivalence UT can call it directly. Pure (reads
+    // only the segment), so static is correct.
+    static int keyHash(MemorySegment seg, long offset, int len) {
         // PR-B2 (V2-11 / D-R3-1) — scalar loop retained intentionally.
         //
         // The Java byte[] hashCode recurrence `h = 31*h + b[i]` is sequentially
@@ -651,8 +657,29 @@ public final class ArrowBinaryBuffer implements AutoCloseable {
         // alternative-hash rewrite is deferred to a follow-up ticket
         // ("PR-B2.1 alternative hash function") that can take the
         // serialization-format hit as part of a coordinated migration.
+        // FRS-VECTORIZED-HASH (2026-06-09): read 8 bytes per FFM access (JAVA_LONG_UNALIGNED) instead
+        // of one bounds-checked seg.get(JAVA_BYTE) per byte — ~8x fewer Panama bounds/session-validity
+        // checks (the JFR-quantified per-access overhead that JNI/critical-array RocksDB avoids). The
+        // `31*h + b` recurrence is preserved EXACTLY: on little-endian, byte i of the long sits at
+        // address offset+i, and `(byte) (v >>> 8*i)` is the SAME signed byte as seg.get(JAVA_BYTE,
+        // offset+i) — so the hash VALUE is byte-identical and the MapState-cache + engine hash-slot
+        // layout are unchanged (no format migration). Big-endian falls back to the scalar loop.
         int h = 1;
-        for (int i = 0; i < len; i++) {
+        int i = 0;
+        if (NATIVE_LITTLE_ENDIAN) {
+            for (; i + 8 <= len; i += 8) {
+                long v = seg.get(ValueLayout.JAVA_LONG_UNALIGNED, offset + i);
+                h = 31 * h + (byte) v;
+                h = 31 * h + (byte) (v >>> 8);
+                h = 31 * h + (byte) (v >>> 16);
+                h = 31 * h + (byte) (v >>> 24);
+                h = 31 * h + (byte) (v >>> 32);
+                h = 31 * h + (byte) (v >>> 40);
+                h = 31 * h + (byte) (v >>> 48);
+                h = 31 * h + (byte) (v >>> 56);
+            }
+        }
+        for (; i < len; i++) {
             h = 31 * h + seg.get(ValueLayout.JAVA_BYTE, offset + i);
         }
         return h;

@@ -235,4 +235,39 @@ class ArrowBinaryBufferTest {
             buf.close();
         }
     }
+
+    /**
+     * FRS-VECTORIZED-HASH correctness gate: the wide-stride (JAVA_LONG) key hash MUST be
+     * byte-identical to the canonical scalar {@code 31*h + b[i]} recurrence — the hash VALUE is shared
+     * with the MapState cache slots AND the engine-side hash slot layout, so any drift corrupts results.
+     * Verified across lengths spanning the 8-byte stride boundary, with negative bytes (sign-extension)
+     * and non-zero/unaligned offsets.
+     */
+    @Test
+    void keyHashByteIdenticalToScalarAcrossBoundaryLengthsAndOffsets() {
+        java.util.Random rnd = new java.util.Random(424242);
+        int[] lens = {0, 1, 2, 7, 8, 9, 15, 16, 17, 23, 31, 32, 33, 64, 100, 257};
+        try (Arena arena = Arena.ofConfined()) {
+            for (int len : lens) {
+                for (int trial = 0; trial < 25; trial++) {
+                    byte[] data = new byte[len];
+                    rnd.nextBytes(data); // includes negative bytes → exercises sign-extension
+                    int off = trial % 7; // 0..6 byte offset → exercises unaligned JAVA_LONG reads
+                    MemorySegment seg = arena.allocate((long) off + len + 8);
+                    for (int i = 0; i < len; i++) {
+                        seg.set(ValueLayout.JAVA_BYTE, off + i, data[i]);
+                    }
+                    int ref = 1;
+                    for (int i = 0; i < len; i++) {
+                        ref = 31 * ref + data[i];
+                    }
+                    int got = ArrowBinaryBuffer.keyHash(seg, off, len);
+                    assertEquals(
+                            ref,
+                            got,
+                            "vectorized keyHash must equal scalar 31*h+b for len=" + len + " off=" + off);
+                }
+            }
+        }
+    }
 }
