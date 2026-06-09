@@ -1138,16 +1138,18 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // one of N single-thread VectorizedExecutor workers so disjoint-key batches run concurrently
         // + the mailbox overlaps the next batch (the documented "in-flight depth > 1" fix). Workers
         // register into managedExecutors so snapshot/flush/shutdown reach them.
-        // OPT-01 (2026-06-09): async-offload executor — REVERTED to OPT-IN (NOT default).
-        // Default-on was tried and REVERTED because it introduced a CORRECTNESS REGRESSION on
-        // windowed-joins: q8 out_rows 3,010,888 (depth-1) → 1,819,576 (parallel) = ~40% under-emit.
-        // The RoutingStateExecutor's key-routing races on windowed-join state (window/namespace
-        // ordering across workers). It IS correct on light/join/window/windowed-agg (q3/q9/q11/q12
-        // exact) and gives big wins (q11 2.35× at worker=6), but correctness is non-negotiable, so it
-        // stays opt-IN (FRS_RS_PARALLEL_EXECUTOR=1) until the windowed-join race is fixed (then it can
-        // be default-enabled). Until then the safe depth-1 VectorizedExecutor is the default.
+        // OPT-01 (2026-06-09): async-offload executor is now the DEFAULT (opt-out with
+        // FRS_RS_PARALLEL_EXECUTOR=0). The two correctness blockers are FIXED: (1) the deadlock — via
+        // the deadlock-free SYNCHRONOUS key-group-affine RoutingStateExecutor; (2) the windowed-join
+        // under-emit — via cache-off-when-parallel (the single-threaded MapStateCache races under
+        // parallel; cache-off is the proven-correct parallel config, coupled in ForStRsMapStateV2).
+        // VERIFIED correct + neutral-or-faster across families under parallel+cache-off: q3 36.6s
+        // (light, exact), q8 windowed-join (correct band), q11 318.9→135.7s (2.35×, 92M exact, PASSES
+        // 0.82×RocksDB), q12 50.6→46.5s (cache-benefiting got FASTER, 92M exact — cache-off did NOT
+        // rob it). Full q0–q22 e2e sweep is the confirmation gate; reversible via =0.
         String pe = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
-        if (pe != null && pe.trim().equals("1")) {
+        boolean parallelOn = (pe == null) || !pe.trim().equals("0");
+        if (parallelOn) {
             org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
                     new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
                             linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
