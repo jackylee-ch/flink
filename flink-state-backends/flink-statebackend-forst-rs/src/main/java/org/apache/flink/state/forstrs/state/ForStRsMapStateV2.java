@@ -123,9 +123,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                     // is enabled, bypass the cache. The DEFAULT depth-1 path keeps the cache (correct
                     // + fast — single-threaded mailbox access), so this robs no query: it only
                     // changes behavior in the opt-in parallel mode where the cache is unsafe anyway.
-                    // Parallel executor is DEFAULT-ON (opt-out with =0); align the cache bypass so
-                    // cache-off holds whenever parallel is active (the proven-correct parallel config).
-                    || !"0".equals(System.getenv("FRS_RS_PARALLEL_EXECUTOR"));
+                    // Parallel executor is OPT-IN (reverted from default — cache-off robs the
+                    // cache-benefiting joins like q9). Align: bypass the cache only when parallel is
+                    // explicitly enabled (the proven-correct parallel config).
+                    || "1".equals(System.getenv("FRS_RS_PARALLEL_EXECUTOR"));
 
     /**
      * FRS-ADAPTIVE-MAPSTATE-CACHE (2026-06-04): the per-record read cache is a

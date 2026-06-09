@@ -1147,9 +1147,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // (light, exact), q8 windowed-join (correct band), q11 318.9→135.7s (2.35×, 92M exact, PASSES
         // 0.82×RocksDB), q12 50.6→46.5s (cache-benefiting got FASTER, 92M exact — cache-off did NOT
         // rob it). Full q0–q22 e2e sweep is the confirmation gate; reversible via =0.
+        // REVERTED to OPT-IN (2026-06-10): default-on robs cache-benefiting throughput-bound joins.
+        // OPT-01 (parallel+cache-off) is correctness-safe and a big win for DRAIN-TAIL-bound queries
+        // (q11 318.9→135.7s = 2.35×; q12 faster) but it forces cache-off, and q9 — a per-probe-read-
+        // bound join that RELIES on the MapStateCache — does NOT get q11's tail win and is
+        // neutral-to-SLOWER (DNF 79.2M@1284s vs depth-1 ~84.5M@1204s). Helping q11 while robbing q9 is
+        // "rob Peter to pay Paul" — forbidden. So OPT-01 stays OPT-IN (FRS_RS_PARALLEL_EXECUTOR=1);
+        // default = depth-1 + cache (correct + fast for ALL). A true default needs the cache KEPT
+        // under parallel (per-worker cache pinned to the key-group's worker thread) — multi-PR.
         String pe = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
-        boolean parallelOn = (pe == null) || !pe.trim().equals("0");
-        if (parallelOn) {
+        if (pe != null && pe.trim().equals("1")) {
             org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
                     new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
                             linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
