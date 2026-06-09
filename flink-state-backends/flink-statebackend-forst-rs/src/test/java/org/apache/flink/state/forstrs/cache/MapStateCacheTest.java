@@ -239,4 +239,41 @@ class MapStateCacheTest {
         assertEquals(0, removed);
         assertNotNull(cache.lookup(new byte[] {1, 2}));
     }
+
+    /**
+     * DECAY FIX gate (2026-06-08): heavy put/remove/evict churn on a small cache forces the
+     * open-addressed hashIndex to accumulate tombstones and trigger many {@code
+     * rehashDropTombstones} rebuilds. Verifies the rehash NEVER corrupts: an immediately-after-write
+     * lookup must hit with the exact value just written (the key is the most-recently-accessed, so
+     * eviction cannot have removed it), and a final scan must return, for every key, either
+     * not-cached (evicted) or the exact model value — never a stale or cross-key value.
+     */
+    @Test
+    void rehashUnderChurnNeverCorrupts() {
+        MapStateCache<Integer> cache = new MapStateCache<>(64);
+        java.util.Map<Integer, Integer> model = new java.util.HashMap<>();
+        java.util.Random rnd = new java.util.Random(20260608L);
+        for (int i = 0; i < 300_000; i++) {
+            int k = rnd.nextInt(500);
+            byte[] kb = new byte[] {(byte) (k >>> 8), (byte) k};
+            if (rnd.nextInt(4) == 0) {
+                cache.remove(kb);
+                model.put(k, null);
+            } else {
+                cache.put(kb, i);
+                model.put(k, i);
+            }
+            MapStateCache.Lookup<Integer> hit = cache.lookup(kb);
+            assertNotNull(hit, "just-written key " + k + " missing at iter " + i);
+            assertTrue(hit.cached(), "just-written key " + k + " not cached at iter " + i);
+            assertEquals(model.get(k), hit.value(), "wrong value for key " + k + " at iter " + i);
+        }
+        for (int k = 0; k < 500; k++) {
+            byte[] kb = new byte[] {(byte) (k >>> 8), (byte) k};
+            MapStateCache.Lookup<Integer> hit = cache.lookup(kb);
+            if (hit != null && hit.cached()) {
+                assertEquals(model.get(k), hit.value(), "stale/corrupt value for key " + k);
+            }
+        }
+    }
 }

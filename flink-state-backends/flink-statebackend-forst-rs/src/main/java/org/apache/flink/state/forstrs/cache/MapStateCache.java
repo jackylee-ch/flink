@@ -130,6 +130,12 @@ public final class MapStateCache<V> implements AutoCloseable {
     private long keyDataCapacity;
     private long keyDataUsed;
     private int size;
+    // DECAY FIX (2026-06-08, JFR-proven): live count of TOMBSTONE_SLOT entries in the
+    // open-addressed hashIndex. Evictions write tombstones that findRow must probe PAST; once
+    // they consume the empty slots, every findRow degrades to an O(hashSlots) scan → O(n²) over a
+    // churn-heavy query (q19 TopN: 52% of all CPU in findRow per JFR). When (size+tombstones)
+    // exceeds 0.75·hashSlots we rehash, dropping all tombstones and restoring O(1) probes.
+    private int tombstones;
     private long clock; // monotonic counter for access-time stamps
     private int clockHand; // sweep cursor for eviction
 
@@ -273,6 +279,11 @@ public final class MapStateCache<V> implements AutoCloseable {
         if (size >= maxEntries) {
             evictClockSweep();
         }
+        // DECAY FIX: rehash to drop accumulated eviction tombstones before they degrade findRow
+        // probes to O(hashSlots). Amortized O(1) (fires every ~0.5·capacity inserts under churn).
+        if ((long) (size + tombstones) * 4L >= (long) hashSlots * 3L) {
+            rehashDropTombstones();
+        }
         row = size++;
         appendKey(row, keyBuf, keyOff, keyLen);
         values[row] = stored;
@@ -330,6 +341,7 @@ public final class MapStateCache<V> implements AutoCloseable {
         checkOpen();
         int prevSize = size;
         size = 0;
+        tombstones = 0; // DECAY FIX: cleared hashIndex below has no tombstones
         keyDataUsed = 0;
         clock = 0;
         clockHand = 0;
@@ -512,6 +524,9 @@ public final class MapStateCache<V> implements AutoCloseable {
                             ValueLayout.JAVA_INT,
                             (long) slot * 2 * Integer.BYTES + Integer.BYTES);
             if (existing == EMPTY_SLOT || existing == TOMBSTONE_SLOT) {
+                if (existing == TOMBSTONE_SLOT) {
+                    tombstones--; // DECAY FIX: reusing a tombstone slot reclaims it
+                }
                 hashIndex.set(
                         ValueLayout.JAVA_INT, (long) slot * 2 * Integer.BYTES, hash);
                 hashIndex.set(
@@ -525,6 +540,38 @@ public final class MapStateCache<V> implements AutoCloseable {
         }
         throw new IllegalStateException(
                 "MapStateCache hash index full at size=" + size + " capacity=" + capacity);
+    }
+
+    /**
+     * DECAY FIX (2026-06-08): rebuild the open-addressed hashIndex from the live row table,
+     * dropping every tombstone. After this, every slot is EMPTY or a live (hash,row) pair, so
+     * findRow probes are short again — eliminating the O(hashSlots) scan that dominated q19 (52% of
+     * CPU per JFR). O(size); the 0.75-load trigger makes it amortized O(1) per insert under churn.
+     */
+    private void rehashDropTombstones() {
+        for (int slot = 0; slot < hashSlots; slot++) {
+            hashIndex.set(
+                    ValueLayout.JAVA_INT,
+                    (long) slot * 2 * Integer.BYTES + Integer.BYTES,
+                    EMPTY_SLOT);
+        }
+        tombstones = 0;
+        // Re-insert every live row; its hash is re-derived from off-heap keyData (no allocation).
+        // All slots are EMPTY now, so insertHashIndex never sees a tombstone (tombstones stays 0).
+        for (int row = 0; row < size; row++) {
+            insertHashIndex(hashOfRow(row), row);
+        }
+    }
+
+    /** DECAY FIX: hash a live row's key straight from off-heap keyData; mirrors {@link #hashOf}. */
+    private int hashOfRow(int row) {
+        int kStart = keyOffsets.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+        int len = keyLengths.get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
+        int h = 1;
+        for (int i = 0; i < len; i++) {
+            h = 31 * h + keyData.get(ValueLayout.JAVA_BYTE, (long) (kStart + i));
+        }
+        return h;
     }
 
     /**
@@ -608,6 +655,7 @@ public final class MapStateCache<V> implements AutoCloseable {
                 (long) slot * 2 * Integer.BYTES + Integer.BYTES,
                 TOMBSTONE_SLOT);
         rowToSlot.set(ValueLayout.JAVA_INT, (long) row * Integer.BYTES, -1);
+        tombstones++; // DECAY FIX: track tombstone buildup for rehash trigger
     }
 
     private void relabelHashIndex(int fromRow, int toRow) {
