@@ -374,6 +374,14 @@ public final class ForStRsLinker {
      */
     private final MethodHandle frsVecIterPrefixOpenBatch;
 
+    /**
+     * PARALLEL variant of {@link #frsVecIterPrefixOpenBatch} — identical ABI, but the engine builds +
+     * drains the K probes across its read pool (FRS_RS_READ_IO_PARALLELISM) instead of a serial loop.
+     * The join read-path lever (q7/q9/q20): the K iterator probes in an async-state batch run
+     * concurrently. Results are byte-identical to the serial open (proven by the engine + FFI tests).
+     */
+    private final MethodHandle frsVecIterPrefixOpenBatchParallel;
+
     private final MethodHandle frsVecMergeAppend;
     private final MethodHandle frsVecMergeAppendBatch; // Phase A.1 (audit-design §3 V4)
 
@@ -1151,6 +1159,19 @@ public final class ForStRsLinker {
         this.frsVecIterPrefixOpenBatch =
                 bind(
                         "frs_vec_iter_prefix_open_batch",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT, // return rc
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // prefixes_off (u32*)
+                                ValueLayout.ADDRESS, // prefixes_data (u8*)
+                                ValueLayout.JAVA_INT, // n (u32)
+                                ValueLayout.ADDRESS, // out_handles (u64*)
+                                ValueLayout.ADDRESS, // out_first_chunks (FrsChunk*)
+                                ValueLayout.JAVA_INT)); // chunk_cap (u32)
+        this.frsVecIterPrefixOpenBatchParallel =
+                bind(
+                        "frs_vec_iter_prefix_open_batch_parallel",
                         FunctionDescriptor.of(
                                 ValueLayout.JAVA_INT, // return rc
                                 ValueLayout.ADDRESS, // db
@@ -4024,6 +4045,36 @@ public final class ForStRsLinker {
                             chunkCap);
         } catch (Throwable t) {
             throw new RuntimeException("frs_vec_iter_prefix_open_batch failed", t);
+        }
+    }
+
+    /**
+     * PARALLEL batched prefix-iterator open (the join read-path lever). Identical ABI + contract to
+     * {@link #frsVecIterPrefixOpenBatch}, but the engine builds + drains the K probes concurrently
+     * across its read pool. Drop-in replacement on the batched-open path.
+     */
+    public int frsVecIterPrefixOpenBatchParallel(
+            MemorySegment db,
+            MemorySegment cf,
+            MemorySegment prefixesOff,
+            MemorySegment prefixesData,
+            int n,
+            MemorySegment outHandles,
+            MemorySegment outFirstChunks,
+            int chunkCap) {
+        try {
+            return (int)
+                    frsVecIterPrefixOpenBatchParallel.invokeExact(
+                            db,
+                            cf,
+                            prefixesOff,
+                            prefixesData,
+                            n,
+                            outHandles,
+                            outFirstChunks,
+                            chunkCap);
+        } catch (Throwable t) {
+            throw new RuntimeException("frs_vec_iter_prefix_open_batch_parallel failed", t);
         }
     }
 

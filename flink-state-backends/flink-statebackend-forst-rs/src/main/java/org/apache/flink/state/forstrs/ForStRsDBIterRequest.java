@@ -252,15 +252,18 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         //     accumulated >= CACHE_SIZE_LIMIT entries (soft cap; the rest goes in continuation).
         //   - The continuation path (existingVecHandle != 0) skips the open and goes straight
         //     into the drain loop.
-        // FRS-ITER-LEAK-FIX: chunkBuf + out-params are TRANSIENT — consumed
-        // within this method (views are copied into the long-lived `arena` by
-        // parseChunkInto, which is what the join keeps). Allocate them from a
-        // per-call confined Arena freed on close, NOT the long-lived executor
-        // `arena`. The pre-fix per-probe `arena.allocate` never freed, so the
-        // executor arena's segment list grew O(n_probes) → each subsequent
-        // allocate got slower (q7 join open crept 2µs→12µs) + native heap
-        // ballooned. The continuation handle (existingVecHandle) is a native
-        // iterator id, not an arena segment, so it safely spans process() calls.
+        // FRS-ITER-LEAK-FIX (2026-06-08): EVERYTHING this drain allocates off-heap
+        // — chunkBuf, out-params, the openVecIter prefix/handle segments, AND the
+        // per-chunk view snapshots (parseChunkInto) — is TRANSIENT: consumed by
+        // completeWithEntries (which deserializes each view into a DETACHED on-heap
+        // UK/UV) before this try(scratch) block closes. So all of it goes on the
+        // per-call confined `scratch`, NOT the long-lived executor `arena` (the
+        // `arena` param is now unused on this path). The pre-fix routed the view
+        // snapshots into `arena` and never freed them, so a join's millions of
+        // MapState iterations grew the executor arena ~9 GB off-heap (UNcounted by
+        // Flink's process.size budget) → q9/q20/q4 cgroup OOM-kill. The continuation
+        // handle (existingVecHandle) is a native iterator id, not an arena segment,
+        // so it safely spans process() calls.
         try (Arena scratch = Arena.ofConfined()) {
         MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
         MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
@@ -289,7 +292,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 int firstRowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
                 int firstBytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
                 if (firstRowCount > 0) {
-                    parseChunkInto(chunkBuf, firstRowCount, firstBytesUsed, drained, arena);
+                    parseChunkInto(chunkBuf, firstRowCount, firstBytesUsed, drained, scratch);
                 }
             }
 
@@ -316,7 +319,7 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                     exhausted = true;
                     break;
                 }
-                parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, arena);
+                parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, scratch);
             } while (drained.size() < CACHE_SIZE_LIMIT);
         } catch (Throwable t) {
             // Any escape (parse failure, FrsBackendException, anything) must release the native
@@ -341,13 +344,116 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         }
         this.existingVecHandle = continuationHandle;
 
-        // Decode views into UK/UV. Each view references a per-chunk arena-allocated snapshot
-        // segment (see parseChunkInto). The reusable chunkBuf is overwritten on each next()
-        // call, but the snapshots are NOT — they remain immutable for the lifetime of the
-        // arena, which the caller closes only after this method returns. So views from
-        // earlier chunks survive subsequent next() calls without corruption.
+        // Decode views into UK/UV. Each view references a per-chunk snapshot segment allocated
+        // from `scratch` (see parseChunkInto). The reusable chunkBuf is overwritten on each
+        // next() call, but the per-chunk snapshots are NOT — they remain immutable for the
+        // lifetime of `scratch`, so views from earlier chunks survive subsequent next() calls.
+        // FRS-ITER-LEAK-FIX (2026-06-08): snapshots now live on `scratch`, NOT the long-lived
+        // executor `arena`. completeWithEntries deserializes every view into a DETACHED on-heap
+        // UK/UV (deserializeUserKey/Value copy the bytes out via the serializer) BEFORE this
+        // try(scratch) block closes — so freeing scratch here is safe, and the per-iteration
+        // off-heap footprint is bounded by ONE drain instead of growing O(n_iterations) forever
+        // (the q9/q20/q4 join-OOM root cause: the executor arena ballooned ~9 GB off-heap).
         completeWithEntries(drained, encounterEnd, null);
         } // end try(scratch): frees the transient chunkBuf + out-params per probe
+    }
+
+    /** The prefix bytes this request iterates (used by the batched-parallel open path). */
+    byte[] prefix() {
+        return prefix;
+    }
+
+    /** True when this is a MAP_IS_EMPTY probe (handled by the single-open path, never batched). */
+    boolean isMapIsEmpty() {
+        return originalRequestType == StateRequestType.MAP_IS_EMPTY;
+    }
+
+    /** True when this request is a continuation (resumes a prior iterator) — not batchable. */
+    boolean hasExistingVecHandle() {
+        return existingVecHandle != 0L;
+    }
+
+    /** The uniform per-probe chunk buffer capacity the batched-parallel open path must allocate. */
+    static int chunkBufCap() {
+        return CHUNK_BUF_CAP;
+    }
+
+    /**
+     * Batched-parallel MAP_ITER drain (the join read-path lever, q7/q9/q20). The caller
+     * ({@link VectorizedExecutor#executeIters}, gated on {@code FRS_RS_PARALLEL_ITER}) has already
+     * opened this probe's iterator via the ONE batched-parallel FFI crossing
+     * ({@code frs_vec_iter_prefix_open_batch_parallel}) — which built+drained the K probes across the
+     * engine read pool — and hands back this probe's native {@code handle} plus its already-filled
+     * first chunk ({@code firstChunkBuf}/{@code firstRowCount}/{@code firstBytesUsed}). This method
+     * does the SAME parse-first-chunk → {@code _next} drain → {@link #completeWithEntries} as
+     * {@link #process}'s MAP_ITER path; the only difference is the open is skipped (already done in the
+     * batch) and the first chunk is supplied rather than produced here. Decode is byte-identical to the
+     * serial path (same {@code parseChunkInto} + zero-copy {@code VIEW_TL} deserialize).
+     *
+     * <p>Only valid for non-MAP_IS_EMPTY, fresh-open requests ({@code existingVecHandle == 0}); the
+     * caller enforces this and routes everything else to {@link #process}.
+     */
+    public void processFromBatchedOpen(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            long handle,
+            MemorySegment firstChunkBuf,
+            int firstRowCount,
+            int firstBytesUsed) {
+        try (Arena scratch = Arena.ofConfined()) {
+            MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
+            MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
+            MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
+
+            ArrayList<IteratorEntryView> drained = new ArrayList<>();
+            boolean exhausted = false;
+            try {
+                // Step 1: parse the first chunk the batched open already filled (its rows were
+                // popped from this probe's iterator during the parallel open — same as the
+                // single-open first-chunk consume in process()).
+                if (firstRowCount > 0) {
+                    parseChunkInto(firstChunkBuf, firstRowCount, firstBytesUsed, drained, scratch);
+                }
+                // Step 2: continue via frs_vec_iter_prefix_next (identical to process()'s drain
+                // loop). The batched open registered the handle (a light shell once exhausted),
+                // so the first next() returns 0/0 with OK when the first chunk held everything.
+                do {
+                    int rc =
+                            linker.frsVecIterPrefixNext(
+                                    handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
+                    if (rc != FrsStatus.OK.code()) {
+                        throwIfFatal(rc, "frs_vec_iter_prefix_next");
+                        throw new FrsBackendException(
+                                statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
+                    }
+                    int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                    int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+                    if (rowCount == 0) {
+                        exhausted = true;
+                        break;
+                    }
+                    parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, scratch);
+                } while (drained.size() < CACHE_SIZE_LIMIT);
+            } catch (Throwable t) {
+                try {
+                    linker.frsVecIterPrefixClose(handle);
+                } catch (Throwable ignored) {
+                    // best-effort close; surface the original failure
+                }
+                this.existingVecHandle = 0L;
+                throw t;
+            }
+
+            boolean encounterEnd = exhausted;
+            long continuationHandle = handle;
+            if (encounterEnd) {
+                linker.frsVecIterPrefixClose(handle);
+                continuationHandle = 0L;
+            }
+            this.existingVecHandle = continuationHandle;
+            completeWithEntries(drained, encounterEnd, null);
+        }
     }
 
     /**
