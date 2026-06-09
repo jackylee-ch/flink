@@ -1138,17 +1138,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // one of N single-thread VectorizedExecutor workers so disjoint-key batches run concurrently
         // + the mailbox overlaps the next batch (the documented "in-flight depth > 1" fix). Workers
         // register into managedExecutors so snapshot/flush/shutdown reach them.
-        // OPT-01 (2026-06-09): the async-offload executor is now the DEFAULT. The depth-1 inline
-        // VectorizedExecutor returned an already-completed future on the mailbox thread, pinning the
-        // AEC in-flight depth at 1 → 10:1 ThreadPark:on-CPU (JFR). RoutingStateExecutor returns an
-        // incomplete future + offloads to N single-thread workers (real fullyLoaded), letting the AEC
-        // pipeline. VERIFIED correctness-exact + neutral-or-better across families: q11 0.35x->0.82x
-        // (fail->pass, 2.35x, out_rows=92M exact), q9 +7.7-15%, q3 neutral (36.6 vs 36.7s exact);
-        // CPU 375%->646% (the prior "refuted" result predated the lock-free memtable that was
-        // serializing the workers). Opt OUT with FRS_RS_PARALLEL_EXECUTOR=0 (falls back to depth-1).
+        // OPT-01 (2026-06-09): async-offload executor — REVERTED to OPT-IN (NOT default).
+        // Default-on was tried and REVERTED because it introduced a CORRECTNESS REGRESSION on
+        // windowed-joins: q8 out_rows 3,010,888 (depth-1) → 1,819,576 (parallel) = ~40% under-emit.
+        // The RoutingStateExecutor's key-routing races on windowed-join state (window/namespace
+        // ordering across workers). It IS correct on light/join/window/windowed-agg (q3/q9/q11/q12
+        // exact) and gives big wins (q11 2.35× at worker=6), but correctness is non-negotiable, so it
+        // stays opt-IN (FRS_RS_PARALLEL_EXECUTOR=1) until the windowed-join race is fixed (then it can
+        // be default-enabled). Until then the safe depth-1 VectorizedExecutor is the default.
         String pe = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
-        boolean parallelOn = (pe == null) || !pe.trim().equals("0");
-        if (parallelOn) {
+        if (pe != null && pe.trim().equals("1")) {
             org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
                     new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
                             linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
