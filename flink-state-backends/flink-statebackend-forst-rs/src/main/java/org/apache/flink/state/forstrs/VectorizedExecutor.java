@@ -1363,25 +1363,70 @@ public class VectorizedExecutor implements StateExecutor {
      * e2e-validated; flip the default once verified.
      */
     private static final boolean PARALLEL_ITER = "1".equals(System.getenv("FRS_RS_PARALLEL_ITER"));
+    private static final boolean ITER_DISPATCH_DIAG =
+            "1".equals(System.getenv("FRS_ITER_DISPATCH_DIAG"));
+    private static final java.util.concurrent.atomic.AtomicLong DIAG_BATCHES =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong DIAG_FRESH =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong DIAG_CONT =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong DIAG_PAR_DISPATCHES =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final java.util.concurrent.atomic.AtomicLong DIAG_NEXT_DUMP =
+            new java.util.concurrent.atomic.AtomicLong(200_000L);
 
     private void executeIters(VectorizedClassifier c) {
         if (c.iterRequests().isEmpty()) {
             return;
         }
-        // FRS-PARALLEL-ITER: when enabled, and EVERY probe is a fresh-open MAP_ITER (no
-        // continuations, no MAP_IS_EMPTY) with >1 probe, dispatch them through ONE batched-parallel
-        // FFI crossing so the engine builds+drains the K probes across its read pool. Any
-        // ineligible mix falls through to the proven serial loop below (identity-preserving).
-        if (PARALLEL_ITER && c.iterRequests().size() > 1) {
-            boolean eligible = true;
-            for (ForStRsDBIterRequest<?, ?, ?, ?> it : c.iterRequests()) {
-                if (it.isMapIsEmpty() || it.hasExistingVecHandle()) {
-                    eligible = false;
-                    break;
+        // FRS-PARALLEL-ITER: when enabled, PARTITION the batch — fresh-open MAP_ITER probes go
+        // through ONE batched-parallel FFI crossing (engine builds+drains the K probes across its
+        // read pool); continuations (existingVecHandle != 0) and MAP_IS_EMPTY stay on the serial
+        // path. A MIXED batch still parallelizes its fresh probes (the prior all-or-nothing gate
+        // fell back to serial whenever a single continuation was present — the common case for
+        // multi-chunk join iterations, which is why q9/q7/q20 saw no speedup).
+        if (PARALLEL_ITER) {
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> all = c.iterRequests();
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> fresh = new java.util.ArrayList<>();
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> rest = new java.util.ArrayList<>();
+            for (ForStRsDBIterRequest<?, ?, ?, ?> it : all) {
+                if (!it.isMapIsEmpty() && !it.hasExistingVecHandle()) {
+                    fresh.add(it);
+                } else {
+                    rest.add(it);
                 }
             }
-            if (eligible) {
-                executeItersBatchedParallel(c);
+            if (ITER_DISPATCH_DIAG) {
+                DIAG_BATCHES.incrementAndGet();
+                DIAG_FRESH.addAndGet(fresh.size());
+                DIAG_CONT.addAndGet(rest.size());
+                long total = DIAG_FRESH.get() + DIAG_CONT.get();
+                long threshold = DIAG_NEXT_DUMP.get();
+                if (total >= threshold && DIAG_NEXT_DUMP.compareAndSet(threshold, threshold + 200_000L)) {
+                    System.out.println(
+                            "[ITER_DISPATCH_DIAG] batches="
+                                    + DIAG_BATCHES.get()
+                                    + " fresh="
+                                    + DIAG_FRESH.get()
+                                    + " continuation="
+                                    + DIAG_CONT.get()
+                                    + " parDispatches="
+                                    + DIAG_PAR_DISPATCHES.get()
+                                    + " fresh%="
+                                    + (total == 0 ? 0 : (100 * DIAG_FRESH.get() / total)));
+                }
+            }
+            if (fresh.size() > 1) {
+                DIAG_PAR_DISPATCHES.incrementAndGet();
+                executeItersBatchedParallel(fresh, c);
+                // Serial-drive the remainder (continuations + IS_EMPTY) below.
+                if (rest.isEmpty()) {
+                    return;
+                }
+                for (ForStRsDBIterRequest<?, ?, ?, ?> iter : rest) {
+                    drainIterSerial(iter, c);
+                }
                 return;
             }
         }
@@ -1393,33 +1438,34 @@ public class VectorizedExecutor implements StateExecutor {
         // through the PUT failure path. Marking + completing-exceptionally on the iter request
         // before rethrowing matches the executePuts / executeGets contract.
         for (ForStRsDBIterRequest<?, ?, ?, ?> iter : c.iterRequests()) {
-            try {
-                iter.process(linker, db, cf, arena);
-            } catch (Throwable t) {
-                // R94-H1 / R93-H2: ForStRsDBIterRequest.throwIfFatal() throws
-                // FrsEnginePanicError for fail-process FFI rc (PANIC_CAUGHT
-                // etc.) on the MapState iter hot path. Escalate to the fatal
-                // handler so the engine doesn't keep running on poisoned
-                // state. Mirrors executePuts / executeDeletes / GET-path
-                // patterns.
-                if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
-                    fatalHandler.onFatalError(panicErr);
-                }
-                StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
-                if (sr != null) {
-                    try {
-                        c.markCompletedExceptionally(sr);
-                    } catch (Throwable ignore) {
-                        // Best-effort marker placement — never swallow the original failure.
-                    }
-                }
-                try {
-                    iter.completeExceptionally(t);
-                } catch (Throwable ignore) {
-                    // Best-effort per-row completion — never swallow the original failure.
-                }
-                throw t;
+            drainIterSerial(iter, c);
+        }
+    }
+
+    /** Serial drain of one iterator request with the R22-M2 per-op fatal/mark/complete contract. */
+    private void drainIterSerial(ForStRsDBIterRequest<?, ?, ?, ?> iter, VectorizedClassifier c) {
+        try {
+            iter.process(linker, db, cf, arena);
+        } catch (Throwable t) {
+            // R94-H1 / R93-H2: throwIfFatal() throws FrsEnginePanicError for fail-process FFI rc;
+            // escalate to the fatal handler so the engine doesn't keep running on poisoned state.
+            if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                fatalHandler.onFatalError(panicErr);
             }
+            StateRequest<?, ?, ?, ?> sr = iter.getStateRequest();
+            if (sr != null) {
+                try {
+                    c.markCompletedExceptionally(sr);
+                } catch (Throwable ignore) {
+                    // Best-effort marker placement — never swallow the original failure.
+                }
+            }
+            try {
+                iter.completeExceptionally(t);
+            } catch (Throwable ignore) {
+                // Best-effort per-row completion — never swallow the original failure.
+            }
+            throw t;
         }
     }
 
@@ -1433,8 +1479,8 @@ public class VectorizedExecutor implements StateExecutor {
      * SAME zero-copy path as the serial loop ({@code completeWithEntries}/{@code VIEW_TL}). Only
      * reached when {@link #PARALLEL_ITER} is on AND every probe is a fresh-open MAP_ITER.
      */
-    private void executeItersBatchedParallel(VectorizedClassifier c) {
-        java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> reqs = c.iterRequests();
+    private void executeItersBatchedParallel(
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> reqs, VectorizedClassifier c) {
         int n = reqs.size();
         final int chunkCap = ForStRsDBIterRequest.chunkBufCap();
         try (Arena scratch = Arena.ofConfined()) {
