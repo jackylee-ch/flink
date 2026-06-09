@@ -301,7 +301,22 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             firstChunkFromOpen = true;
         }
 
-        ArrayList<IteratorEntryView> drained = new ArrayList<>();
+        // FRS-ZERO-SNAPSHOT (2026-06-09, lever-1 completion): decode each chunk's entries to
+        // DETACHED on-heap UK/UV IMMEDIATELY after parsing it — referencing the reused chunkBuf
+        // directly — instead of snapshotting every chunk into a fresh scratch.allocate(bytesUsed)
+        // and decoding at the end. chunkBuf is stable until the next frs_vec_iter_prefix_next()
+        // overwrites it; we deserialize (which copies bytes out to heap) BEFORE that next() call,
+        // so the on-heap entries are detached and the buffer can be safely reused. This removes
+        // the per-chunk native snapshot alloc (the remaining per-probe `initNativeMemory` the
+        // chunkBuf-reuse didn't cover) AND the intermediate IteratorEntryView accumulation list.
+        final int prefixLen = prefix.length;
+        final ArrayList<Map.Entry<UK, UV>> mapEntries =
+                originalRequestType == StateRequestType.MAP_ITER ? new ArrayList<>() : null;
+        final ArrayList<UK> keys =
+                originalRequestType == StateRequestType.MAP_ITER_KEY ? new ArrayList<>() : null;
+        final ArrayList<UV> values =
+                originalRequestType == StateRequestType.MAP_ITER_VALUE ? new ArrayList<>() : null;
+        int decodedCount = 0;
         boolean exhausted = false;
         try {
             // Step 1 (open-path only): consume the first chunk that frs_vec_iter_prefix_open
@@ -314,7 +329,15 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 int firstRowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
                 int firstBytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
                 if (firstRowCount > 0) {
-                    parseChunkInto(chunkBuf, firstRowCount, firstBytesUsed, drained, scratch);
+                    decodedCount +=
+                            decodeChunkDirect(
+                                    chunkBuf,
+                                    firstRowCount,
+                                    firstBytesUsed,
+                                    prefixLen,
+                                    mapEntries,
+                                    keys,
+                                    values);
                 }
             }
 
@@ -341,8 +364,10 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                     exhausted = true;
                     break;
                 }
-                parseChunkInto(chunkBuf, rowCount, bytesUsed, drained, scratch);
-            } while (drained.size() < CACHE_SIZE_LIMIT);
+                decodedCount +=
+                        decodeChunkDirect(
+                                chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys, values);
+            } while (decodedCount < CACHE_SIZE_LIMIT);
         } catch (Throwable t) {
             // Any escape (parse failure, FrsBackendException, anything) must release the native
             // handle before propagating — otherwise the iterator leaks for the lifetime of the
@@ -366,17 +391,12 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         }
         this.existingVecHandle = continuationHandle;
 
-        // Decode views into UK/UV. Each view references a per-chunk snapshot segment allocated
-        // from `scratch` (see parseChunkInto). The reusable chunkBuf is overwritten on each
-        // next() call, but the per-chunk snapshots are NOT — they remain immutable for the
-        // lifetime of `scratch`, so views from earlier chunks survive subsequent next() calls.
-        // FRS-ITER-LEAK-FIX (2026-06-08): snapshots now live on `scratch`, NOT the long-lived
-        // executor `arena`. completeWithEntries deserializes every view into a DETACHED on-heap
-        // UK/UV (deserializeUserKey/Value copy the bytes out via the serializer) BEFORE this
-        // try(scratch) block closes — so freeing scratch here is safe, and the per-iteration
-        // off-heap footprint is bounded by ONE drain instead of growing O(n_iterations) forever
-        // (the q9/q20/q4 join-OOM root cause: the executor arena ballooned ~9 GB off-heap).
-        completeWithEntries(drained, encounterEnd, null);
+        // Entries were already decoded to DETACHED on-heap UK/UV per chunk (FRS-ZERO-SNAPSHOT
+        // above) — no view-snapshot accumulation, no per-chunk native alloc. Build the result
+        // iterator from the pre-decoded collection. The per-iteration off-heap footprint is the
+        // single reused chunkBuf (the q9/q20/q4 join-OOM root cause — an executor arena ballooning
+        // ~9 GB off-heap from never-freed per-chunk snapshots — is structurally gone).
+        completeFromDecoded(mapEntries, keys, values, encounterEnd);
         } // end try(scratch): frees the transient chunkBuf + out-params per probe
     }
 
@@ -614,6 +634,120 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         }
         // bytesUsed paranoia check (asserts only under -ea).
         assert off == bytesUsed : "chunk parse off=" + off + " != bytesUsed=" + bytesUsed;
+    }
+
+    /**
+     * FRS-ZERO-SNAPSHOT (2026-06-09): decode one chunk's {@code rowCount} entries DIRECTLY into the
+     * pre-allocated typed result collection, referencing {@code chunkBuf} in place (no per-chunk
+     * snapshot alloc). {@code deserializeUserKey/Value} materialize DETACHED on-heap UK/UV (copying
+     * the bytes out of the segment) synchronously here — before the caller's next
+     * {@code frs_vec_iter_prefix_next} reuses {@code chunkBuf} — so the on-heap entries survive the
+     * buffer reuse. Exactly one of {@code mapEntries}/{@code keys}/{@code values} is non-null,
+     * selected by {@code originalRequestType}. Returns the number of rows processed (== rowCount),
+     * so the drain's soft-cap accounting matches the prior view-accumulation semantics exactly
+     * (rows counted regardless of null-value skips). Null-value skip rules match
+     * {@link #completeWithEntries}.
+     */
+    private int decodeChunkDirect(
+            MemorySegment chunkBuf,
+            int rowCount,
+            int bytesUsed,
+            int prefixLen,
+            @Nullable ArrayList<Map.Entry<UK, UV>> mapEntries,
+            @Nullable ArrayList<UK> keys,
+            @Nullable ArrayList<UV> values) {
+        int off = 0;
+        for (int i = 0; i < rowCount; i++) {
+            int klen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+            off += 4;
+            int vlen = chunkBuf.get(ValueLayout.JAVA_INT_UNALIGNED, off);
+            off += 4;
+            int keyOff = off;
+            off += klen;
+            int valOff = off;
+            off += vlen;
+            IteratorEntryView v = new IteratorEntryView(chunkBuf, keyOff, klen, valOff, vlen);
+            if (mapEntries != null) {
+                UK uk = iterableState.deserializeUserKey(v, prefixLen);
+                UV uv = iterableState.deserializeUserValue(v);
+                if (uv != null) {
+                    mapEntries.add(new SimpleEntry<>(uk, uv));
+                }
+            } else if (keys != null) {
+                keys.add(iterableState.deserializeUserKey(v, prefixLen));
+            } else if (values != null) {
+                UV uv = iterableState.deserializeUserValue(v);
+                if (uv != null) {
+                    values.add(uv);
+                }
+            }
+        }
+        assert off == bytesUsed : "chunk decode off=" + off + " != bytesUsed=" + bytesUsed;
+        return rowCount;
+    }
+
+    /**
+     * FRS-ZERO-SNAPSHOT (2026-06-09): build + complete the result iterator from collections already
+     * decoded per chunk by {@link #decodeChunkDirect}. Mirrors {@link #completeWithEntries}'s
+     * iterator construction exactly (same {@code ForStRsMapIterator} args + future completion);
+     * the only difference is the decode happened streaming during the drain, not here. Exactly one
+     * collection is non-null per {@code originalRequestType}.
+     */
+    @SuppressWarnings("unchecked")
+    private void completeFromDecoded(
+            @Nullable Collection<Map.Entry<UK, UV>> mapEntries,
+            @Nullable Collection<UK> keys,
+            @Nullable Collection<UV> values,
+            boolean encounterEnd) {
+        StateRequestHandler handler = iterableState.getStateRequestHandler();
+        long contHandle = encounterEnd ? 0L : existingVecHandle;
+        switch (originalRequestType) {
+            case MAP_ITER:
+                ForStRsMapIterator<Map.Entry<UK, UV>> entryIter =
+                        new ForStRsMapIterator<>(
+                                iterableState.asState(),
+                                StateRequestType.MAP_ITER,
+                                handler,
+                                mapEntries,
+                                encounterEnd,
+                                null,
+                                contHandle);
+                ((InternalAsyncFuture<StateIterator<Map.Entry<UK, UV>>>)
+                                (InternalAsyncFuture<?>) request.getFuture())
+                        .complete(entryIter);
+                break;
+            case MAP_ITER_KEY:
+                ForStRsMapIterator<UK> keyIter =
+                        new ForStRsMapIterator<>(
+                                iterableState.asState(),
+                                StateRequestType.MAP_ITER_KEY,
+                                handler,
+                                keys,
+                                encounterEnd,
+                                null,
+                                contHandle);
+                ((InternalAsyncFuture<StateIterator<UK>>)
+                                (InternalAsyncFuture<?>) request.getFuture())
+                        .complete(keyIter);
+                break;
+            case MAP_ITER_VALUE:
+                ForStRsMapIterator<UV> valueIter =
+                        new ForStRsMapIterator<>(
+                                iterableState.asState(),
+                                StateRequestType.MAP_ITER_VALUE,
+                                handler,
+                                values,
+                                encounterEnd,
+                                null,
+                                contHandle);
+                ((InternalAsyncFuture<StateIterator<UV>>)
+                                (InternalAsyncFuture<?>) request.getFuture())
+                        .complete(valueIter);
+                break;
+            default:
+                throw new IllegalArgumentException(
+                        "Unknown iter request type: " + originalRequestType);
+        }
     }
 
     @SuppressWarnings("unchecked")
