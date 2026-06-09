@@ -196,8 +196,22 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         completeWithEntries(views, encounterEnd, null);
     }
 
-    @SuppressWarnings("unchecked")
+    /**
+     * Test/compat overload — allocates a one-off chunk buffer from {@code arena}. PRODUCTION callers
+     * ({@code VectorizedExecutor}/{@code ForStRsStateExecutor}) MUST use the 5-arg form with a reused
+     * per-executor buffer to avoid the per-probe 64 KiB native allocation (FRS-REUSE-CHUNKBUF).
+     */
     public void process(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
+        process(linker, db, cf, arena, arena.allocate(CHUNK_BUF_CAP));
+    }
+
+    @SuppressWarnings("unchecked")
+    public void process(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            Arena arena,
+            MemorySegment reusedChunkBuf) {
         // MAP_IS_EMPTY: single open + close with a small chunk; emptiness == 0 rows returned.
         if (originalRequestType == StateRequestType.MAP_IS_EMPTY) {
             // FRS-ITER-LEAK-FIX: these are all TRANSIENT — consumed before this
@@ -265,7 +279,15 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
         // handle (existingVecHandle) is a native iterator id, not an arena segment,
         // so it safely spans process() calls.
         try (Arena scratch = Arena.ofConfined()) {
-        MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
+        // FRS-REUSE-CHUNKBUF (2026-06-09): use the per-executor REUSED 64 KiB chunk buffer instead of
+        // a fresh scratch.allocate(CHUNK_BUF_CAP) PER PROBE. The JFR pinned that per-probe 64 KiB native
+        // allocation (+ zero-fill) as the `initNativeMemory` hotspot — paid on EVERY join probe (the
+        // per-record-alloc mandate violation). Cross-probe reuse is safe: the drain loop already
+        // overwrites chunkBuf per chunk, and parseChunkInto SNAPSHOTS each chunk's bytes into `scratch`
+        // before the next overwrite — so the reused buffer is never aliased by a live view. Per-executor
+        // (single-threaded within an executor; the parallel RoutingStateExecutor gives each worker its
+        // own executor + buffer), so no cross-thread sharing. The tiny out-params stay on `scratch`.
+        MemorySegment chunkBuf = reusedChunkBuf;
         MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
         MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
 

@@ -127,6 +127,15 @@ public class VectorizedExecutor implements StateExecutor {
     private final FrsCfHandle cf;
     private final Arena arena;
 
+    /**
+     * FRS-REUSE-CHUNKBUF (2026-06-09): per-executor REUSED iterator chunk buffer (CHUNK_BUF_CAP, 64 KiB),
+     * lazily allocated ONCE from {@link #arena} and handed to every {@link ForStRsDBIterRequest#process}.
+     * Eliminates the per-probe 64 KiB native allocation + zero-fill (the JFR-pinned {@code initNativeMemory}
+     * hotspot on the q9/q7/q20 join drain — a per-record-alloc mandate violation). Single-threaded per
+     * executor (the parallel RoutingStateExecutor gives each worker its own executor, hence its own buffer).
+     */
+    private MemorySegment reusableIterChunkBuf;
+
     // Optional metrics + fatal-handler — set via setters after construction so that
     // backends that don't yet have a MetricGroup can still instantiate the executor.
     private DispatchMetrics metrics;
@@ -1445,7 +1454,10 @@ public class VectorizedExecutor implements StateExecutor {
     /** Serial drain of one iterator request with the R22-M2 per-op fatal/mark/complete contract. */
     private void drainIterSerial(ForStRsDBIterRequest<?, ?, ?, ?> iter, VectorizedClassifier c) {
         try {
-            iter.process(linker, db, cf, arena);
+            if (reusableIterChunkBuf == null) {
+                reusableIterChunkBuf = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+            }
+            iter.process(linker, db, cf, arena, reusableIterChunkBuf);
         } catch (Throwable t) {
             // R94-H1 / R93-H2: throwIfFatal() throws FrsEnginePanicError for fail-process FFI rc;
             // escalate to the fatal handler so the engine doesn't keep running on poisoned state.

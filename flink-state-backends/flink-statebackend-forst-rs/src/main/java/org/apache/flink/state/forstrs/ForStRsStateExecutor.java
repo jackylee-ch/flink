@@ -40,6 +40,9 @@ public class ForStRsStateExecutor implements StateExecutor {
     private final FrsDb db;
     private final FrsCfHandle cf;
     private final Arena arena;
+    /** FRS-REUSE-CHUNKBUF: per-executor reused iterator chunk buffer (lazily allocated once), so
+     * each probe's {@link ForStRsDBIterRequest#process} reuses it instead of a per-probe 64 KiB alloc. */
+    private MemorySegment reusableIterChunkBuf;
 
     /**
      * R28-M2: post-shutdown gate. {@link #shutdown()} was previously a no-op so a backend
@@ -296,8 +299,11 @@ public class ForStRsStateExecutor implements StateExecutor {
         if (OPCOUNT) {
             OC_ITERS.addAndGet(iters.size());
         }
+        if (reusableIterChunkBuf == null) {
+            reusableIterChunkBuf = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+        }
         for (int i = 0; i < iters.size(); i++) {
-            iters.get(i).process(linker, db, cf, arena);
+            iters.get(i).process(linker, db, cf, arena, reusableIterChunkBuf);
             progressOut[0] = i + 1;
         }
     }
