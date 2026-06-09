@@ -113,7 +113,17 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      * This tests the user's "merge per-row into batch execution" directive.
      */
     private static final boolean DISABLE_MAPSTATE_CACHE =
-            "1".equals(System.getenv("FRS_DISABLE_MAPSTATE_CACHE"));
+            "1".equals(System.getenv("FRS_DISABLE_MAPSTATE_CACHE"))
+                    // FRS-PARALLEL-SAFE (2026-06-09): the MapStateCache is write-through but
+                    // SINGLE-THREADED. Under the parallel RoutingStateExecutor, cache ops fire on
+                    // threads that don't align with the key-group→worker affinity, so the cache
+                    // returns inconsistent reads → q8 windowed-join under-emit (shared −10%,
+                    // per-worker −6.7%). cache-OFF is the PROVEN-correct parallel config (q8 N=3
+                    // cache-off = 3,064,514 ≈ RocksDB 3,064,457). So whenever the parallel executor
+                    // is enabled, bypass the cache. The DEFAULT depth-1 path keeps the cache (correct
+                    // + fast — single-threaded mailbox access), so this robs no query: it only
+                    // changes behavior in the opt-in parallel mode where the cache is unsafe anyway.
+                    || "1".equals(System.getenv("FRS_RS_PARALLEL_EXECUTOR"));
 
     /**
      * FRS-ADAPTIVE-MAPSTATE-CACHE (2026-06-04): the per-record read cache is a
