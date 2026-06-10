@@ -177,50 +177,38 @@ public final class RoutingStateExecutor implements StateExecutor {
     }
 
     /**
-     * PR-1 adaptive container: ONE inline classifier for all non-iterator requests (executed on
-     * the mailbox FIRST — preserving the batch's writes-before-iters invariant) + per-key-group
-     * sub-classifiers for ITERATOR requests only (latch-dispatched to the worker pool after the
-     * inline phase). Same-key get/iter ordering is preserved: the AEC admits at most one in-flight
-     * record per key, and within a batch the unsplit classifier ALSO executed puts/deletes/gets
-     * before iters — the phase split reproduces that exact order.
+     * PR-1 adaptive container (DEFER-CLASSIFY — final design): buffers raw requests at offer
+     * (no serialization, no routing) and decides the dispatch shape per WHOLE BATCH:
+     *
+     * <ul>
+     *   <li>iter-free batch → ONE classifier executed INLINE on the mailbox = byte-identical to
+     *       depth-1 (the q17-proven regime; full-batch kg-splitting cost q17 2×);
+     *   <li>batch with iterators → per-key-group classifiers in OFFER ORDER, latch-dispatched =
+     *       byte-identical to the full-split mode that measured q8 IN BAND (3,064,493).
+     * </ul>
+     *
+     * <p>Phase-splitting iters from deletes was REFUTED twice (q8 −53% main-first, −30%
+     * iters-first): window operators emit same-key ITER/CLEAR pairs in BOTH orders, so only
+     * offer-order execution within one routing domain is sound.
      */
     private final class SplitItersContainer
             implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
-        AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main;
-
-        @SuppressWarnings("unchecked")
-        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] iterSubs =
-                (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
-                        new AsyncRequestContainer<?>[workers.length];
+        final java.util.ArrayList<StateRequest<?, ?, ?, ?>> reqs = new java.util.ArrayList<>(64);
+        boolean hasIter;
 
         @Override
         public void offer(StateRequest<?, ?, ?, ?> request) {
-            if (org.apache.flink.state.forstrs.VectorizedClassifier.isIterKind(
-                    request.getRequestType())) {
-                int w = Math.floorMod(request.getRecordContext().getKeyGroup(), workers.length);
-                if (iterSubs[w] == null) {
-                    iterSubs[w] = workers[w].createRequestContainer();
-                }
-                iterSubs[w].offer(request);
-            } else {
-                if (main == null) {
-                    main = workers[0].createRequestContainer();
-                }
-                main.offer(request);
+            if (!hasIter
+                    && org.apache.flink.state.forstrs.VectorizedClassifier.isIterKind(
+                            request.getRequestType())) {
+                hasIter = true;
             }
+            reqs.add(request);
         }
 
         @Override
         public boolean isEmpty() {
-            if (main != null && !main.isEmpty()) {
-                return false;
-            }
-            for (AsyncRequestContainer<StateRequest<?, ?, ?, ?>> s : iterSubs) {
-                if (s != null && !s.isEmpty()) {
-                    return false;
-                }
-            }
-            return true;
+            return reqs.isEmpty();
         }
     }
 
@@ -237,19 +225,38 @@ public final class RoutingStateExecutor implements StateExecutor {
         // cross-batch reuse hazard). Cross-batch pipelining (depth>1) is a later optimization (OPT-02
         // / double-buffering); this delivers correctness + intra-batch parallelism safely.
         final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs;
-        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>> inlineMainAfterIters;
         if (container instanceof SplitItersContainer sc) {
-            // ADAPTIVE phase order: ITERS FIRST (worker pool, latch below), MAIN AFTER (inline).
-            // Iters-first is the correct order for the real same-key same-batch hazard — the
-            // window FIRE-THEN-PURGE pattern offers ITER(read window) before CLEAR(purge window);
-            // running main (with the CLEAR) first made the iter read a purged window → q8
-            // 1,441,352 (−53%, measured 2026-06-10). Map PUTS stay visible to iters regardless of
-            // phase order: MapStateV2 puts ride the state-level statebuf (staged at request
-            // creation on the mailbox, flushed at iter creation) — they are not classifier rows.
-            inlineMainAfterIters = (sc.main != null && !sc.main.isEmpty()) ? sc.main : null;
-            subs = sc.iterSubs;
+            if (sc.reqs.isEmpty()) {
+                return CompletableFuture.completedFuture(null);
+            }
+            if (!sc.hasIter) {
+                // DEFER-CLASSIFY fast path: iter-free batch → ONE classifier, offer order
+                // preserved, executed INLINE = byte-identical to depth-1.
+                AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main =
+                        workers[0].createRequestContainer();
+                for (StateRequest<?, ?, ?, ?> r : sc.reqs) {
+                    main.offer(r);
+                }
+                Throwable mt = runInlineMain(main);
+                return (mt != null)
+                        ? CompletableFuture.failedFuture(mt)
+                        : CompletableFuture.completedFuture(null);
+            }
+            // Iter batch → FULL per-key-group split in OFFER ORDER (the regime that measured
+            // q8 in band), latch-dispatched to the workers below.
+            @SuppressWarnings("unchecked")
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] kgSubs =
+                    (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
+                            new AsyncRequestContainer<?>[workers.length];
+            for (StateRequest<?, ?, ?, ?> r : sc.reqs) {
+                int w = Math.floorMod(r.getRecordContext().getKeyGroup(), workers.length);
+                if (kgSubs[w] == null) {
+                    kgSubs[w] = workers[w].createRequestContainer();
+                }
+                kgSubs[w].offer(r);
+            }
+            subs = kgSubs;
         } else {
-            inlineMainAfterIters = null;
             subs = ((RoutingRequestContainer) container).subs;
         }
         java.util.List<Integer> busy = new java.util.ArrayList<>(workers.length);
@@ -259,11 +266,7 @@ public final class RoutingStateExecutor implements StateExecutor {
             }
         }
         if (busy.isEmpty()) {
-            // No iter sub-batches — the common cheap-batch case: just the inline main phase.
-            Throwable mt = runInlineMain(inlineMainAfterIters);
-            return (mt != null)
-                    ? CompletableFuture.failedFuture(mt)
-                    : CompletableFuture.completedFuture(null);
+            return CompletableFuture.completedFuture(null);
         }
         final java.util.concurrent.atomic.AtomicReference<Throwable> err =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -300,10 +303,6 @@ public final class RoutingStateExecutor implements StateExecutor {
             }
         }
         Throwable e = err.get();
-        if (e == null) {
-            // ADAPTIVE phase 2: main classifier inline AFTER the iter sub-batches completed.
-            e = runInlineMain(inlineMainAfterIters);
-        }
         return (e != null)
                 ? CompletableFuture.failedFuture(e)
                 : CompletableFuture.completedFuture(null);
