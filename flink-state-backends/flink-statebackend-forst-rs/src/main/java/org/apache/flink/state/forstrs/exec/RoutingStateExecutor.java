@@ -165,9 +165,11 @@ public final class RoutingStateExecutor implements StateExecutor {
         // classifier executed INLINE on the mailbox — zero handoff, zero kg-splitting (full-batch
         // splitting cost q17 2×: 148.8s vs 77s). Only ITERATOR requests route by key-group for
         // parallel fan-out. ROUTING (non-adaptive): everything routes by key-group as before.
-        if (adaptiveInline) {
-            return new SplitItersContainer();
-        }
+        // ADAPTIVE uses the SAME offer-time routing container as ROUTING. Deferred-offer
+        // containers were REFUTED (q8 −40%, 2026-06-10): VectorizedClassifier.offer serializes
+        // keys/namespaces from the STATE OBJECT's live context (window states setCurrentNamespace
+        // before request creation) — deferring serialization to dispatch time stamps requests
+        // with a LATER record's namespace. Serialization must happen at offer time, always.
         // KEY-GROUP-AFFINE ROUTING: the returned container routes each offered request to a
         // per-worker sub-container by keyGroup % N, so a given key-group's state always lands in ONE
         // worker's MapStateCache (read-your-writes + per-key ordering — the windowed-join correctness
@@ -176,41 +178,6 @@ public final class RoutingStateExecutor implements StateExecutor {
         return new RoutingRequestContainer();
     }
 
-    /**
-     * PR-1 adaptive container (DEFER-CLASSIFY — final design): buffers raw requests at offer
-     * (no serialization, no routing) and decides the dispatch shape per WHOLE BATCH:
-     *
-     * <ul>
-     *   <li>iter-free batch → ONE classifier executed INLINE on the mailbox = byte-identical to
-     *       depth-1 (the q17-proven regime; full-batch kg-splitting cost q17 2×);
-     *   <li>batch with iterators → per-key-group classifiers in OFFER ORDER, latch-dispatched =
-     *       byte-identical to the full-split mode that measured q8 IN BAND (3,064,493).
-     * </ul>
-     *
-     * <p>Phase-splitting iters from deletes was REFUTED twice (q8 −53% main-first, −30%
-     * iters-first): window operators emit same-key ITER/CLEAR pairs in BOTH orders, so only
-     * offer-order execution within one routing domain is sound.
-     */
-    private final class SplitItersContainer
-            implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
-        final java.util.ArrayList<StateRequest<?, ?, ?, ?>> reqs = new java.util.ArrayList<>(64);
-        boolean hasIter;
-
-        @Override
-        public void offer(StateRequest<?, ?, ?, ?> request) {
-            if (!hasIter
-                    && org.apache.flink.state.forstrs.VectorizedClassifier.isIterKind(
-                            request.getRequestType())) {
-                hasIter = true;
-            }
-            reqs.add(request);
-        }
-
-        @Override
-        public boolean isEmpty() {
-            return reqs.isEmpty();
-        }
-    }
 
     @Override
     public CompletableFuture<Void> executeBatchRequests(
@@ -224,52 +191,8 @@ public final class RoutingStateExecutor implements StateExecutor {
         // pooled classifiers are free again before the next batch's createRequestContainer (no
         // cross-batch reuse hazard). Cross-batch pipelining (depth>1) is a later optimization (OPT-02
         // / double-buffering); this delivers correctness + intra-batch parallelism safely.
-        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs;
-        if (container instanceof SplitItersContainer sc) {
-            if (sc.reqs.isEmpty()) {
-                return CompletableFuture.completedFuture(null);
-            }
-            // ALL batches go through per-key-group classifiers in OFFER ORDER — the ONLY regime
-            // measured correct (routing ✓ 3,064,485; full-split adaptive ✓ 3,064,493). Executing
-            // cheap batches through a kg-UNAFFINE single classifier corrupted q8 by −40%
-            // (1,831,340, 2026-06-10) for reasons not yet root-caused — do NOT reintroduce a
-            // single-classifier fast path without an e2e q8-band gate.
-            @SuppressWarnings("unchecked")
-            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] kgSubs =
-                    (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
-                            new AsyncRequestContainer<?>[workers.length];
-            for (StateRequest<?, ?, ?, ?> r : sc.reqs) {
-                int w = Math.floorMod(r.getRecordContext().getKeyGroup(), workers.length);
-                if (kgSubs[w] == null) {
-                    kgSubs[w] = workers[w].createRequestContainer();
-                }
-                kgSubs[w].offer(r);
-            }
-            if (!sc.hasIter) {
-                // Iter-free batch: execute each kg sub-batch INLINE sequentially on the mailbox,
-                // each on ITS OWN worker's executor (matching the measured-correct full-split
-                // configuration exactly — q8 3,064,493, q17 148.8s). No worker handoff.
-                try {
-                    for (int id = 0; id < kgSubs.length; id++) {
-                        AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub = kgSubs[id];
-                        if (sub == null || sub.isEmpty()) {
-                            continue;
-                        }
-                        CompletableFuture<Void> inner = workers[id].executeBatchRequests(sub);
-                        Throwable t = inner.handle((v, ex) -> ex).getNow(null);
-                        if (t != null) {
-                            return CompletableFuture.failedFuture(t);
-                        }
-                    }
-                    return CompletableFuture.completedFuture(null);
-                } catch (Throwable t) {
-                    return CompletableFuture.failedFuture(t);
-                }
-            }
-            subs = kgSubs;
-        } else {
-            subs = ((RoutingRequestContainer) container).subs;
-        }
+        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs =
+                ((RoutingRequestContainer) container).subs;
         java.util.List<Integer> busy = new java.util.ArrayList<>(workers.length);
         for (int i = 0; i < subs.length; i++) {
             if (subs[i] != null && !subs[i].isEmpty()) {
@@ -278,6 +201,24 @@ public final class RoutingStateExecutor implements StateExecutor {
         }
         if (busy.isEmpty()) {
             return CompletableFuture.completedFuture(null);
+        }
+        if (adaptiveInline && !anySubHasIters(subs, busy)) {
+            // ADAPTIVE fast path (the leak-fixed configuration that measured q8 IN BAND
+            // 3,064,493 / q17 148.8s): iter-free batch → execute each kg sub-batch INLINE
+            // sequentially on this (mailbox) thread, each on its own worker's executor. No
+            // worker handoff. Iter batches fall through to the parallel latch dispatch below.
+            try {
+                for (int id : busy) {
+                    CompletableFuture<Void> inner = workers[id].executeBatchRequests(subs[id]);
+                    Throwable t = inner.handle((v, ex) -> ex).getNow(null);
+                    if (t != null) {
+                        return CompletableFuture.failedFuture(t);
+                    }
+                }
+                return CompletableFuture.completedFuture(null);
+            } catch (Throwable t) {
+                return CompletableFuture.failedFuture(t);
+            }
         }
         final java.util.concurrent.atomic.AtomicReference<Throwable> err =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -319,22 +260,17 @@ public final class RoutingStateExecutor implements StateExecutor {
                 : CompletableFuture.completedFuture(null);
     }
 
-    /**
-     * Executes the adaptive container's main (non-iterator) classifier INLINE on the calling
-     * thread. Error contract matches {@link #runSubBatchAndWait}: extract an already-present
-     * error via getNow but never wait on the container future (the AEC ignores it; per-row
-     * futures carry completion). Returns the error or {@code null}.
-     */
-    private Throwable runInlineMain(AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main) {
-        if (main == null) {
-            return null;
+
+    /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
+    private static boolean anySubHasIters(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        for (int id : busy) {
+            if (subs[id] instanceof org.apache.flink.state.forstrs.VectorizedClassifier vc
+                    && vc.hasIterRequests()) {
+                return true;
+            }
         }
-        try {
-            CompletableFuture<Void> inner = workers[0].executeBatchRequests(main);
-            return inner.handle((v, ex) -> ex).getNow(null);
-        } catch (Throwable t) {
-            return t;
-        }
+        return false;
     }
 
     /** Runs one worker's sub-batch on its worker thread and blocks until it completes. */
