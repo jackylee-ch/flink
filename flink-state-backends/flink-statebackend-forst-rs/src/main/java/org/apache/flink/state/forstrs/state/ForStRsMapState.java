@@ -132,6 +132,9 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
     private final Map<ByteArrayKey, byte[]> readCache = new HashMap<>(256);
     private int writeCacheCount = 0;
 
+    /** Optional namespace bytes appended after the state prefix and before the map user key. */
+    private byte[] namespaceSuffix;
+
     /** Lazily-allocated. Released on close(). */
     private Arena offHeapArena;
 
@@ -301,20 +304,18 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         this.offheapOutputView = new MemorySegmentDataOutputView();
     }
 
+    /** Sets the namespace suffix used by V1 InternalMapState adapters. */
+    public void setNamespaceSuffix(byte[] namespaceSuffix) {
+        this.namespaceSuffix =
+                namespaceSuffix == null || namespaceSuffix.length == 0 ? null : namespaceSuffix;
+    }
+
     @Override
     public UV get(UK key) throws IOException {
         if (statebuf != null) {
             // 1c.1 off-heap mode — ZERO byte[] allocation on the hot path.
             MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForMapOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            keySerializer,
-                            key,
-                            scratch,
-                            0L);
+            long encoded = encodeForMapOffheap(key, scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int row = statebuf.find(scratch, keyOff, keyLen);
@@ -365,15 +366,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         if (statebuf != null) {
             // 1c.1 off-heap mode — ZERO byte[] allocation on the hot path.
             MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForMapOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            keySerializer,
-                            key,
-                            scratch,
-                            0L);
+            long encoded = encodeForMapOffheap(key, scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int valOff = keyOff + keyLen;
@@ -538,15 +531,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         if (statebuf != null) {
             // 1c.1 off-heap mode — drop from buffer + issue native delete.
             MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForMapOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            keySerializer,
-                            key,
-                            scratch,
-                            0L);
+            long encoded = encodeForMapOffheap(key, scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             statebuf.remove(scratch, keyOff, keyLen);
@@ -567,15 +552,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         if (statebuf != null) {
             // 1c.1 off-heap mode — buffer-first, then native existence probe.
             MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForMapOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            keySerializer,
-                            key,
-                            scratch,
-                            0L);
+            long encoded = encodeForMapOffheap(key, scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int row = statebuf.find(scratch, keyOff, keyLen);
@@ -934,15 +911,38 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         }
     }
 
+    private boolean hasNamespaceSuffix() {
+        return namespaceSuffix != null && namespaceSuffix.length > 0;
+    }
+
+    private long encodeForMapOffheap(UK userKey, MemorySegment scratch) {
+        if (!hasNamespaceSuffix()) {
+            return kgSerializerOffheap.encodeForMapOffheap(
+                    keyGroupSupplier.getAsInt(),
+                    keySupplier.get(),
+                    stateNameBytesOffheap,
+                    keySerializer,
+                    userKey,
+                    scratch,
+                    0L);
+        }
+        byte[] compositeKey = composite(userKey);
+        MemorySegment.copy(compositeKey, 0, scratch, ValueLayout.JAVA_BYTE, 0L, compositeKey.length);
+        return compositeKey.length;
+    }
+
     /**
      * Returns the per-state byte prefix shared by every map entry. In legacy mode this is the
      * construction-time {@code keyPrefix}; in kg-mode this is invoked dynamically.
      */
     private byte[] currentPrefix() {
-        if (prefixComputer != null) {
-            return prefixComputer.get();
+        byte[] base = prefixComputer != null ? prefixComputer.get() : keyPrefix;
+        if (!hasNamespaceSuffix()) {
+            return base;
         }
-        return keyPrefix;
+        byte[] full = java.util.Arrays.copyOf(base, base.length + namespaceSuffix.length);
+        System.arraycopy(namespaceSuffix, 0, full, base.length, namespaceSuffix.length);
+        return full;
     }
 
     /**
@@ -951,7 +951,7 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
      * keyed-state backend wires to {@code ForStRsKeyGroupedSerializer.encodeForMap}).
      */
     private byte[] composite(UK userKey) {
-        if (compositeKeyComputer != null) {
+        if (compositeKeyComputer != null && !hasNamespaceSuffix()) {
             return compositeKeyComputer.apply(userKey);
         }
         keyOutBuffer.clear();
@@ -964,9 +964,10 @@ public class ForStRsMapState<UK, UV> implements MapState<UK, UV> {
         // — saves the intermediate byte[] that getCopyOfBuffer() would allocate. The final
         // {@code full} array still needs to be owned (it's stashed in the writeCache).
         int keyLen = keyOutBuffer.length();
-        byte[] full = new byte[keyPrefix.length + keyLen];
-        System.arraycopy(keyPrefix, 0, full, 0, keyPrefix.length);
-        System.arraycopy(keyOutBuffer.getSharedBuffer(), 0, full, keyPrefix.length, keyLen);
+        byte[] prefix = currentPrefix();
+        byte[] full = new byte[prefix.length + keyLen];
+        System.arraycopy(prefix, 0, full, 0, prefix.length);
+        System.arraycopy(keyOutBuffer.getSharedBuffer(), 0, full, prefix.length, keyLen);
         return full;
     }
 

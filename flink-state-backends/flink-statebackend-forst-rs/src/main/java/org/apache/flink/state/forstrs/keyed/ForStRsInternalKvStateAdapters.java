@@ -361,59 +361,66 @@ final class ForStRsInternalKvStateAdapters {
             return cachedState;
         }
 
+        private ForStRsMapState<UK, UV> bindNs() {
+            ForStRsMapState<UK, UV> s = bind();
+            s.setNamespaceSuffix(
+                    currentNamespace == null ? null : serializeNamespace(currentNamespace));
+            return s;
+        }
+
         @Override
         public UV get(UK key) throws Exception {
-            return bind().get(key);
+            return bindNs().get(key);
         }
 
         @Override
         public void put(UK key, UV value) throws Exception {
-            bind().put(key, value);
+            bindNs().put(key, value);
         }
 
         @Override
         public void putAll(Map<UK, UV> map) throws Exception {
-            bind().putAll(map);
+            bindNs().putAll(map);
         }
 
         @Override
         public void remove(UK key) throws Exception {
-            bind().remove(key);
+            bindNs().remove(key);
         }
 
         @Override
         public boolean contains(UK key) throws Exception {
-            return bind().contains(key);
+            return bindNs().contains(key);
         }
 
         @Override
         public Iterable<Map.Entry<UK, UV>> entries() throws Exception {
-            return bind().entries();
+            return bindNs().entries();
         }
 
         @Override
         public Iterable<UK> keys() throws Exception {
-            return bind().keys();
+            return bindNs().keys();
         }
 
         @Override
         public Iterable<UV> values() throws Exception {
-            return bind().values();
+            return bindNs().values();
         }
 
         @Override
         public Iterator<Map.Entry<UK, UV>> iterator() throws Exception {
-            return bind().iterator();
+            return bindNs().iterator();
         }
 
         @Override
         public boolean isEmpty() throws Exception {
-            return bind().isEmpty();
+            return bindNs().isEmpty();
         }
 
         @Override
         public void clear() {
-            bind().clear();
+            bindNs().clear();
         }
     }
 
