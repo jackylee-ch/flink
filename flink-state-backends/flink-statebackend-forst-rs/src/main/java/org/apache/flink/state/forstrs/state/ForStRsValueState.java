@@ -28,6 +28,7 @@ import org.apache.flink.state.forstrs.ffm.FrsCfHandle;
 import org.apache.flink.state.forstrs.ffm.FrsDb;
 
 import java.lang.foreign.MemorySegment;
+import java.lang.foreign.ValueLayout;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.function.Consumer;
@@ -291,13 +292,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
         if (statebuf != null) {
             // Off-heap mode (1b.1) — ZERO byte[] allocation on the hot path.
             java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForStateOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            scratch,
-                            0L);
+            long encoded = encodeCurrentOffheapKey(scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int row = statebuf.find(scratch, keyOff, keyLen);
@@ -352,13 +347,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
         if (statebuf != null) {
             // Off-heap mode (1b.1) — ZERO byte[] allocation on the hot path.
             java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForStateOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            scratch,
-                            0L);
+            long encoded = encodeCurrentOffheapKey(scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             int valStart = keyOff + keyLen;
@@ -414,13 +403,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
     public void clear() {
         if (statebuf != null) {
             java.lang.foreign.MemorySegment scratch = scratchArenaSupplier.get();
-            long encoded =
-                    kgSerializerOffheap.encodeForStateOffheap(
-                            keyGroupSupplier.getAsInt(),
-                            keySupplier.get(),
-                            stateNameBytesOffheap,
-                            scratch,
-                            0L);
+            long encoded = encodeCurrentOffheapKey(scratch);
             int keyOff = (int) (encoded >>> 32);
             int keyLen = (int) (encoded & 0xFFFFFFFFL);
             statebuf.remove(scratch, keyOff, keyLen);
@@ -492,6 +475,7 @@ public class ForStRsValueState<T> implements ValueState<T> {
 
     public void setNamespaceSuffix(byte[] ns) {
         this.namespaceSuffix = ns;
+        this.lastValueKey = null;
     }
 
     private byte[] computeKey() {
@@ -502,5 +486,38 @@ public class ForStRsValueState<T> implements ValueState<T> {
         byte[] out = java.util.Arrays.copyOf(base, base.length + namespaceSuffix.length);
         System.arraycopy(namespaceSuffix, 0, out, base.length, namespaceSuffix.length);
         return out;
+    }
+
+    private long encodeCurrentOffheapKey(MemorySegment scratch) {
+        long encoded =
+                kgSerializerOffheap.encodeForStateOffheap(
+                        keyGroupSupplier.getAsInt(),
+                        keySupplier.get(),
+                        stateNameBytesOffheap,
+                        scratch,
+                        0L);
+        if (namespaceSuffix == null || namespaceSuffix.length == 0) {
+            return encoded;
+        }
+        int keyOff = (int) (encoded >>> 32);
+        int keyLen = (int) (encoded & 0xFFFFFFFFL);
+        long suffixOff = (long) keyOff + keyLen;
+        long suffixEnd = suffixOff + namespaceSuffix.length;
+        if (suffixEnd > scratch.byteSize()) {
+            throw new IllegalStateException(
+                    "Off-heap key scratch segment too small for namespace suffix: need "
+                            + suffixEnd
+                            + " bytes, available "
+                            + scratch.byteSize());
+        }
+        MemorySegment.copy(
+                namespaceSuffix,
+                0,
+                scratch,
+                ValueLayout.JAVA_BYTE,
+                suffixOff,
+                namespaceSuffix.length);
+        int fullKeyLen = keyLen + namespaceSuffix.length;
+        return ((long) keyOff << 32) | (fullKeyLen & 0xFFFFFFFFL);
     }
 }

@@ -167,4 +167,36 @@ class ForStRsValueStateOffheapTest {
             buf.close();
         }
     }
+
+    @Test
+    void namespaceSuffixPartitionsValues() throws Exception {
+        ArrowBinaryBuffer buf = new ArrowBinaryBuffer(1024);
+        try {
+            ForStRsValueState<Long> state = newState(buf);
+            currentKey = 7L;
+            state.setNamespaceSuffix(new byte[] {1});
+            state.update(100L);
+            state.setNamespaceSuffix(new byte[] {2});
+            state.update(200L);
+
+            state.setNamespaceSuffix(new byte[] {1});
+            assertEquals(100L, state.value());
+            state.setNamespaceSuffix(new byte[] {2});
+            assertEquals(200L, state.value());
+
+            state.flushStateBuffer();
+            ArrowBinaryBuffer freshBuf = new ArrowBinaryBuffer(1024);
+            try {
+                ForStRsValueState<Long> state2 = newState(freshBuf);
+                state2.setNamespaceSuffix(new byte[] {1});
+                assertEquals(100L, state2.value());
+                state2.setNamespaceSuffix(new byte[] {2});
+                assertEquals(200L, state2.value());
+            } finally {
+                freshBuf.close();
+            }
+        } finally {
+            buf.close();
+        }
+    }
 }
