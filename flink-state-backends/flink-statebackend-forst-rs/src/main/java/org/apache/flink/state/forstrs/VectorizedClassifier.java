@@ -513,6 +513,18 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         return iterRangeBuffer;
     }
 
+    /**
+     * PR-1 adaptive dispatch: whether this batch contains ITERATOR requests (prefix or range).
+     * Iter-free batches are cheap (point gets/puts/deletes) and execute INLINE on the mailbox —
+     * the coordinator handoff costs more than it saves for them (q17 measured: 271.8s offloaded
+     * vs 77s inline). Iter-containing batches carry the expensive engine round-trips and benefit
+     * from the parallel worker pool (q11 2.35×, q20 DNF→finish, q7 1441→1052s measured).
+     */
+    public boolean hasIterRequests() {
+        return (iterPrefixBuffer != null && iterPrefixBuffer.count() > 0)
+                || (iterRangeBuffer != null && iterRangeBuffer.count() > 0);
+    }
+
     // -----------------------------------------------------------------
     // Lazy init helpers (fail-fast when buffers not configured)
     // -----------------------------------------------------------------

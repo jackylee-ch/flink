@@ -136,7 +136,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         String m = System.getenv("FRS_RS_EXECUTOR");
         if (m != null) {
             String t = m.trim();
-            if (t.equals("coordinated") || t.equals("routing")) {
+            if (t.equals("coordinated") || t.equals("routing") || t.equals("adaptive")) {
                 return true;
             }
         }

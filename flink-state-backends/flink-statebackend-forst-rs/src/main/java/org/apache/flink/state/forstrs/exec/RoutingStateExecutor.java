@@ -97,12 +97,37 @@ public final class RoutingStateExecutor implements StateExecutor {
         return dflt;
     }
 
+    /**
+     * PR-1 adaptive dispatch: when {@code true}, ITER-FREE batches (point gets/puts/deletes only)
+     * execute INLINE on the calling (mailbox) thread instead of being dispatched to workers — the
+     * mailbox→worker→mailbox handoff costs more than it saves for cheap high-rate batches (q17
+     * measured: 271.8s offloaded ≈ ForSt's own 253s, vs 77s inline — the 3.3× frs-over-ForSt q17
+     * advantage IS the inline path). Iter-containing batches still fan out to the worker pool
+     * (q11 2.35×, q20 DNF→finish, q7 1441→1052s measured). Both paths complete synchronously
+     * before returning, so at most one batch is ever in flight — the lockstep visibility
+     * semantics that depth-1 and the blocking router are proven correct under is preserved by
+     * construction (the non-blocking pipelined mode corrupted q8 by −18%: mailbox-direct statebuf
+     * writes overtook queued reads — see the 2026-06-10 bisect in the sweep doc).
+     */
+    private final boolean adaptiveInline;
+
     public RoutingStateExecutor(
             ForStRsLinker linker,
             FrsDb db,
             FrsCfHandle cf,
             DispatchMetrics metrics,
             java.util.function.Consumer<VectorizedExecutor> register) {
+        this(linker, db, cf, metrics, register, false);
+    }
+
+    public RoutingStateExecutor(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            DispatchMetrics metrics,
+            java.util.function.Consumer<VectorizedExecutor> register,
+            boolean adaptiveInline) {
+        this.adaptiveInline = adaptiveInline;
         int n = workerCount();
         this.workers = new VectorizedExecutor[n];
         this.workerThreads = new ExecutorService[n];
@@ -167,6 +192,20 @@ public final class RoutingStateExecutor implements StateExecutor {
         if (busy.isEmpty()) {
             return CompletableFuture.completedFuture(null);
         }
+        if (adaptiveInline && !anySubHasIters(subs, busy)) {
+            // ADAPTIVE FAST PATH: iter-free batch → execute the sub-batches sequentially on the
+            // CALLING (mailbox) thread, exactly like the depth-1 inline executor. The worker
+            // threads are idle (batches complete synchronously → never two in flight), so the
+            // workers' executor-owned out-segments are safe to use from this thread.
+            try {
+                for (int id : busy) {
+                    workers[id].executeBatchRequests(subs[id]).join();
+                }
+                return CompletableFuture.completedFuture(null);
+            } catch (Throwable t) {
+                return CompletableFuture.failedFuture(t);
+            }
+        }
         final java.util.concurrent.atomic.AtomicReference<Throwable> err =
                 new java.util.concurrent.atomic.AtomicReference<>();
         if (busy.size() == 1) {
@@ -205,6 +244,18 @@ public final class RoutingStateExecutor implements StateExecutor {
         return (e != null)
                 ? CompletableFuture.failedFuture(e)
                 : CompletableFuture.completedFuture(null);
+    }
+
+    /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
+    private static boolean anySubHasIters(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        for (int id : busy) {
+            if (subs[id] instanceof org.apache.flink.state.forstrs.VectorizedClassifier vc
+                    && vc.hasIterRequests()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /** Runs one worker's sub-batch on its worker thread and blocks until it completes. */

@@ -1172,6 +1172,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             mode = (legacy != null && legacy.trim().equals("1")) ? "routing" : "inline";
         }
         switch (mode) {
+            case "adaptive":
+                // PR-1 adaptive: iter-free batches inline (q17-class keeps depth-1 speed),
+                // iter batches → blocking parallel fan-out (q11/q20/q7-class wins). Both
+                // synchronous → lockstep semantics, the proven-correct regime.
+                org.apache.flink.state.forstrs.exec.RoutingStateExecutor a =
+                        new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                                linker, db, defaultCf, dispatchMetrics, managedExecutors::add, true);
+                routingExecutors.add(a);
+                return a;
             case "coordinated":
                 org.apache.flink.state.forstrs.exec.CoordinatedStateExecutor c =
                         org.apache.flink.state.forstrs.exec.CoordinatedStateExecutor.create(
