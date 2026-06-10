@@ -178,7 +178,6 @@ public final class RoutingStateExecutor implements StateExecutor {
         return new RoutingRequestContainer();
     }
 
-
     @Override
     public CompletableFuture<Void> executeBatchRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container) {
@@ -259,7 +258,6 @@ public final class RoutingStateExecutor implements StateExecutor {
                 ? CompletableFuture.failedFuture(e)
                 : CompletableFuture.completedFuture(null);
     }
-
 
     /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
     private static boolean anySubHasIters(
