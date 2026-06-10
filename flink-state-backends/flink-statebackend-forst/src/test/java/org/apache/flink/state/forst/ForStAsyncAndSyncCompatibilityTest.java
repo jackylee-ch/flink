@@ -55,6 +55,8 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.RunnableFuture;
 
 import static org.apache.flink.state.forst.ForStStateTestBase.getMockEnvironment;
@@ -77,6 +79,7 @@ class ForStAsyncAndSyncCompatibilityTest {
         FileSystem.initialize(new Configuration(), null);
         Configuration configuration = new Configuration();
         configuration.set(ForStOptions.PRIMARY_DIRECTORY, temporaryFolder.toURI().toString());
+        configuration.set(ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE, 2);
         forStStateBackend = new ForStStateBackend().configure(configuration, null);
 
         env = getMockEnvironment(temporaryFolder);
@@ -163,6 +166,40 @@ class ForStAsyncAndSyncCompatibilityTest {
             assertThat(syncListState.get()).isEqualTo(Arrays.asList(40, 50));
         } finally {
             IOUtils.closeQuietly(syncKeyedStateBackend);
+        }
+    }
+
+    @Test
+    void testSyncMapStateIteratorCrossesCacheBatches() throws Exception {
+        ForStSyncKeyedStateBackend<String> keyedBackend =
+                createSyncKeyedStateBackend(
+                        forStStateBackend, env, StringSerializer.INSTANCE, Collections.emptyList());
+        org.apache.flink.api.common.state.MapStateDescriptor<Integer, String> descriptor =
+                new org.apache.flink.api.common.state.MapStateDescriptor<>(
+                        "mapStateIterator", IntSerializer.INSTANCE, StringSerializer.INSTANCE);
+        org.apache.flink.api.common.state.MapState<Integer, String> mapState =
+                keyedBackend.getOrCreateKeyedState(IntSerializer.INSTANCE, descriptor);
+
+        try {
+            keyedBackend.setCurrentKey("testKey");
+            ((InternalKvState) mapState).setCurrentNamespace(1);
+
+            Map<Integer, String> expected = new HashMap<>();
+            for (int i = 0; i < 5; i++) {
+                expected.put(i, "value-" + i);
+                mapState.put(i, "value-" + i);
+            }
+
+            Map<Integer, String> actualEntries = new HashMap<>();
+            for (Map.Entry<Integer, String> entry : mapState.entries()) {
+                actualEntries.put(entry.getKey(), entry.getValue());
+            }
+
+            assertThat(actualEntries).isEqualTo(expected);
+            assertThat(mapState.keys()).containsExactlyInAnyOrderElementsOf(expected.keySet());
+            assertThat(mapState.values()).containsExactlyInAnyOrderElementsOf(expected.values());
+        } finally {
+            IOUtils.closeQuietly(keyedBackend);
         }
     }
 

@@ -554,10 +554,11 @@ class ForStSyncMapState<K, N, UK, UV> extends AbstractForStSyncState<K, N, Map<U
     /** An auxiliary utility to scan all entries under the given key. */
     private abstract class RocksDBMapIterator<T> implements Iterator<T> {
 
-        private static final int CACHE_SIZE_LIMIT = 128;
-
         /** The db where data resides. */
         private final RocksDB db;
+
+        /** The maximum number of entries to cache before reopening the native iterator. */
+        private final int cacheSizeLimit;
 
         /**
          * The prefix bytes of the key being accessed. All entries under the same key have the same
@@ -594,6 +595,7 @@ class ForStSyncMapState<K, N, UK, UV> extends AbstractForStSyncState<K, N, Map<U
                 DataInputDeserializer dataInputView) {
 
             this.db = db;
+            this.cacheSizeLimit = backend.getOptionsContainer().getMapStateIteratorCacheSize();
             this.keyPrefixBytes = keyPrefixBytes;
             this.keySerializer = keySerializer;
             this.valueSerializer = valueSerializer;
@@ -679,7 +681,7 @@ class ForStSyncMapState<K, N, UK, UV> extends AbstractForStSyncState<K, N, Map<U
                         break;
                     }
 
-                    if (cacheEntries.size() >= CACHE_SIZE_LIMIT) {
+                    if (cacheEntries.size() >= cacheSizeLimit) {
                         break;
                     }
 

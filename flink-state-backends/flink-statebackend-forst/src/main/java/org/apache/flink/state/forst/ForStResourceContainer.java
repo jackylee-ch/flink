@@ -324,6 +324,15 @@ public final class ForStResourceContainer implements AutoCloseable {
         return configuration.get(ForStOptions.EXECUTOR_WRITE_IO_PARALLELISM);
     }
 
+    public int getMapStateIteratorCacheSize() {
+        int cacheSize = configuration.get(ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE);
+        Preconditions.checkArgument(
+                cacheSize > 0,
+                "%s must be larger than 0.",
+                ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE.key());
+        return cacheSize;
+    }
+
     /**
      * Prepare local and remote directories.
      *

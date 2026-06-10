@@ -654,6 +654,57 @@ public class ForStStateBackendConfigTest {
     }
 
     @Test
+    public void testMapStateIteratorCacheSizeConfig() throws Exception {
+        try (final ForStResourceContainer optionsContainer =
+                new ForStResourceContainer(
+                        new Configuration(),
+                        null,
+                        null,
+                        ForStPathContainer.empty(),
+                        null,
+                        null,
+                        null,
+                        false)) {
+            assertEquals(
+                    ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE.defaultValue().intValue(),
+                    optionsContainer.getMapStateIteratorCacheSize());
+        }
+
+        Configuration configuration = new Configuration();
+        configuration.set(ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE, 8192);
+        try (final ForStResourceContainer optionsContainer =
+                new ForStResourceContainer(
+                        configuration,
+                        null,
+                        null,
+                        ForStPathContainer.empty(),
+                        null,
+                        null,
+                        null,
+                        false)) {
+            assertEquals(8192, optionsContainer.getMapStateIteratorCacheSize());
+        }
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testMapStateIteratorCacheSizeMustBePositive() throws Exception {
+        Configuration configuration = new Configuration();
+        configuration.set(ForStOptions.MAP_STATE_ITERATOR_CACHE_SIZE, 0);
+        try (final ForStResourceContainer optionsContainer =
+                new ForStResourceContainer(
+                        configuration,
+                        null,
+                        null,
+                        ForStPathContainer.empty(),
+                        null,
+                        null,
+                        null,
+                        false)) {
+            optionsContainer.getMapStateIteratorCacheSize();
+        }
+    }
+
+    @Test
     public void testPredefinedAndOptionsFactory() throws Exception {
         final ForStOptionsFactory optionsFactory =
                 new ForStOptionsFactory() {

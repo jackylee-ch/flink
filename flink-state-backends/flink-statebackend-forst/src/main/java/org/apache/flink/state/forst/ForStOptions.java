@@ -260,6 +260,17 @@ public class ForStOptions {
                                             + "of ForSt timer service, but consumes more heap memory at the same time.",
                                     TIMER_SERVICE_FACTORY.key(), ForStDB.name()));
 
+    /** The number of entries cached by each ForSt sync MapState iterator batch. */
+    @Documentation.Section(Documentation.Sections.EXPERT_FORST)
+    public static final ConfigOption<Integer> MAP_STATE_ITERATOR_CACHE_SIZE =
+            ConfigOptions.key("state.backend.forst.map-state.iterator-cache-size")
+                    .intType()
+                    .defaultValue(4096)
+                    .withDescription(
+                            "The number of entries cached by each synchronous ForSt MapState iterator batch. "
+                                    + "Increasing this value reduces native iterator reopen and seek overhead for large MapState scans, "
+                                    + "but consumes more heap memory while an iterator is active.");
+
     @Documentation.Section(Documentation.Sections.EXPERT_FORST)
     public static final ConfigOption<Boolean> EXECUTOR_COORDINATOR_INLINE =
             ConfigOptions.key("state.backend.forst.executor.inline-coordinator")
