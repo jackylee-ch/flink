@@ -229,21 +229,11 @@ public final class RoutingStateExecutor implements StateExecutor {
             if (sc.reqs.isEmpty()) {
                 return CompletableFuture.completedFuture(null);
             }
-            if (!sc.hasIter) {
-                // DEFER-CLASSIFY fast path: iter-free batch → ONE classifier, offer order
-                // preserved, executed INLINE = byte-identical to depth-1.
-                AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main =
-                        workers[0].createRequestContainer();
-                for (StateRequest<?, ?, ?, ?> r : sc.reqs) {
-                    main.offer(r);
-                }
-                Throwable mt = runInlineMain(main);
-                return (mt != null)
-                        ? CompletableFuture.failedFuture(mt)
-                        : CompletableFuture.completedFuture(null);
-            }
-            // Iter batch → FULL per-key-group split in OFFER ORDER (the regime that measured
-            // q8 in band), latch-dispatched to the workers below.
+            // ALL batches go through per-key-group classifiers in OFFER ORDER — the ONLY regime
+            // measured correct (routing ✓ 3,064,485; full-split adaptive ✓ 3,064,493). Executing
+            // cheap batches through a kg-UNAFFINE single classifier corrupted q8 by −40%
+            // (1,831,340, 2026-06-10) for reasons not yet root-caused — do NOT reintroduce a
+            // single-classifier fast path without an e2e q8-band gate.
             @SuppressWarnings("unchecked")
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] kgSubs =
                     (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
@@ -254,6 +244,27 @@ public final class RoutingStateExecutor implements StateExecutor {
                     kgSubs[w] = workers[w].createRequestContainer();
                 }
                 kgSubs[w].offer(r);
+            }
+            if (!sc.hasIter) {
+                // Iter-free batch: execute each kg sub-batch INLINE sequentially on the mailbox,
+                // each on ITS OWN worker's executor (matching the measured-correct full-split
+                // configuration exactly — q8 3,064,493, q17 148.8s). No worker handoff.
+                try {
+                    for (int id = 0; id < kgSubs.length; id++) {
+                        AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub = kgSubs[id];
+                        if (sub == null || sub.isEmpty()) {
+                            continue;
+                        }
+                        CompletableFuture<Void> inner = workers[id].executeBatchRequests(sub);
+                        Throwable t = inner.handle((v, ex) -> ex).getNow(null);
+                        if (t != null) {
+                            return CompletableFuture.failedFuture(t);
+                        }
+                    }
+                    return CompletableFuture.completedFuture(null);
+                } catch (Throwable t) {
+                    return CompletableFuture.failedFuture(t);
+                }
             }
             subs = kgSubs;
         } else {
