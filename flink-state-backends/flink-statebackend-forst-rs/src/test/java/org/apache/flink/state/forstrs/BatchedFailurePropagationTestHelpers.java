@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
  * pattern (forbidden by Flink's coding guidelines outside the legacy-suppression allowlist) with
  * thin manually-written stubs so the tests stay self-contained.
  */
-final class BatchedFailurePropagationTestHelpers {
+public final class BatchedFailurePropagationTestHelpers {
 
     private BatchedFailurePropagationTestHelpers() {}
 
@@ -53,19 +53,33 @@ final class BatchedFailurePropagationTestHelpers {
      * Used as the per-row input the {@link VectorizedClassifier} routes through the FFI dispatcher
      * under test.
      */
-    static StateRequest<Object, Object, Object, Object> newRequest(
+    public static StateRequest<Object, Object, Object, Object> newRequest(
             StateRequestType type,
             Object payload,
             byte[] key,
             byte[] value,
             RecordingFuture<Object> future) {
+        return newRequest(type, payload, key, value, future, /* keyGroup */ 0);
+    }
+
+    /**
+     * Variant with an explicit key-group, for the key-group-affine routing tests
+     * (CoordinatedStateExecutor routes by {@code keyGroup % workerCount}).
+     */
+    public static StateRequest<Object, Object, Object, Object> newRequest(
+            StateRequestType type,
+            Object payload,
+            byte[] key,
+            byte[] value,
+            RecordingFuture<Object> future,
+            int keyGroup) {
         StubState state = new StubState(key, value);
         RecordContext<Object> ctx =
                 new RecordContext<>(
                         /* record */ null,
                         /* key */ null,
                         /* disposer */ rc -> {},
-                        /* keyGroup */ 0,
+                        keyGroup,
                         /* epoch */ new Epoch(0L),
                         new AtomicReferenceArray<>(0),
                         /* priority */ 0);
@@ -78,7 +92,7 @@ final class BatchedFailurePropagationTestHelpers {
      * {@code invokeVectorizedBatch*} seams, so the test subclass overrides those seams and this
      * stub never gets called.
      */
-    static ForStRsLinker stubLinker(Arena arena) {
+    public static ForStRsLinker stubLinker(Arena arena) {
         // ForStRsLinker is final and only constructible via its public Arena ctor. Real
         // construction loads native methodhandles which we then never invoke (the test
         // subclass overrides the seam methods).
@@ -89,7 +103,7 @@ final class BatchedFailurePropagationTestHelpers {
      * A {@link FrsDb} placeholder — used only as an argument that the seam overrides discard.
      * {@link FrsDb} is final, so the test relies on its public no-op fields being safely ignored.
      */
-    static FrsDb stubDb() {
+    public static FrsDb stubDb() {
         // The VectorizedExecutor never dereferences db.* on the failure path that the
         // dispatcher's catch-block traverses, because the test subclass intercepts the
         // FFI call before db is read by the linker.
@@ -97,7 +111,7 @@ final class BatchedFailurePropagationTestHelpers {
     }
 
     /** Same rationale as {@link #stubDb()} for the column-family handle. */
-    static FrsCfHandle stubCf() {
+    public static FrsCfHandle stubCf() {
         return null;
     }
 
@@ -156,7 +170,7 @@ final class BatchedFailurePropagationTestHelpers {
      * failure through this method; the test only needs to verify it was called with the
      * propagated cause.
      */
-    static final class RecordingFuture<T> implements InternalAsyncFuture<T> {
+    public static final class RecordingFuture<T> implements InternalAsyncFuture<T> {
         final AtomicInteger exceptionalCalls = new AtomicInteger(0);
         final AtomicReference<Throwable> recordedCause = new AtomicReference<>();
         final AtomicInteger normalCalls = new AtomicInteger(0);
