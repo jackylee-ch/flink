@@ -686,30 +686,23 @@ public class VectorizedExecutor implements StateExecutor {
         if (writes == 0) {
             return false;
         }
-        // 2026-05-29 PERF-RESTORE-#1b (DOMINANT q4/q7 regression vs v3.8):
-        // v3.8 had NO ordered-dispatch machinery at all — every batch ran the
-        // vectorized passes (executePuts → executeDeletes → executeGets →
-        // executeIters) unconditionally. The same-key probe below, when it
-        // trips, routes the WHOLE batch into executeBatchInOfferOrder which
-        // does a per-row synchronous FFI crossing — collapsing a 1024-row
-        // vectorized batch into 1024 individual engine round-trips (the exact
-        // 100×-1000× amplification that turns q4/q7 from ~50s into a >600s
-        // timeout). q4 (JOIN+GroupAgg) and q7 (TUMBLE+JOIN) are read-modify-
-        // write workloads whose GET+PUT on the same context key trips
-        // hasSameKey(getKeys, putKeys) on essentially every batch.
+        // A pure GET+PUT batch can still carry a real read-modify-write ordering
+        // dependency for the same state cell. Window aggregates issue
+        // asyncValue(window).thenCompose(asyncUpdate(window, acc)); if a later
+        // callback lets the UPDATE and a subsequent GET for the same composite
+        // key drain in one classifier, bucket-order dispatch (PUT before GET)
+        // makes the GET observe the just-written accumulator instead of the
+        // prior value. For HOP windows this over-counts by the overlap factor.
         //
-        // The genuine ordering hazards the machinery was ADDED for are
-        // DELETE-vs-write (CLEAR then PUT / PUT then CLEAR on the same
-        // key/prefix) and MERGE chains (append-merge ordering). A pure
-        // GET+PUT batch with NO deletes and NO append-merges has no such
-        // hazard: the AsyncExecutionController serializes same-(key,namespace)
-        // requests across batches via its per-key future chains, so a GET and
-        // a PUT that land in ONE batch are for DIFFERENT logical state cells
-        // even when their composite-key bytes collide on the prefix. Gate the
-        // entire probe behind delete/append-merge presence so the steady-state
-        // RMW batch goes straight through the vectorized passes like v3.8.
-        // Correctness is gated empirically by q4/q7 output diff vs rocksdb
-        // (q3/q4/q7 are byte-identical to rocksdb per prior validation).
+        // Keep the performance restoration for non-overlapping GET+PUT batches,
+        // but exact same composite-key overlap must preserve offer order.
+        if (hasSameKey(
+                classifier.getKeys(),
+                classifier.getCount(),
+                classifier.putKeys(),
+                classifier.putCount())) {
+            return true;
+        }
         if (classifier.deleteCount() == 0 && classifier.appendMergeCount() == 0) {
             return false;
         }
@@ -719,11 +712,6 @@ public class VectorizedExecutor implements StateExecutor {
         ColumnarBatchBuffer offHeapAppendKeys = classifier.offHeapAppendMergeKeys();
         int offHeapAppendCount = offHeapAppendKeys == null ? 0 : offHeapAppendKeys.count();
         if (hasSameKey(
-                        classifier.getKeys(),
-                        classifier.getCount(),
-                        classifier.putKeys(),
-                        classifier.putCount())
-                || hasSameKey(
                         classifier.getKeys(), classifier.getCount(), heapAppendKeys, heapAppendCount)
                 || hasSameKey(
                         classifier.getKeys(),

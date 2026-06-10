@@ -49,18 +49,12 @@ import static org.assertj.core.api.Assertions.assertThat;
 class VectorizedExecutorOrderingHazardTest {
 
     @Test
-    void sameKeyGetThenPutStaysVectorizedWhenNoDeleteOrMergeHazard() {
-        // PERF-RESTORE-#1b (2026-05-29): a pure GET+PUT batch (no DELETE, no append-merge) must
-        // NOT be routed to ordered per-row dispatch. The AsyncExecutionController already
-        // serializes same-(key,namespace) requests across batches via its per-key future chains,
-        // so a GET and a PUT that land in ONE batch are for DIFFERENT logical state cells even
-        // when their composite-key bytes collide on the prefix. Forcing offer-order here would
-        // collapse the vectorized batch into per-row FFI crossings — the q4/q7 100x-1000x
-        // amplification that turned ~50s into a >600s timeout. So the executor runs the
-        // vectorized passes (executePuts -> executeGets), i.e. bucket order ["PUT","GET"], NOT
-        // offer order. Correctness is gated empirically (q3/q4/q7 byte-identical to rocksdb).
-        // The genuine same-key hazards — DELETE-vs-write and append-merge chains — DO trigger
-        // ordered dispatch (see listAppendThenGetUsesHeapOrderedFallbackByDefault).
+    void sameKeyGetThenPutUsesOrderedDispatch() {
+        // A pure GET+PUT batch can still represent a read-modify-write chain on the same state
+        // cell. Running the vectorized buckets as PUT -> GET makes the GET observe the just-written
+        // value instead of the prior accumulator. HOP window aggregation exposed this as a 5x q5
+        // over-count, so exact same-key overlap must preserve offer order even without deletes or
+        // append-merge rows.
         try (Arena arena = Arena.ofConfined()) {
             ForStRsLinker linker = BatchedFailurePropagationTestHelpers.stubLinker(arena);
             FrsDb db = BatchedFailurePropagationTestHelpers.stubDb();
@@ -86,7 +80,36 @@ class VectorizedExecutorOrderingHazardTest {
                             new RecordingFuture<>()));
 
             assertThat(exec.executeBatchRequests(container)).isCompleted();
-            // Vectorized passes ran (PUT bucket before GET bucket); NOT collapsed to offer order.
+            assertThat(exec.calls).containsExactly("GET", "PUT");
+        }
+    }
+
+    @Test
+    void differentKeyGetThenPutStaysVectorizedWhenNoDeleteOrMergeHazard() {
+        try (Arena arena = Arena.ofConfined()) {
+            ForStRsLinker linker = BatchedFailurePropagationTestHelpers.stubLinker(arena);
+            FrsDb db = BatchedFailurePropagationTestHelpers.stubDb();
+            FrsCfHandle cf = BatchedFailurePropagationTestHelpers.stubCf();
+            RecordingExecutor exec = new RecordingExecutor(linker, db, cf, arena);
+
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>> container =
+                    exec.createRequestContainer();
+            container.offer(
+                    BatchedFailurePropagationTestHelpers.newRequest(
+                            StateRequestType.VALUE_GET,
+                            null,
+                            "get-key".getBytes(StandardCharsets.UTF_8),
+                            null,
+                            new RecordingFuture<>()));
+            container.offer(
+                    BatchedFailurePropagationTestHelpers.newRequest(
+                            StateRequestType.VALUE_UPDATE,
+                            "v",
+                            "put-key".getBytes(StandardCharsets.UTF_8),
+                            "v".getBytes(StandardCharsets.UTF_8),
+                            new RecordingFuture<>()));
+
+            assertThat(exec.executeBatchRequests(container)).isCompleted();
             assertThat(exec.calls).containsExactly("PUT", "GET");
         }
     }
