@@ -19,9 +19,11 @@
 package org.apache.flink.table.gateway.rest.util;
 
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.table.gateway.api.SqlGatewayService;
 import org.apache.flink.table.gateway.api.utils.SqlGatewayException;
 import org.apache.flink.table.gateway.rest.SqlGatewayRestEndpoint;
+import org.apache.flink.util.FileUtils;
 
 import org.junit.jupiter.api.extension.AfterAllCallback;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
@@ -30,6 +32,8 @@ import org.junit.jupiter.api.extension.ExtensionContext;
 
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
@@ -48,6 +52,7 @@ public class SqlGatewayRestEndpointExtension implements BeforeAllCallback, After
     private SqlGatewayService sqlGatewayService;
     private String targetAddress;
     private int targetPort;
+    private Path uploadDir;
 
     public String getTargetAddress() {
         return targetAddress;
@@ -77,10 +82,14 @@ public class SqlGatewayRestEndpointExtension implements BeforeAllCallback, After
     }
 
     @Override
-    public void beforeAll(ExtensionContext context) {
+    public void beforeAll(ExtensionContext context) throws Exception {
         String address = InetAddress.getLoopbackAddress().getHostAddress();
         Configuration flinkConfig = getFlinkConfig(address, address, "0");
         flinkConfConsumer.accept(flinkConfig);
+        if (!flinkConfig.contains(WebOptions.UPLOAD_DIR)) {
+            uploadDir = Files.createTempDirectory("flink-sql-gateway-rest-upload-");
+            flinkConfig.set(WebOptions.UPLOAD_DIR, uploadDir.toString());
+        }
         Configuration config = getBaseConfig(flinkConfig);
 
         try {
@@ -106,6 +115,8 @@ public class SqlGatewayRestEndpointExtension implements BeforeAllCallback, After
             throw new SqlGatewayException(
                     "Unexpected error occurred when trying to stop the rest endpoint of sql gateway.",
                     e);
+        } finally {
+            FileUtils.deleteDirectoryQuietly(uploadDir == null ? null : uploadDir.toFile());
         }
     }
 }
