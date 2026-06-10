@@ -161,12 +161,67 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public AsyncRequestContainer<StateRequest<?, ?, ?, ?>> createRequestContainer() {
+        // ADAPTIVE (split-iters-only): cheap requests (gets/puts/deletes/appends) go into ONE
+        // classifier executed INLINE on the mailbox — zero handoff, zero kg-splitting (full-batch
+        // splitting cost q17 2×: 148.8s vs 77s). Only ITERATOR requests route by key-group for
+        // parallel fan-out. ROUTING (non-adaptive): everything routes by key-group as before.
+        if (adaptiveInline) {
+            return new SplitItersContainer();
+        }
         // KEY-GROUP-AFFINE ROUTING: the returned container routes each offered request to a
         // per-worker sub-container by keyGroup % N, so a given key-group's state always lands in ONE
         // worker's MapStateCache (read-your-writes + per-key ordering — the windowed-join correctness
         // fix). executeBatchRequests then runs the non-empty sub-containers in PARALLEL and completes
         // SYNCHRONOUSLY (no incomplete-future / fullyLoaded coordination → deadlock-free).
         return new RoutingRequestContainer();
+    }
+
+    /**
+     * PR-1 adaptive container: ONE inline classifier for all non-iterator requests (executed on
+     * the mailbox FIRST — preserving the batch's writes-before-iters invariant) + per-key-group
+     * sub-classifiers for ITERATOR requests only (latch-dispatched to the worker pool after the
+     * inline phase). Same-key get/iter ordering is preserved: the AEC admits at most one in-flight
+     * record per key, and within a batch the unsplit classifier ALSO executed puts/deletes/gets
+     * before iters — the phase split reproduces that exact order.
+     */
+    private final class SplitItersContainer
+            implements AsyncRequestContainer<StateRequest<?, ?, ?, ?>> {
+        AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main;
+
+        @SuppressWarnings("unchecked")
+        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] iterSubs =
+                (AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[])
+                        new AsyncRequestContainer<?>[workers.length];
+
+        @Override
+        public void offer(StateRequest<?, ?, ?, ?> request) {
+            if (org.apache.flink.state.forstrs.VectorizedClassifier.isIterKind(
+                    request.getRequestType())) {
+                int w = Math.floorMod(request.getRecordContext().getKeyGroup(), workers.length);
+                if (iterSubs[w] == null) {
+                    iterSubs[w] = workers[w].createRequestContainer();
+                }
+                iterSubs[w].offer(request);
+            } else {
+                if (main == null) {
+                    main = workers[0].createRequestContainer();
+                }
+                main.offer(request);
+            }
+        }
+
+        @Override
+        public boolean isEmpty() {
+            if (main != null && !main.isEmpty()) {
+                return false;
+            }
+            for (AsyncRequestContainer<StateRequest<?, ?, ?, ?>> s : iterSubs) {
+                if (s != null && !s.isEmpty()) {
+                    return false;
+                }
+            }
+            return true;
+        }
     }
 
     @Override
@@ -181,8 +236,28 @@ public final class RoutingStateExecutor implements StateExecutor {
         // pooled classifiers are free again before the next batch's createRequestContainer (no
         // cross-batch reuse hazard). Cross-batch pipelining (depth>1) is a later optimization (OPT-02
         // / double-buffering); this delivers correctness + intra-batch parallelism safely.
-        RoutingRequestContainer rc = (RoutingRequestContainer) container;
-        AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs = rc.subs;
+        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs;
+        if (container instanceof SplitItersContainer sc) {
+            // ADAPTIVE: phase 1 — execute the (cheap) main classifier INLINE on this (mailbox)
+            // thread, exactly like depth-1: zero handoff, zero splitting. Error contract matches
+            // runSubBatchAndWait: extract present errors via getNow, never wait on the container
+            // future (join() on async-tail futures parked the mailbox — 2026-06-10).
+            if (sc.main != null && !sc.main.isEmpty()) {
+                try {
+                    CompletableFuture<Void> inner = workers[0].executeBatchRequests(sc.main);
+                    Throwable t = inner.handle((v, e) -> e).getNow(null);
+                    if (t != null) {
+                        return CompletableFuture.failedFuture(t);
+                    }
+                } catch (Throwable t) {
+                    return CompletableFuture.failedFuture(t);
+                }
+            }
+            // Phase 2 — fan the iterator sub-batches out to the worker pool (latch below).
+            subs = sc.iterSubs;
+        } else {
+            subs = ((RoutingRequestContainer) container).subs;
+        }
         java.util.List<Integer> busy = new java.util.ArrayList<>(workers.length);
         for (int i = 0; i < subs.length; i++) {
             if (subs[i] != null && !subs[i].isEmpty()) {
@@ -191,28 +266,6 @@ public final class RoutingStateExecutor implements StateExecutor {
         }
         if (busy.isEmpty()) {
             return CompletableFuture.completedFuture(null);
-        }
-        if (adaptiveInline && !anySubHasIters(subs, busy)) {
-            // ADAPTIVE FAST PATH: iter-free batch → execute the sub-batches sequentially on the
-            // CALLING (mailbox) thread, exactly like the depth-1 inline executor. The worker
-            // threads are idle (batches complete synchronously → never two in flight), so the
-            // workers' executor-owned out-segments are safe to use from this thread.
-            try {
-                for (int id : busy) {
-                    // Match runSubBatchAndWait's contract: extract an already-present error via
-                    // getNow but NEVER wait on the container future (join() here parked the
-                    // mailbox forever when the inner future had an async tail — the AEC ignores
-                    // container futures; per-row futures carry completion).
-                    CompletableFuture<Void> inner = workers[id].executeBatchRequests(subs[id]);
-                    Throwable t = inner.handle((v, e) -> e).getNow(null);
-                    if (t != null) {
-                        return CompletableFuture.failedFuture(t);
-                    }
-                }
-                return CompletableFuture.completedFuture(null);
-            } catch (Throwable t) {
-                return CompletableFuture.failedFuture(t);
-            }
         }
         final java.util.concurrent.atomic.AtomicReference<Throwable> err =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -252,18 +305,6 @@ public final class RoutingStateExecutor implements StateExecutor {
         return (e != null)
                 ? CompletableFuture.failedFuture(e)
                 : CompletableFuture.completedFuture(null);
-    }
-
-    /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
-    private static boolean anySubHasIters(
-            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
-        for (int id : busy) {
-            if (subs[id] instanceof org.apache.flink.state.forstrs.VectorizedClassifier vc
-                    && vc.hasIterRequests()) {
-                return true;
-            }
-        }
-        return false;
     }
 
     /** Runs one worker's sub-batch on its worker thread and blocks until it completes. */

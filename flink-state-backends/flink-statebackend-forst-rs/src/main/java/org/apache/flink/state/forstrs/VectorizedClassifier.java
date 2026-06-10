@@ -525,6 +525,17 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                 || (iterRangeBuffer != null && iterRangeBuffer.count() > 0);
     }
 
+    /**
+     * PR-1 adaptive (split-iters-only): whether this request type routes to the ITER dispatch
+     * kind. Used by the adaptive container to send ONLY iterator requests through key-group
+     * routing/offload while everything else stays in one inline classifier (the per-batch
+     * kg-splitting of cheap requests cost q17 2× — 148.8s vs 77s).
+     */
+    public static boolean isIterKind(StateRequestType type) {
+        DispatchKind k = DISPATCH_TABLE[type.ordinal()];
+        return k == DispatchKind.ITER;
+    }
+
     // -----------------------------------------------------------------
     // Lazy init helpers (fail-fast when buffers not configured)
     // -----------------------------------------------------------------
