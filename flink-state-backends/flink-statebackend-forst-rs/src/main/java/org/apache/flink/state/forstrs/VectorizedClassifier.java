@@ -536,6 +536,37 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         return k == DispatchKind.ITER;
     }
 
+    /**
+     * FRS_REENTRY_DIAG=2 stream-stats (q8-race localization, 2026-06-10): per-request-type
+     * offer counts, dumped every 2^20 offers. Diffing the final dumps of an adaptive run vs a
+     * routing run on the SAME query shows which op family diverges first (e.g., fewer MAP_ITER
+     * offers → fewer window fires; equal offers but short out_rows → loss is in results).
+     * Static/global: q8 has multiple operator subtasks; the aggregate is what we diff.
+     */
+    private static final boolean STREAM_STATS =
+            "2".equals(System.getenv("FRS_REENTRY_DIAG"));
+
+    private static final java.util.concurrent.atomic.AtomicLongArray TYPE_OFFERS =
+            new java.util.concurrent.atomic.AtomicLongArray(StateRequestType.values().length);
+    private static final java.util.concurrent.atomic.AtomicLong OFFER_TOTAL =
+            new java.util.concurrent.atomic.AtomicLong();
+
+    private static void recordStreamStat(StateRequestType type) {
+        TYPE_OFFERS.incrementAndGet(type.ordinal());
+        long n = OFFER_TOTAL.incrementAndGet();
+        if ((n & ((1L << 20) - 1)) == 0) {
+            StringBuilder sb = new StringBuilder("[STREAM_STATS] offers=").append(n);
+            StateRequestType[] vals = StateRequestType.values();
+            for (int i = 0; i < vals.length; i++) {
+                long c = TYPE_OFFERS.get(i);
+                if (c > 0) {
+                    sb.append(' ').append(vals[i]).append('=').append(c);
+                }
+            }
+            System.err.println(sb);
+        }
+    }
+
     // -----------------------------------------------------------------
     // Lazy init helpers (fail-fast when buffers not configured)
     // -----------------------------------------------------------------
@@ -648,6 +679,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         }
         ForStRsInnerTable<?, ?, ?> table = (ForStRsInnerTable<?, ?, ?>) state;
         StateRequestType type = stateRequest.getRequestType();
+        if (STREAM_STATS) {
+            recordStreamStat(type);
+        }
         // Single array load → branch-predictor friendly. JIT can lower the
         // small 5-case switch below into a tableswitch / jump table.
         DispatchKind kind = DISPATCH_TABLE[type.ordinal()];
