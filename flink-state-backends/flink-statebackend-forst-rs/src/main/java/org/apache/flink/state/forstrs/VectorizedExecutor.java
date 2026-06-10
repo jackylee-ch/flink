@@ -361,6 +361,13 @@ public class VectorizedExecutor implements StateExecutor {
     private final java.util.concurrent.ConcurrentLinkedDeque<VectorizedClassifier> classifierPool =
             new java.util.concurrent.ConcurrentLinkedDeque<>();
 
+    /** FRS_REENTRY_DIAG: per-thread executeBatchRequests depth on THIS executor instance. */
+    private final ThreadLocal<Integer> REENTRY_DEPTH = ThreadLocal.withInitial(() -> 0);
+
+    private static final java.util.concurrent.atomic.AtomicLong REENTRY_COUNT =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final boolean REENTRY_DIAG = "1".equals(System.getenv("FRS_REENTRY_DIAG"));
+
     /**
      * V3.1 (V20 sub-spec §5): register a ListState name so the per-batch classifier's
      * APPEND_MERGE routing recognizes LIST_ADD requests on this state. Idempotent.
@@ -454,6 +461,20 @@ public class VectorizedExecutor implements StateExecutor {
             return CompletableFuture.failedFuture(err);
         }
         VectorizedClassifier classifier = (VectorizedClassifier) container;
+        // FRS_REENTRY_DIAG (2026-06-10, q8-race probe): detect RE-ENTRANT execution on the SAME
+        // executor instance — a recursive trigger (per-row completion callback running inline on
+        // the mailbox → state op → AEC trigger) would overwrite the executor-owned out-segments
+        // mid-decode of the outer batch = the corruption mechanism candidate.
+        int depth = REENTRY_DEPTH.get();
+        if (depth > 0 && REENTRY_DIAG) {
+            long n = REENTRY_COUNT.incrementAndGet();
+            if (n <= 5 || n % 1000 == 0) {
+                System.err.println(
+                        "[REENTRY_DIAG] executeBatchRequests re-entered depth=" + (depth + 1)
+                                + " count=" + n + " thread=" + Thread.currentThread().getName());
+            }
+        }
+        REENTRY_DEPTH.set(depth + 1);
         if (metrics != null) {
             metrics.recordBatchStart();
         }
@@ -609,6 +630,7 @@ public class VectorizedExecutor implements StateExecutor {
             if (metrics != null) {
                 metrics.recordBatchEnd();
             }
+            REENTRY_DEPTH.set(REENTRY_DEPTH.get() - 1);
             // PR-1 leak fix: SELF-RELEASE the classifier back to the pool. Every container
             // passes through executeBatchRequests exactly once, in EVERY executor mode
             // (inline/routing/adaptive/coordinated) — without this, each batch leaked a fresh
