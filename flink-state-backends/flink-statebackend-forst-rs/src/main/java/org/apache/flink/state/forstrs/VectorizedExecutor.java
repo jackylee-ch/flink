@@ -313,11 +313,22 @@ public class VectorizedExecutor implements StateExecutor {
         // explicitly documents that buffers can be safely SHARED — so pool a
         // single classifier at executor level and just reset() it per batch.
         // Saves one MemorySegment alloc + memset(0) per batch on the hot loop.
-        VectorizedClassifier classifier = pooledClassifier;
+        // PR-1 (coordinated executor): a POOL of classifiers, each owning a PRIVATE buffer
+        // quartet, so two outstanding containers never share fill-side state — the mailbox can
+        // fill batch N+1 while batch N executes on a worker thread (the depth>1 blocker in the
+        // PR-E2 comment below). Inline mode never calls releaseRequestContainer, so the pool
+        // grows to exactly one entry there — identical allocation behavior to the prior single
+        // pooledClassifier (PERF-RESTORE-#0 preserved). Under CoordinatedStateExecutor the pool
+        // is bounded by AEC admission (fullyLoaded) — at most a few classifiers per executor.
+        VectorizedClassifier classifier = classifierPool.pollFirst();
         if (classifier == null) {
-            classifier = new VectorizedClassifier(getKeys, putKeys, putValues, deleteKeys);
+            classifier =
+                    new VectorizedClassifier(
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena),
+                            new ColumnarBatchBuffer(arena));
             classifier.initNewKindBuffers(arena);
-            pooledClassifier = classifier;
         }
         classifier.reset();
         // V3.1: propagate the executor-level listStateNames registry into the
@@ -328,8 +339,27 @@ public class VectorizedExecutor implements StateExecutor {
         return classifier;
     }
 
-    /** PERF-RESTORE-#0: shared pooled classifier; lifecycle owned by this executor. */
-    private VectorizedClassifier pooledClassifier;
+    /**
+     * Returns a batch's classifier to the pool once its execution has fully completed. Thread
+     * model: under {@code CoordinatedStateExecutor}, create runs on the mailbox thread (container
+     * fill for batch N+1) CONCURRENTLY with a worker thread releasing batch N's classifier — so
+     * the pool is a lock-free concurrent deque. A classifier instance itself is never touched by
+     * two threads at once: it is exclusively the mailbox's during fill, handed off to exactly one
+     * worker for execution (happens-before via the executor submit), and only re-enters the pool
+     * after execution finishes.
+     */
+    public void releaseRequestContainer(
+            org.apache.flink.runtime.asyncprocessing.AsyncRequestContainer<
+                            org.apache.flink.runtime.asyncprocessing.StateRequest<?, ?, ?, ?>>
+                    container) {
+        if (container instanceof VectorizedClassifier vc) {
+            classifierPool.addLast(vc);
+        }
+    }
+
+    /** PR-1: pooled classifiers, each with a private buffer quartet; owned by this executor. */
+    private final java.util.concurrent.ConcurrentLinkedDeque<VectorizedClassifier> classifierPool =
+            new java.util.concurrent.ConcurrentLinkedDeque<>();
 
     /**
      * V3.1 (V20 sub-spec §5): register a ListState name so the per-batch classifier's
