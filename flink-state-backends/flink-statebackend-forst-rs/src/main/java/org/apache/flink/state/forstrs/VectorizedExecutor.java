@@ -609,6 +609,15 @@ public class VectorizedExecutor implements StateExecutor {
             if (metrics != null) {
                 metrics.recordBatchEnd();
             }
+            // PR-1 leak fix: SELF-RELEASE the classifier back to the pool. Every container
+            // passes through executeBatchRequests exactly once, in EVERY executor mode
+            // (inline/routing/adaptive/coordinated) — without this, each batch leaked a fresh
+            // classifier + 4 arena-allocated ColumnarBatchBuffers (arena memory frees only at
+            // close) → multi-GB/min native growth on high-batch-rate queries (q17 adaptive:
+            // TM cgroup-OOM-killed within seconds = the "wedge"). Safe to pool here: per-row
+            // completions were issued with detached values during execution, and the next
+            // createRequestContainer() resets before reuse.
+            releaseRequestContainer(container);
         }
     }
 

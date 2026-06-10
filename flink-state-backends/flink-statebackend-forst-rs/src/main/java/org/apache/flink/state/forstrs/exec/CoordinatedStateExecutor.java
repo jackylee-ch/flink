@@ -169,9 +169,9 @@ public final class CoordinatedStateExecutor implements StateExecutor {
                         } catch (Throwable t) {
                             err.compareAndSet(null, t);
                         } finally {
-                            // Execution fully done → classifier (and its private buffers) can be
-                            // refilled by the mailbox for a future batch.
-                            workers[id].releaseRequestContainer(sub);
+                            // NOTE: the classifier self-releases inside executeBatchRequests'
+                            // finally (PR-1 leak fix) — releasing again here would double-pool
+                            // the same instance (two future batches sharing one classifier).
                             ongoing.decrementAndGet();
                             if (remaining.decrementAndGet() == 0) {
                                 Throwable e = err.get();

@@ -199,7 +199,15 @@ public final class RoutingStateExecutor implements StateExecutor {
             // workers' executor-owned out-segments are safe to use from this thread.
             try {
                 for (int id : busy) {
-                    workers[id].executeBatchRequests(subs[id]).join();
+                    // Match runSubBatchAndWait's contract: extract an already-present error via
+                    // getNow but NEVER wait on the container future (join() here parked the
+                    // mailbox forever when the inner future had an async tail — the AEC ignores
+                    // container futures; per-row futures carry completion).
+                    CompletableFuture<Void> inner = workers[id].executeBatchRequests(subs[id]);
+                    Throwable t = inner.handle((v, e) -> e).getNow(null);
+                    if (t != null) {
+                        return CompletableFuture.failedFuture(t);
+                    }
                 }
                 return CompletableFuture.completedFuture(null);
             } catch (Throwable t) {
