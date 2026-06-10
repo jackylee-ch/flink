@@ -237,25 +237,19 @@ public final class RoutingStateExecutor implements StateExecutor {
         // cross-batch reuse hazard). Cross-batch pipelining (depth>1) is a later optimization (OPT-02
         // / double-buffering); this delivers correctness + intra-batch parallelism safely.
         final AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs;
+        final AsyncRequestContainer<StateRequest<?, ?, ?, ?>> inlineMainAfterIters;
         if (container instanceof SplitItersContainer sc) {
-            // ADAPTIVE: phase 1 — execute the (cheap) main classifier INLINE on this (mailbox)
-            // thread, exactly like depth-1: zero handoff, zero splitting. Error contract matches
-            // runSubBatchAndWait: extract present errors via getNow, never wait on the container
-            // future (join() on async-tail futures parked the mailbox — 2026-06-10).
-            if (sc.main != null && !sc.main.isEmpty()) {
-                try {
-                    CompletableFuture<Void> inner = workers[0].executeBatchRequests(sc.main);
-                    Throwable t = inner.handle((v, e) -> e).getNow(null);
-                    if (t != null) {
-                        return CompletableFuture.failedFuture(t);
-                    }
-                } catch (Throwable t) {
-                    return CompletableFuture.failedFuture(t);
-                }
-            }
-            // Phase 2 — fan the iterator sub-batches out to the worker pool (latch below).
+            // ADAPTIVE phase order: ITERS FIRST (worker pool, latch below), MAIN AFTER (inline).
+            // Iters-first is the correct order for the real same-key same-batch hazard — the
+            // window FIRE-THEN-PURGE pattern offers ITER(read window) before CLEAR(purge window);
+            // running main (with the CLEAR) first made the iter read a purged window → q8
+            // 1,441,352 (−53%, measured 2026-06-10). Map PUTS stay visible to iters regardless of
+            // phase order: MapStateV2 puts ride the state-level statebuf (staged at request
+            // creation on the mailbox, flushed at iter creation) — they are not classifier rows.
+            inlineMainAfterIters = (sc.main != null && !sc.main.isEmpty()) ? sc.main : null;
             subs = sc.iterSubs;
         } else {
+            inlineMainAfterIters = null;
             subs = ((RoutingRequestContainer) container).subs;
         }
         java.util.List<Integer> busy = new java.util.ArrayList<>(workers.length);
@@ -265,7 +259,11 @@ public final class RoutingStateExecutor implements StateExecutor {
             }
         }
         if (busy.isEmpty()) {
-            return CompletableFuture.completedFuture(null);
+            // No iter sub-batches — the common cheap-batch case: just the inline main phase.
+            Throwable mt = runInlineMain(inlineMainAfterIters);
+            return (mt != null)
+                    ? CompletableFuture.failedFuture(mt)
+                    : CompletableFuture.completedFuture(null);
         }
         final java.util.concurrent.atomic.AtomicReference<Throwable> err =
                 new java.util.concurrent.atomic.AtomicReference<>();
@@ -302,9 +300,31 @@ public final class RoutingStateExecutor implements StateExecutor {
             }
         }
         Throwable e = err.get();
+        if (e == null) {
+            // ADAPTIVE phase 2: main classifier inline AFTER the iter sub-batches completed.
+            e = runInlineMain(inlineMainAfterIters);
+        }
         return (e != null)
                 ? CompletableFuture.failedFuture(e)
                 : CompletableFuture.completedFuture(null);
+    }
+
+    /**
+     * Executes the adaptive container's main (non-iterator) classifier INLINE on the calling
+     * thread. Error contract matches {@link #runSubBatchAndWait}: extract an already-present
+     * error via getNow but never wait on the container future (the AEC ignores it; per-row
+     * futures carry completion). Returns the error or {@code null}.
+     */
+    private Throwable runInlineMain(AsyncRequestContainer<StateRequest<?, ?, ?, ?>> main) {
+        if (main == null) {
+            return null;
+        }
+        try {
+            CompletableFuture<Void> inner = workers[0].executeBatchRequests(main);
+            return inner.handle((v, ex) -> ex).getNow(null);
+        } catch (Throwable t) {
+            return t;
+        }
     }
 
     /** Runs one worker's sub-batch on its worker thread and blocks until it completes. */
