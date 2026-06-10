@@ -39,6 +39,12 @@
             <td>The local directory (on the TaskManager) where ForSt puts some metadata files. By default, it will be &lt;WORKING_DIR&gt;/tmp. See <code class="highlighter-rouge">process.taskmanager.working-dir</code> for more details.</td>
         </tr>
         <tr>
+            <td><h5>state.backend.forst.map-state.iterator-cache-size</h5></td>
+            <td style="word-wrap: break-word;">4096</td>
+            <td>Integer</td>
+            <td>The number of entries cached by each synchronous ForSt MapState iterator batch. Increasing this value reduces native iterator reopen and seek overhead for large MapState scans, but consumes more heap memory while an iterator is active.</td>
+        </tr>
+        <tr>
             <td><h5>state.backend.forst.memory.fixed-per-slot</h5></td>
             <td style="word-wrap: break-word;">(none)</td>
             <td>MemorySize</td>
