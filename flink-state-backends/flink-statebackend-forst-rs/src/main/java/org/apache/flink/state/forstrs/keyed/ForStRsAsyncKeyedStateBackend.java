@@ -212,10 +212,10 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
-    // M1: routing (parallel) executors created when FRS_RS_PARALLEL_EXECUTOR=1; their worker
-    // VectorizedExecutors live in managedExecutors, but the router owns the worker threads + arenas
-    // and must be shut down in dispose().
-    private final java.util.List<org.apache.flink.state.forstrs.exec.RoutingStateExecutor>
+    // M1/PR-1: parallel executors (routing or coordinated, per FRS_RS_EXECUTOR); their worker
+    // VectorizedExecutors live in managedExecutors, but the router/coordinator owns the worker
+    // threads + arenas and must be shut down in dispose().
+    private final java.util.List<org.apache.flink.runtime.asyncprocessing.StateExecutor>
             routingExecutors = new java.util.ArrayList<>();
 
     /**
@@ -1155,18 +1155,41 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // "rob Peter to pay Paul" — forbidden. So OPT-01 stays OPT-IN (FRS_RS_PARALLEL_EXECUTOR=1);
         // default = depth-1 + cache (correct + fast for ALL). A true default needs the cache KEPT
         // under parallel (per-worker cache pinned to the key-group's worker thread) — multi-PR.
-        String pe = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
-        if (pe != null && pe.trim().equals("1")) {
-            org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
-                    new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
-                            linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
-            routingExecutors.add(r);
-            return r;
+        // PR-1 executor selection (2026-06-10):
+        //   FRS_RS_EXECUTOR=coordinated → CoordinatedStateExecutor (non-blocking ForSt model;
+        //                                  target default once the Task-5 benchmark gates pass)
+        //   FRS_RS_EXECUTOR=routing     → RoutingStateExecutor (the measured synchronous opt-in)
+        //   FRS_RS_EXECUTOR=inline      → depth-1 VectorizedExecutor (kill switch)
+        // Back-compat: FRS_RS_PARALLEL_EXECUTOR=1 (the old opt-in) == routing.
+        // Default REMAINS inline until the PR-1 Task-5 gates (q8 band, q17 ≤85s, q11, q20, q9
+        // no-regress) pass on 8c/32g; the flip is PR-1 Task 6.
+        String mode = System.getenv("FRS_RS_EXECUTOR");
+        if (mode != null) {
+            mode = mode.trim();
         }
-        var e = new VectorizedExecutor(linker, db, defaultCf, arena);
-        e.setDispatchMetrics(dispatchMetrics);
-        managedExecutors.add(e);
-        return e;
+        if (mode == null || mode.isEmpty()) {
+            String legacy = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
+            mode = (legacy != null && legacy.trim().equals("1")) ? "routing" : "inline";
+        }
+        switch (mode) {
+            case "coordinated":
+                org.apache.flink.state.forstrs.exec.CoordinatedStateExecutor c =
+                        org.apache.flink.state.forstrs.exec.CoordinatedStateExecutor.create(
+                                linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
+                routingExecutors.add(c);
+                return c;
+            case "routing":
+                org.apache.flink.state.forstrs.exec.RoutingStateExecutor r =
+                        new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                                linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
+                routingExecutors.add(r);
+                return r;
+            default:
+                var e = new VectorizedExecutor(linker, db, defaultCf, arena);
+                e.setDispatchMetrics(dispatchMetrics);
+                managedExecutors.add(e);
+                return e;
+        }
     }
 
     /** Returns the per-backend dispatch metrics. Exposed for testing and monitoring integration. */
@@ -1868,9 +1891,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             awaitOutstandingSnapshots();
             managedExecutors.forEach(VectorizedExecutor::flushDirty);
             managedExecutors.forEach(VectorizedExecutor::shutdown);
-            // M1: shut down routing-executor worker threads + close their arenas (awaits idle).
+            // M1/PR-1: shut down parallel-executor worker threads + close their arenas (awaits idle).
             routingExecutors.forEach(
-                    org.apache.flink.state.forstrs.exec.RoutingStateExecutor::shutdown);
+                    org.apache.flink.runtime.asyncprocessing.StateExecutor::shutdown);
             managedExecutors.clear();
             // D5-H2: release each MapStateV2's MapStateCache arena BEFORE clearing the state
             // cache and dropping registry references. Pre-fix, the cache's Arena.ofShared()

@@ -126,7 +126,23 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                     // Parallel executor is OPT-IN (reverted from default — cache-off robs the
                     // cache-benefiting joins like q9). Align: bypass the cache only when parallel is
                     // explicitly enabled (the proven-correct parallel config).
-                    || "1".equals(System.getenv("FRS_RS_PARALLEL_EXECUTOR"));
+                    // PR-1 (2026-06-10): same coupling for BOTH parallel modes — routing (legacy
+                    // FRS_RS_PARALLEL_EXECUTOR=1 or FRS_RS_EXECUTOR=routing) and the non-blocking
+                    // FRS_RS_EXECUTOR=coordinated. A worker-confined per-key-group cache is PR-2,
+                    // gate-driven (q11 passed 134.7s WITH cache off).
+                    || parallelExecutorActive();
+
+    private static boolean parallelExecutorActive() {
+        String m = System.getenv("FRS_RS_EXECUTOR");
+        if (m != null) {
+            String t = m.trim();
+            if (t.equals("coordinated") || t.equals("routing")) {
+                return true;
+            }
+        }
+        String legacy = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
+        return legacy != null && legacy.trim().equals("1");
+    }
 
     /**
      * FRS-ADAPTIVE-MAPSTATE-CACHE (2026-06-04): the per-record read cache is a
