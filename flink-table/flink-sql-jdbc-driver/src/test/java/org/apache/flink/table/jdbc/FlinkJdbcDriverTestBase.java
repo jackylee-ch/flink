@@ -18,6 +18,8 @@
 
 package org.apache.flink.table.jdbc;
 
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.table.client.gateway.SingleSessionManager;
 import org.apache.flink.table.gateway.rest.util.SqlGatewayRestEndpointExtension;
@@ -27,15 +29,21 @@ import org.apache.flink.test.junit5.MiniClusterExtension;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
+import java.io.IOException;
+import java.nio.file.Files;
 import java.util.Properties;
 
 /** Base test for flink jdbc driver which will launch flink cluster and sql gatewa. */
 public class FlinkJdbcDriverTestBase {
+    private static final Configuration MINI_CLUSTER_CONFIGURATION =
+            createMiniClusterConfiguration();
+
     @RegisterExtension
     @Order(1)
     private static final MiniClusterExtension MINI_CLUSTER_RESOURCE =
             new MiniClusterExtension(
                     new MiniClusterResourceConfiguration.Builder()
+                            .setConfiguration(MINI_CLUSTER_CONFIGURATION)
                             .setNumberTaskManagers(2)
                             .setNumberSlotsPerTaskManager(4)
                             .build());
@@ -62,5 +70,17 @@ public class FlinkJdbcDriverTestBase {
                         SQL_GATEWAY_REST_ENDPOINT_EXTENSION.getTargetAddress(),
                         SQL_GATEWAY_REST_ENDPOINT_EXTENSION.getTargetPort()),
                 properties);
+    }
+
+    private static Configuration createMiniClusterConfiguration() {
+        final Configuration configuration = new Configuration();
+        try {
+            configuration.set(
+                    WebOptions.UPLOAD_DIR,
+                    Files.createTempDirectory("flink-sql-jdbc-upload-").toString());
+        } catch (IOException e) {
+            throw new ExceptionInInitializerError(e);
+        }
+        return configuration;
     }
 }
