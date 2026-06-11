@@ -21,7 +21,6 @@ package org.apache.flink.runtime.rest;
 import org.apache.flink.core.testutils.EachCallbackWrapper;
 import org.apache.flink.runtime.io.network.netty.NettyLeakDetectionExtension;
 import org.apache.flink.runtime.rest.handler.HandlerRequest;
-import org.apache.flink.runtime.rest.handler.router.MultipartRoutes;
 import org.apache.flink.runtime.rest.messages.MessageHeaders;
 import org.apache.flink.runtime.rest.messages.RequestBody;
 import org.apache.flink.runtime.rest.util.RestMapperUtils;
@@ -32,7 +31,6 @@ import org.apache.flink.util.function.BiConsumerWithException;
 
 import org.apache.flink.shaded.jackson2.com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseStatus;
-import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.HttpPostRequestDecoder;
 
 import okhttp3.MediaType;
 import okhttp3.MultipartBody;
@@ -48,7 +46,6 @@ import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.io.StringWriter;
 import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -64,9 +61,6 @@ import java.util.stream.Collectors;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
-import static org.mockito.Mockito.doThrow;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * Tests for the {@link FileUploadHandler}. Ensures that multipart http messages containing files
@@ -402,26 +396,6 @@ class FileUploadHandlerITCase {
         multipartUpdateExtensionWrapper.getCustomExtension().assertUploadDirectoryIsEmpty();
 
         verifyNoFileIsRegisteredToDeleteOnExitHook();
-    }
-
-    @Test
-    void testResetIgnoresDecoderDestroyFailure(@TempDir Path tmp) throws Exception {
-        FileUploadHandler handler =
-                new FileUploadHandler(tmp, new MultipartRoutes.Builder().build());
-        HttpPostRequestDecoder decoder = mock(HttpPostRequestDecoder.class);
-        when(decoder.getBodyHttpDatas()).thenReturn(Collections.emptyList());
-        doThrow(new IllegalStateException("destroy failed")).when(decoder).destroy();
-
-        Field decoderField =
-                FileUploadHandler.class.getDeclaredField("currentHttpPostRequestDecoder");
-        decoderField.setAccessible(true);
-        decoderField.set(handler, decoder);
-
-        Method reset = FileUploadHandler.class.getDeclaredMethod("reset");
-        reset.setAccessible(true);
-
-        assertThatCode(() -> reset.invoke(handler)).doesNotThrowAnyException();
-        assertThat(decoderField.get(handler)).isNull();
     }
 
     @Test

@@ -280,25 +280,16 @@ public class FileUploadHandler extends SimpleChannelInboundHandler<HttpObject> {
         // IllegalReferenceCountException
         // see https://github.com/netty/netty/issues/7814
         try {
-            if (currentHttpPostRequestDecoder != null) {
-                try {
-                    currentHttpPostRequestDecoder.getBodyHttpDatas().clear();
-                } catch (HttpPostRequestDecoder.NotEnoughDataDecoderException ned) {
-                    // this method always fails if not all chunks were offered to the decoder yet
-                    LOG.debug("Error while resetting handler.", ned);
-                }
-                try {
-                    currentHttpPostRequestDecoder.destroy();
-                } catch (Exception e) {
-                    LOG.debug("Error while destroying multipart request decoder.", e);
-                }
-            }
-        } finally {
-            currentHttpPostRequestDecoder = null;
-            currentHttpRequest = null;
-            currentUploadDir = null;
-            currentJsonPayload = null;
+            currentHttpPostRequestDecoder.getBodyHttpDatas().clear();
+        } catch (HttpPostRequestDecoder.NotEnoughDataDecoderException ned) {
+            // this method always fails if not all chunks were offered to the decoder yet
+            LOG.debug("Error while resetting handler.", ned);
         }
+        currentHttpPostRequestDecoder.destroy();
+        currentHttpPostRequestDecoder = null;
+        currentHttpRequest = null;
+        currentUploadDir = null;
+        currentJsonPayload = null;
     }
 
     public static FileUploads getMultipartFileUploads(ChannelHandlerContext ctx) {
