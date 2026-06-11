@@ -39,6 +39,7 @@ import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.HttpResponseSt
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.LastHttpContent;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.Attribute;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.DefaultHttpDataFactory;
+import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.DiskAttribute;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.DiskFileUpload;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.HttpDataFactory;
 import org.apache.flink.shaded.netty4.io.netty.handler.codec.http.multipart.HttpPostRequestDecoder;
@@ -75,9 +76,9 @@ public class FileUploadHandler extends SimpleChannelInboundHandler<HttpObject> {
     private static final AttributeKey<FileUploads> UPLOADED_FILES =
             AttributeKey.valueOf("UPLOADED_FILES");
 
-    private final Path uploadDir;
+    private static final HttpDataFactory DATA_FACTORY = new DefaultHttpDataFactory(true);
 
-    private final HttpDataFactory dataFactory;
+    private final Path uploadDir;
 
     private final MultipartRoutes multipartRoutes;
 
@@ -95,13 +96,14 @@ public class FileUploadHandler extends SimpleChannelInboundHandler<HttpObject> {
         // it's no need to register those files (post chunks and upload file chunks) to
         // java.io.DeleteOnExitHook
         // which may lead to memory leak.
-        final DefaultHttpDataFactory dataFactory = new DefaultHttpDataFactory(true);
-        dataFactory.setDeleteOnExit(false);
+        DiskAttribute.deleteOnExitTemporaryFile = false;
+        DiskFileUpload.deleteOnExitTemporaryFile = false;
+
+        DiskFileUpload.baseDirectory = uploadDir.normalize().toAbsolutePath().toString();
         // share the same directory with file upload for post chunks storage.
-        dataFactory.setBaseDir(uploadDir.normalize().toAbsolutePath().toString());
+        DiskAttribute.baseDirectory = DiskFileUpload.baseDirectory;
 
         this.uploadDir = requireNonNull(uploadDir);
-        this.dataFactory = dataFactory;
         this.multipartRoutes = requireNonNull(multipartRoutes);
     }
 
@@ -122,7 +124,7 @@ public class FileUploadHandler extends SimpleChannelInboundHandler<HttpObject> {
                         checkState(currentHttpRequest == null);
                         checkState(currentUploadDir == null);
                         currentHttpPostRequestDecoder =
-                                new HttpPostRequestDecoder(dataFactory, httpRequest);
+                                new HttpPostRequestDecoder(DATA_FACTORY, httpRequest);
                         currentHttpRequest = ReferenceCountUtil.retain(httpRequest);
 
                         // We check this after initializing the multipart file upload in order for
