@@ -682,6 +682,9 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         if (STREAM_STATS) {
             recordStreamStat(type);
         }
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.offered(type);
+        }
         // Single array load → branch-predictor friendly. JIT can lower the
         // small 5-case switch below into a tableswitch / jump table.
         DispatchKind kind = DISPATCH_TABLE[type.ordinal()];

@@ -2633,6 +2633,9 @@ public class VectorizedExecutor implements StateExecutor {
 
     @SuppressWarnings("unchecked")
     private static void completePut(StateRequest<?, ?, ?, ?> request) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.completed(request.getRequestType());
+        }
         ((InternalAsyncFuture<Object>) request.getFuture()).complete(null);
     }
 
@@ -2808,6 +2811,9 @@ public class VectorizedExecutor implements StateExecutor {
     @SuppressWarnings("unchecked")
     private static void completePutExceptionally(
             StateRequest<?, ?, ?, ?> request, Throwable cause) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.failed(request.getRequestType());
+        }
         // Use the cause's own message if specific (FrsException/FrsEnginePanicError
         // include rc + row index); fall back to a generic label only when message is empty.
         String msg = cause.getMessage();
@@ -2833,6 +2839,9 @@ public class VectorizedExecutor implements StateExecutor {
             MemorySegment data,
             long offset,
             int len) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.completed(request.getRequestType());
+        }
         Object result;
         StateRequestType type = request.getRequestType();
         if (type == StateRequestType.MAP_CONTAINS) {
@@ -2855,6 +2864,9 @@ public class VectorizedExecutor implements StateExecutor {
     @SuppressWarnings({"unchecked", "rawtypes"})
     private static void completeGetExceptionally(
             StateRequest<?, ?, ?, ?> request, ForStRsInnerTable table, Throwable cause) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.failed(request.getRequestType());
+        }
         String msg = cause.getMessage();
         if (msg == null || msg.isEmpty()) {
             msg = "ForSt-RS GET dispatch failed: " + cause.getClass().getSimpleName();
@@ -2868,6 +2880,9 @@ public class VectorizedExecutor implements StateExecutor {
      */
     @SuppressWarnings("unchecked")
     private static void completeDelete(StateRequest<?, ?, ?, ?> request) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.completed(request.getRequestType());
+        }
         ((InternalAsyncFuture<Object>) request.getFuture()).complete(null);
     }
 
@@ -2878,6 +2893,9 @@ public class VectorizedExecutor implements StateExecutor {
     @SuppressWarnings("unchecked")
     private static void completeDeleteExceptionally(
             StateRequest<?, ?, ?, ?> request, Throwable cause) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.failed(request.getRequestType());
+        }
         String msg = cause.getMessage();
         if (msg == null || msg.isEmpty()) {
             msg = "ForSt-RS DELETE dispatch failed: " + cause.getClass().getSimpleName();

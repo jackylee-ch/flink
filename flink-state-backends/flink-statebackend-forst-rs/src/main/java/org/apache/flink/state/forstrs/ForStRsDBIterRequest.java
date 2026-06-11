@@ -160,6 +160,9 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
      */
     @SuppressWarnings("unchecked")
     public void completeExceptionally(Throwable t) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.failed(request.getRequestType());
+        }
         ((InternalAsyncFuture<Object>) (InternalAsyncFuture<?>) request.getFuture())
                 .completeExceptionally("ITER request failed", t);
     }
@@ -749,6 +752,9 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             ArrayList<IteratorEntryView> views,
             boolean encounterEnd,
             @Nullable FrsIterator continuationIter) {
+        if (DiagCompletionCounters.ENABLED) {
+            DiagCompletionCounters.completed(request.getRequestType());
+        }
         int prefixLen = prefix.length;
         StateRequestHandler handler = iterableState.getStateRequestHandler();
         int n = views.size();
