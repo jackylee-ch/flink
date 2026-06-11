@@ -250,7 +250,13 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                 }
                 long handle = outHandle.get(ValueLayout.JAVA_LONG, 0);
                 int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
-                linker.frsVecIterPrefixClose(handle);
+                // P0 AUTO-CLOSE: handle == 0 means the engine already closed the
+                // exhausted-at-open iterator — skip the close() crossing entirely
+                // (calling it would be a safe no-op, but it's a pure-overhead FFM
+                // downcall on the hottest MAP_IS_EMPTY probe path).
+                if (handle != 0L) {
+                    linker.frsVecIterPrefixClose(handle);
+                }
                 boolean isEmpty = (rowCount == 0);
                 ((InternalAsyncFuture<Boolean>) (InternalAsyncFuture<?>) request.getFuture())
                         .complete(isEmpty);
@@ -304,6 +310,14 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             firstChunkFromOpen = true;
         }
 
+        // P0 EOF + AUTO-CLOSE (streaming-read redesign §2.3): the engine signals
+        // exhausted-at-open by returning handle == 0 with the rows already in
+        // chunkBuf. The iterator is ALREADY closed engine-side (nothing was
+        // registered), so the mandatory trailing next() and the close() — the
+        // two guaranteed-wasted crossings of the dominant q7-class probe — are
+        // both skipped below.
+        final boolean eofAtOpen = firstChunkFromOpen && handle == 0L;
+
         // FRS-ZERO-SNAPSHOT (2026-06-09, lever-1 completion): decode each chunk's entries to
         // DETACHED on-heap UK/UV IMMEDIATELY after parsing it — referencing the reused chunkBuf
         // directly — instead of snapshotting every chunk into a fresh scratch.allocate(bytesUsed)
@@ -349,47 +363,63 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             // NOT exhaustion since the chunker is byte-budget bounded, not row-count bounded) or
             // we hit the CACHE_SIZE_LIMIT soft cap (remainder returns via continuation).
             //
-            // We always invoke next() at least once after the open-path first chunk; this is
-            // safe (an exhausted iterator returns 0/0 with rc=OK) and gives a single, uniform
-            // exhaustion signal regardless of whether open's first chunk filled the buffer.
-            do {
-                int rc =
-                        linker.frsVecIterPrefixNext(
-                                handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
-                if (rc != FrsStatus.OK.code()) {
-                    throwIfFatal(rc, "frs_vec_iter_prefix_next");
-                    throw new FrsBackendException(
-                            statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
-                }
-                int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
-                int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
-                if (rowCount == 0) {
-                    exhausted = true;
-                    break;
-                }
-                decodedCount +=
-                        decodeChunkDirect(
-                                chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys, values);
-            } while (decodedCount < CACHE_SIZE_LIMIT);
+            // P0: when the open already reported EOF (eofAtOpen — engine auto-closed the
+            // iterator, handle == 0), the trailing next() is provably redundant and is
+            // SKIPPED — the engine guaranteed exhaustion in the open's out-params. For
+            // registered handles we keep the pre-P0 contract: always invoke next() at
+            // least once after the open-path first chunk (an exhausted iterator returns
+            // 0/0 with rc=OK), giving a single uniform exhaustion signal.
+            if (eofAtOpen) {
+                exhausted = true;
+            } else {
+                do {
+                    int rc =
+                            linker.frsVecIterPrefixNext(
+                                    handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
+                    if (rc != FrsStatus.OK.code()) {
+                        throwIfFatal(rc, "frs_vec_iter_prefix_next");
+                        throw new FrsBackendException(
+                                statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
+                    }
+                    int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                    int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+                    if (rowCount == 0) {
+                        exhausted = true;
+                        break;
+                    }
+                    decodedCount +=
+                            decodeChunkDirect(
+                                    chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys,
+                                    values);
+                } while (decodedCount < CACHE_SIZE_LIMIT);
+            }
         } catch (Throwable t) {
             // Any escape (parse failure, FrsBackendException, anything) must release the native
             // handle before propagating — otherwise the iterator leaks for the lifetime of the
-            // process.
-            try {
-                linker.frsVecIterPrefixClose(handle);
-            } catch (Throwable ignored) {
-                // best-effort close; surface the original failure
+            // process. (P0: skip for auto-closed handles — nothing is registered; close(0)
+            // would be a harmless no-op crossing.)
+            if (!eofAtOpen) {
+                try {
+                    linker.frsVecIterPrefixClose(handle);
+                } catch (Throwable ignored) {
+                    // best-effort close; surface the original failure
+                }
             }
             this.existingVecHandle = 0L;
             throw t;
         }
 
-        // encounterEnd is true ONLY when Rust reported out_row_count == 0 (true exhaustion).
-        // Soft-cap-reached returns the current batch and stashes the handle for continuation.
+        // encounterEnd is true ONLY when Rust reported exhaustion (out_row_count == 0 from
+        // next(), or the P0 auto-close EOF at open). Soft-cap-reached returns the current
+        // batch and stashes the handle for continuation.
         boolean encounterEnd = exhausted;
         long continuationHandle = handle;
         if (encounterEnd) {
-            linker.frsVecIterPrefixClose(handle);
+            // P0: auto-closed iterators (eofAtOpen) were never registered — skip the
+            // close() crossing entirely.
+            if (!eofAtOpen) {
+                linker.frsVecIterPrefixClose(handle);
+            }
             continuationHandle = 0L;
         }
         this.existingVecHandle = continuationHandle;
@@ -446,6 +476,28 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             MemorySegment firstChunkBuf,
             int firstRowCount,
             int firstBytesUsed) {
+        processFromBatchedOpen(
+                linker, db, cf, handle, firstChunkBuf, firstRowCount, firstBytesUsed,
+                /* eofAtOpen= */ false);
+    }
+
+    /**
+     * P0 EOF-aware variant: {@code eofAtOpen} is the {@code FRS_CHUNK_EOF} bit from this probe's
+     * {@code FrsChunk._reserved} flag word. When set, the engine exhausted the probe in its first
+     * chunk and AUTO-CLOSED the iterator (the non-zero handle was never registered) — the
+     * mandatory trailing {@code frs_vec_iter_prefix_next} and the {@code
+     * frs_vec_iter_prefix_close} crossings are both skipped. When clear, behaviour is exactly the
+     * pre-P0 drain.
+     */
+    public void processFromBatchedOpen(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            long handle,
+            MemorySegment firstChunkBuf,
+            int firstRowCount,
+            int firstBytesUsed,
+            boolean eofAtOpen) {
         try (Arena scratch = Arena.ofConfined()) {
             MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
             MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
@@ -480,33 +532,42 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
                                     values);
                 }
                 // Step 2: continue via frs_vec_iter_prefix_next (identical to process()'s drain
-                // loop). The batched open registered the handle (a light shell once exhausted),
-                // so the first next() returns 0/0 with OK when the first chunk held everything.
-                do {
-                    int rc =
-                            linker.frsVecIterPrefixNext(
-                                    handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
-                    if (rc != FrsStatus.OK.code()) {
-                        throwIfFatal(rc, "frs_vec_iter_prefix_next");
-                        throw new FrsBackendException(
-                                statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
-                    }
-                    int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
-                    int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
-                    if (rowCount == 0) {
-                        exhausted = true;
-                        break;
-                    }
-                    decodedCount +=
-                            decodeChunkDirect(
-                                    chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys,
-                                    values);
-                } while (decodedCount < CACHE_SIZE_LIMIT);
+                // loop). P0: when the batched open flagged FRS_CHUNK_EOF the iterator is
+                // already auto-closed — the trailing next() is provably redundant and is
+                // skipped. For unflagged probes the batched open registered the handle, so
+                // the first next() returns 0/0 with OK when the first chunk held everything.
+                if (eofAtOpen) {
+                    exhausted = true;
+                } else {
+                    do {
+                        int rc =
+                                linker.frsVecIterPrefixNext(
+                                        handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
+                        if (rc != FrsStatus.OK.code()) {
+                            throwIfFatal(rc, "frs_vec_iter_prefix_next");
+                            throw new FrsBackendException(
+                                    statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
+                        }
+                        int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                        int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+                        if (rowCount == 0) {
+                            exhausted = true;
+                            break;
+                        }
+                        decodedCount +=
+                                decodeChunkDirect(
+                                        chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys,
+                                        values);
+                    } while (decodedCount < CACHE_SIZE_LIMIT);
+                }
             } catch (Throwable t) {
-                try {
-                    linker.frsVecIterPrefixClose(handle);
-                } catch (Throwable ignored) {
-                    // best-effort close; surface the original failure
+                // P0: nothing to release for auto-closed probes (never registered).
+                if (!eofAtOpen) {
+                    try {
+                        linker.frsVecIterPrefixClose(handle);
+                    } catch (Throwable ignored) {
+                        // best-effort close; surface the original failure
+                    }
                 }
                 this.existingVecHandle = 0L;
                 throw t;
@@ -515,7 +576,10 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             boolean encounterEnd = exhausted;
             long continuationHandle = handle;
             if (encounterEnd) {
-                linker.frsVecIterPrefixClose(handle);
+                // P0: skip the close() crossing for auto-closed probes.
+                if (!eofAtOpen) {
+                    linker.frsVecIterPrefixClose(handle);
+                }
                 continuationHandle = 0L;
             }
             this.existingVecHandle = continuationHandle;

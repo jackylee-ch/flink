@@ -61,10 +61,19 @@ class ForStRsDBIterRequestTest {
         FrsDb db = mock(FrsDb.class);
         FrsCfHandle cf = mock(FrsCfHandle.class);
 
-        // frs_vec_iter_prefix_open: write 0 rows / 0 bytes into the out-params and return OK.
+        // frs_vec_iter_prefix_open: write 0 rows / 0 bytes into the out-params, hand back a
+        // LIVE (non-zero) handle, and return OK. P0 semantics: a zero out-handle means the
+        // engine exhausted the probe at open and AUTO-CLOSED it (the drain then legitimately
+        // skips next/close), so this test must return a live handle to exercise the chunked
+        // drain it asserts on.
         when(linker.frsVecIterPrefixOpen(
                         any(), any(), any(), anyInt(), any(), anyInt(), any(), any(), any()))
-                .thenReturn(0); // FrsErrorCode.OK
+                .thenAnswer(
+                        inv -> {
+                            java.lang.foreign.MemorySegment outHandle = inv.getArgument(6);
+                            outHandle.set(java.lang.foreign.ValueLayout.JAVA_LONG, 0L, 0xBEEFL);
+                            return 0; // FrsErrorCode.OK
+                        });
         when(linker.frsVecIterPrefixNext(anyLong(), any(), anyInt(), any(), any())).thenReturn(0);
         when(linker.frsVecIterPrefixClose(anyLong())).thenReturn(0);
 

@@ -1536,6 +1536,10 @@ public class VectorizedExecutor implements StateExecutor {
                 long handle = outHandles.get(ValueLayout.JAVA_LONG, (long) i * Long.BYTES);
                 int rows = ForStRsLinker.getFrsChunkRowCount(outChunks, i);
                 int bytes = ForStRsLinker.getFrsChunkBytesUsed(outChunks, i);
+                // P0: FRS_CHUNK_EOF (bit 0 of FrsChunk._reserved) — the engine exhausted
+                // this probe in its first chunk and AUTO-CLOSED the iterator; the drain
+                // skips the trailing next() + close() crossings for it.
+                boolean eofAtOpen = ForStRsLinker.isFrsChunkEof(outChunks, i);
                 MemorySegment cb = chunkData.asSlice((long) i * chunkCap, chunkCap);
                 try {
                     if (handle == 0L) {
@@ -1548,7 +1552,8 @@ public class VectorizedExecutor implements StateExecutor {
                         }
                         throw new FrsException(code, i, new byte[0]);
                     }
-                    req.processFromBatchedOpen(linker, db, cf, handle, cb, rows, bytes);
+                    req.processFromBatchedOpen(
+                            linker, db, cf, handle, cb, rows, bytes, eofAtOpen);
                 } catch (Throwable t) {
                     if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
                         fatalHandler.onFatalError(panicErr);
@@ -2343,6 +2348,13 @@ public class VectorizedExecutor implements StateExecutor {
             rowsTotal += firstChunkRows;
             bytesIn += firstChunkBytes;
 
+            // P0 NOTE (integration follow-up, not wired here): when
+            // ForStRsLinker.isFrsChunkEof(outChunks, row) is true the engine auto-closed
+            // this row's iterator — the FrsIterHandle path below stays CORRECT unchanged
+            // (its eventual next() reports clean EOF and close() is a safe no-op), but a
+            // follow-up could skip the FrsIterHandle/slotScope registration and complete
+            // the future as already-exhausted to save the trailing next()+close()
+            // crossings on this legacy batched-open path too.
             long jHandleId = nextIterHandleId.incrementAndGet();
             // PR-E3 zero-memory-copy gate: the FrsIterHandle borrows the executor's
             // long-lived arena (ownsArena=false) so close() does NOT close it.  The
@@ -2467,6 +2479,11 @@ public class VectorizedExecutor implements StateExecutor {
             rowsTotal += firstChunkRows;
             bytesIn += firstChunkBytes;
 
+            // P0 NOTE: nativeHandle may now be 0 — the engine auto-closed an
+            // exhausted-at-open range iterator (rows are already in chunkBuf). The
+            // FrsIterHandle below remains CORRECT with nativeHandle == 0: next(0)
+            // reports clean EOF and close(0) is a no-op. A follow-up can complete the
+            // future as already-exhausted to skip those two crossings.
             long jHandleId = nextIterHandleId.incrementAndGet();
             // ownsArena=false: arena is the executor-owned long-lived arena and must NOT
             // be closed when this handle closes (mirrors PR-E3 dispatchIterPrefix).

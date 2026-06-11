@@ -136,7 +136,7 @@ public final class ForStRsLinker {
      * +8   JAVA_INT  (4B)  buf_cap     — buffer capacity in bytes (input)
      * +12  JAVA_INT  (4B)  row_count   — rows written by engine (output)
      * +16  JAVA_INT  (4B)  bytes_used  — bytes written by engine (output)
-     * +20  JAVA_INT  (4B)  _reserved   — explicit padding for u64 alignment
+     * +20  JAVA_INT  (4B)  _reserved   — engine flag word (output); bit 0 = {@link #FRS_CHUNK_EOF}
      * </pre>
      */
     public static final StructLayout FRS_CHUNK_LAYOUT =
@@ -147,6 +147,16 @@ public final class ForStRsLinker {
                     ValueLayout.JAVA_INT.withName("bytes_used"),
                     ValueLayout.JAVA_INT.withName("_reserved"));
 
+    /**
+     * P0 (streaming-read redesign §2.3): bit 0 of {@code FrsChunk._reserved}. Set by the batched
+     * open paths when the FIRST chunk already exhausted the iterator and no error is pending. The
+     * engine has AUTO-CLOSED the iterator (the returned non-zero handle was never registered), so
+     * the caller can — and should — skip both the mandatory trailing {@code
+     * frs_vec_iter_prefix_next} and the {@code frs_vec_iter_prefix_close} crossings. Advisory:
+     * calling them anyway yields clean EOF / a no-op respectively.
+     */
+    public static final int FRS_CHUNK_EOF = 1;
+
     private static final VarHandle FRS_CHUNK_BUF_PTR =
             FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("buf_ptr"));
     private static final VarHandle FRS_CHUNK_BUF_CAP =
@@ -155,6 +165,8 @@ public final class ForStRsLinker {
             FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("row_count"));
     private static final VarHandle FRS_CHUNK_BYTES_USED =
             FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("bytes_used"));
+    private static final VarHandle FRS_CHUNK_RESERVED =
+            FRS_CHUNK_LAYOUT.varHandle(MemoryLayout.PathElement.groupElement("_reserved"));
 
     /**
      * {@code FrsEngineOptions} struct layout (B-Prod-P7, spec §6d). Mirrors the {@code #[repr(C)]}
@@ -4193,6 +4205,19 @@ public final class ForStRsLinker {
     /** Per-iter FrsChunk read: bytes_used written by the engine. */
     public static int getFrsChunkBytesUsed(MemorySegment chunks, int i) {
         return (int) FRS_CHUNK_BYTES_USED.get(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize());
+    }
+
+    /**
+     * P0: per-iter FrsChunk read of the engine flag word ({@code _reserved}); bit 0 = {@link
+     * #FRS_CHUNK_EOF} (exhausted-at-open, iterator auto-closed — skip trailing next/close).
+     */
+    public static int getFrsChunkReserved(MemorySegment chunks, int i) {
+        return (int) FRS_CHUNK_RESERVED.get(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize());
+    }
+
+    /** P0 convenience: true when row {@code i}'s first chunk carries {@link #FRS_CHUNK_EOF}. */
+    public static boolean isFrsChunkEof(MemorySegment chunks, int i) {
+        return (getFrsChunkReserved(chunks, i) & FRS_CHUNK_EOF) != 0;
     }
 
     /** Appends N merge operands for key (P6-B §1 §a). Returns native error code. */
