@@ -131,7 +131,8 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * (61s spread), and TIMER_DIAG showed the dedicated CF leaves the timer-scan access pattern
      * unchanged — refills 5357 vs 5291, entriesPerRefill 989 vs 993 vs the shared-CF baseline. The
      * q11/q12 cost is diffuse LSM range-scan read-amplification over the GROWING timer state (the
-     * same q4/q9-class engine gap, see {@link ForStRsKeyGroupedInternalPriorityQueue#readRangeIntoCache}),
+     * same q4/q9-class engine gap; the engine-read refill path has since been deleted entirely —
+     * the queue now serves polls from a memory-resident timer index),
      * NOT timer/state interleaving or delete tombstones — so a separate CF removes nothing. The
      * capability is retained behind the flag (it is correct and fully checkpoint-safe) for future
      * timer-CF experiments such as targeted compaction; it is not on the production path.

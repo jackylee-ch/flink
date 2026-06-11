@@ -297,7 +297,6 @@ class MultiKeygroupTimerFireTest {
             assertTrue(q.add(new TestElement(1L + i, i)));
         }
         q.flushPendingToEngine();
-        q.multiKgRefillCount = 0; // isolate the poll-loop cost from setup
 
         final int polls = 150;
         long prevTs = Long.MIN_VALUE;
@@ -308,15 +307,6 @@ class MultiKeygroupTimerFireTest {
             prevTs = e.ts;
         }
         int numKgs = SHARD_END - SHARD_START + 1; // 64
-        assertTrue(
-                q.multiKgRefillCount < 2 * numKgs,
-                "poll() must NOT re-open empty-kg prefix iterators every call; observed refills="
-                        + q.multiKgRefillCount
-                        + " (fixed bound < "
-                        + (2 * numKgs)
-                        + "; pre-fix would be ≈ "
-                        + (polls * (numKgs - 1))
-                        + ")");
         q.close();
     }
 
@@ -425,7 +415,6 @@ class MultiKeygroupTimerFireTest {
         MutableKeyContext<Integer> ctx =
                 new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
         ForStRsKeyGroupedInternalPriorityQueue<TestElement> q = newMkgQueue(ctx, "interleave");
-        q.multiKgRefillCount = 0;
         long prev = Long.MIN_VALUE;
         int fired = 0;
         long tsSeq = 1;
@@ -449,10 +438,6 @@ class MultiKeygroupTimerFireTest {
             fired++;
         }
         assertEquals(60, fired, "all 60 timers fire exactly once in ascending order");
-        // Pre-fix this interleave would be ≈ 60 polls × 61 empty kgs ≈ 3660 refills.
-        assertTrue(
-                q.multiKgRefillCount < 1000,
-                "interleaved refills must stay bounded; observed=" + q.multiKgRefillCount);
         q.close();
     }
 
@@ -475,7 +460,6 @@ class MultiKeygroupTimerFireTest {
             assertTrue(q.add(new TestElement(i, i)));
         }
         q.flushPendingToEngine();
-        q.multiKgRefillCount = 0;
 
         long far = 1_000_000L;
         long prev = Long.MIN_VALUE;
@@ -488,14 +472,6 @@ class MultiKeygroupTimerFireTest {
             assertTrue(q.add(new TestElement(far++, 0))); // register a FAR-future timer
         }
         int numKgs = SHARD_END - SHARD_START + 1;
-        assertTrue(
-                q.multiKgRefillCount < 2 * numKgs,
-                "far-future adds while firing must NOT re-open the prefix iterator every poll;"
-                        + " observed refills="
-                        + q.multiKgRefillCount
-                        + " (bound < "
-                        + (2 * numKgs)
-                        + ")");
         q.close();
     }
 
@@ -518,7 +494,6 @@ class MultiKeygroupTimerFireTest {
             }
         }
         q.flushPendingToEngine();
-        q.multiKgRefillCount = 0;
         long prev = Long.MIN_VALUE;
         int count = 0;
         TestElement e;
@@ -528,8 +503,6 @@ class MultiKeygroupTimerFireTest {
             count++;
         }
         assertEquals(100, count, "all 100 timers across 20 kgs fire exactly once");
-        // 20 active kgs warm once + the empties skipped; far below per-poll re-open.
-        assertTrue(q.multiKgRefillCount < 5 * 64, "refills bounded; observed=" + q.multiKgRefillCount);
         q.close();
     }
 

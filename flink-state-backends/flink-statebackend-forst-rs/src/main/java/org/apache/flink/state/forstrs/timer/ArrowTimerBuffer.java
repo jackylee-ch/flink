@@ -85,6 +85,27 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     private long keyDataCapacity;
 
     /**
+     * TIMER-INDEX (2026-06-11): bytes of {@link #keyData} referenced by LIVE rows. The original
+     * pending-buffer use cleared the whole buffer every flush, so {@code keyDataUsed} never
+     * out-grew the live set. The memory-resident timer index is LONG-LIVED (it holds every live
+     * timer for the queue's lifetime) and appends key bytes on every insert while {@link
+     * #removeAt} only drops the row — without compaction {@code keyDataUsed} would grow without
+     * bound (one ~50B key per timer ADD over the job's life). {@code liveKeyBytes} lets {@link
+     * #appendKey} compact in place (O(live) staging copy) instead of growing when at least half
+     * the key area is dead.
+     */
+    private long liveKeyBytes;
+
+    /**
+     * TIMER-INDEX (2026-06-11): count of TOMBSTONE slots in {@link #hashIndex}. Same long-lived
+     * concern as {@link #liveKeyBytes}: the open-addressed probe loops only stop at EMPTY slots,
+     * so millions of insert/remove cycles would saturate the table with tombstones and degrade
+     * every miss-probe to a full-table scan. When tombstones exceed {@code capacity} the table
+     * is rebuilt from the live rows (O(size), amortized O(1) per op).
+     */
+    private int hashTombstones;
+
+    /**
      * B5-HIGH-6: reusable scratch buffer for {@link #swapHeap(int, int)} row copies. Q12-style
      * timer-heavy workloads issue O(log N) heap sifts per add/remove and millions of timer ops, so
      * allocating a fresh {@code byte[24]} per swap was a material hot-path allocation. The buffer
@@ -225,10 +246,19 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         if (heapPos < 0 || heapPos >= size) {
             return;
         }
+        // TIMER-INDEX: long-lived index hygiene — rebuild the hash table when tombstones
+        // dominate (see hashTombstones doc). Done at ENTRY, while every row (including the
+        // one about to be removed) is still live, so the rebuilt table is consistent before
+        // the tombstone/swap below mutates it.
+        if (hashTombstones > capacity) {
+            rebuildHashIndex();
+        }
         int hashRemoved =
                 heapArray.get(ValueLayout.JAVA_INT, (long) heapPos * HEAP_ROW_BYTES + HASH_OFF);
         // Mark the hash-index slot referencing heapPos as TOMBSTONE.
         tombstoneHashSlot(hashRemoved, heapPos);
+        // TIMER-INDEX: the removed row's key bytes are now dead in keyData.
+        liveKeyBytes -= keyLenAt(heapPos);
 
         int last = size - 1;
         if (heapPos == last) {
@@ -244,19 +274,38 @@ public final class ArrowTimerBuffer implements AutoCloseable {
 
         size--;
         // Re-heapify: sift down then up (one direction will be a no-op).
-        long parentTs =
-                heapPos == 0
-                        ? Long.MIN_VALUE
-                        : heapArray.get(
-                                ValueLayout.JAVA_LONG,
-                                (long) ((heapPos - 1) >>> 1) * HEAP_ROW_BYTES + TS_OFF);
-        long curTs =
-                heapArray.get(ValueLayout.JAVA_LONG, (long) heapPos * HEAP_ROW_BYTES + TS_OFF);
-        if (heapPos > 0 && curTs < parentTs) {
+        if (heapPos > 0 && heapLess(heapPos, (heapPos - 1) >>> 1)) {
             siftUp(heapPos);
         } else {
             siftDown(heapPos);
         }
+    }
+
+    /**
+     * Heap order: timestamp-major, composite-key-bytes tiebreak (unsigned lexicographic). The
+     * tiebreak makes equal-ts ordering DETERMINISTIC and equal to the engine's composite-byte
+     * order — same-kg same-ts timers fire in element (seq) order, matching both the legacy
+     * engine-read path and the RocksDB backend, which our exactness gates compare against.
+     */
+    private boolean heapLess(int i, int j) {
+        long tsI = heapArray.get(ValueLayout.JAVA_LONG, (long) i * HEAP_ROW_BYTES + TS_OFF);
+        long tsJ = heapArray.get(ValueLayout.JAVA_LONG, (long) j * HEAP_ROW_BYTES + TS_OFF);
+        if (tsI != tsJ) {
+            return tsI < tsJ;
+        }
+        int offI = keyOffsetAt(i);
+        int lenI = keyLenAt(i);
+        int offJ = keyOffsetAt(j);
+        int lenJ = keyLenAt(j);
+        int n = Math.min(lenI, lenJ);
+        for (int k = 0; k < n; k++) {
+            int bi = keyData.get(ValueLayout.JAVA_BYTE, (long) offI + k) & 0xFF;
+            int bj = keyData.get(ValueLayout.JAVA_BYTE, (long) offJ + k) & 0xFF;
+            if (bi != bj) {
+                return bi < bj;
+            }
+        }
+        return lenI < lenJ;
     }
 
     /**
@@ -295,10 +344,87 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     public void clear() {
         size = 0;
         keyDataUsed = 0;
+        liveKeyBytes = 0;
+        clearHashSlots();
+    }
+
+    private void clearHashSlots() {
         int slots = capacity * 2;
         for (int i = 0; i < slots; i++) {
             hashIndex.set(ValueLayout.JAVA_INT, (long) i * HASH_SLOT_BYTES + 4L, EMPTY_SLOT);
         }
+        hashTombstones = 0;
+    }
+
+    /** Returns the stored hash of the entry at the given heap position. */
+    private int hashAt(int heapPos) {
+        return heapArray.get(ValueLayout.JAVA_INT, (long) heapPos * HEAP_ROW_BYTES + HASH_OFF);
+    }
+
+    /**
+     * TIMER-INDEX: rebuilds {@link #hashIndex} from the live rows, dropping every TOMBSTONE.
+     * O(size); triggered when tombstones exceed {@code capacity} (see {@link #hashTombstones}).
+     */
+    private void rebuildHashIndex() {
+        clearHashSlots();
+        for (int row = 0; row < size; row++) {
+            hashInsert(hashAt(row), row);
+        }
+    }
+
+    /**
+     * TIMER-INDEX (spill support): returns the {@code rank}-th smallest timestamp currently in
+     * the buffer (0-based). Used by the timer queue's cap-spill to choose the eviction cutoff
+     * (e.g. {@code tsAtRank(cap/2)} keeps the smallest half). O(n log n) — rare path only.
+     */
+    public long tsAtRank(int rank) {
+        if (size == 0) {
+            throw new IllegalStateException("tsAtRank on empty buffer");
+        }
+        long[] all = new long[size];
+        for (int i = 0; i < size; i++) {
+            all[i] = tsAt(i);
+        }
+        Arrays.sort(all);
+        return all[Math.min(Math.max(rank, 0), size - 1)];
+    }
+
+    /**
+     * TIMER-INDEX (spill support): removes EVERY entry whose timestamp is {@code >= cutoffTs}.
+     * Returns the number of rows removed. Implementation: in-place stable compaction of the
+     * surviving rows, then full heap + hash-index rebuild — O(size), used only on the rare
+     * spill/horizon-advance path (never on the per-timer hot path). A loop of {@link #removeAt}
+     * would be both O(n²) and unsound to drive by index because each removal re-heapifies.
+     */
+    public int removeAtOrAboveTs(long cutoffTs) {
+        int w = 0;
+        long bytes = 0L;
+        for (int r = 0; r < size; r++) {
+            if (tsAt(r) < cutoffTs) {
+                if (w != r) {
+                    copyRow(r, w);
+                }
+                bytes += keyLenAt(w);
+                w++;
+            }
+        }
+        int removed = size - w;
+        if (removed == 0) {
+            return 0;
+        }
+        size = w;
+        liveKeyBytes = bytes;
+        // The hash table references old positions wholesale — clear it FIRST so the
+        // heapify's swapHeap/updateHashSlotPos calls below hit EMPTY slots and no-op,
+        // then re-insert every surviving row at its final position.
+        clearHashSlots();
+        for (int i = (size >>> 1) - 1; i >= 0; i--) {
+            siftDown(i);
+        }
+        for (int row = 0; row < size; row++) {
+            hashInsert(hashAt(row), row);
+        }
+        return removed;
     }
 
     @Override
@@ -327,18 +453,46 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         int row = size;
         writeRow(row, ts, op, kStart, keyLen, hash);
         size++;
+        liveKeyBytes += keyLen;
         hashInsert(hash, row);
         return siftUp(row);
     }
 
     private int appendKey(MemorySegment seg, long off, int len) {
         if (keyDataUsed + len > keyDataCapacity) {
-            growKeyData(keyDataUsed + len);
+            // TIMER-INDEX: prefer in-place compaction over growth when at least half of the
+            // key area is dead bytes left behind by removeAt (long-lived index usage). Keeps
+            // keyData bounded by ~2× the live key bytes instead of growing forever.
+            if (liveKeyBytes + len <= keyDataCapacity / 2 && liveKeyBytes <= Integer.MAX_VALUE) {
+                compactKeyData();
+            } else {
+                growKeyData(keyDataUsed + len);
+            }
         }
         int start = (int) keyDataUsed;
         MemorySegment.copy(seg, off, keyData, keyDataUsed, len);
         keyDataUsed += len;
         return start;
+    }
+
+    /**
+     * TIMER-INDEX: rewrites {@link #keyData} so only live rows' key bytes remain, updating each
+     * row's keyOffset. Uses a transient on-heap staging copy (NOT a new segment — segments share
+     * the arena and are only reclaimed at {@link #close()}, so allocating a fresh segment per
+     * compaction would itself leak). O(liveKeyBytes); amortized O(1) per insert.
+     */
+    private void compactKeyData() {
+        byte[] staging = new byte[(int) liveKeyBytes];
+        int pos = 0;
+        for (int row = 0; row < size; row++) {
+            int kOff = keyOffsetAt(row);
+            int kLen = keyLenAt(row);
+            MemorySegment.copy(keyData, ValueLayout.JAVA_BYTE, kOff, staging, pos, kLen);
+            heapArray.set(ValueLayout.JAVA_INT, (long) row * HEAP_ROW_BYTES + KOFF_OFF, pos);
+            pos += kLen;
+        }
+        MemorySegment.copy(staging, 0, keyData, ValueLayout.JAVA_BYTE, 0L, pos);
+        keyDataUsed = pos;
     }
 
     private void growKeyData(long needed) {
@@ -410,12 +564,7 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     private int siftUp(int i) {
         while (i > 0) {
             int parent = (i - 1) >>> 1;
-            long childTs =
-                    heapArray.get(ValueLayout.JAVA_LONG, (long) i * HEAP_ROW_BYTES + TS_OFF);
-            long parentTs =
-                    heapArray.get(
-                            ValueLayout.JAVA_LONG, (long) parent * HEAP_ROW_BYTES + TS_OFF);
-            if (childTs < parentTs) {
+            if (heapLess(i, parent)) {
                 swapHeap(i, parent);
                 i = parent;
             } else {
@@ -430,25 +579,11 @@ public final class ArrowTimerBuffer implements AutoCloseable {
             int left = 2 * i + 1;
             int right = 2 * i + 2;
             int smallest = i;
-            long smallestTs =
-                    heapArray.get(ValueLayout.JAVA_LONG, (long) i * HEAP_ROW_BYTES + TS_OFF);
-            if (left < size) {
-                long leftTs =
-                        heapArray.get(
-                                ValueLayout.JAVA_LONG, (long) left * HEAP_ROW_BYTES + TS_OFF);
-                if (leftTs < smallestTs) {
-                    smallest = left;
-                    smallestTs = leftTs;
-                }
+            if (left < size && heapLess(left, smallest)) {
+                smallest = left;
             }
-            if (right < size) {
-                long rightTs =
-                        heapArray.get(
-                                ValueLayout.JAVA_LONG, (long) right * HEAP_ROW_BYTES + TS_OFF);
-                if (rightTs < smallestTs) {
-                    smallest = right;
-                    smallestTs = rightTs;
-                }
+            if (right < size && heapLess(right, smallest)) {
+                smallest = right;
             }
             if (smallest != i) {
                 swapHeap(i, smallest);
@@ -547,6 +682,9 @@ public final class ArrowTimerBuffer implements AutoCloseable {
             int existing =
                     hashIndex.get(ValueLayout.JAVA_INT, (long) slot * HASH_SLOT_BYTES + 4L);
             if (existing == EMPTY_SLOT || existing == TOMBSTONE) {
+                if (existing == TOMBSTONE) {
+                    hashTombstones--; // TIMER-INDEX: slot reuse retires the tombstone
+                }
                 hashIndex.set(ValueLayout.JAVA_INT, (long) slot * HASH_SLOT_BYTES, hash);
                 hashIndex.set(ValueLayout.JAVA_INT, (long) slot * HASH_SLOT_BYTES + 4L, heapPos);
                 return;
@@ -573,6 +711,7 @@ public final class ArrowTimerBuffer implements AutoCloseable {
                 if (storedHash == hash) {
                     hashIndex.set(
                             ValueLayout.JAVA_INT, (long) slot * HASH_SLOT_BYTES + 4L, TOMBSTONE);
+                    hashTombstones++; // TIMER-INDEX: see rebuild trigger in removeAt
                     return;
                 }
             }
@@ -653,6 +792,9 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         for (int i = 0; i < newCapacity * 2; i++) {
             hashIndex.set(ValueLayout.JAVA_INT, (long) i * HASH_SLOT_BYTES + 4L, EMPTY_SLOT);
         }
+        hashTombstones = 0; // TIMER-INDEX: fresh table has no tombstones
+
+        // liveKeyBytes is unchanged by resize (rows are copied verbatim below).
 
         // Copy heapArray rows + keyData bytes verbatim — keeps row indices stable, so the hash
         // index can be rebuilt by re-inserting from each existing row's stored hash.

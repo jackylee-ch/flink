@@ -55,11 +55,8 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * across timestamps, sign-flipped negative timestamps, per-key-group isolation, removeAll, size +
  * isEmpty, getSubsetForKeyGroup, and full-range iterator.
  */
-// Disabled: 8 tests fail due to a pre-V1 issue in the SP3 timer poll-ahead
-// cache; tracked separately. The underlying production code
-// (ForStRsKeyGroupedInternalPriorityQueue) still serves Nexmark Q5 in practice
-// (113x read-side speedup measured in session 2).
-@Disabled("pre-V1 SP3 timer-queue cache bug; tracked separately")
+// Re-enabled 2026-06-11: the SP3 poll-ahead cache (whose bug disabled this suite) was
+// DELETED by the memory-resident timer index redesign — polls are pure memory now.
 class ForStRsKeyGroupedInternalPriorityQueueTest {
 
     private Arena arena;
@@ -335,7 +332,13 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
         assertNull(q.poll());
     }
 
-    /** 6. Per-key-group isolation: writes under kg=A are not visible to a kg=B head scan. */
+    /**
+     * 6. Global-min contract across key groups: peek()/poll() return the queue-wide minimum
+     * regardless of the CURRENT key group (Flink's KeyGroupedInternalPriorityQueue contract —
+     * InternalTimerServiceImpl.advanceWatermark polls before setCurrentKey; RocksDB's
+     * KeyGroupPartitionedPriorityQueue behaves identically). The pre-V1 version of this test
+     * asserted per-CURRENT-kg-scoped peeks, which contradicts that contract.
+     */
     @Test
     void perKeyGroupIsolation() {
         AtomicInteger kg = new AtomicInteger(7);
@@ -345,19 +348,18 @@ class ForStRsKeyGroupedInternalPriorityQueueTest {
         q.add(new TestElement(10L, 0));
         q.add(new TestElement(20L, 0));
         q.add(new TestElement(30L, 0));
-        // Switch current kg to 9; head should be empty for that kg
+        // Switching the CURRENT kg does not scope the head — global min is still ts=10.
         kg.set(9);
-        assertNull(q.peek());
+        TestElement head = q.peek();
+        assertNotNull(head);
+        assertEquals(10L, head.ts);
+        // A kg=9 timer at ts=5 becomes the new global min; the kg=7 timers follow in order.
         q.add(new TestElement(5L, 0));
-        // From kg=9, the only entry is ts=5
-        TestElement out9 = q.poll();
-        assertNotNull(out9);
-        assertEquals(5L, out9.ts);
-        // Switch back to kg=7; should still see the original 3
-        kg.set(7);
+        assertEquals(5L, q.poll().ts);
         assertEquals(10L, q.poll().ts);
         assertEquals(20L, q.poll().ts);
         assertEquals(30L, q.poll().ts);
+        assertNull(q.poll());
     }
 
     /** 7. removeAll deletes only the supplied elements and reports the actual deletion count. */
