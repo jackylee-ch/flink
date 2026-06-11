@@ -17,8 +17,6 @@
 
 package org.apache.flink.runtime.rpc.pekko;
 
-import org.apache.flink.shaded.netty4.io.netty.handler.ssl.util.FingerprintTrustManagerFactory;
-
 import com.typesafe.config.Config;
 import org.apache.pekko.actor.ActorSystem;
 import org.apache.pekko.remote.RemoteTransportException;
@@ -35,9 +33,7 @@ import java.security.GeneralSecurityException;
 import java.security.KeyStore;
 import java.util.List;
 
-/**
- * Extension of the {@link ConfigSSLEngineProvider} to use a {@link FingerprintTrustManagerFactory}.
- */
+/** Extension of the {@link ConfigSSLEngineProvider} to use Netty's fingerprint trust manager. */
 @SuppressWarnings("deprecation")
 public class CustomSSLEngineProvider extends ConfigSSLEngineProvider {
     private final String sslTrustStore;
@@ -64,7 +60,8 @@ public class CustomSSLEngineProvider extends ConfigSSLEngineProvider {
                     sslCertFingerprints.isEmpty()
                             ? TrustManagerFactory.getInstance(
                                     TrustManagerFactory.getDefaultAlgorithm())
-                            : FingerprintTrustManagerFactory.builder("SHA1")
+                            : io.netty.handler.ssl.util.FingerprintTrustManagerFactory.builder(
+                                            "SHA1")
                                     .fingerprints(sslCertFingerprints)
                                     .build();
 

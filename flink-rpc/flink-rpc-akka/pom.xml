@@ -54,13 +54,6 @@ under the License.
 			<scope>provided</scope>
 		</dependency>
 		<dependency>
-			<!-- used by the CustomSSLEngineProvider -->
-			<groupId>org.apache.flink</groupId>
-			<artifactId>flink-shaded-netty</artifactId>
-			<scope>provided</scope>
-		</dependency>
-
-		<dependency>
 			<groupId>org.apache.pekko</groupId>
 			<artifactId>pekko-actor_${scala.binary.version}</artifactId>
 			<version>${pekko.version}</version>
@@ -195,7 +188,7 @@ under the License.
 							<relocations>
 								<relocation>
 									<pattern>io.netty</pattern>
-									<shadedPattern>org.apache.flink.shaded.netty4.io.netty</shadedPattern>
+									<shadedPattern>org.apache.flink.runtime.rpc.pekko.shaded.netty4.io.netty</shadedPattern>
 								</relocation>
 							</relocations>
 							<filters>

@@ -23,8 +23,6 @@ import org.apache.flink.configuration.RpcOptions;
 import org.apache.flink.runtime.rpc.RpcSystem;
 import org.apache.flink.util.NetUtils;
 
-import org.apache.flink.shaded.netty4.io.netty.channel.ChannelException;
-
 import com.typesafe.config.Config;
 import org.apache.pekko.actor.ActorSystem;
 import org.slf4j.Logger;
@@ -122,9 +120,7 @@ public class ActorSystemBootstrapTools {
             } catch (Exception e) {
                 // we can continue to try if this contains a netty channel exception
                 Throwable cause = e.getCause();
-                if (!(cause
-                                instanceof
-                                org.apache.flink.shaded.netty4.io.netty.channel.ChannelException
+                if (!(cause instanceof io.netty.channel.ChannelException
                         || cause instanceof java.net.BindException)) {
                     throw e;
                 } // else fall through the loop and try the next port
@@ -188,7 +184,7 @@ public class ActorSystemBootstrapTools {
 
             return startActorSystem(pekkoConfig, actorSystemName, logger);
         } catch (Throwable t) {
-            if (t instanceof ChannelException) {
+            if (t instanceof io.netty.channel.ChannelException) {
                 Throwable cause = t.getCause();
                 if (cause != null && t.getCause() instanceof BindException) {
                     throw new IOException(
