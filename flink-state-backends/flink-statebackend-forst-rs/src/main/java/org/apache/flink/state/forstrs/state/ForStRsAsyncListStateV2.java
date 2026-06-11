@@ -155,6 +155,19 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
         this.cf = cf;
     }
 
+    /**
+     * STAGE-0 diagnostic: counts OPERATOR-side asyncAdd invocations (before any framework
+     * buffering), so a corrupt run discriminates "operator never called us" (late-drop at
+     * the WindowJoinHelper gate) from "lost between handleRequest and classifier offer".
+     */
+    @Override
+    public org.apache.flink.api.common.state.v2.StateFuture<Void> asyncAdd(V value) {
+        if (org.apache.flink.state.forstrs.DiagCompletionCounters.ENABLED) {
+            org.apache.flink.state.forstrs.DiagCompletionCounters.named("opAsyncAdd");
+        }
+        return super.asyncAdd(value);
+    }
+
     /** Test/backend accessor — may be null when the legacy constructor was used. */
     public ListStateArrowBuffer buffer() {
         return buffer;

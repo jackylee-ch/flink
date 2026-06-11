@@ -84,7 +84,19 @@ public final class DiagCompletionCounters {
                     .append(" done=").append(done)
                     .append(" fail=").append(fail);
         }
+        for (java.util.Map.Entry<String, java.util.concurrent.atomic.AtomicLong> e : NAMED.entrySet()) {
+            sb.append(' ').append(e.getKey()).append('=').append(e.getValue().get());
+        }
         return sb.toString();
+    }
+
+    /** Named auxiliary counters (e.g. operator-side asyncAdd call counts). */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicLong>
+            NAMED = new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** Counts an auxiliary named event; appears in {@link #report()} as {@code name=N}. */
+    public static void named(String name) {
+        NAMED.computeIfAbsent(name, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
     }
 
     /** Test hook. */
