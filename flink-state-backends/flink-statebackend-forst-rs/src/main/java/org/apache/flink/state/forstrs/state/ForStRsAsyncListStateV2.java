@@ -215,8 +215,18 @@ public class ForStRsAsyncListStateV2<K, N, V> extends AbstractListState<K, N, V>
      * @return {@code null} when no buffer is configured (caller falls back to heap-path); else the
      *     per-row future that will be completed on the next buffer flush.
      */
+    /** STAGE-1 Task 7: injected by the backend under two-regime; null otherwise. */
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.exec.RegimeSwitch regimeSwitch;
+
+    public void setRegimeSwitch(org.apache.flink.state.forstrs.exec.RegimeSwitch rs) {
+        this.regimeSwitch = rs;
+    }
+
     public CompletableFuture<Void> recordAppendMergeOffHeap(StateRequest<K, N, ?, ?> request) {
-        if (buffer == null) {
+        // Task 7: under HEAVY the per-state accumulator must not be touched (worker-drain vs
+        // mailbox-append overlap); fall back to the classifier's per-batch heap path.
+        if (buffer == null || (regimeSwitch != null && !regimeSwitch.isLight())) {
             return null;
         }
         Object payload = request.getPayload();

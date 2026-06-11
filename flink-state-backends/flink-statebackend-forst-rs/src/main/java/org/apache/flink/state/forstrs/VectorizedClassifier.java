@@ -767,6 +767,11 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         return getCount;
     }
 
+    /** STAGE-1: total requests offered into this classifier across all kinds. */
+    public int totalRequestCount() {
+        return getCount() + putCount() + deleteCount() + appendMergeCount() + iterRequests.size();
+    }
+
     public int putCount() {
         return putCount;
     }

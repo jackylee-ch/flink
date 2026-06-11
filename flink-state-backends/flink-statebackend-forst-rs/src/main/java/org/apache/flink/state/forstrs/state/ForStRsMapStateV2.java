@@ -147,7 +147,37 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
      */
     public static boolean pipelinedExecutorActive() {
         String m = System.getenv("FRS_RS_EXECUTOR");
+        if (m == null) {
+            return false;
+        }
+        String t = m.trim();
+        return t.equals("routing-async") || t.equals("two-regime");
+    }
+
+    /**
+     * STAGE-1 Task 7: legacy always-pipelined mode (staging buffers statically OFF). Under
+     * two-regime the buffers EXIST and are gated dynamically per operation via the injected
+     * {@link org.apache.flink.state.forstrs.exec.RegimeSwitch} (LIGHT ⇒ staging usable).
+     */
+    public static boolean legacyPipelinedActive() {
+        String m = System.getenv("FRS_RS_EXECUTOR");
         return m != null && m.trim().equals("routing-async");
+    }
+
+    /** STAGE-1 Task 7: injected by the backend under two-regime; null otherwise. */
+    @Nullable private org.apache.flink.state.forstrs.exec.RegimeSwitch regimeSwitch;
+
+    public void setRegimeSwitch(org.apache.flink.state.forstrs.exec.RegimeSwitch rs) {
+        this.regimeSwitch = rs;
+    }
+
+    /**
+     * Staging usable ⇔ buffer exists AND (no regime switch OR regime is LIGHT). Under HEAVY the
+     * mailbox must not absorb effects (its watermark drain would issue mailbox-direct engine
+     * writes racing in-flight worker batches); writes flow through the classifier instead.
+     */
+    private boolean stagingUsable() {
+        return offHeapBuf != null && (regimeSwitch == null || regimeSwitch.isLight());
     }
 
     private static boolean parallelExecutorActive() {
@@ -157,6 +187,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
             if (t.equals("coordinated")
                     || t.equals("routing")
                     || t.equals("routing-async")
+                    || t.equals("two-regime")
                     || t.equals("adaptive")) {
                 return true;
             }
@@ -284,9 +315,10 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         this.linker = linker;
         this.db = db;
         this.cf = cf;
-        // B-SPIKE: no staging buffer under the pipelined executor (see pipelinedExecutorActive).
+        // B-SPIKE/Task-7: no staging buffer under LEGACY routing-async; under two-regime the
+        // buffer exists and stagingUsable() gates it per operation by the live regime.
         this.offHeapBuf =
-                (linker != null && db != null && cf != null && !pipelinedExecutorActive())
+                (linker != null && db != null && cf != null && !legacyPipelinedActive())
                         ? new MapStateArrowBuffer()
                         : null;
     }
@@ -407,7 +439,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         }
         // PR-C1: probe the off-heap buffer before falling through to the engine. A buffer hit
         // resolves locally; a buffer tombstone short-circuits to null without an engine probe.
-        if (offHeapBuf != null) {
+        if (stagingUsable()) {
             MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);
             if (bufHit.cached) {
                 UV resolved = bufHit.tombstone ? null : deserializeFromBuffer(bufHit.row);
@@ -448,7 +480,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         }
         // PR-C1: stage the PUT off-heap. Bypasses the V2 columnar dispatch until the buffer's
         // auto-flush watermark or the snapshot pre-hook drains it via linker.batchPut.
-        if (offHeapBuf != null) {
+        if (stagingUsable()) {
             // PR-M3: avoid getCopyOfBuffer() — MapStateArrowBuffer copies the key+value bytes
             // synchronously into its own off-heap staging segment, so we can pass the shared
             // keyOut/valueOut buffers directly.
@@ -488,7 +520,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         if (useCache()) {
             cache.remove(keyBuf, 0, keyLen);
         }
-        if (offHeapBuf != null) {
+        if (stagingUsable()) {
             // Stage a buffer tombstone + drop any prior buffered PUT for this key. The engine
             // delete fires when the buffer is drained.
             offHeapBuf.remove(keyBuf, 0, keyLen, linker, db, cf);
@@ -510,7 +542,7 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                 return StateFutureUtils.completedFuture(hit.value() != null);
             }
         }
-        if (offHeapBuf != null) {
+        if (stagingUsable()) {
             MapStateArrowBuffer.Lookup bufHit = offHeapBuf.lookup(keyBuf, 0, keyLen);
             if (bufHit.cached) {
                 return StateFutureUtils.completedFuture(!bufHit.tombstone);

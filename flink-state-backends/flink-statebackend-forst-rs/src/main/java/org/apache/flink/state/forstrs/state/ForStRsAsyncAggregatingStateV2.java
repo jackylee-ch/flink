@@ -151,6 +151,26 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      * {@link RecordContext} instead of a StateRequest.
      */
     @SuppressWarnings("unchecked")
+    /** STAGE-1 Task 7: injected by the backend under two-regime; null otherwise. */
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.exec.RegimeSwitch regimeSwitch;
+
+    public void setRegimeSwitch(org.apache.flink.state.forstrs.exec.RegimeSwitch rs) {
+        this.regimeSwitch = rs;
+    }
+
+    /**
+     * RMW cache usable ⇔ NOT legacy-pipelined AND (no regime switch OR regime LIGHT). Under
+     * HEAVY the cache's mailbox folds + flushHandler mailbox engine writes would race in-flight
+     * worker batches; adds flow through the framework get-fold-put instead.
+     */
+    private boolean rmwCacheUsable() {
+        if (ForStRsMapStateV2.legacyPipelinedActive()) {
+            return false;
+        }
+        return regimeSwitch == null || regimeSwitch.isLight();
+    }
+
     private int writeCacheKeyToKeyOut() {
         AsyncExecutionController<K, ?> aec =
                 (AsyncExecutionController<K, ?>) stateRequestHandler;
@@ -194,7 +214,7 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
         // writes from the mailbox) — the same lockstep-only pattern as the Map/List staging
         // buffers. Bypass the cache write path; with the cache never written, every other
         // cache consult (asyncGet probe, flushOnBarrier, onClear gen) degrades to a no-op.
-        if (ForStRsMapStateV2.pipelinedExecutorActive()) {
+        if (!rmwCacheUsable()) {
             return super.asyncAdd(value);
         }
         if (value == null) {

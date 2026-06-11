@@ -118,6 +118,33 @@ public final class RoutingStateExecutor implements StateExecutor {
         return 2 * workerCount;
     }
 
+    /** True when the backend selected the STAGE-1 two-regime executor mode. */
+    static boolean twoRegimeMode() {
+        String m = System.getenv("FRS_RS_EXECUTOR");
+        return m != null && m.trim().equals("two-regime");
+    }
+
+    /** Env-tunable LIGHT-inline ceiling (FRS_RS_INLINE_MAX, default 256 = the AEC batch size). */
+    private static int inlineMaxBatch() {
+        String s = System.getenv("FRS_RS_INLINE_MAX");
+        if (s != null) {
+            try {
+                int v = Integer.parseInt(s.trim());
+                if (v > 0) {
+                    return v;
+                }
+            } catch (NumberFormatException ignore) {
+                // fall through to default
+            }
+        }
+        return 256;
+    }
+
+    /** Test/backend accessor for the two-regime switch (null in other modes). */
+    public RegimeSwitch regimeSwitch() {
+        return regime;
+    }
+
     /**
      * PR-1 adaptive dispatch: when {@code true}, ITER-FREE batches (point gets/puts/deletes only)
      * execute INLINE on the calling (mailbox) thread instead of being dispatched to workers — the
@@ -169,6 +196,18 @@ public final class RoutingStateExecutor implements StateExecutor {
     private final int maxOutstanding;
 
     /**
+     * STAGE-1 two-regime mode (design 2026-06-11 §3): non-null only for
+     * FRS_RS_EXECUTOR=two-regime. LIGHT (pipeline empty + small iter-free batch) executes
+     * inline on the mailbox — today's proven depth-1 semantics, the measured q17-class win;
+     * HEAVY dispatches to the kg-affine worker FIFOs non-blocking. The dispatch predicate
+     * (outstanding == 0) and the no-overtaking safety invariant coincide by construction.
+     */
+    final RegimeSwitch regime;
+
+    /** LIGHT-inline ceiling: batches above this request count dispatch HEAVY. */
+    private final int inlineMax;
+
+    /**
      * STAGE-0 sync-direct experiment: a DEDICATED executor (own arena + buffers) for
      * mailbox-inline sync requests, so direct execution never shares scratch with a worker
      * thread mid-batch. Null unless nonBlocking && FRS_RS_SYNC_DIRECT=1.
@@ -207,6 +246,8 @@ public final class RoutingStateExecutor implements StateExecutor {
         this.nonBlocking = nonBlocking;
         int n = workerCount();
         this.maxOutstanding = maxInFlightBatches(n);
+        this.regime = twoRegimeMode() ? new RegimeSwitch() : null;
+        this.inlineMax = inlineMaxBatch();
         this.workers = new VectorizedExecutor[n];
         this.workerThreads = new ExecutorService[n];
         this.workerArenas = new Arena[n];
@@ -256,6 +297,8 @@ public final class RoutingStateExecutor implements StateExecutor {
         this.nonBlocking = nonBlocking;
         int n = testWorkers.length;
         this.maxOutstanding = maxInFlightBatches(n);
+        this.regime = twoRegimeMode() ? new RegimeSwitch() : null;
+        this.inlineMax = inlineMaxBatch();
         this.workers = testWorkers;
         this.workerThreads = new ExecutorService[n];
         this.workerArenas = new Arena[n];
@@ -319,6 +362,32 @@ public final class RoutingStateExecutor implements StateExecutor {
             return CompletableFuture.completedFuture(null);
         }
         if (nonBlocking) {
+            if (regime != null
+                    && regime.isLight()
+                    && !anySubHasIters(subs, busy)
+                    && totalRequests(subs, busy) <= inlineMax) {
+                // STAGE-1 LIGHT: inline on the mailbox — zero handoff (q17-class win). Safe:
+                // nothing outstanding ⇒ nothing can be overtaken; inner executors are
+                // synchronous so the future is complete at return.
+                try {
+                    for (int id : busy) {
+                        CompletableFuture<Void> inner = workers[id].executeBatchRequests(subs[id]);
+                        Throwable t = inner.handle((v, e) -> e).getNow(null);
+                        if (t != null) {
+                            return CompletableFuture.failedFuture(t);
+                        }
+                    }
+                    return CompletableFuture.completedFuture(null);
+                } catch (Throwable t) {
+                    return CompletableFuture.failedFuture(t);
+                }
+            }
+            if (regime != null) {
+                regime.batchDispatched();
+                CompletableFuture<Void> agg = dispatchNonBlocking(subs, busy);
+                agg.whenComplete((v, e) -> regime.batchSettled());
+                return agg;
+            }
             return dispatchNonBlocking(subs, busy);
         }
         if (adaptiveInline && !anySubHasIters(subs, busy)) {
@@ -437,6 +506,18 @@ public final class RoutingStateExecutor implements StateExecutor {
         return agg;
     }
 
+    /** STAGE-1: total requests across busy sub-batches (LIGHT-inline ceiling check). */
+    private static int totalRequests(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        int total = 0;
+        for (int id : busy) {
+            if (subs[id] instanceof org.apache.flink.state.forstrs.VectorizedClassifier vc) {
+                total += vc.totalRequestCount();
+            }
+        }
+        return total;
+    }
+
     /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
     private static boolean anySubHasIters(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
@@ -514,7 +595,7 @@ public final class RoutingStateExecutor implements StateExecutor {
         // (outstanding stays 0). Non-blocking mode: report loaded once the dispatched-unfinished
         // batch count reaches the cap, so the AEC stops triggering and the classifier pool stays
         // bounded (the documented fullyLoaded()-always-false unbounded-pipelining hazard).
-        return outstanding.get() >= maxOutstanding;
+        return (regime != null ? regime.outstanding() : outstanding.get()) >= maxOutstanding;
     }
 
     /**

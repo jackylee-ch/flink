@@ -212,6 +212,32 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private StateRequestHandler stateRequestHandler;
     private final Map<String, InternalKeyedState<K, ?, ?>> stateCache = new HashMap<>();
     private final Set<VectorizedExecutor> managedExecutors = new HashSet<>();
+    /** STAGE-1: the two-regime switch (null unless FRS_RS_EXECUTOR=two-regime). */
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.exec.RegimeSwitch twoRegimeSwitch;
+
+    /**
+     * STAGE-1 L→H seal (design §3.2, H=1-or-N simplification): runs on the MAILBOX at the
+     * 0→1 outstanding transition — nothing in flight, so the synchronous vectorized drains
+     * are race-free by construction. Off-heap batched FFI throughout (spec §8).
+     */
+    private void flushAllStagingForRegimeTransition() {
+        for (org.apache.flink.state.forstrs.state.ForStRsMapStateV2<?, ?, ?, ?> s :
+                registeredMapStatesV2) {
+            s.flushOffHeapBuffer();
+        }
+        for (org.apache.flink.state.forstrs.state.ForStRsAsyncListStateV2<?, ?, ?> s :
+                registeredListStatesV2) {
+            s.flushPreSnapshot();
+        }
+        for (ForStRsAsyncReducingStateV2<?, ?, ?> s : registeredAsyncReducingStates) {
+            s.flushOnBarrier();
+        }
+        for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAsyncAggregatingStates) {
+            s.flushOnBarrier();
+        }
+    }
+
     // M1/PR-1: parallel executors (routing or coordinated, per FRS_RS_EXECUTOR); their worker
     // VectorizedExecutors live in managedExecutors, but the router/coordinator owns the worker
     // threads + arenas and must be shut down in dispose().
@@ -1022,6 +1048,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 db,
                                 defaultCf);
                 registeredMapStatesV2.add(mapStateV2);
+                if (twoRegimeSwitch != null) {
+                    mapStateV2.setRegimeSwitch(twoRegimeSwitch);
+                }
                 return (S) mapStateV2;
             case LIST:
                 // V3.2 (V20 sub-spec §5): register the ListState name with every managed
@@ -1042,7 +1071,7 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 // null → caller falls back; flushPreSnapshot no-ops).
                 org.apache.flink.state.forstrs.state.ListStateArrowBuffer listBuf =
                         org.apache.flink.state.forstrs.state.ForStRsMapStateV2
-                                        .pipelinedExecutorActive()
+                                        .legacyPipelinedActive()
                                 ? null
                                 : new org.apache.flink.state.forstrs.state.ListStateArrowBuffer();
                 ForStRsAsyncListStateV2<K, N, ?> listStateV2 =
@@ -1057,6 +1086,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 db,
                                 defaultCf);
                 registeredListStatesV2.add(listStateV2);
+                if (twoRegimeSwitch != null) {
+                    listStateV2.setRegimeSwitch(twoRegimeSwitch);
+                }
                 return (S) listStateV2;
             case REDUCING:
                 return (S) createReducingState(name, nsSer, desc, activeSerializer);
@@ -1093,6 +1125,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // operator key — exactly what {@code linker.put} already takes as a raw key.
         state.setFlushHandler(this::rmwFlushToEngine);
         registeredAsyncReducingStates.add(state);
+        if (twoRegimeSwitch != null) {
+            state.setRegimeSwitch(twoRegimeSwitch);
+        }
         return state;
     }
 
@@ -1116,6 +1151,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // for the A4-H2 rationale.
         state.setFlushHandler(this::rmwFlushToEngine);
         registeredAsyncAggregatingStates.add(state);
+        if (twoRegimeSwitch != null) {
+            state.setRegimeSwitch(twoRegimeSwitch);
+        }
         return state;
     }
 
@@ -1201,6 +1239,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
                 routingExecutors.add(r);
                 return r;
+            case "two-regime":
+                // STAGE-1 (design 2026-06-11 §3): LIGHT inline-when-pipeline-empty (q17-class
+                // keeps depth-1 speed) / HEAVY non-blocking kg-FIFO dispatch. Same ctor as
+                // routing-async; the mode string activates RegimeSwitch (twoRegimeMode()).
+                org.apache.flink.state.forstrs.exec.RoutingStateExecutor tr =
+                        new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                                linker,
+                                db,
+                                defaultCf,
+                                dispatchMetrics,
+                                managedExecutors::add,
+                                false,
+                                true);
+                routingExecutors.add(tr);
+                this.twoRegimeSwitch = tr.regimeSwitch();
+                tr.regimeSwitch().setOnHeavyTransition(this::flushAllStagingForRegimeTransition);
+                return tr;
             case "routing-async":
                 // FRS-ROUTING-ASYNC (2026-06-11): routing's kg-affine worker FIFOs WITHOUT the
                 // mailbox latch — executeBatchRequests returns a truthful incomplete future and

@@ -282,6 +282,26 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * override which runs before any state request is built.
      */
     @SuppressWarnings("unchecked")
+    /** STAGE-1 Task 7: injected by the backend under two-regime; null otherwise. */
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.exec.RegimeSwitch regimeSwitch;
+
+    public void setRegimeSwitch(org.apache.flink.state.forstrs.exec.RegimeSwitch rs) {
+        this.regimeSwitch = rs;
+    }
+
+    /**
+     * RMW cache usable ⇔ NOT legacy-pipelined AND (no regime switch OR regime LIGHT). Under
+     * HEAVY the cache's mailbox folds + flushHandler mailbox engine writes would race in-flight
+     * worker batches; adds flow through the framework get-fold-put instead.
+     */
+    private boolean rmwCacheUsable() {
+        if (ForStRsMapStateV2.legacyPipelinedActive()) {
+            return false;
+        }
+        return regimeSwitch == null || regimeSwitch.isLight();
+    }
+
     private int writeCacheKeyToKeyOut() {
         AsyncExecutionController<K, ?> aec =
                 (AsyncExecutionController<K, ?>) stateRequestHandler;
@@ -326,7 +346,7 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         // same lockstep-only staging pattern as the Map/List buffers. With the cache never
         // written, all other cache consults degrade to no-ops. See
         // ForStRsAsyncAggregatingStateV2#asyncAdd for the identical gate.
-        if (ForStRsMapStateV2.pipelinedExecutorActive()) {
+        if (!rmwCacheUsable()) {
             return super.asyncAdd(value);
         }
         if (value == null) {
