@@ -18,9 +18,6 @@
 
 package org.apache.flink.table.gateway;
 
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.configuration.WebOptions;
-import org.apache.flink.runtime.testutils.MiniClusterResourceConfiguration;
 import org.apache.flink.table.gateway.api.SqlGatewayService;
 import org.apache.flink.table.gateway.service.utils.SqlGatewayServiceExtension;
 import org.apache.flink.table.gateway.utils.TestSqlStatement;
@@ -36,8 +33,6 @@ import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
@@ -54,8 +49,7 @@ public abstract class AbstractSqlGatewayStatementITCase
 
     @RegisterExtension
     @Order(1)
-    public static final MiniClusterExtension MINI_CLUSTER =
-            new MiniClusterExtension(AbstractSqlGatewayStatementITCase::createMiniClusterConfig);
+    public static final MiniClusterExtension MINI_CLUSTER = new MiniClusterExtension();
 
     @RegisterExtension
     @Order(2)
@@ -120,16 +114,4 @@ public abstract class AbstractSqlGatewayStatementITCase
     protected abstract String runSingleStatement(String statement) throws Exception;
 
     protected abstract String stringifyException(Throwable t);
-
-    private static MiniClusterResourceConfiguration createMiniClusterConfig() {
-        final Configuration config = new Configuration();
-        try {
-            config.set(
-                    WebOptions.UPLOAD_DIR,
-                    Files.createTempDirectory("flink-sql-gateway-mini-cluster-upload-").toString());
-        } catch (IOException e) {
-            throw new ExceptionInInitializerError(e);
-        }
-        return new MiniClusterResourceConfiguration.Builder().setConfiguration(config).build();
-    }
 }
