@@ -1820,6 +1820,65 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * #close()}. The public entry checks {@code closed.get()} before delegating; {@code close()}
      * calls this directly to drain pending entries before flipping the {@code closed} flag.
      */
+    /**
+     * CACHE-MERGE OPT (2026-06-11): merge this flush's ADD composites for one key group into
+     * its live, composite-sorted poll deque — in memory, no engine re-read, cursor intact.
+     * Only adds at or below the resume {@code cursor} are inserted (rows beyond it are read
+     * by the cursor-resumed refill; inserting them would duplicate). Duplicate composites
+     * (timer re-registration of an entry already cached) are skipped, matching the engine's
+     * idempotent-put semantics. Returns true on success (always, currently — kept boolean so
+     * callers can fall back to the floor path if a future precondition fails).
+     */
+    private boolean mergeAddsIntoCache(
+            ArrayDeque<Entry> dq, java.util.List<byte[]> adds, byte[] cursor) {
+        java.util.ArrayList<byte[]> within = new java.util.ArrayList<>(adds.size());
+        for (byte[] c : adds) {
+            if (java.util.Arrays.compareUnsigned(c, cursor) <= 0) {
+                within.add(c);
+            }
+        }
+        if (within.isEmpty()) {
+            // Every add lies beyond the cursor — the cached prefix is untouched and the
+            // cursor-resumed refill picks the adds up naturally.
+            return true;
+        }
+        within.sort(java.util.Arrays::compareUnsigned);
+        java.util.ArrayDeque<Entry> merged = new java.util.ArrayDeque<>(dq.size() + within.size());
+        java.util.Iterator<Entry> it = dq.iterator();
+        Entry cached = it.hasNext() ? it.next() : null;
+        int ai = 0;
+        byte[] prevAdd = null;
+        while (cached != null || ai < within.size()) {
+            if (ai < within.size()
+                    && (cached == null
+                            || java.util.Arrays.compareUnsigned(within.get(ai), cached.composite)
+                                    < 0)) {
+                byte[] add = within.get(ai++);
+                // Dedupe vs the previous add and vs an equal cached entry just emitted.
+                if ((prevAdd == null || java.util.Arrays.compareUnsigned(add, prevAdd) != 0)
+                        && (merged.isEmpty()
+                                || java.util.Arrays.compareUnsigned(
+                                                add, merged.peekLast().composite)
+                                        != 0)) {
+                    merged.addLast(new Entry(add, decodeElement(add)));
+                }
+                prevAdd = add;
+            } else {
+                // Equal composites: keep the cached entry, skip the add (idempotent put).
+                if (ai < within.size()
+                        && java.util.Arrays.compareUnsigned(within.get(ai), cached.composite)
+                                == 0) {
+                    prevAdd = within.get(ai++);
+                }
+                merged.addLast(cached);
+                cached = it.hasNext() ? it.next() : null;
+            }
+        }
+        dq.clear();
+        dq.addAll(merged);
+        return true;
+    }
+
     private void drainPendingBufferInternal() {
         // FRS-TIMER-DRAIN-BATCH: persist staged fired-timer deletes before snapshot/close (this is
         // the mandatory pre-snapshot hook) — BEFORE the early-return, since pendingPollDeletes may
@@ -1841,6 +1900,14 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         final java.util.Set<Integer> touchedKgs = new java.util.HashSet<>();
         final java.util.Map<Integer, Long> minAddTsByKg = new java.util.HashMap<>();
         final java.util.Set<Integer> removedKgs = new java.util.HashSet<>();
+        // CACHE-MERGE OPT (2026-06-11, q9 +16% fix-tax recovery): collect the ADD composites
+        // for key groups that currently hold a live poll cache, so the within-window
+        // invalidation below can MERGE them into the cached deque in memory instead of
+        // dropping the cache + re-reading the whole orphaned span from the engine (the
+        // refill-floor path). Bounded by this flush's rows; only kgs with a non-empty cache
+        // collect (cheap pre-check).
+        final java.util.Map<Integer, java.util.List<byte[]>> addCompositesByKg =
+                new java.util.HashMap<>();
         {
             MemorySegment kds = pendingBuffer.keyDataSegment();
             for (int i = 0; i < n; i++) {
@@ -1857,6 +1924,14 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 int op = pendingBuffer.opAt(i);
                 if (op == ArrowTimerBuffer.OP_ADD) {
                     long ts = pendingBuffer.tsAt(i);
+                    java.util.ArrayDeque<Entry> liveDq = multiKgPollCache.get(kg);
+                    if (liveDq != null && !liveDq.isEmpty()) {
+                        byte[] composite = new byte[kLen];
+                        MemorySegment.copy(kds, ValueLayout.JAVA_BYTE, kOff, composite, 0, kLen);
+                        addCompositesByKg
+                                .computeIfAbsent(kg, k -> new java.util.ArrayList<>())
+                                .add(composite);
+                    }
                     Long cur = minAddTsByKg.get(kg);
                     if (cur == null || ts < cur) {
                         minAddTsByKg.put(kg, ts);
@@ -2098,6 +2173,19 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                             // window (it would otherwise be skipped).
                             long tailTs = decodeTimestamp(dq.peekLast().composite);
                             invalidate = (minAdd != null && minAdd <= tailTs);
+                            if (invalidate) {
+                                // CACHE-MERGE OPT: the flushed adds are in memory — merge
+                                // them into the sorted deque (entries ≤ the resume cursor
+                                // only; beyond-cursor rows are covered by the cursor-resumed
+                                // refill) instead of dropping + engine re-read.
+                                byte[] cur = multiKgResumeCursor.get(kg);
+                                java.util.List<byte[]> adds = addCompositesByKg.get(kg);
+                                if (cur != null
+                                        && adds != null
+                                        && mergeAddsIntoCache(dq, adds, cur)) {
+                                    continue;
+                                }
+                            }
                         }
                         if (!invalidate) {
                             continue;

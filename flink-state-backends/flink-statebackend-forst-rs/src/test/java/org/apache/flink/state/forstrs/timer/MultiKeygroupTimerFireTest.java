@@ -178,6 +178,49 @@ class MultiKeygroupTimerFireTest {
         assertEquals(Arrays.asList(150L, 200L, 300L, 400L), polled);
     }
 
+    /**
+     * CACHE-MERGE OPT dedupe regression: re-registering a timer whose composite is already in
+     * the live poll cache (same key + same ts) must NOT duplicate it — exactly one fire.
+     */
+    @Test
+    void mergedDuplicateAddFiresOnce() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(1);
+        Integer k = keys.get(0);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q =
+                new ForStRsKeyGroupedInternalPriorityQueue<>(
+                        linker,
+                        db,
+                        cf,
+                        arena,
+                        "mergeDedupe",
+                        TestElementSerializer.INSTANCE,
+                        e -> e.ts,
+                        ctx,
+                        TOTAL_KEY_GROUPS,
+                        new KeyGroupRange(SHARD_START, SHARD_END));
+        ctx.setCurrentKey(k);
+        assertTrue(q.add(new TestElement(100L, 0)));
+        assertTrue(q.add(new TestElement(200L, 1)));
+        assertTrue(q.add(new TestElement(300L, 2)));
+        q.flushPendingToEngine();
+        TestElement first = q.poll(); // caches [200, 300]
+        assertNotNull(first);
+        assertEquals(100L, first.ts);
+        // Re-register ts=200 for the SAME key (composite already cached) + a genuinely new
+        // within-window timer at ts=250, then flush → merge path.
+        q.add(new TestElement(200L, 1));
+        q.add(new TestElement(250L, 3));
+        q.flushPendingToEngine();
+        List<Long> polled = new ArrayList<>();
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            polled.add(e.ts);
+        }
+        assertEquals(Arrays.asList(200L, 250L, 300L), polled);
+    }
+
     @Test
     void timersFireAcrossMultipleKeygroupsWithinShard() {
         List<Integer> keys = pickKeysInDistinctKeyGroups(3);
