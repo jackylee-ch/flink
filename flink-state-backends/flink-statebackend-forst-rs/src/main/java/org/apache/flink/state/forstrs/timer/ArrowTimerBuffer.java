@@ -19,6 +19,7 @@
 package org.apache.flink.state.forstrs.timer;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.state.forstrs.SegmentHash;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -599,38 +600,23 @@ public final class ArrowTimerBuffer implements AutoCloseable {
     // ------------------------------------------------------------------
 
     /**
-     * D-R4-4 (SIMD timer hash): per-thread scratch byte[] used to stage the segment slice for
-     * {@link Arrays#hashCode(byte[])}. The JIT intrinsifies {@code Arrays.hashCode(byte[])} to a
-     * vectorized polynomial-31 reduction on AVX2/NEON (the sequential {@code h = 31*h + b}
-     * recurrence is broken via a pre-multiplied 31^k power table inside the intrinsic), which
-     * beats the scalar per-byte {@code seg.get(JAVA_BYTE, off+i)} on the Q12 timer hot path. The
-     * hash output is bitwise-identical to the previous scalar formula — both start the
-     * accumulator at {@code 1} and fold each byte as {@code h = 31*h + b}, so existing
-     * open-addressed slot-layout entries remain compatible.
+     * M5-V2 (hot-path alloc/copy audit 2026-06-12): the polynomial-31 hash is computed DIRECTLY
+     * over the {@link MemorySegment} ({@link SegmentHash#polynomial31} — 8-byte {@code getLong}
+     * strides folded with the precomputed {@code 31^k} power table, scalar tail ≤7 bytes). The
+     * previous D-R4-4 route staged the slice into a thread-local scratch {@code byte[]} for the
+     * {@code Arrays.hashCode} intrinsic; that paid (a) an unconditional segment→heap copy per
+     * hash and (b) a scratch REALLOC on ANY width mismatch — its doc claimed increase-only, but
+     * the code reallocated on every change, so a queue serving two timer states with different
+     * key widths reallocated on EVERY find/insert (the V2/V7 code-vs-comment drift). Both the
+     * copy and the scratch (and the TL lookup) are gone.
      *
-     * <p>For the common Q12 case the timer key size is stable across calls (timestamp + key
-     * encoding), so the scratch buffer is reused without reallocation — the only allocation
-     * happens (a) on first use per thread and (b) on a strict size increase. The whole
-     * {@code scratch} is the input to {@code Arrays.hashCode} so the buffer is sized exactly to
-     * {@code len} after the first miss-match to keep the intrinsic engaged.
+     * <p>The hash output is bitwise-identical to {@code Arrays.hashCode(byte[])} and therefore to
+     * every previous formula generation — accumulator starts at {@code 1}, each SIGNED byte folds
+     * as {@code h = 31*h + b} — so existing open-addressed slot-layout entries remain compatible
+     * (hard requirement; property-tested new-vs-old in ArrowTimerBufferTest).
      */
-    private static final ThreadLocal<byte[]> HASH_SCRATCH_TL =
-            ThreadLocal.withInitial(() -> new byte[0]);
-
     private int hashOf(MemorySegment seg, long offset, int len) {
-        // D-R4-4: copy the segment slice into the exact-size scratch byte[] and route through
-        // {@code Arrays.hashCode(byte[])}, which the JIT intrinsifies. The polynomial-31
-        // accumulator is bitwise-identical to the previous scalar loop, so previously-populated
-        // hash-index slots remain valid.
-        byte[] scratch = HASH_SCRATCH_TL.get();
-        if (scratch.length != len) {
-            scratch = new byte[len];
-            HASH_SCRATCH_TL.set(scratch);
-        }
-        if (len > 0) {
-            MemorySegment.copy(seg, ValueLayout.JAVA_BYTE, offset, scratch, 0, len);
-        }
-        return Arrays.hashCode(scratch);
+        return SegmentHash.polynomial31(seg, offset, len);
     }
 
     private boolean rowKeyEquals(int row, MemorySegment seg, long offset, int len) {
@@ -641,13 +627,13 @@ public final class ArrowTimerBuffer implements AutoCloseable {
         if (kLen != len) {
             return false;
         }
-        for (int i = 0; i < len; i++) {
-            if (keyData.get(ValueLayout.JAVA_BYTE, kStart + i)
-                    != seg.get(ValueLayout.JAVA_BYTE, offset + i)) {
-                return false;
-            }
-        }
-        return true;
+        // M5-V3 (hot-path alloc/copy audit 2026-06-12): MemorySegment.mismatch
+        // intrinsic (SWAR/SIMD, branch-cheap for the common equal case) replaces
+        // the scalar per-byte loop run on every hash-probe hit/collision.
+        // Semantics identical (kLen != len early-out retained above).
+        return MemorySegment.mismatch(
+                        keyData, kStart, kStart + (long) len, seg, offset, offset + len)
+                == -1;
     }
 
     private int probeFind(int hash, MemorySegment seg, long offset, int len) {

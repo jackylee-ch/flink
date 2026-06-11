@@ -720,11 +720,34 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
         return out;
     }
 
-    /** Decodes {@code composite} through the head-memo (see {@link #peekMemoKey}). */
-    private T decodeElementMemo(byte[] composite) {
-        if (peekMemoKey != null && java.util.Arrays.equals(peekMemoKey, composite)) {
-            return peekMemoElement;
-        }
+    /**
+     * M5-V1 (hot-path alloc/copy audit 2026-06-12): segment-direct head-memo probe — true iff the
+     * index head's composite bytes at {@code (kOff, kLen)} equal {@link #peekMemoKey}. Replaces
+     * the old {@code decodeElementMemo(copyIndexKey(0))} shape whose memo-HIT case (the common
+     * one: repeated peeks of the same head) still paid a fresh byte[] alloc + segment→heap copy +
+     * {@code Arrays.equals} before discovering it didn't need the bytes. The compare runs via the
+     * {@code MemorySegment.mismatch} intrinsic with ZERO allocation ({@code ofArray} is a
+     * non-copying heap-segment view the JIT scalarizes).
+     *
+     * <p>Caution (audit V1): {@code removeAtOrAboveTs}/index mutation invalidate offsets — callers
+     * must read {@code keyOffsetAt(0)}/{@code keyLenAt(0)} AFTER any mutation and use this probe
+     * before {@code removeAt(0)}.
+     */
+    private boolean headMatchesMemo(int kOff, int kLen) {
+        return peekMemoKey != null
+                && peekMemoKey.length == kLen
+                && MemorySegment.mismatch(
+                                liveIndex.keyDataSegment(),
+                                kOff,
+                                kOff + (long) kLen,
+                                MemorySegment.ofArray(peekMemoKey),
+                                0L,
+                                kLen)
+                        == -1;
+    }
+
+    /** Memo-MISS path: decodes the OWNED {@code composite} and refreshes the head-memo. */
+    private T decodeAndMemoize(byte[] composite) {
         T e = decodeElement(composite);
         peekMemoKey = composite;
         peekMemoElement = e;
@@ -1099,21 +1122,39 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 return null;
             }
         }
-        byte[] composite = copyIndexKey(0);
-        T elem = decodeElementMemo(composite);
+        // M5-V1 (hot-path alloc/copy audit 2026-06-12): the head's composite bytes already live
+        // in liveIndex.keyDataSegment() — serve the memo compare AND the pendingBuffer probe
+        // segment-direct. The old shape allocated a fresh byte[] copy per poll PLUS copied it
+        // back into scratchSeg just to call find(); both copies (and, on the memo-HIT and
+        // pending-ADD-cancel branches, the alloc itself) are gone. The composite is materialized
+        // ONLY for the memo-miss decode and the pendingPollDeletes staging branch — the two
+        // places that genuinely need owned bytes.
+        int kOff = liveIndex.keyOffsetAt(0);
+        int kLen = liveIndex.keyLenAt(0);
+        T elem;
+        byte[] owned; // owned composite bytes, or null until a branch needs them
+        if (headMatchesMemo(kOff, kLen)) {
+            elem = peekMemoElement;
+            // peekMemoKey IS the head composite (exact bytes, owned, never mutated in place) —
+            // reusable for the staging branch below without re-copying.
+            owned = peekMemoKey;
+        } else {
+            owned = copyIndexKey(0);
+            elem = decodeAndMemoize(owned);
+        }
+        // Probe the pending buffer segment-direct BEFORE removeAt(0): index mutation invalidates
+        // (kOff, kLen). find() only reads pendingBuffer, removeAt(0) only mutates liveIndex, so
+        // hoisting the probe above the removal is order-equivalent.
+        int pending = pendingBuffer.find(liveIndex.keyDataSegment(), kOff, kLen);
         liveIndex.removeAt(0);
         // Engine-side delete. If the timer is still an UNFLUSHED pending ADD, cancel it
         // in-buffer — the engine never saw it, and staging a delete would race the later ADD
         // flush (delete-then-add would resurrect... actually add-after-delete: the orphan row
         // would re-appear). Otherwise stage the batched delete.
-        ensureScratchCapacity(composite.length);
-        MemorySegment.copy(
-                composite, 0, scratchSeg, ValueLayout.JAVA_BYTE, 0, composite.length);
-        int pending = pendingBuffer.find(scratchSeg, 0L, composite.length);
         if (pending >= 0 && pendingBuffer.opAt(pending) == ArrowTimerBuffer.OP_ADD) {
             pendingBuffer.removeAt(pending);
         } else if (pending < 0) {
-            pendingPollDeletes.add(composite);
+            pendingPollDeletes.add(owned);
             if (pendingPollDeletes.size() >= FLUSH_THRESHOLD) {
                 flushPollDeletes();
             }
@@ -1140,7 +1181,16 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                 return null;
             }
         }
-        return decodeElementMemo(copyIndexKey(0));
+        // M5-V1: memo-compare segment-direct BEFORE allocating — the common case (repeated peeks
+        // of the same head) is now alloc- and copy-free; the byte[] composite is materialized
+        // only on memo miss (head changed). Pure-read path: no index mutation between the
+        // offset reads and the compare.
+        int kOff = liveIndex.keyOffsetAt(0);
+        int kLen = liveIndex.keyLenAt(0);
+        if (headMatchesMemo(kOff, kLen)) {
+            return peekMemoElement;
+        }
+        return decodeAndMemoize(copyIndexKey(0));
     }
 
     @Override

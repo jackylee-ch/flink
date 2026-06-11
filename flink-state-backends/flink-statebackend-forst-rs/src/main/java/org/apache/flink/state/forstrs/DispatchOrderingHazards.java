@@ -346,14 +346,16 @@ final class DispatchOrderingHazards {
         }
 
         private static int computeHash(MemorySegment seg, int off, int len) {
-            // FNV-1a 32-bit — sufficient distribution for set-keyed dedup,
-            // and a hot 1-byte-at-a-time loop the JIT can unroll easily.
-            int h = 0x811c9dc5;
-            for (int i = 0; i < len; i++) {
-                h ^= (seg.get(ValueLayout.JAVA_BYTE, (long) (off + i)) & 0xff);
-                h *= 0x01000193;
-            }
-            return h;
+            // M5-V4 (hot-path alloc/copy audit 2026-06-12): the previous
+            // FNV-1a fold was an inherently sequential 1-byte-at-a-time loop
+            // (data-dependent XOR between multiplies — cannot be strided).
+            // Replaced with the strided polynomial-31 segment hash (8 bytes
+            // per getLong, recurrence broken via precomputed 31^k powers —
+            // same shape as the Arrays.hashCode intrinsic). The hash value
+            // CHANGES vs FNV-1a, which is safe here: SliceKey hashes are
+            // transient per-batch HashSet probes (never persisted, never
+            // compared across processes) and equals() verifies the bytes.
+            return SegmentHash.polynomial31(seg, off, len);
         }
 
         @Override
@@ -428,12 +430,14 @@ final class DispatchOrderingHazards {
 
     private static boolean sliceBytesEqual(
             MemorySegment left, long leftStart, MemorySegment right, long rightStart, int len) {
-        for (int i = 0; i < len; i++) {
-            if (left.get(ValueLayout.JAVA_BYTE, leftStart + i)
-                    != right.get(ValueLayout.JAVA_BYTE, rightStart + i)) {
-                return false;
-            }
-        }
-        return true;
+        // M5-V4 (hot-path alloc/copy audit 2026-06-12): MemorySegment.mismatch
+        // is a JIT intrinsic (SWAR/SIMD compare, branch-cheap for the common
+        // equal case) — replaces the scalar per-byte loop that ran on every
+        // classified batch with writes, per probe-hit and per delete-conflict
+        // scan. Semantics identical: equal iff no mismatching byte in
+        // [0, len); len == 0 compares empty ranges and returns -1 (equal).
+        return MemorySegment.mismatch(
+                        left, leftStart, leftStart + len, right, rightStart, rightStart + len)
+                == -1;
     }
 }
