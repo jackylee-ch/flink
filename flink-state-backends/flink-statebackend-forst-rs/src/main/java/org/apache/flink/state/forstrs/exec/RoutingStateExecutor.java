@@ -168,6 +168,14 @@ public final class RoutingStateExecutor implements StateExecutor {
     /** Backpressure cap for {@link #fullyLoaded()} (env FRS_RS_MAX_INFLIGHT_BATCHES). */
     private final int maxOutstanding;
 
+    /**
+     * STAGE-0 sync-direct experiment: a DEDICATED executor (own arena + buffers) for
+     * mailbox-inline sync requests, so direct execution never shares scratch with a worker
+     * thread mid-batch. Null unless nonBlocking && FRS_RS_SYNC_DIRECT=1.
+     */
+    private final VectorizedExecutor syncDirectWorker;
+    private final Arena syncDirectArena;
+
     public RoutingStateExecutor(
             ForStRsLinker linker,
             FrsDb db,
@@ -227,6 +235,19 @@ public final class RoutingStateExecutor implements StateExecutor {
             this.workerThreads[i] = Executors.newSingleThreadExecutor(tf);
             this.free.addLast(i);
         }
+        if (nonBlocking && "1".equals(System.getenv("FRS_RS_SYNC_DIRECT"))) {
+            this.syncDirectArena = Arena.ofShared();
+            this.syncDirectWorker = new VectorizedExecutor(linker, db, cf, syncDirectArena);
+            if (metrics != null) {
+                this.syncDirectWorker.setDispatchMetrics(metrics);
+            }
+            if (register != null) {
+                register.accept(this.syncDirectWorker);
+            }
+        } else {
+            this.syncDirectArena = null;
+            this.syncDirectWorker = null;
+        }
     }
 
     /** Test-only: wrap pre-built (stub) workers; no native linker/db touched. */
@@ -251,6 +272,8 @@ public final class RoutingStateExecutor implements StateExecutor {
             this.workerThreads[i] = Executors.newSingleThreadExecutor(tf);
             this.free.addLast(i);
         }
+        this.syncDirectArena = null;
+        this.syncDirectWorker = null;
     }
 
     @Override
@@ -452,6 +475,15 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
+        // STAGE-0 EXPERIMENT (FRS_RS_SYNC_DIRECT=1): execute sync requests DIRECTLY on the
+        // calling thread — community ForSt's exact behavior (ForStStateExecutor.executeRequestSync
+        // converts and runs inline, jumping its coordinator queue). Safe by the AEC key contract:
+        // a sync request for key K is only issued when no async ops for K are in flight
+        // (KeyAccountingUnit), so jumping the worker FIFO cannot reorder same-key effects.
+        if (syncDirectWorker != null) {
+            syncDirectWorker.executeRequestSync(request);
+            return;
+        }
         // Route the sync request to ITS key-group's worker so it observes that key-group's cached
         // writes (read-your-writes). Blocking modes: batches complete synchronously, nothing to
         // drain. Non-blocking mode: any in-flight batch for this key-group sits in the SAME
@@ -546,6 +578,14 @@ public final class RoutingStateExecutor implements StateExecutor {
                 a.close();
             } catch (Throwable ignore) {
                 // best-effort; a racing close is benign at teardown
+            }
+        }
+        if (syncDirectWorker != null) {
+            syncDirectWorker.shutdown();
+            try {
+                syncDirectArena.close();
+            } catch (Throwable ignore) {
+                // best-effort at teardown
             }
         }
     }

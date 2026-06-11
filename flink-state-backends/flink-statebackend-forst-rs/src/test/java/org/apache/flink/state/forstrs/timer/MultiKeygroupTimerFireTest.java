@@ -39,6 +39,7 @@ import javax.annotation.Nonnull;
 import java.io.IOException;
 import java.lang.foreign.Arena;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
@@ -46,6 +47,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -120,6 +122,62 @@ class MultiKeygroupTimerFireTest {
      * registered per key; the queue is advanced once per key and the visitor receives all 3
      * timers. Validates PR-A4 — without the fix the queue would only see the kg-0 timer.
      */
+    /**
+     * STAGE-0 regression (2026-06-11, q8 timer loss): the post-flush one-shot refill FLOOR
+     * must only ever LOWER the effective refill start. Pre-fix, a second flush touching the
+     * same key group before its next refill OVERWROTE a lower outstanding floor with a higher
+     * one (cache empty → headTs=MAX → floor=minAdd2), permanently skipping every engine timer
+     * in [floor1, floor2): registered-but-never-polled timers = unfired windows = the q8
+     * GlobalWindowAggregate under-emit (g7Add=2,000,000 vs g7Poll=1,055,800).
+     *
+     * <p>Sequence: 3 timers flushed; one poll caches the rest and positions the resume cursor;
+     * an add INSIDE the cached window flushes (floor=150, cache dropped); an add BEYOND the old
+     * tail flushes again (pre-fix: floor overwritten to 400 → 150/200/300 lost). All four
+     * remaining timers must poll in timestamp order.
+     */
+    @Test
+    void refillFloorNeverRisesAcrossConsecutiveFlushes() {
+        List<Integer> keys = pickKeysInDistinctKeyGroups(1);
+        Integer k = keys.get(0);
+        MutableKeyContext<Integer> ctx =
+                new MutableKeyContext<>(new KeyGroupRange(SHARD_START, SHARD_END), TOTAL_KEY_GROUPS);
+        ForStRsKeyGroupedInternalPriorityQueue<TestElement> q =
+                new ForStRsKeyGroupedInternalPriorityQueue<>(
+                        linker,
+                        db,
+                        cf,
+                        arena,
+                        "floorRegression",
+                        TestElementSerializer.INSTANCE,
+                        e -> e.ts,
+                        ctx,
+                        TOTAL_KEY_GROUPS,
+                        new KeyGroupRange(SHARD_START, SHARD_END));
+        ctx.setCurrentKey(k);
+        assertTrue(q.add(new TestElement(100L, 0)));
+        assertTrue(q.add(new TestElement(200L, 1)));
+        assertTrue(q.add(new TestElement(300L, 2)));
+        q.flushPendingToEngine();
+        // Poll once: fires ts=100, caches [200, 300], resume cursor at the batch tail.
+        TestElement first = q.poll();
+        assertNotNull(first);
+        assertEquals(100L, first.ts);
+        // Flush #1: add INSIDE the cached window → cache dropped, floor := min(200, 150) = 150.
+        assertTrue(q.add(new TestElement(150L, 3)));
+        q.flushPendingToEngine();
+        // Flush #2: add BEYOND the old tail with the cache now empty. Pre-fix this OVERWROTE
+        // the 150 floor with 400, orphaning 150/200/300 in the engine forever.
+        assertTrue(q.add(new TestElement(400L, 4)));
+        q.flushPendingToEngine();
+        // Drain: every remaining timer must surface, in ts order.
+        List<Long> polled = new ArrayList<>();
+        TestElement e;
+        while ((e = q.poll()) != null) {
+            polled.add(e.ts);
+        }
+        assertEquals(Arrays.asList(150L, 200L, 300L, 400L), polled);
+    }
+
     @Test
     void timersFireAcrossMultipleKeygroupsWithinShard() {
         List<Integer> keys = pickKeysInDistinctKeyGroups(3);

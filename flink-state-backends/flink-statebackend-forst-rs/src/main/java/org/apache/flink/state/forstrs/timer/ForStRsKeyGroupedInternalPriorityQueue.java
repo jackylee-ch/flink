@@ -700,8 +700,26 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
      * REMOVE, no-ops on a matching pending ADD, or inserts a fresh ADD. Triggers a flush when the
      * buffer reaches {@link #FLUSH_THRESHOLD}.
      */
+    /** TEMP-DIAG: per-task timer counter tag from the task thread name. */
+    private static String diagTag(String op) {
+        String tn = Thread.currentThread().getName();
+        if (tn.contains("GlobalWindowAggregate[7]")) {
+            return "g7" + op;
+        }
+        if (tn.contains("GlobalWindowAggregate[14]")) {
+            return "g14" + op;
+        }
+        if (tn.contains("WindowJoin")) {
+            return "jn" + op;
+        }
+        return "ot" + op;
+    }
+
     @Override
     public boolean add(T element) {
+        if (org.apache.flink.state.forstrs.DiagCompletionCounters.ENABLED) {
+            org.apache.flink.state.forstrs.DiagCompletionCounters.named(diagTag("Add"));
+        }
         // R38-H2: reject mutations on a closed queue. Without this gate a
         // late timer callback could call encodeIntoScratch (which writes via
         // MemorySegment.copy on the scratch arena) AFTER {@link #close()}
@@ -831,6 +849,9 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
 
     @Override
     public T poll() {
+        if (org.apache.flink.state.forstrs.DiagCompletionCounters.ENABLED) {
+            org.apache.flink.state.forstrs.DiagCompletionCounters.named(diagTag("Poll"));
+        }
         // R38-H2: reject post-close access. poll() triggers a flush which
         // calls into FFM via the closed flushArena; surface the lifecycle
         // bug loudly instead.
@@ -2104,7 +2125,34 @@ public class ForStRsKeyGroupedInternalPriorityQueue<T extends HeapPriorityQueueE
                             continue;
                         }
                         multiKgPollCache.remove(kg);
-                        multiKgRefillFloor.put(kg, buildSeekKey(kg, floorTs));
+                        // STAGE-0 FIX (2026-06-11, q8 timer loss): the floor is a ONE-SHOT
+                        // obligation to re-read rows the cache drop just orphaned, and the
+                        // effective refill start must only ever move BACKWARD until consumed.
+                        // The previous plain put() violated that two ways when a SECOND flush
+                        // touched the same kg before its next refill (cache now empty →
+                        // headTs==MAX → floorTs=minAdd2): (1) it OVERWROTE a lower outstanding
+                        // floor — every engine row in [oldFloor, newFloor) was permanently
+                        // skipped (timers never fired; q8 GWA lost 944K of 2.0M windows,
+                        // g7Add=2,000,000 vs g7Poll=1,055,800); (2) with minAdd2 beyond the
+                        // kept resume cursor it set a floor PAST the cursor baseline, skipping
+                        // [cursor, floor). Rule: adopt the new floor only if it LOWERS the
+                        // effective refill start (existing floor, else cursor successor, else
+                        // kg-prefix start = already-lowest).
+                        byte[] newFloorKey = buildSeekKey(kg, floorTs);
+                        byte[] existingFloor = multiKgRefillFloor.get(kg);
+                        byte[] baseline;
+                        if (existingFloor != null) {
+                            baseline = existingFloor;
+                        } else {
+                            byte[] cur = multiKgResumeCursor.get(kg);
+                            baseline = (cur != null) ? successorKey(cur) : null;
+                        }
+                        // baseline == null ⇒ next refill already starts at the kg-prefix
+                        // start (the lowest point) — adopting any floor would RAISE it.
+                        if (baseline != null
+                                && java.util.Arrays.compareUnsigned(newFloorKey, baseline) < 0) {
+                            multiKgRefillFloor.put(kg, newFloorKey);
+                        }
                         // Keep the resume cursor: the one-shot floor overrides the
                         // next refill, after which the cursor resumes normally.
                     }
