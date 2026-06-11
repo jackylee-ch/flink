@@ -1193,6 +1193,24 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
                 routingExecutors.add(r);
                 return r;
+            case "routing-async":
+                // FRS-ROUTING-ASYNC (2026-06-11): routing's kg-affine worker FIFOs WITHOUT the
+                // mailbox latch — executeBatchRequests returns a truthful incomplete future and
+                // the AEC pipelines (fullyLoaded() caps depth). Motivated by the q9@100M perf
+                // profile: TM averaged 1.7/8 cores under blocking routing (latency-bound, not
+                // CPU-bound); the latch was the cap. No mailbox-inline execution, so the
+                // 2026-06-10 statebuf-overtake corruption mechanism cannot occur.
+                org.apache.flink.state.forstrs.exec.RoutingStateExecutor ra =
+                        new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                                linker,
+                                db,
+                                defaultCf,
+                                dispatchMetrics,
+                                managedExecutors::add,
+                                false,
+                                true);
+                routingExecutors.add(ra);
+                return ra;
             default:
                 var e = new VectorizedExecutor(linker, db, defaultCf, arena);
                 e.setDispatchMetrics(dispatchMetrics);

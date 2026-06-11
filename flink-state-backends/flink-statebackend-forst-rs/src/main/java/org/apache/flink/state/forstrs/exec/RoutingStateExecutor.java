@@ -98,6 +98,27 @@ public final class RoutingStateExecutor implements StateExecutor {
     }
 
     /**
+     * Backpressure cap for the non-blocking mode: once this many batches are dispatched and
+     * unfinished, {@link #fullyLoaded()} reports {@code true} and the AEC stops triggering new
+     * batches until workers catch up. Default {@code 2 × workerCount()} — one executing + one
+     * queued per worker — keeps the classifier pool bounded while letting every worker stay busy.
+     */
+    public static int maxInFlightBatches(int workerCount) {
+        String s = System.getenv("FRS_RS_MAX_INFLIGHT_BATCHES");
+        if (s != null) {
+            try {
+                int v = Integer.parseInt(s.trim());
+                if (v > 0) {
+                    return v;
+                }
+            } catch (NumberFormatException ignore) {
+                // fall through to default
+            }
+        }
+        return 2 * workerCount;
+    }
+
+    /**
      * PR-1 adaptive dispatch: when {@code true}, ITER-FREE batches (point gets/puts/deletes only)
      * execute INLINE on the calling (mailbox) thread instead of being dispatched to workers — the
      * mailbox→worker→mailbox handoff costs more than it saves for cheap high-rate batches (q17
@@ -111,13 +132,49 @@ public final class RoutingStateExecutor implements StateExecutor {
      */
     private final boolean adaptiveInline;
 
+    /**
+     * FRS-ROUTING-ASYNC (2026-06-11): when {@code true}, {@link #executeBatchRequests} dispatches
+     * each non-empty per-worker sub-batch to its worker FIFO and returns IMMEDIATELY with a
+     * truthful aggregate future (completed when every sub-batch actually finishes) — the mailbox
+     * thread is never blocked on engine work, so the AEC pipelines the next batch's offer phase
+     * while workers execute (in-flight depth &gt; 1).
+     *
+     * <p><b>⚠ EXPERIMENTAL — FAILED the q8@100M exactness canary (2026-06-11). DO NOT enable in
+     * production.</b> Run 1: permanent wedge after source completion (windows never fired,
+     * MAXSEC@600). Run 2: finished 36.7s but emitted 1,285,415 rows vs the 3,064,4xx reference
+     * band (−58% under-emit). Root cause (mechanism, post-mortem): the request-routing here is
+     * sound — classifier buffers ARE per-batch private (pool + worker-side self-release), and
+     * per-key-group FIFO ordering holds — but the PER-STATE off-heap staging buffers
+     * (MapStateV2 Arrow buffer, ListStateArrowBuffer, value statebufs) are long-lived and shared
+     * per state object: the mailbox APPENDS to them at offer time while a worker DRAINS them at
+     * batch-execution time. Every proven mode is lockstep (offer N+1 strictly after execute N),
+     * so those buffers see one thread at a time; any non-blocking mode overlaps the phases and
+     * tears them. This is the same mechanism as the 2026-06-10 coordinated-mode corruption — it
+     * was never specific to inline execution. Prerequisite for enabling this mode: per-batch
+     * ownership of the per-state staging buffers (seal/swap at dispatch — the "per-batch buffer
+     * ownership refactor of the C1 design" deferred on
+     * {@code VectorizedExecutor#executeBatchRequests}).
+     *
+     * <p>What WAS validated: the AEC contract supports incomplete container futures +
+     * {@link #fullyLoaded()} backpressure (job ran end-to-end at 10M and at 100M run 2), and the
+     * q9@100M profile proves the blocking latch caps the TM at 1.7/8 cores — the motivation
+     * stands; the per-state buffer refactor is the remaining blocker.
+     */
+    private final boolean nonBlocking;
+
+    /** Outstanding dispatched-but-unfinished batches; drives {@link #fullyLoaded()}. */
+    private final AtomicInteger outstanding = new AtomicInteger();
+
+    /** Backpressure cap for {@link #fullyLoaded()} (env FRS_RS_MAX_INFLIGHT_BATCHES). */
+    private final int maxOutstanding;
+
     public RoutingStateExecutor(
             ForStRsLinker linker,
             FrsDb db,
             FrsCfHandle cf,
             DispatchMetrics metrics,
             java.util.function.Consumer<VectorizedExecutor> register) {
-        this(linker, db, cf, metrics, register, false);
+        this(linker, db, cf, metrics, register, false, false);
     }
 
     public RoutingStateExecutor(
@@ -127,8 +184,21 @@ public final class RoutingStateExecutor implements StateExecutor {
             DispatchMetrics metrics,
             java.util.function.Consumer<VectorizedExecutor> register,
             boolean adaptiveInline) {
+        this(linker, db, cf, metrics, register, adaptiveInline, false);
+    }
+
+    public RoutingStateExecutor(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            DispatchMetrics metrics,
+            java.util.function.Consumer<VectorizedExecutor> register,
+            boolean adaptiveInline,
+            boolean nonBlocking) {
         this.adaptiveInline = adaptiveInline;
+        this.nonBlocking = nonBlocking;
         int n = workerCount();
+        this.maxOutstanding = maxInFlightBatches(n);
         this.workers = new VectorizedExecutor[n];
         this.workerThreads = new ExecutorService[n];
         this.workerArenas = new Arena[n];
@@ -154,6 +224,30 @@ public final class RoutingStateExecutor implements StateExecutor {
                     };
             this.workers[i] = w;
             this.workerArenas[i] = a;
+            this.workerThreads[i] = Executors.newSingleThreadExecutor(tf);
+            this.free.addLast(i);
+        }
+    }
+
+    /** Test-only: wrap pre-built (stub) workers; no native linker/db touched. */
+    RoutingStateExecutor(VectorizedExecutor[] testWorkers, boolean adaptiveInline, boolean nonBlocking) {
+        this.adaptiveInline = adaptiveInline;
+        this.nonBlocking = nonBlocking;
+        int n = testWorkers.length;
+        this.maxOutstanding = maxInFlightBatches(n);
+        this.workers = testWorkers;
+        this.workerThreads = new ExecutorService[n];
+        this.workerArenas = new Arena[n];
+        this.free = new ArrayDeque<>(n);
+        AtomicInteger seq = new AtomicInteger();
+        for (int i = 0; i < n; i++) {
+            final int id = i;
+            ThreadFactory tf =
+                    r -> {
+                        Thread t = new Thread(r, "forst-rs-state-worker-" + id + "-" + seq.incrementAndGet());
+                        t.setDaemon(true);
+                        return t;
+                    };
             this.workerThreads[i] = Executors.newSingleThreadExecutor(tf);
             this.free.addLast(i);
         }
@@ -200,6 +294,9 @@ public final class RoutingStateExecutor implements StateExecutor {
         }
         if (busy.isEmpty()) {
             return CompletableFuture.completedFuture(null);
+        }
+        if (nonBlocking) {
+            return dispatchNonBlocking(subs, busy);
         }
         if (adaptiveInline && !anySubHasIters(subs, busy)) {
             // ADAPTIVE fast path (the leak-fixed configuration that measured q8 IN BAND
@@ -259,6 +356,64 @@ public final class RoutingStateExecutor implements StateExecutor {
                 : CompletableFuture.completedFuture(null);
     }
 
+    /**
+     * FRS-ROUTING-ASYNC dispatch: enqueue each busy sub-batch on its worker's FIFO and return a
+     * truthful aggregate future without waiting. The mailbox thread is free to build the next
+     * batch; same-key-group ordering across batches is preserved by the per-worker single-thread
+     * FIFO (a later batch's sub enqueues strictly after an earlier batch's sub for that worker).
+     * Inner futures are read with {@code getNow} only AFTER the worker task returns — the wrapped
+     * {@link VectorizedExecutor#executeBatchRequests} is synchronous (always returns an
+     * already-completed future), so the read is exact, and the aggregate completes only when
+     * every sub-batch has actually finished (no early-success discard).
+     */
+    private CompletableFuture<Void> dispatchNonBlocking(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        final CompletableFuture<Void> agg = new CompletableFuture<>();
+        final AtomicInteger pending = new AtomicInteger(busy.size());
+        final java.util.concurrent.atomic.AtomicReference<Throwable> err =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        outstanding.incrementAndGet();
+        final Runnable settleOne =
+                () -> {
+                    if (pending.decrementAndGet() == 0) {
+                        outstanding.decrementAndGet();
+                        Throwable e = err.get();
+                        if (e != null) {
+                            agg.completeExceptionally(e);
+                        } else {
+                            agg.complete(null);
+                        }
+                    }
+                };
+        for (int wi : busy) {
+            final int id = wi;
+            final AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub = subs[id];
+            try {
+                workerThreads[id].execute(
+                        () -> {
+                            try {
+                                CompletableFuture<Void> inner =
+                                        workers[id].executeBatchRequests(sub);
+                                Throwable t = inner.handle((v, e) -> e).getNow(null);
+                                if (t != null) {
+                                    err.compareAndSet(null, t);
+                                }
+                            } catch (Throwable t) {
+                                err.compareAndSet(null, t);
+                            } finally {
+                                settleOne.run();
+                            }
+                        });
+            } catch (java.util.concurrent.RejectedExecutionException rex) {
+                // Shutdown raced the dispatch: the worker pool is closed. Per-row futures of this
+                // sub were never started; fail the batch so nothing waits forever.
+                err.compareAndSet(null, rex);
+                settleOne.run();
+            }
+        }
+        return agg;
+    }
+
     /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
     private static boolean anySubHasIters(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
@@ -298,8 +453,9 @@ public final class RoutingStateExecutor implements StateExecutor {
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
         // Route the sync request to ITS key-group's worker so it observes that key-group's cached
-        // writes (read-your-writes). Batches complete synchronously (executeBatchRequests blocks), so
-        // there is no async in-flight batch to drain here.
+        // writes (read-your-writes). Blocking modes: batches complete synchronously, nothing to
+        // drain. Non-blocking mode: any in-flight batch for this key-group sits in the SAME
+        // worker's FIFO ahead of this submission, so the .get() below transitively drains it.
         int kg = request.getRecordContext().getKeyGroup();
         int id = Math.floorMod(kg, workers.length);
         try {
@@ -321,9 +477,12 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public boolean fullyLoaded() {
-        // Synchronous design: executeBatchRequests blocks until the batch completes and returns an
-        // already-completed future, so there is never an outstanding async batch → never "loaded".
-        return false;
+        // Blocking modes: executeBatchRequests blocks until the batch completes and returns an
+        // already-completed future, so there is never an outstanding async batch → never "loaded"
+        // (outstanding stays 0). Non-blocking mode: report loaded once the dispatched-unfinished
+        // batch count reaches the cap, so the AEC stops triggering and the classifier pool stays
+        // bounded (the documented fullyLoaded()-always-false unbounded-pipelining hazard).
+        return outstanding.get() >= maxOutstanding;
     }
 
     /**
