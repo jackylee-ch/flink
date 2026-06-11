@@ -122,6 +122,32 @@ public class VectorizedExecutor implements StateExecutor {
     private static final int FRS_STATUS_OK = 0;
     private static final int FRS_STATUS_BUFFER_TOO_SMALL = 17;
 
+    /**
+     * Stage-3 Unit-2 (two-regime design §3.4, gated per §4 Stage 3 / §8): env gate {@code
+     * FRS_RS_MIXED_BATCH=true|false} for the MIXED write batch. When true, a classified batch's
+     * puts + deletes + heap-path appendMerges against this executor's CF commit in ONE {@code
+     * frs_vectorized_batch_mixed} crossing (one atomic engine sequence allocation) instead of up
+     * to three separate crossings. DEFAULT FALSE until the Stage-3 gates pass (engine suite,
+     * q20@100M, q9 re-run, q17/q3/q8 no-regress); the multi-call path stays the default and is
+     * byte-for-byte untouched when the gate is off.
+     */
+    static final boolean MIXED_BATCH_ENV =
+            Boolean.parseBoolean(System.getenv("FRS_RS_MIXED_BATCH"));
+
+    /**
+     * Per-executor effective gate. Initialized from {@link #MIXED_BATCH_ENV}; package-private
+     * setter below lets unit tests exercise both paths in one JVM (env vars are immutable
+     * in-process). Read once per batch at container creation — the per-batch mode is captured on
+     * the classifier ({@link VectorizedClassifier#setMixedStaging}) so a mid-batch flip can never
+     * split one batch across staging models.
+     */
+    private volatile boolean mixedBatchEnabled = MIXED_BATCH_ENV;
+
+    /** Test seam: arms/disarms the mixed write batch for containers created AFTER the call. */
+    void setMixedBatchEnabledForTests(boolean enabled) {
+        this.mixedBatchEnabled = enabled;
+    }
+
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsCfHandle cf;
@@ -331,6 +357,14 @@ public class VectorizedExecutor implements StateExecutor {
             classifier.initNewKindBuffers(arena);
         }
         classifier.reset();
+        // Stage-3 Unit-2: arm mixed write staging for THIS batch (must precede
+        // the first offer()). reset() above disarmed any prior-batch mode, so
+        // pooled classifiers re-capture the gate value each batch. The
+        // executeRequestSync per-call classifier intentionally never arms it
+        // (single-row batches gain nothing and the sync path stays untouched).
+        if (mixedBatchEnabled) {
+            classifier.setMixedStaging(true);
+        }
         // V3.1: propagate the executor-level listStateNames registry into the
         // classifier so APPEND_MERGE routing survives the per-batch reset.
         for (String name : listStateNames) {
@@ -491,7 +525,7 @@ public class VectorizedExecutor implements StateExecutor {
             if (poison != null) {
                 return CompletableFuture.failedFuture(poison);
             }
-            if (requiresOrderedDispatch(classifier)) {
+            if (DispatchOrderingHazards.requiresOrderedDispatch(classifier)) {
                 if (OC_DISPATCH) {
                     OC_ORDERED_BATCHES.incrementAndGet();
                     OC_ORDERED_ROWS.addAndGet(classifier.orderedCount());
@@ -508,8 +542,25 @@ public class VectorizedExecutor implements StateExecutor {
             // Spec §Correctness Invariant 2: any deferred / cached writes must be
             // flushed BEFORE iterator ops. Within a single batch the natural
             // ordering of PUT/DELETE before ITER guarantees that.
-            executePuts(classifier);
-            executeDeletes(classifier);
+            //
+            // Stage-3 Unit-2: under mixed staging, puts + deletes + heap-path
+            // appendMerges commit in ONE frs_vectorized_batch_mixed crossing
+            // HERE (write-before-read per batch, two-regime design §3.2/§8).
+            // Ordering safety: requiresOrderedDispatch above already routed
+            // every batch with a same-key/prefix conflict across write kinds
+            // (or get-vs-write) to offer-order sync dispatch, so the rows
+            // committed here are cross-kind conflict-free; within the mixed
+            // column rows apply in offer order (engine row order = seq order).
+            // The ONE semantic delta vs the multi-call path: heap appendMerge
+            // rows are engine-visible to SAME-BATCH iterators (multi-call
+            // dispatched merges after iters) — which is what Invariant 2 asks
+            // for; get-vs-merge overlap still routes ordered, unchanged.
+            if (classifier.isMixedStaging()) {
+                executeMixedWrites(classifier);
+            } else {
+                executePuts(classifier);
+                executeDeletes(classifier);
+            }
             executeGets(classifier);
             executeIters(classifier);
             // Dispatch vectorized APPEND_MERGE requests (P6-B, ListState path).
@@ -546,7 +597,15 @@ public class VectorizedExecutor implements StateExecutor {
                 }
                 // Track per-path indices: heap rows index into heapFuturesArr in heap-append order.
                 int heapIdx = 0;
+                boolean mixedStaged = classifier.isMixedStaging();
                 for (int i = 0; i < amCount; i++) {
+                    if (mixedStaged && offFutures[i] == null) {
+                        // Stage-3 Unit-2: heap-path rows were committed AND
+                        // completed by executeMixedWrites (success: completePut;
+                        // failure: the batch never reaches this loop). They have
+                        // no amBuf tracking future — do not consume one.
+                        continue;
+                    }
                     CompletableFuture<Void> amFut =
                             offFutures[i] != null
                                     ? offFutures[i]
@@ -678,236 +737,6 @@ public class VectorizedExecutor implements StateExecutor {
         return firstFailure == null
                 ? CompletableFuture.completedFuture(null)
                 : CompletableFuture.failedFuture(firstFailure);
-    }
-
-    private boolean requiresOrderedDispatch(VectorizedClassifier classifier) {
-        int writes =
-                classifier.putCount() + classifier.deleteCount() + classifier.appendMergeCount();
-        if (writes == 0) {
-            return false;
-        }
-        // A pure GET+PUT batch can still carry a real read-modify-write ordering
-        // dependency for the same state cell. Window aggregates issue
-        // asyncValue(window).thenCompose(asyncUpdate(window, acc)); if a later
-        // callback lets the UPDATE and a subsequent GET for the same composite
-        // key drain in one classifier, bucket-order dispatch (PUT before GET)
-        // makes the GET observe the just-written accumulator instead of the
-        // prior value. For HOP windows this over-counts by the overlap factor.
-        //
-        // Keep the performance restoration for non-overlapping GET+PUT batches,
-        // but exact same composite-key overlap must preserve offer order.
-        if (hasSameKey(
-                classifier.getKeys(),
-                classifier.getCount(),
-                classifier.putKeys(),
-                classifier.putCount())) {
-            return true;
-        }
-        if (classifier.deleteCount() == 0 && classifier.appendMergeCount() == 0) {
-            return false;
-        }
-        AppendMergeBatchBuffer appendMerge = classifier.appendMergeBuffer();
-        ColumnarBatchBuffer heapAppendKeys = appendMerge == null ? null : appendMerge.keyBuffer();
-        int heapAppendCount = heapAppendKeys == null ? 0 : heapAppendKeys.count();
-        ColumnarBatchBuffer offHeapAppendKeys = classifier.offHeapAppendMergeKeys();
-        int offHeapAppendCount = offHeapAppendKeys == null ? 0 : offHeapAppendKeys.count();
-        if (hasSameKey(
-                        classifier.getKeys(), classifier.getCount(), heapAppendKeys, heapAppendCount)
-                || hasSameKey(
-                        classifier.getKeys(),
-                        classifier.getCount(),
-                        offHeapAppendKeys,
-                        offHeapAppendCount)
-                || hasSameKey(
-                        classifier.putKeys(), classifier.putCount(), heapAppendKeys, heapAppendCount)
-                || hasSameKey(
-                        classifier.putKeys(),
-                        classifier.putCount(),
-                        offHeapAppendKeys,
-                        offHeapAppendCount)) {
-            return true;
-        }
-        return hasDeleteOrderingHazard(
-                classifier, heapAppendKeys, heapAppendCount, offHeapAppendKeys, offHeapAppendCount);
-    }
-
-    private boolean hasDeleteOrderingHazard(
-            VectorizedClassifier classifier,
-            ColumnarBatchBuffer heapAppendKeys,
-            int heapAppendCount,
-            ColumnarBatchBuffer offHeapAppendKeys,
-            int offHeapAppendCount) {
-        int deleteCount = classifier.deleteCount();
-        if (deleteCount == 0) {
-            return false;
-        }
-        StateRequest<?, ?, ?, ?>[] deleteReqs = classifier.deleteRequests();
-        ColumnarBatchBuffer deleteKeys = classifier.deleteKeys();
-        for (int i = 0; i < deleteCount; i++) {
-            boolean prefixDelete = deleteReqs[i].getRequestType() == StateRequestType.CLEAR;
-            if (hasDeleteConflict(
-                            deleteKeys, i, classifier.getKeys(), classifier.getCount(), prefixDelete)
-                    || hasDeleteConflict(
-                            deleteKeys, i, classifier.putKeys(), classifier.putCount(), prefixDelete)
-                    || hasDeleteConflict(deleteKeys, i, heapAppendKeys, heapAppendCount, prefixDelete)
-                    || hasDeleteConflict(
-                            deleteKeys, i, offHeapAppendKeys, offHeapAppendCount, prefixDelete)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean hasSameKey(
-            ColumnarBatchBuffer left, int leftCount, ColumnarBatchBuffer right, int rightCount) {
-        if (left == null || right == null || leftCount == 0 || rightCount == 0) {
-            return false;
-        }
-        // B-C5R1-NEW-H4: O(N+M) hash-set probe replaces the prior O(N×M)
-        // nested loop. For mixed batches of 1024 rows the old path did ~1M
-        // scalar byte compares per drain just to detect ordering hazards;
-        // the hash-set probe collapses this to N hashes + M probes. Build
-        // the set on the smaller buffer to bound memory.
-        ColumnarBatchBuffer small;
-        int smallCount;
-        ColumnarBatchBuffer large;
-        int largeCount;
-        if (leftCount <= rightCount) {
-            small = left;
-            smallCount = leftCount;
-            large = right;
-            largeCount = rightCount;
-        } else {
-            small = right;
-            smallCount = rightCount;
-            large = left;
-            largeCount = leftCount;
-        }
-        // Build a HashSet of SliceKey wrappers over the smaller buffer.
-        // Capacity sized to avoid rehash on typical batch sizes (256-1024).
-        java.util.HashSet<SliceKey> probe = new java.util.HashSet<>(smallCount * 2);
-        for (int i = 0; i < smallCount; i++) {
-            probe.add(new SliceKey(small, i));
-        }
-        for (int j = 0; j < largeCount; j++) {
-            if (probe.contains(new SliceKey(large, j))) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    /**
-     * B-C5R1-NEW-H4 helper: wraps a (buffer, row) tuple with hashCode/equals
-     * computed over the off-heap key bytes. Allocates one object per probe
-     * step; the alternative O(N×M) nested-loop scalar compare scaled
-     * quadratically with batch size and dominated mixed-batch drain latency.
-     */
-    private static final class SliceKey {
-        private final ColumnarBatchBuffer buf;
-        private final int row;
-        private final int len;
-        private final int hash;
-
-        SliceKey(ColumnarBatchBuffer buf, int row) {
-            this.buf = buf;
-            this.row = row;
-            int start = sliceStart(buf, row);
-            int end = sliceEnd(buf, row);
-            this.len = end - start;
-            this.hash = computeHash(buf.dataSegment(), start, len);
-        }
-
-        private static int computeHash(MemorySegment seg, int off, int len) {
-            // FNV-1a 32-bit — sufficient distribution for set-keyed dedup,
-            // and a hot 1-byte-at-a-time loop the JIT can unroll easily.
-            int h = 0x811c9dc5;
-            for (int i = 0; i < len; i++) {
-                h ^= (seg.get(ValueLayout.JAVA_BYTE, (long) (off + i)) & 0xff);
-                h *= 0x01000193;
-            }
-            return h;
-        }
-
-        @Override
-        public int hashCode() {
-            return hash;
-        }
-
-        @Override
-        public boolean equals(Object o) {
-            if (!(o instanceof SliceKey other)) {
-                return false;
-            }
-            if (this.hash != other.hash || this.len != other.len) {
-                return false;
-            }
-            return sliceEquals(this.buf, this.row, other.buf, other.row);
-        }
-    }
-
-    private static boolean hasDeleteConflict(
-            ColumnarBatchBuffer deleteKeys,
-            int deleteRow,
-            ColumnarBatchBuffer other,
-            int otherCount,
-            boolean prefixDelete) {
-        if (other == null || otherCount == 0) {
-            return false;
-        }
-        for (int i = 0; i < otherCount; i++) {
-            if (prefixDelete
-                    ? sliceStartsWith(other, i, deleteKeys, deleteRow)
-                    : sliceEquals(deleteKeys, deleteRow, other, i)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    private static boolean sliceEquals(
-            ColumnarBatchBuffer left, int leftRow, ColumnarBatchBuffer right, int rightRow) {
-        int leftStart = sliceStart(left, leftRow);
-        int leftLen = sliceEnd(left, leftRow) - leftStart;
-        int rightStart = sliceStart(right, rightRow);
-        int rightLen = sliceEnd(right, rightRow) - rightStart;
-        if (leftLen != rightLen) {
-            return false;
-        }
-        return sliceBytesEqual(
-                left.dataSegment(), leftStart, right.dataSegment(), rightStart, leftLen);
-    }
-
-    private static boolean sliceStartsWith(
-            ColumnarBatchBuffer value, int valueRow, ColumnarBatchBuffer prefix, int prefixRow) {
-        int valueStart = sliceStart(value, valueRow);
-        int valueLen = sliceEnd(value, valueRow) - valueStart;
-        int prefixStart = sliceStart(prefix, prefixRow);
-        int prefixLen = sliceEnd(prefix, prefixRow) - prefixStart;
-        if (prefixLen > valueLen) {
-            return false;
-        }
-        return sliceBytesEqual(
-                value.dataSegment(), valueStart, prefix.dataSegment(), prefixStart, prefixLen);
-    }
-
-    private static int sliceStart(ColumnarBatchBuffer buffer, int row) {
-        return buffer.offsetsSegment().get(ValueLayout.JAVA_INT, (long) row * Integer.BYTES);
-    }
-
-    private static int sliceEnd(ColumnarBatchBuffer buffer, int row) {
-        return buffer.offsetsSegment().get(ValueLayout.JAVA_INT, (long) (row + 1) * Integer.BYTES);
-    }
-
-    private static boolean sliceBytesEqual(
-            MemorySegment left, long leftStart, MemorySegment right, long rightStart, int len) {
-        for (int i = 0; i < len; i++) {
-            if (left.get(ValueLayout.JAVA_BYTE, leftStart + i)
-                    != right.get(ValueLayout.JAVA_BYTE, rightStart + i)) {
-                return false;
-            }
-        }
-        return true;
     }
 
     @Override
@@ -1250,6 +1079,114 @@ public class VectorizedExecutor implements StateExecutor {
                 try {
                     c.markCompletedExceptionally(reqs[i]);
                     completeDeleteExceptionally(reqs[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
+                }
+            }
+            throw t;
+        }
+    }
+
+    /**
+     * Stage-3 Unit-2: commits a mixed-staged batch's puts + deletes + heap-path appendMerges in
+     * ONE {@code frs_vectorized_batch_mixed} crossing (one atomic engine sequence allocation).
+     *
+     * <p>ZERO-COPY: the classifier's unified off-heap columns ({@code mixedKeys} /
+     * {@code mixedValues} / {@code kinds}) are handed to the FFI verbatim — rows were serialized
+     * exactly once at classification time, in offer order; the kinds byte per row was written
+     * during per-op classification (no boxing, no dispatch-time column rebuild).
+     *
+     * <p>Engine ordering contract (frs_vectorized_batch_mixed, lib.rs): rows apply in array
+     * order under one seq range — a later same-key row wins; merge operands concatenate in row
+     * order. Batches with cross-kind same-key/prefix conflicts never reach this method
+     * ({@link DispatchOrderingHazards#requiresOrderedDispatchMixed} routes them to offer-order sync dispatch), so
+     * offer-order commit here is observationally identical to the multi-call path's
+     * put→delete→merge grouped order.
+     *
+     * <p>Completion: put / delete rows complete here (mirrors {@link #executePuts} /
+     * {@link #executeDeletes}); heap-path APPEND_MERGE rows complete in the shared
+     * post-dispatch loop in {@link #executeBatchRequests} via the {@code offFutures[i] == null →
+     * completePut(amReqs[i])} arm being SKIPPED and completed here instead (they carry no
+     * tracking future). On throw, ALL three kinds drain exceptionally before the rethrow —
+     * sister pattern to the executePuts/executeDeletes catch blocks (R21-H1 markers + R93-H1
+     * panic escalation).
+     */
+    private void executeMixedWrites(VectorizedClassifier c) {
+        int n = c.mixedRowCount();
+        if (n == 0) {
+            return;
+        }
+        StateRequest<?, ?, ?, ?>[] putReqs = c.putRequests();
+        int putCount = c.putCount();
+        StateRequest<?, ?, ?, ?>[] delReqs = c.deleteRequests();
+        int delCount = c.deleteCount();
+        StateRequest<?, ?, ?, ?>[] amReqs = c.appendMergeRequests();
+        CompletableFuture<Void>[] offFutures = c.offHeapAppendMergeFutures();
+        int amCount = c.appendMergeCount();
+        long t0 = System.nanoTime();
+        try {
+            invokeVectorizedBatchMixed(
+                    c.mixedKindsSegment(),
+                    c.mixedKeys().offsetsSegment(),
+                    c.mixedKeys().dataSegment(),
+                    c.mixedValues().offsetsSegment(),
+                    c.mixedValues().dataSegment(),
+                    n);
+            if (DiagCompletionCounters.ENABLED) {
+                DiagCompletionCounters.named("mixedBatchCalls");
+                DiagCompletionCounters.namedAdd("mixedBatchOps", n);
+            }
+            long latencyNs = System.nanoTime() - t0;
+            if (metrics != null) {
+                metrics.recordDispatch(
+                        VectorizedStateRequest.Kind.PUT, MIXED_STATE, n, 0L, latencyNs);
+            }
+            for (int i = 0; i < putCount; i++) {
+                completePut(putReqs[i]);
+            }
+            for (int i = 0; i < delCount; i++) {
+                completeDelete(delReqs[i]);
+            }
+            // Heap-path APPEND_MERGE rows (offFutures[i] == null) committed in
+            // this same crossing; complete them now. Off-heap rows resolve via
+            // their per-state buffer flush, untouched by the mixed path.
+            for (int i = 0; i < amCount; i++) {
+                if (offFutures[i] == null) {
+                    completePut(amReqs[i]);
+                }
+            }
+        } catch (Throwable t) {
+            // R93-H1 sister: escalate engine panics to the fatal handler so a
+            // poisoned engine never keeps serving writes.
+            if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                fatalHandler.onFatalError(panicErr);
+            }
+            // PR-A10 / S1-9 + R21-H1 sister: drain EVERY row this crossing
+            // covered (put + delete + heap-merge) so no per-row future hangs,
+            // marking each first so outer catches skip duplicate completion.
+            for (int i = 0; i < putCount; i++) {
+                try {
+                    c.markCompletedExceptionally(putReqs[i]);
+                    completePutExceptionally(putReqs[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
+                }
+            }
+            for (int i = 0; i < delCount; i++) {
+                try {
+                    c.markCompletedExceptionally(delReqs[i]);
+                    completeDeleteExceptionally(delReqs[i], t);
+                } catch (Throwable ignore) {
+                    // continue draining the rest
+                }
+            }
+            for (int i = 0; i < amCount; i++) {
+                if (offFutures[i] != null) {
+                    continue;
+                }
+                try {
+                    c.markCompletedExceptionally(amReqs[i]);
+                    completePutExceptionally(amReqs[i], t);
                 } catch (Throwable ignore) {
                     // continue draining the rest
                 }
@@ -2587,6 +2524,22 @@ public class VectorizedExecutor implements StateExecutor {
     protected void invokeVectorizedBatchDelete(
             MemorySegment keyOffsetsSeg, MemorySegment keyDataSeg, long count) {
         linker.vectorizedBatchDelete(db, cf, keyOffsetsSeg, keyDataSeg, count);
+    }
+
+    /**
+     * Stage-3 Unit-2 test seam: invoked from {@link #executeMixedWrites(VectorizedClassifier)}.
+     * Production impl forwards to {@link ForStRsLinker#vectorizedBatchMixed}; tests may override
+     * to capture segments (zero-copy assertion) or throw (per-row failure propagation).
+     */
+    protected void invokeVectorizedBatchMixed(
+            MemorySegment kindsSeg,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            MemorySegment valOffsetsSeg,
+            MemorySegment valDataSeg,
+            long count) {
+        linker.vectorizedBatchMixed(
+                db, cf, kindsSeg, keyOffsetsSeg, keyDataSeg, valOffsetsSeg, valDataSeg, count);
     }
 
     /**

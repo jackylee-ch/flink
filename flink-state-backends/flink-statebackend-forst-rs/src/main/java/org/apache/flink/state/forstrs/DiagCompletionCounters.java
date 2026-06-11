@@ -100,6 +100,21 @@ public final class DiagCompletionCounters {
         NAMED.computeIfAbsent(name, k -> new java.util.concurrent.atomic.AtomicLong()).incrementAndGet();
     }
 
+    /**
+     * Stage-3 Unit-2: adds {@code delta} to an auxiliary named counter (e.g. {@code
+     * mixedBatchOps} aggregates per-batch row counts; {@code named} alone would only count
+     * batches). Appears in {@link #report()} as {@code name=N}.
+     */
+    public static void namedAdd(String name, long delta) {
+        NAMED.computeIfAbsent(name, k -> new java.util.concurrent.atomic.AtomicLong()).addAndGet(delta);
+    }
+
+    /** Reads a named counter (0 when never incremented). Test/diagnostic accessor. */
+    public static long namedValue(String name) {
+        java.util.concurrent.atomic.AtomicLong v = NAMED.get(name);
+        return v == null ? 0L : v.get();
+    }
+
     /** Test hook. */
     static void resetForTests() {
         for (int i = 0; i < N; i++) {

@@ -91,6 +91,75 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     /** Buffer for ITER_RANGE requests. Wired to FFI in P9. */
     private IterRangeBatchBuffer iterRangeBuffer;
 
+    // -----------------------------------------------------------------
+    // Stage-3 Unit-2 (two-regime design §3.4 / §8): MIXED write staging.
+    //
+    // When {@link #setMixedStaging(boolean) mixed staging} is enabled
+    // (env FRS_RS_MIXED_BATCH=true, wired by
+    // {@link VectorizedExecutor#createRequestContainer}), PUT / DELETE /
+    // heap-path APPEND_MERGE rows are serialized ONCE, in OFFER ORDER,
+    // into a single shared column pair ({@link #mixedKeys} /
+    // {@link #mixedValues}) plus a parallel off-heap {@code kinds} byte
+    // column ({@code 0}=Delete, {@code 1}=Put, {@code 2}=Merge — the
+    // engine OpType discriminants). The executor then commits the whole
+    // write set with ONE {@code frs_vectorized_batch_mixed} crossing.
+    //
+    // ZERO-COPY: the FFI consumes these segments directly — no byte[]
+    // round-trip, no dispatch-time column concatenation. The kinds byte
+    // is written at classification time (per-op, no boxing).
+    //
+    // Per-kind bookkeeping (putRequests/deleteRequests/appendMergeRequests
+    // + counts) is UNCHANGED — only the DATA columns are unified. The
+    // per-kind row-index arrays below map each kind's i-th request to its
+    // row in the mixed columns so the ordering-hazard checks
+    // (VectorizedExecutor#requiresOrderedDispatch) keep their exact
+    // semantics over the unified column.
+    //
+    // Delete rows append an EMPTY value slice (engine contract: a
+    // non-empty delete value is BatchHeaderMalformed).
+    // -----------------------------------------------------------------
+
+    /** Engine OpType discriminants for the mixed-batch kinds column. */
+    public static final byte MIXED_KIND_DELETE = 0;
+
+    public static final byte MIXED_KIND_PUT = 1;
+    public static final byte MIXED_KIND_MERGE = 2;
+
+    private static final int MIXED_KINDS_INIT_CAPACITY = 4096;
+
+    /** Whether THIS batch stages writes into the mixed columns. Set per batch; reset() clears. */
+    private boolean mixedStaging;
+
+    /** Unified write key/value columns (lazily created on first enable; reused afterwards). */
+    private ColumnarBatchBuffer mixedKeys;
+
+    private ColumnarBatchBuffer mixedValues;
+
+    /** Off-heap kinds column: one byte per mixed row, engine OpType discriminant. */
+    private java.lang.foreign.MemorySegment mixedKinds;
+
+    private int mixedKindsCapacity;
+
+    /** Total rows staged into the mixed columns this batch. */
+    private int mixedRowCount;
+
+    /** Mixed-column row index of put i (parallel to {@link #putRequests}). */
+    private int[] mixedPutRows = new int[INIT_SLOTS];
+
+    /** Mixed-column row index of delete i (parallel to {@link #deleteRequests}). */
+    private int[] mixedDeleteRows = new int[INIT_SLOTS];
+
+    /**
+     * Mixed-column row indices of HEAP-path APPEND_MERGE rows (dense; off-heap rows never enter
+     * the mixed columns — they stay in their per-state {@code ListStateArrowBuffer}).
+     */
+    private int[] mixedMergeRows = new int[INIT_SLOTS];
+
+    private int mixedMergeRowCount;
+
+    /** Arena captured by {@link #initNewKindBuffers} — backs lazy mixed-column allocation. */
+    private Arena newKindArena;
+
     /**
      * Registry of state names that belong to a {@code ListState}. Used by the APPEND_MERGE guard
      * (spec §1 §a). Thread-safe; populated once per state primitive registration, not on the hot
@@ -192,6 +261,11 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
      * call multiple times with the same arena.
      */
     public void initNewKindBuffers(Arena arena) {
+        // Stage-3 Unit-2: remember the arena so the mixed write columns can be
+        // created lazily on the FIRST setMixedStaging(true) call — sync-path
+        // per-call classifiers (executeRequestSync) never enable mixed staging
+        // and therefore never pay the extra allocation.
+        this.newKindArena = arena;
         if (appendMergeBuffer == null) {
             appendMergeBuffer = new AppendMergeBatchBuffer(arena);
         }
@@ -235,6 +309,18 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         }
         appendMergeCount = 0;
         orderedCount = 0;
+        // Stage-3 Unit-2: tear down the mixed staging state. mixedStaging is
+        // re-armed per batch by the executor (createRequestContainer) so a
+        // pooled classifier never carries the mode across batches.
+        mixedStaging = false;
+        mixedRowCount = 0;
+        mixedMergeRowCount = 0;
+        if (mixedKeys != null) {
+            mixedKeys.reset();
+        }
+        if (mixedValues != null) {
+            mixedValues.reset();
+        }
         iterRequests.clear();
         if (appendMergeBuffer != null) {
             appendMergeBuffer.reset();
@@ -511,6 +597,113 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     /** Returns the ITER_RANGE buffer, or {@code null} if not yet initialised. */
     public IterRangeBatchBuffer iterRangeBuffer() {
         return iterRangeBuffer;
+    }
+
+    // -----------------------------------------------------------------
+    // Stage-3 Unit-2: mixed write staging API
+    // -----------------------------------------------------------------
+
+    /**
+     * Arms (or disarms) mixed write staging for THIS batch. Must be called right after {@link
+     * #reset()} and BEFORE the first {@link #offer(StateRequest)} — flipping mid-batch would split
+     * rows across the per-kind and mixed columns. Wired by {@code
+     * VectorizedExecutor.createRequestContainer} from the {@code FRS_RS_MIXED_BATCH} env gate.
+     *
+     * @throws IllegalStateException if enabling before {@link #initNewKindBuffers(Arena)}
+     */
+    public void setMixedStaging(boolean enabled) {
+        if (enabled) {
+            if (mixedRowCount > 0 || putCount > 0 || deleteCount > 0 || appendMergeCount > 0) {
+                throw new IllegalStateException(
+                        "setMixedStaging(true) must precede the first offer() of the batch");
+            }
+            ensureMixedBuffers();
+        }
+        this.mixedStaging = enabled;
+    }
+
+    /** Whether this batch stages PUT/DELETE/heap-APPEND_MERGE rows into the mixed columns. */
+    public boolean isMixedStaging() {
+        return mixedStaging;
+    }
+
+    /** Unified write key column (valid only when {@link #isMixedStaging()}). */
+    public ColumnarBatchBuffer mixedKeys() {
+        return mixedKeys;
+    }
+
+    /** Unified write value column; delete rows hold an empty slice. */
+    public ColumnarBatchBuffer mixedValues() {
+        return mixedValues;
+    }
+
+    /**
+     * Off-heap kinds column ({@code mixedRowCount} valid bytes). Handed verbatim to {@code
+     * frs_vectorized_batch_mixed} — engine OpType discriminants, written per-op at classification
+     * time.
+     */
+    public java.lang.foreign.MemorySegment mixedKindsSegment() {
+        return mixedKinds;
+    }
+
+    /** Total rows staged into the mixed columns this batch. */
+    public int mixedRowCount() {
+        return mixedRowCount;
+    }
+
+    /** Mixed-column row index per put (parallel to {@link #putRequests()}, {@code putCount} valid). */
+    public int[] mixedPutRows() {
+        return mixedPutRows;
+    }
+
+    /** Mixed-column row index per delete (parallel to {@link #deleteRequests()}). */
+    public int[] mixedDeleteRows() {
+        return mixedDeleteRows;
+    }
+
+    /** Mixed-column row indices of heap-path APPEND_MERGE rows (dense). */
+    public int[] mixedMergeRows() {
+        return mixedMergeRows;
+    }
+
+    /** Number of heap-path APPEND_MERGE rows staged into the mixed columns. */
+    public int mixedMergeRowCount() {
+        return mixedMergeRowCount;
+    }
+
+    private void ensureMixedBuffers() {
+        if (mixedKeys != null) {
+            return;
+        }
+        if (newKindArena == null) {
+            throw new IllegalStateException(
+                    "Mixed write staging requires initNewKindBuffers(Arena) first");
+        }
+        mixedKeys = new ColumnarBatchBuffer(newKindArena);
+        mixedValues = new ColumnarBatchBuffer(newKindArena);
+        mixedKinds = newKindArena.allocate(MIXED_KINDS_INIT_CAPACITY);
+        mixedKindsCapacity = MIXED_KINDS_INIT_CAPACITY;
+    }
+
+    /** Appends one kind byte; returns the mixed row index it occupies. */
+    private int appendMixedKind(byte kind) {
+        if (mixedRowCount >= mixedKindsCapacity) {
+            int newCap = mixedKindsCapacity << 1;
+            java.lang.foreign.MemorySegment grown = newKindArena.allocate(newCap);
+            java.lang.foreign.MemorySegment.copy(mixedKinds, 0L, grown, 0L, mixedRowCount);
+            mixedKinds = grown;
+            mixedKindsCapacity = newCap;
+        }
+        int row = mixedRowCount++;
+        mixedKinds.set(java.lang.foreign.ValueLayout.JAVA_BYTE, row, kind);
+        return row;
+    }
+
+    private static int[] ensureRowSlot(int[] rows, int index) {
+        if (index < rows.length) {
+            return rows;
+        }
+        return Arrays.copyOf(rows, rows.length << 1);
     }
 
     /**
@@ -836,6 +1029,18 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
     private <K, N, V> void recordPut(
             ForStRsInnerTable<K, N, V> table, StateRequest<K, N, ?, ?> request) {
         ensurePutCapacity();
+        if (mixedStaging) {
+            // Stage-3 Unit-2: serialize ONCE into the unified write columns, in
+            // offer order; per-kind request bookkeeping is unchanged.
+            table.serializeKeyInto(request, mixedKeys);
+            table.serializeValueInto(request, mixedValues);
+            int row = appendMixedKind(MIXED_KIND_PUT);
+            mixedPutRows = ensureRowSlot(mixedPutRows, putCount);
+            mixedPutRows[putCount] = row;
+            putRequests[putCount] = request;
+            putCount++;
+            return;
+        }
         table.serializeKeyInto(request, putKeys);
         table.serializeValueInto(request, putValues);
         putRequests[putCount] = request;
@@ -918,6 +1123,20 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
                     "ForSt-RS onClear flush failed (checked exception wrapped)", t);
         }
         ensureDeleteCapacity();
+        if (mixedStaging) {
+            // Stage-3 Unit-2: delete row in the unified columns. Engine
+            // contract: a Delete row MUST carry an EMPTY value slice
+            // (value_offsets[i] == value_offsets[i+1]) — appendEmpty keeps the
+            // value column index-aligned without bytes.
+            table.serializeKeyInto(request, mixedKeys);
+            mixedValues.appendEmpty();
+            int row = appendMixedKind(MIXED_KIND_DELETE);
+            mixedDeleteRows = ensureRowSlot(mixedDeleteRows, deleteCount);
+            mixedDeleteRows[deleteCount] = row;
+            deleteRequests[deleteCount] = request;
+            deleteCount++;
+            return;
+        }
         table.serializeKeyInto(request, deleteKeys);
         deleteRequests[deleteCount] = request;
         deleteCount++;
@@ -1029,6 +1248,30 @@ public class VectorizedClassifier implements AsyncRequestContainer<StateRequest<
         // payloads only; null payload routes to recordDelete (preserving previous behavior).
         if (request.getPayload() == null) {
             recordDelete(table, request);
+            return;
+        }
+        // Stage-3 Unit-2: heap-path APPEND_MERGE row in mixed staging — the
+        // pre-encoded merge operand (serializeValueInto yields the SAME bytes
+        // dispatchAppendMergeBatch would hand to frs_vec_merge_append_batch)
+        // becomes a kind=2 row in the unified columns; the engine writes an
+        // OpType::Merge entry, identical semantics, but committed in the ONE
+        // mixed crossing. No AppendMergeBatchBuffer staging and no per-row
+        // CompletableFuture: the executor completes appendMergeRequests[i]
+        // (offHeapAppendMergeFutures[i] == null marks heap rows) directly
+        // after the mixed FFI call.
+        if (mixedStaging) {
+            ensureAppendMergeCapacity();
+            table.serializeKeyInto(request, mixedKeys);
+            table.serializeValueInto(request, mixedValues);
+            int row = appendMixedKind(MIXED_KIND_MERGE);
+            mixedMergeRows = ensureRowSlot(mixedMergeRows, mixedMergeRowCount);
+            mixedMergeRows[mixedMergeRowCount] = row;
+            mixedMergeRowCount++;
+            appendMergeRequests[appendMergeCount] = request;
+            ensureOffHeapAppendMergeCapacity();
+            offHeapAppendMergeFutures[appendMergeCount] = null;
+            offHeapAppendMergeStates[appendMergeCount] = null;
+            appendMergeCount++;
             return;
         }
         // B6-H1: flow the heap-path key + value bytes directly through the column buffers via

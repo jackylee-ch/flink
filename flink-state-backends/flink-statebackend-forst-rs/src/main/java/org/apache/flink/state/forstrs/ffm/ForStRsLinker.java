@@ -325,6 +325,11 @@ public final class ForStRsLinker {
     private final MethodHandle frsVectorizedBatchGet;
     private final MethodHandle frsVectorizedBatchPut;
     private final MethodHandle frsVectorizedBatchDelete;
+    // Stage-3 Unit-2 (two-regime design §3.4): MIXED put/delete/merge batch —
+    // one FFI crossing + ONE atomic engine sequence allocation for an
+    // interleaved write batch. Requires a dylib built from engine commit
+    // b5b85a9b9 or later (frs_vectorized_batch_mixed).
+    private final MethodHandle frsVectorizedBatchMixed;
 
     // --- 6c. Explicit WriteBatch (SP4) — Java-held handle for atomic batches.
     private final MethodHandle frsWritebatchOpen;
@@ -926,6 +931,36 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // key_data
                                 ValueLayout.JAVA_LONG, // key_data_len
                                 ValueLayout.JAVA_LONG)); // count
+
+        // Native signature (frs_vectorized_batch_mixed) — Stage-3 Unit-2:
+        //   int frs_vectorized_batch_mixed(
+        //     FrsDb, FrsCfHandle,
+        //     *const u8 kinds, usize count,
+        //     *const i32 key_offsets, *const u8 key_data, usize key_data_len,
+        //     *const i32 value_offsets, *const u8 value_data, usize value_data_len);
+        // kinds[i]: 0 = Delete, 1 = Put, 2 = Merge (engine OpType discriminants).
+        // Delete rows MUST carry an empty value slice (value_offsets[i] ==
+        // value_offsets[i+1]); Merge rows require the CF to have a merge
+        // operator. The whole batch lands atomically with ONE sequence-range
+        // allocation; rows apply in array order (later same-key row wins).
+        // D6-H2 rationale applies verbatim: plain bind (NOT critical) — the
+        // commit path can stall on memtable-full / rate-limited flush and
+        // must not pin JVM safepoints.
+        this.frsVectorizedBatchMixed =
+                bind(
+                        "frs_vectorized_batch_mixed",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // kinds (*const u8)
+                                ValueLayout.JAVA_LONG, // count (usize)
+                                ValueLayout.ADDRESS, // key_offsets (*const i32)
+                                ValueLayout.ADDRESS, // key_data    (*const u8)
+                                ValueLayout.JAVA_LONG, // key_data_len (usize)
+                                ValueLayout.ADDRESS, // value_offsets (*const i32)
+                                ValueLayout.ADDRESS, // value_data    (*const u8)
+                                ValueLayout.JAVA_LONG)); // value_data_len (usize)
 
         // 6c. Explicit WriteBatch — Java holds a handle so it can stage cross-CF
         // puts/deletes and commit atomically.
@@ -2748,6 +2783,63 @@ public final class ForStRsLinker {
                     FrsStatus.PANIC, "frs_vectorized_batch_delete threw: " + t.getMessage());
         }
         checkVectorized(rc, "frs_vectorized_batch_delete");
+    }
+
+    /**
+     * Stage-3 Unit-2: vectorized MIXED write batch — puts, deletes, and merge-appends in ONE FFI
+     * crossing with ONE atomic engine sequence allocation.
+     *
+     * <p>Layout contract (mirrors {@code frs_vectorized_batch_mixed} in {@code
+     * crates/forst-rs-ffi/src/lib.rs}):
+     *
+     * <ul>
+     *   <li>{@code kindsSeg}: {@code count} bytes — {@code 0} = Delete, {@code 1} = Put, {@code 2}
+     *       = Merge (engine {@code OpType} discriminants, forwarded verbatim).
+     *   <li>{@code keyOffsetsSeg} / {@code keyDataSeg} and {@code valOffsetsSeg} / {@code
+     *       valDataSeg}: Arrow BinaryArray columns ({@code count + 1} i32 offsets + flat data).
+     *   <li>Delete rows MUST have an empty value slice ({@code valOffsets[i] == valOffsets[i+1]});
+     *       a non-empty delete value is rejected as {@code BatchHeaderMalformed}.
+     *   <li>Merge rows require the CF to have a merge operator (checked engine-side, lazily).
+     *   <li>Rows apply in array order under a single seq-range: a later row for the same key wins
+     *       (delete-then-put yields the put); Merge operands concatenate in row order.
+     * </ul>
+     *
+     * <p>Same non-critical bind + {@link #checkVectorized} escalation as the put/delete sisters.
+     */
+    public void vectorizedBatchMixed(
+            FrsDb db,
+            FrsCfHandle cf,
+            MemorySegment kindsSeg,
+            MemorySegment keyOffsetsSeg,
+            MemorySegment keyDataSeg,
+            MemorySegment valOffsetsSeg,
+            MemorySegment valDataSeg,
+            long count) {
+        if (OPCOUNT) {
+
+            oc(1);
+
+        }
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsVectorizedBatchMixed.invokeExact(
+                                    db.handle(),
+                                    cf.handle(),
+                                    kindsSeg,
+                                    count,
+                                    keyOffsetsSeg,
+                                    keyDataSeg,
+                                    keyDataSeg.byteSize(),
+                                    valOffsetsSeg,
+                                    valDataSeg,
+                                    valDataSeg.byteSize());
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_vectorized_batch_mixed threw: " + t.getMessage());
+        }
+        checkVectorized(rc, "frs_vectorized_batch_mixed");
     }
 
     // -----------------------------------------------------------------
