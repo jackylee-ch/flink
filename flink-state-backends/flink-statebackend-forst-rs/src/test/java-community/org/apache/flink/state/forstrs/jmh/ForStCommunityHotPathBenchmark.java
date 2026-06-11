@@ -76,6 +76,7 @@ public final class ForStCommunityHotPathBenchmark {
                 STATE_ROWS, BATCH_ROWS, PROBE_ROWS);
 
         Result openClose = measure("openClose", warmupNanos, measureNanos, ForStCommunityHotPathBenchmark::openClose);
+        Result writeBatchResult = measureWriteBatch(warmupNanos, measureNanos);
 
         Path tmp = Files.createTempDirectory("forst-community-hotpaths-");
         long opt = 0L;
@@ -157,24 +158,6 @@ public final class ForStCommunityHotPathBenchmark {
                                 }
                                 return 1L;
                             });
-            Result writeBatchResult =
-                    measure(
-                            "writeBatch",
-                            warmupNanos,
-                            measureNanos,
-                            () -> {
-                                WriteBatch.clear0(writeBatchHandle);
-                                for (int i = 0; i < BATCH_ROWS; i++) {
-                                    WriteBatch.put(
-                                            writeBatchHandle,
-                                            batchKeys[i],
-                                            batchKeys[i].length,
-                                            batchValues[i],
-                                            batchValues[i].length);
-                                }
-                                RocksDB.write0(dbHandle, writeOptionsHandle, writeBatchHandle);
-                                return BATCH_ROWS;
-                            });
             Result multiGet =
                     measureOptional(
                             "multiGet",
@@ -196,6 +179,60 @@ public final class ForStCommunityHotPathBenchmark {
             System.out.printf(
                     "variant.libpath %s%n",
                     System.getProperty("org.forstdb.libpath", "<via java.library.path>"));
+        } finally {
+            if (writeBatch != 0L) {
+                WriteBatch.disposeInternal(writeBatch);
+            }
+            if (writeOpt != 0L) {
+                WriteOptions.disposeInternal(writeOpt);
+            }
+            if (db != 0L) {
+                RocksDB.closeDatabase(db);
+            }
+            if (opt != 0L) {
+                Options.disposeInternal(opt);
+            }
+            deleteRecursively(tmp);
+        }
+    }
+
+    private static Result measureWriteBatch(long warmupNanos, long measureNanos) throws Exception {
+        Path tmp = Files.createTempDirectory("forst-community-batch-put-");
+        long opt = 0L;
+        long db = 0L;
+        long writeOpt = 0L;
+        long writeBatch = 0L;
+        try {
+            opt = Options.newOptions();
+            Options.setCreateIfMissing(opt, true);
+            db = RocksDB.open(opt, tmp.toString());
+            if (db == 0L) {
+                throw new IllegalStateException("failed to open community ForSt DB for writeBatch");
+            }
+            writeOpt = WriteOptions.newWriteOptions();
+            writeBatch = WriteBatch.newWriteBatch(BATCH_ROWS * 128);
+            final long dbHandle = db;
+            final long writeOptionsHandle = writeOpt;
+            final long writeBatchHandle = writeBatch;
+            byte[][] batchKeys = keys("batch/q4", BATCH_ROWS);
+            byte[][] batchValues = values(BATCH_ROWS, 96);
+            return measure(
+                    "writeBatch",
+                    warmupNanos,
+                    measureNanos,
+                    () -> {
+                        WriteBatch.clear0(writeBatchHandle);
+                        for (int i = 0; i < BATCH_ROWS; i++) {
+                            WriteBatch.put(
+                                    writeBatchHandle,
+                                    batchKeys[i],
+                                    batchKeys[i].length,
+                                    batchValues[i],
+                                    batchValues[i].length);
+                        }
+                        RocksDB.write0(dbHandle, writeOptionsHandle, writeBatchHandle);
+                        return BATCH_ROWS;
+                    });
         } finally {
             if (writeBatch != 0L) {
                 WriteBatch.disposeInternal(writeBatch);

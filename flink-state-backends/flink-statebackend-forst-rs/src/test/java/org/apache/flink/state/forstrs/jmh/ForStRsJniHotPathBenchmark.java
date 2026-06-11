@@ -70,6 +70,7 @@ public final class ForStRsJniHotPathBenchmark {
                 STATE_ROWS, BATCH_ROWS, PROBE_ROWS, PREFIX_ROWS);
 
         Result openClose = measure("openClose", warmupNanos, measureNanos, ForStRsJniHotPathBenchmark::openClose);
+        Result batchPut = measureBatchPut(warmupNanos, measureNanos);
 
         Path tmp = Files.createTempDirectory("forst-rs-jni-hotpaths-");
         long db = 0L;
@@ -153,15 +154,6 @@ public final class ForStRsJniHotPathBenchmark {
                                 }
                                 return 1L;
                             });
-            Result batchPut =
-                    measure(
-                            "batchPut",
-                            warmupNanos,
-                            measureNanos,
-                            () -> {
-                                RocksDB.writeBatch(dbHandle, cfHandle, batchKeys, batchValues);
-                                return BATCH_ROWS;
-                            });
             Result batchGet =
                     measure(
                             "batchGet",
@@ -212,6 +204,35 @@ public final class ForStRsJniHotPathBenchmark {
             System.out.printf(
                     "variant.libpath %s%n",
                     System.getProperty("org.forstdb.libpath", "<via java.library.path>"));
+        } finally {
+            if (db != 0L) {
+                RocksDB.close(db);
+            }
+            deleteRecursively(tmp);
+        }
+    }
+
+    private static Result measureBatchPut(long warmupNanos, long measureNanos) throws Exception {
+        Path tmp = Files.createTempDirectory("forst-rs-jni-batch-put-");
+        long db = 0L;
+        try {
+            db = RocksDB.open(tmp.toString());
+            long cf = RocksDB.getDefaultColumnFamily(db);
+            if (db == 0L || cf == 0L) {
+                throw new IllegalStateException("failed to open ForSt-RS JNI DB for batchPut");
+            }
+            final long dbHandle = db;
+            final long cfHandle = cf;
+            byte[][] batchKeys = keys("batch/q4", BATCH_ROWS);
+            byte[][] batchValues = values(BATCH_ROWS, 96);
+            return measure(
+                    "batchPut",
+                    warmupNanos,
+                    measureNanos,
+                    () -> {
+                        RocksDB.writeBatch(dbHandle, cfHandle, batchKeys, batchValues);
+                        return BATCH_ROWS;
+                    });
         } finally {
             if (db != 0L) {
                 RocksDB.close(db);
