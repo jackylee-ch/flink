@@ -321,6 +321,14 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      */
     @Override
     public StateFuture<Void> asyncAdd(V value) {
+        // B-SPIKE (per-batch-buffer-ownership §2): bypass the RMW cache under the PIPELINED
+        // executor — mailbox-folded accumulators + flushHandler mailbox engine writes are the
+        // same lockstep-only staging pattern as the Map/List buffers. With the cache never
+        // written, all other cache consults degrade to no-ops. See
+        // ForStRsAsyncAggregatingStateV2#asyncAdd for the identical gate.
+        if (ForStRsMapStateV2.pipelinedExecutorActive()) {
+            return super.asyncAdd(value);
+        }
         if (value == null) {
             return StateFutureUtils.completedVoidFuture();
         }

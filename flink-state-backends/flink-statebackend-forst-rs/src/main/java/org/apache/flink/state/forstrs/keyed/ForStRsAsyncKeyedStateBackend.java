@@ -1035,8 +1035,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 // AsyncListStateV2 so the classifier's APPEND_MERGE routing goes through the
                 // off-heap fast path (skips the heap-byte[] AppendMergeBatchBuffer). Register
                 // the instance so the snapshot pre-hook drains its accumulator.
+                // B-SPIKE (per-batch-buffer-ownership §2): no per-state staging accumulator
+                // under the pipelined executor — the worker-side flushIfDirty drain would race
+                // mailbox appends. Null buffer = the heap APPEND_MERGE path via the classifier's
+                // per-batch-private AppendMergeBatchBuffer (recordAppendMergeOffHeap returns
+                // null → caller falls back; flushPreSnapshot no-ops).
                 org.apache.flink.state.forstrs.state.ListStateArrowBuffer listBuf =
-                        new org.apache.flink.state.forstrs.state.ListStateArrowBuffer();
+                        org.apache.flink.state.forstrs.state.ForStRsMapStateV2
+                                        .pipelinedExecutorActive()
+                                ? null
+                                : new org.apache.flink.state.forstrs.state.ListStateArrowBuffer();
                 ForStRsAsyncListStateV2<K, N, ?> listStateV2 =
                         new ForStRsAsyncListStateV2<>(
                                 stateRequestHandler,

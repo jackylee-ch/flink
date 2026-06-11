@@ -189,6 +189,14 @@ public class ForStRsAsyncAggregatingStateV2<K, N, IN, ACC, OUT>
      */
     @Override
     public StateFuture<Void> asyncAdd(IN value) {
+        // B-SPIKE (per-batch-buffer-ownership §2): under the PIPELINED executor the RMW cache
+        // is a third staging mechanism (mailbox-folded accumulators + flushHandler engine
+        // writes from the mailbox) — the same lockstep-only pattern as the Map/List staging
+        // buffers. Bypass the cache write path; with the cache never written, every other
+        // cache consult (asyncGet probe, flushOnBarrier, onClear gen) degrades to a no-op.
+        if (ForStRsMapStateV2.pipelinedExecutorActive()) {
+            return super.asyncAdd(value);
+        }
         if (value == null) {
             return StateFutureUtils.completedVoidFuture();
         }

@@ -132,6 +132,24 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
                     // gate-driven (q11 passed 134.7s WITH cache off).
                     || parallelExecutorActive();
 
+    /**
+     * B-SPIKE (2026-06-11, per-batch-buffer-ownership design §2): {@code true} when the
+     * PIPELINED executor is selected ({@code FRS_RS_EXECUTOR=routing-async}). Pipelined modes
+     * overlap the mailbox offer phase with worker batch execution, so the per-state staging
+     * buffers (MapStateArrowBuffer / ListStateArrowBuffer) — whose threading contract is
+     * lockstep-single-threaded — MUST NOT be used: MapState's watermark drain issues
+     * mailbox-direct engine writes that overtake queued worker reads (the q8@100M canary
+     * wedge/−58%), and ListState's buffer is drained worker-side while the mailbox appends.
+     * With the buffers off, all state effects flow through the classifier's per-batch-private
+     * buffers (PUT→DELETE→GET→ITER order = same-batch read-your-writes; per-worker kg-FIFO =
+     * cross-batch ordering). Lockstep modes (inline/routing/adaptive) keep the buffers.
+     * Approach A (sharded seal/swap staging) will restore staging under pipelining.
+     */
+    public static boolean pipelinedExecutorActive() {
+        String m = System.getenv("FRS_RS_EXECUTOR");
+        return m != null && m.trim().equals("routing-async");
+    }
+
     private static boolean parallelExecutorActive() {
         String m = System.getenv("FRS_RS_EXECUTOR");
         if (m != null) {
@@ -266,7 +284,11 @@ public class ForStRsMapStateV2<K, N, UK, UV> extends AbstractMapState<K, N, UK, 
         this.linker = linker;
         this.db = db;
         this.cf = cf;
-        this.offHeapBuf = (linker != null && db != null && cf != null) ? new MapStateArrowBuffer() : null;
+        // B-SPIKE: no staging buffer under the pipelined executor (see pipelinedExecutorActive).
+        this.offHeapBuf =
+                (linker != null && db != null && cf != null && !pipelinedExecutorActive())
+                        ? new MapStateArrowBuffer()
+                        : null;
     }
 
     // -----------------------------------------------------------------
