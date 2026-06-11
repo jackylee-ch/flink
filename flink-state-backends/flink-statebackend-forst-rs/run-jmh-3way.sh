@@ -148,6 +148,8 @@ case "$VARIANT" in
     SRCS=(
       "$SRC_DIR/org/forstdb/RocksDB.java"
       "$SRC_DIR/org/forstdb/Options.java"
+      "$SRC_DIR/org/forstdb/DBOptions.java"
+      "$SRC_DIR/org/forstdb/ColumnFamilyOptions.java"
       "$SRC_DIR/org/forstdb/FlushOptions.java"
       "$SRC_DIR/org/forstdb/WriteOptions.java"
       "$SRC_DIR/org/forstdb/WriteBatch.java"

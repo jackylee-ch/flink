@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.jmh;
 
+import org.forstdb.ColumnFamilyOptions;
+import org.forstdb.DBOptions;
 import org.forstdb.FlushOptions;
 import org.forstdb.Options;
 import org.forstdb.RocksDB;
@@ -128,22 +130,26 @@ public final class ForStCommunityBenchmark {
                 maxBackgroundFlushes);
 
         Path tmp = Files.createTempDirectory("forst-community-bench-");
-        long opt = 0L, db = 0L, flushOpt = 0L, writeOpt = 0L, writeBatch = 0L;
+        long opt = 0L, dbOpt = 0L, cfOpt = 0L, db = 0L, flushOpt = 0L, writeOpt = 0L, writeBatch = 0L;
         try {
-            opt = Options.newOptions();
+            if (writeBufferSize > 0 || maxWriteBufferNumber > 0 || maxBackgroundCompactions > 0 || maxBackgroundFlushes > 0) {
+                dbOpt = DBOptions.newDBOptions();
+                cfOpt = ColumnFamilyOptions.newColumnFamilyOptions();
+                if (writeBufferSize > 0) {
+                    ColumnFamilyOptions.setWriteBufferSize(cfOpt, writeBufferSize);
+                }
+                if (maxWriteBufferNumber > 0) {
+                    ColumnFamilyOptions.setMaxWriteBufferNumber(cfOpt, maxWriteBufferNumber);
+                }
+                int maxBackgroundJobs = maxBackgroundCompactions + maxBackgroundFlushes;
+                if (maxBackgroundJobs > 0) {
+                    DBOptions.setMaxBackgroundJobs(dbOpt, maxBackgroundJobs);
+                }
+                opt = Options.newOptions(dbOpt, cfOpt);
+            } else {
+                opt = Options.newOptions();
+            }
             Options.setCreateIfMissing(opt, true);
-            if (writeBufferSize > 0) {
-                Options.setWriteBufferSize(opt, writeBufferSize);
-            }
-            if (maxWriteBufferNumber > 0) {
-                Options.setMaxWriteBufferNumber(opt, maxWriteBufferNumber);
-            }
-            if (maxBackgroundCompactions > 0) {
-                Options.setMaxBackgroundCompactions(opt, maxBackgroundCompactions);
-            }
-            if (maxBackgroundFlushes > 0) {
-                Options.setMaxBackgroundFlushes(opt, maxBackgroundFlushes);
-            }
             db = RocksDB.open(opt, tmp.toString());
             if (db == 0L) {
                 throw new IllegalStateException("community RocksDB.open returned 0");
@@ -319,6 +325,20 @@ public final class ForStCommunityBenchmark {
                 }
             } catch (Throwable t) {
                 System.err.println("[teardown] opt dispose threw: " + t);
+            }
+            try {
+                if (cfOpt != 0L) {
+                    ColumnFamilyOptions.disposeInternal(cfOpt);
+                }
+            } catch (Throwable t) {
+                System.err.println("[teardown] cfOpt dispose threw: " + t);
+            }
+            try {
+                if (dbOpt != 0L) {
+                    DBOptions.disposeInternal(dbOpt);
+                }
+            } catch (Throwable t) {
+                System.err.println("[teardown] dbOpt dispose threw: " + t);
             }
             try {
                 Files.walk(tmp)
