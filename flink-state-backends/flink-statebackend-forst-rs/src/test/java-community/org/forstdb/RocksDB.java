@@ -111,6 +111,24 @@ public class RocksDB {
     public static native byte[] get(
             long handle, long readOptionsHandle, byte[] key, int keyOff, int keyLen, long cfHandle);
 
+    // -- multiGet: declare overloads to force long-form JNI symbol lookup.
+    public static native byte[][] multiGet(
+            long handle, byte[][] keys, int[] offsets, int[] lengths);
+
+    public static native byte[][] multiGet(
+            long handle, byte[][] keys, int[] offsets, int[] lengths, long[] cfHandles);
+
+    public static native byte[][] multiGet(
+            long handle, long readOptionsHandle, byte[][] keys, int[] offsets, int[] lengths);
+
+    public static native byte[][] multiGet(
+            long handle,
+            long readOptionsHandle,
+            byte[][] keys,
+            int[] offsets,
+            int[] lengths,
+            long[] cfHandles);
+
     // -- delete: 4 overloads. We don't actually call delete in the bench.
     public static native void delete(long handle, byte[] key, int keyOff, int keyLen)
             throws Exception;

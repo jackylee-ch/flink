@@ -44,6 +44,9 @@ public class RocksDB {
     // Lifecycle
     public static native long open(String path);
 
+    /** Declared to force long-form JNI lookup for {@link #open(String)}. */
+    public static native long open(long optionsHandle, String path);
+
     public static native void close(long handle);
 
     public static native boolean isClosed(long handle);
@@ -103,6 +106,41 @@ public class RocksDB {
     // in lock-step; arrays MUST have equal length or an exception is thrown.
     public static native void batchPut(long handle, long cfHandle, byte[][] keys, byte[][] values);
 
+    public static native byte[][] batchGet(long handle, long cfHandle, byte[][] keys);
+
     public static native void writeBatch(
             long handle, long cfHandle, byte[][] keys, byte[][] values);
+
+    public static native byte[][] multiGet(
+            long handle, byte[][] keys, int[] offsets, int[] lengths);
+
+    public static native byte[][] multiGet(
+            long handle, byte[][] keys, int[] offsets, int[] lengths, long[] cfHandles);
+
+    public static native byte[][] multiGet(
+            long handle, long readOptionsHandle, byte[][] keys, int[] offsets, int[] lengths);
+
+    public static native byte[][] multiGet(
+            long handle,
+            long readOptionsHandle,
+            byte[][] keys,
+            int[] offsets,
+            int[] lengths,
+            long[] cfHandles);
+
+    // Prefix and full-CF iterator helpers used by benchmark-only hot-path coverage.
+    public static native long prefixLookupOpen(
+            long handle, long cfHandle, byte[] prefix, int prefixOff, int prefixLen);
+
+    public static native byte[][] prefixLookupNext(long iterHandle);
+
+    public static native void prefixLookupClose(long iterHandle);
+
+    public static native long iteratorOpen(long handle, long cfHandle);
+
+    public static native void iteratorSeek(long iterHandle, byte[] key, int keyOff, int keyLen);
+
+    public static native byte[][] iteratorNext(long iterHandle);
+
+    public static native void iteratorClose(long iterHandle);
 }

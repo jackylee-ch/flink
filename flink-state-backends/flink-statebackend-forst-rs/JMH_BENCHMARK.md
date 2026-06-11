@@ -52,7 +52,9 @@ variant flag.
 | `src/test/java-community/org/forstdb/{RocksDB,Options,FlushOptions,Status,RocksDBException}.java` | Java mirrors for the community cdylib |
 | `src/test/java-community/org/apache/flink/state/forstrs/jmh/ForStCommunityBenchmark.java` | Bench class for the community variant |
 | `src/test/java-rocksdb/org/apache/flink/state/forstrs/jmh/RocksDbJniBenchmark.java` | Bench class for the canonical RocksDB-via-JNI variant |
-| `run-jmh-3way.sh` | Compile-and-run wrapper (variants: `forst-rs`, `forst-rs-ffm`, `forst`, `rocksdb-jni`) |
+| `src/test/java/org/apache/flink/state/forstrs/jmh/ForStRsJniHotPathBenchmark.java` | ForSt-RS compat-JNI interface matrix for ForStBackend-shaped hot paths |
+| `src/test/java-community/org/apache/flink/state/forstrs/jmh/ForStCommunityHotPathBenchmark.java` | Community ForSt JNI interface matrix for the same supported hot paths |
+| `run-jmh-3way.sh` | Compile-and-run wrapper (variants: `forst-rs`, `forst-rs-ffm`, `forst`, `rocksdb-jni`; optional mode: `throughput` or `hotpaths`) |
 
 The two `org.forstdb.RocksDB` classes intentionally share package + class
 name — the JNI mangler couples C symbol names to package + class, so we
@@ -160,7 +162,37 @@ JAVA_HOME=/path/to/jdk25 ./run-jmh-3way.sh forst-rs
 ```
 
 Results are written both to stdout and to
-`/tmp/jmh-results-{forst-rs,forst-rs-ffm,forst}.txt`.
+`/tmp/jmh-results-<variant>-<mode>-<preset>.txt`.
+
+## Hot-path JNI matrix
+
+The default runner mode keeps the original throughput benchmark. Pass
+`hotpaths` as the second argument to exercise a broader ForStBackend-shaped
+interface matrix:
+
+```sh
+FORST_RS_LIB=/private/tmp/forst-compat-jni-forst-backend/target/release/libforst_rs_ffi.dylib \
+  BENCH_WARMUP_S=1 BENCH_MEASURE_S=2 ./run-jmh-3way.sh forst-rs hotpaths
+
+BENCH_WARMUP_S=1 BENCH_MEASURE_S=2 ./run-jmh-3way.sh forst hotpaths
+```
+
+The ForSt-RS JNI hot-path class reports open/close, point get, point put,
+delete-then-miss, batchPut, batchGet, multiGet, prefixScan, and
+flush/compact/read. The community ForSt JNI class reports the same supported
+subset: open/close, point get, point put, delete-then-miss, WriteBatch, and
+multiGet when the community JNI symbol resolves locally. Unsupported community
+symbols are printed as `unsupported`.
+
+ForSt-RS FFI is measured in the ForSt repository by:
+
+```sh
+cargo bench -p forst-rs-bench --bench compat_jni_forst_backend_hotpaths -- --noplot
+```
+
+Interpretation rule: use `forst-rs hotpaths` vs `forst hotpaths` as the primary
+Java/JNI comparison; use the Rust FFI criterion results as the native ceiling to
+decide whether a weak Java result is caused by JNI translation or the engine.
 
 ## 4-way Java-layer comparison (M1 Pro, JDK 25.0.3, --release build, 6s warmup + 25s measure)
 

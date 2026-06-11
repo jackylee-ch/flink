@@ -21,7 +21,7 @@
 # Maven artifact, using a freshly compiled classpath from the bench source —
 # no Maven build of the surrounding Flink module, no toolchain dance.
 #
-# Usage:  ./run-jmh-3way.sh (forst-rs|forst-rs-ffm|forst|rocksdb-jni)
+# Usage:  ./run-jmh-3way.sh (forst-rs|forst-rs-ffm|forst|rocksdb-jni) [throughput|hotpaths]
 #
 # Env overrides:
 #   FORST_RS_LIB        cdylib for the "forst-rs" / "forst-rs-ffm" variants
@@ -33,6 +33,15 @@
 set -euo pipefail
 
 VARIANT="${1:-forst-rs}"
+BENCH_KIND="${2:-throughput}"
+case "$BENCH_KIND" in
+  throughput|hotpaths)
+    ;;
+  *)
+    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst|rocksdb-jni) [throughput|hotpaths]" >&2
+    exit 2
+    ;;
+esac
 ROCKSDB_JNI_VERSION="${ROCKSDB_JNI_VERSION:-8.11.4}"
 ROCKSDB_JNI_JAR="${HOME}/.m2/repository/org/rocksdb/rocksdbjni/${ROCKSDB_JNI_VERSION}/rocksdbjni-${ROCKSDB_JNI_VERSION}.jar"
 case "$VARIANT" in
@@ -48,7 +57,7 @@ case "$VARIANT" in
     LIB="$ROCKSDB_JNI_JAR"
     ;;
   *)
-    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst|rocksdb-jni)" >&2
+    echo "Usage: $0 (forst-rs|forst-rs-ffm|forst|rocksdb-jni) [throughput|hotpaths]" >&2
     exit 2
     ;;
 esac
@@ -104,9 +113,14 @@ case "$VARIANT" in
     SRCS=(
       "$SRC_DIR/org/forstdb/RocksDB.java"
       "$SRC_DIR/org/forstdb/RocksDBException.java"
-      "$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCompareBenchmark.java"
     )
-    MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCompareBenchmark"
+    if [ "$BENCH_KIND" = hotpaths ]; then
+      SRCS+=("$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStRsJniHotPathBenchmark.java")
+      MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStRsJniHotPathBenchmark"
+    else
+      SRCS+=("$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCompareBenchmark.java")
+      MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCompareBenchmark"
+    fi
     ;;
   forst-rs-ffm)
     # The FFM bench depends on the production ForStRsLinker + FrsDb/Cf/Iterator
@@ -139,9 +153,14 @@ case "$VARIANT" in
       "$SRC_DIR/org/forstdb/WriteBatch.java"
       "$SRC_DIR/org/forstdb/Status.java"
       "$SRC_DIR/org/forstdb/RocksDBException.java"
-      "$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCommunityBenchmark.java"
     )
-    MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCommunityBenchmark"
+    if [ "$BENCH_KIND" = hotpaths ]; then
+      SRCS+=("$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCommunityHotPathBenchmark.java")
+      MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCommunityHotPathBenchmark"
+    else
+      SRCS+=("$SRC_DIR/org/apache/flink/state/forstrs/jmh/ForStCommunityBenchmark.java")
+      MAIN_CLASS="org.apache.flink.state.forstrs.jmh.ForStCommunityBenchmark"
+    fi
     ;;
   rocksdb-jni)
     # The canonical org.rocksdb:rocksdbjni Maven artifact ships the full Java
@@ -155,6 +174,11 @@ case "$VARIANT" in
     MAIN_CLASS="org.apache.flink.state.forstrs.jmh.RocksDbJniBenchmark"
     ;;
 esac
+
+if [ "$BENCH_KIND" = hotpaths ] && [ "$VARIANT" != forst-rs ] && [ "$VARIANT" != forst ]; then
+  echo "hotpaths mode is currently supported for forst-rs and forst variants" >&2
+  exit 2
+fi
 
 mkdir -p "$OUT_DIR"
 # FFM (Arena, Linker, MemorySegment, ...) became stable only in JDK 22, so the
@@ -224,8 +248,8 @@ case "$VARIANT" in
     ;;
 esac
 
-echo "[run] variant=$VARIANT preset=$PRESET lib=$LIB main=$MAIN_CLASS"
-RESULT_FILE="/tmp/jmh-results-$VARIANT-$PRESET.txt"
+echo "[run] variant=$VARIANT kind=$BENCH_KIND preset=$PRESET lib=$LIB main=$MAIN_CLASS"
+RESULT_FILE="/tmp/jmh-results-$VARIANT-$BENCH_KIND-$PRESET.txt"
 "$JAVA_HOME/bin/java" \
   --enable-native-access=ALL-UNNAMED \
   --add-modules jdk.incubator.vector \
