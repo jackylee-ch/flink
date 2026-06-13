@@ -305,6 +305,27 @@ public class ForStRsRestoreOperation {
         if (fastPath) {
             return restoreNoRescaling(incHandles.get(0));
         }
+
+        // FRS-PHASE2-C2U3 rescale-by-clip: when DOWN-scaling from a SINGLE
+        // LINK-mode source whose key-group range strictly CONTAINS this
+        // subtask's assigned range, adopt only the assigned sub-range from the
+        // linked checkpoint (zero download, zero row-by-row copy) instead of
+        // the generic rescaling path. Multi-source rescale (range merge) and
+        // upload-mode handles fall through to restoreWithRescaling unchanged.
+        if (incHandles.size() == 1) {
+            IncrementalRemoteKeyedStateHandle only = incHandles.get(0);
+            KeyGroupRange sourceRange = only.getKeyGroupRange();
+            boolean contains =
+                    sourceRange.getStartKeyGroup() <= targetRange.getStartKeyGroup()
+                            && sourceRange.getEndKeyGroup() >= targetRange.getEndKeyGroup();
+            boolean linkMode =
+                    !only.getSharedState().isEmpty()
+                            && only.getSharedState().stream()
+                                    .allMatch(h -> h.getHandle() instanceof LinkedSstStateHandle);
+            if (contains && linkMode) {
+                return restoreInstantLinkedClipped(only);
+            }
+        }
         return restoreWithRescaling(incHandles);
     }
 
@@ -551,6 +572,106 @@ public class ForStRsRestoreOperation {
                     "Instant-link restore of checkpoint {} from {} complete; adopted residual = {}",
                     handle.getCheckpointId(),
                     ckptDir,
+                    linker.dbAdoptedResidual(arena, db));
+        }
+        return new RestoreResult(
+                db,
+                defaultCf,
+                new LinkedHashMap<>(),
+                handle.getCheckpointId(),
+                restoredSerializerMetadata);
+    }
+
+    /**
+     * FRS-PHASE2-C2U3 rescale-by-clip: INSTANT-LINK restore that adopts ONLY this subtask's assigned
+     * key-group sub-range {@code [startKeyGroup, endKeyGroup]} from a single LINK-mode source whose
+     * range contains it. Downloads nothing and copies no rows — the engine drops fully-disjoint SSTs
+     * from the restored Version and installs a read-path clip for boundary SSTs.
+     *
+     * <p>The clip bounds are the backend's composite-key prefix bytes: a 2-byte big-endian key group
+     * (matching {@link ForStRsKeyGroupedSerializer#keyGroupPrefix}). Start = {@code startKeyGroup}
+     * (inclusive); end = {@code endKeyGroup + 1} (exclusive). The +1 cannot overflow the 2-byte
+     * encoding because Flink caps the max key groups at 32768.
+     */
+    private RestoreResult restoreInstantLinkedClipped(IncrementalRemoteKeyedStateHandle handle)
+            throws IOException {
+        LinkedSstStateHandle first =
+                (LinkedSstStateHandle) handle.getSharedState().get(0).getHandle();
+        Path linked = Paths.get(first.getLinkedPath());
+        String ckptDir = linked.getParent().toString();
+
+        HandleAndLocalPath registryEntry = null;
+        for (HandleAndLocalPath hlp : handle.getPrivateState()) {
+            if (ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH.equals(hlp.getLocalPath())) {
+                registryEntry = hlp;
+            }
+        }
+        Map<String, StateSerializerMetadata> restoredSerializerMetadata =
+                registryEntry == null
+                        ? Collections.emptyMap()
+                        : downloadAndParseRegistryBlob(registryEntry, handle);
+
+        // 2-byte big-endian key-group prefixes (see ForStRsKeyGroupedSerializer#keyGroupPrefix).
+        int startKg = targetRange.getStartKeyGroup();
+        int endKgExclusive = targetRange.getEndKeyGroup() + 1; // inclusive end -> exclusive bound
+        byte[] clipStart = {(byte) ((startKg >>> 8) & 0xFF), (byte) (startKg & 0xFF)};
+        byte[] clipEnd = {(byte) ((endKgExclusive >>> 8) & 0xFF), (byte) (endKgExclusive & 0xFF)};
+
+        boolean remotePrimary = remoteConfig != null && remoteConfig.isRemote();
+        FrsDb db;
+        try {
+            if (remotePrimary) {
+                db =
+                        linker.dbOpenFromLinkedCheckpointInstantClippedRemote(
+                                arena,
+                                remoteConfig.storageUri,
+                                remoteConfig.opendalConfigJson,
+                                remoteConfig.cacheDir,
+                                remoteConfig.cacheCapacityBytes,
+                                ckptDir,
+                                targetDir.toString(),
+                                clipStart,
+                                clipEnd);
+            } else {
+                db =
+                        linker.dbOpenFromLinkedCheckpointInstantClipped(
+                                arena, ckptDir, targetDir.toString(), clipStart, clipEnd);
+            }
+        } catch (RuntimeException re) {
+            throw new ForStRsCheckpointRestoreException(
+                    ckptDir,
+                    handle.getCheckpointId(),
+                    "ForSt-RS clipped instant-link restore refused ("
+                            + (remotePrimary ? "remote-primary" : "local-fs")
+                            + ", clip kg ["
+                            + startKg
+                            + ","
+                            + targetRange.getEndKeyGroup()
+                            + "]): "
+                            + re.getMessage(),
+                    re);
+        }
+        FrsCfHandle defaultCf;
+        try {
+            defaultCf = linker.dbDefaultCf(db, arena);
+        } catch (RuntimeException re) {
+            db.close();
+            throw new ForStRsCheckpointRestoreException(
+                    targetDir.toString(),
+                    handle.getCheckpointId(),
+                    "ForSt-RS engine restored (clipped), but default CF unreachable: "
+                            + re.getMessage(),
+                    re);
+        }
+
+        if (LOG.isInfoEnabled()) {
+            LOG.info(
+                    "Clipped instant-link restore of checkpoint {} from {} (kg [{},{}]) complete;"
+                            + " adopted residual = {}",
+                    handle.getCheckpointId(),
+                    ckptDir,
+                    startKg,
+                    targetRange.getEndKeyGroup(),
                     linker.dbAdoptedResidual(arena, db));
         }
         return new RestoreResult(
