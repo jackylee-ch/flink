@@ -113,4 +113,88 @@ public final class ForStRsConfigurableOptions {
                     .memoryType()
                     .defaultValue(MemorySize.parse("4kb"))
                     .withDescription("Uncompressed SST block size. Advisory today.");
+
+    // ------------------------------------------------------------------
+    // FRS-PHASE2 backend-effective feature flags. Each maps to an engine
+    // knob (per-DB FrsEngineOptions field or a process env var the engine
+    // reads). Defaults preserve the pre-Phase-2 behaviour exactly.
+    // ------------------------------------------------------------------
+
+    /**
+     * SST data-block compression codec. Honoured per-DB via {@code FrsEngineOptions.sst_compression}.
+     * Default {@code lz4} — this is also the engine's built-in default and matches ForSt/RocksDB
+     * (the FRS-PHASE2 fairness fix: the backend never forces {@code none}). {@code none} trades disk
+     * for CPU on local storage; {@code zstd} maximises compression for the remote/S3 upload path. The
+     * {@code FRS_SST_COMPRESSION} env var (if set) still overrides this on the remote open path.
+     */
+    public static final ConfigOption<String> SST_COMPRESSION =
+            ConfigOptions.key("state.backend.forst-rs.sst-compression")
+                    .stringType()
+                    .defaultValue("lz4")
+                    .withDescription(
+                            "SST data-block compression codec: 'lz4' (default, matches"
+                                    + " ForSt/RocksDB), 'none', or 'zstd'.");
+
+    /**
+     * Compression codec for KV-separated value-log ({@code *.vlog}) payloads. Honoured via the {@code
+     * FRS_VLOG_COMPRESSION} engine env var. Default {@code inherit} = follow {@link #SST_COMPRESSION}
+     * (the matching-policy default). Only takes effect when {@link #KV_SEPARATION} is on.
+     */
+    public static final ConfigOption<String> VLOG_COMPRESSION =
+            ConfigOptions.key("state.backend.forst-rs.vlog-compression")
+                    .stringType()
+                    .defaultValue("inherit")
+                    .withDescription(
+                            "Compression codec for KV-separated value-log payloads: 'inherit'"
+                                    + " (default, follows sst-compression), 'none', 'lz4', or 'zstd'."
+                                    + " Only effective when kv-separation is enabled.");
+
+    /**
+     * FRS-WA-V2a-2 KV separation: when on, eligible CFs write large values (≥ {@link
+     * #KV_SEPARATION_MIN_BLOB_SIZE}) to an append-once value-log and store a pointer in the SST, so
+     * compaction moves pointers not values (write-amp cut). Honoured via {@code FRS_KV_SEPARATION}.
+     * Default OFF (byte-identical to pre-Phase-2).
+     */
+    public static final ConfigOption<Boolean> KV_SEPARATION =
+            ConfigOptions.key("state.backend.forst-rs.kv-separation")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "FRS-WA-V2a-2 key-value separation (large values to a value-log,"
+                                    + " pointers in the SST). Default OFF.");
+
+    /** KV-separation threshold in bytes (values shorter stay inline). {@code FRS_KV_MIN_BLOB_SIZE}. */
+    public static final ConfigOption<MemorySize> KV_SEPARATION_MIN_BLOB_SIZE =
+            ConfigOptions.key("state.backend.forst-rs.kv-separation.min-blob-size")
+                    .memoryType()
+                    .defaultValue(MemorySize.parse("128 bytes"))
+                    .withDescription(
+                            "Minimum value size (bytes) to separate into the value-log when"
+                                    + " kv-separation is on. Values shorter stay inline. Floor 22.");
+
+    /**
+     * FRS-WA-V3 trivial-move (link) compaction: a compaction whose inputs do not overlap the
+     * destination level becomes ONE metadata VersionEdit (zero rewrite / zero new files / zero
+     * uploads). Honoured via {@code FRS_TRIVIAL_MOVE}. Default OFF.
+     */
+    public static final ConfigOption<Boolean> TRIVIAL_MOVE =
+            ConfigOptions.key("state.backend.forst-rs.trivial-move")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "FRS-WA-V3 trivial-move (link) compaction: non-overlapping rollups become"
+                                    + " a metadata-only VersionEdit. Default OFF.");
+
+    /**
+     * FRS-REMOTE-COMPACTION (paper pillar 6b): selects the offloaded/emulated compaction executor
+     * instead of the in-process local executor. Honoured via {@code FRS_REMOTE_COMPACTION}. Default
+     * OFF (in-process local compaction, byte-identical to pre-Phase-2).
+     */
+    public static final ConfigOption<Boolean> REMOTE_COMPACTION =
+            ConfigOptions.key("state.backend.forst-rs.remote-compaction")
+                    .booleanType()
+                    .defaultValue(false)
+                    .withDescription(
+                            "FRS-REMOTE-COMPACTION: use the offloaded/emulated compaction executor."
+                                    + " Default OFF (in-process local compaction).");
 }

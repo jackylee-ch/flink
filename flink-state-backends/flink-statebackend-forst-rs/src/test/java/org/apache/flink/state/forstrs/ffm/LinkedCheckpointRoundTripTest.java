@@ -325,6 +325,157 @@ class LinkedCheckpointRoundTripTest {
         }
     }
 
+    /**
+     * FRS-PHASE2 compression: {@code dbOpenWithOptions} round-trips byte-exact for each SST
+     * compression discriminant (0=default lz4, 1=none, 2=lz4, 3=zstd). The discriminant maps to
+     * {@code FrsEngineOptions.sst_compression}; a flush forces it through the SST writer so a non-lz4
+     * codec is actually exercised, and reads must return the same bytes regardless of codec.
+     */
+    @Test
+    void sstCompressionRoundTripPerCodec(@TempDir Path tmp) {
+        int[] discriminants = {0, 1, 2, 3};
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            for (int codec : discriminants) {
+                Path dbDir = tmp.resolve("db-codec-" + codec);
+                try (FrsDb db =
+                        linker.dbOpenWithOptions(
+                                arena, dbDir.toString(), 0L, 0, 0, 0, 0L, 0L, codec)) {
+                    FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+                    for (int i = 0; i < 200; i++) {
+                        // Compressible payload (repeated bytes) so a real codec has work to do.
+                        linker.put(
+                                db,
+                                cf,
+                                b(String.format("ckey%04d", i)),
+                                b("payload-" + i + "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                    }
+                    linker.flush(db);
+                    for (int i = 0; i < 200; i++) {
+                        assertArrayEquals(
+                                b("payload-" + i + "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                                linker.get(db, cf, b(String.format("ckey%04d", i))),
+                                "codec=" + codec + " must read back byte-exact after flush");
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * FRS-PHASE2 KV-separation: the backend feature-flag bridge ({@link ForStRsLinker#setEnv}) sets
+     * {@code FRS_KV_SEPARATION=1} + {@code FRS_KV_MIN_BLOB_SIZE} so flushes of eligible CFs separate
+     * large values into a value-log; reads return the same bytes either way. This cell verifies the
+     * env plumbs to the engine and a large-value round trip is byte-exact under separation. Restores
+     * the env afterwards so the shared test process is not perturbed.
+     *
+     * <p>NOTE: KV-sep is a process-wide engine OnceLock cached on first flush. In a shared test JVM a
+     * previously-run test may have already cached it; this cell asserts the WRITE/READ round trip is
+     * byte-exact (the observable contract) rather than the internal vlog file count, so it is robust
+     * to ordering.
+     */
+    @Test
+    void kvSeparationEnvRoundTrip(@TempDir Path tmp) {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            // Feature-flag bridge: the exact calls ForStRsKeyedStateBackendBuilder makes at open.
+            linker.setEnv(arena, "FRS_KV_SEPARATION", "1");
+            linker.setEnv(arena, "FRS_KV_MIN_BLOB_SIZE", "64");
+
+            Path dbDir = tmp.resolve("db-kvsep");
+            byte[] bigVal = new byte[512];
+            for (int i = 0; i < bigVal.length; i++) {
+                bigVal[i] = (byte) ('a' + (i % 26));
+            }
+            try (FrsDb db = linker.dbOpen(arena, dbDir.toString())) {
+                FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+                for (int i = 0; i < 64; i++) {
+                    linker.put(db, cf, b(String.format("big%03d", i)), bigVal);
+                    linker.put(db, cf, b(String.format("small%03d", i)), b("s" + i));
+                }
+                linker.flush(db);
+                for (int i = 0; i < 64; i++) {
+                    assertArrayEquals(
+                            bigVal,
+                            linker.get(db, cf, b(String.format("big%03d", i))),
+                            "separated large value must read back byte-exact");
+                    assertArrayEquals(
+                            b("s" + i),
+                            linker.get(db, cf, b(String.format("small%03d", i))),
+                            "inline small value must read back byte-exact");
+                }
+            }
+        }
+    }
+
+    /**
+     * FRS-PHASE2-C2U3 rescale-by-clip: clipped instant restore adopts only the assigned key-group
+     * sub-range. Builds a checkpoint over four 2-byte big-endian key-group prefixes (matching {@link
+     * org.apache.flink.state.forstrs.keyed.ForStRsKeyGroupedSerializer#keyGroupPrefix}), then restores
+     * only {@code [kg 1, kg 2]} via {@link
+     * ForStRsLinker#dbOpenFromLinkedCheckpointInstantClipped(Arena, String, String, byte[], byte[])}.
+     * Groups 1-2 survive; groups 0 and 3 are clipped out.
+     */
+    @Test
+    void clippedInstantRestoreAdoptsOnlyAssignedRange(@TempDir Path tmp) {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            Path dbDir = tmp.resolve("db");
+            Path restoreDir = tmp.resolve("restored-clip");
+
+            String ckptDir;
+            try (FrsDb db = linker.dbOpen(arena, dbDir.toString())) {
+                FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+                for (int kg = 0; kg < 4; kg++) {
+                    for (int i = 0; i < 8; i++) {
+                        linker.put(db, cf, kgKey(kg, i), b("v-" + kg + "-" + i));
+                    }
+                }
+                linker.flush(db);
+
+                FrsSnapshot snap = linker.dbSnapshot(db, arena);
+                MemorySegment result = arena.allocate(24);
+                linker.createIncrementalCheckpointLinked(db, snap, 1L, 0L, result);
+                snap.close();
+                Path manifest = readCString(result, 0L);
+                assertNotNull(manifest);
+                ckptDir = manifest.getParent().toString();
+                linker.dbLinkedCheckpointResultFree(result);
+            }
+
+            // Clip to key groups [1, 3): start = 0x0001, end (exclusive) = 0x0003.
+            byte[] clipStart = {0x00, 0x01};
+            byte[] clipEnd = {0x00, 0x03};
+            try (FrsDb restored =
+                    linker.dbOpenFromLinkedCheckpointInstantClipped(
+                            arena, ckptDir, restoreDir.toString(), clipStart, clipEnd)) {
+                FrsCfHandle cf = linker.dbDefaultCf(restored, arena);
+                for (int kg = 0; kg < 4; kg++) {
+                    boolean inRange = kg == 1 || kg == 2;
+                    for (int i = 0; i < 8; i++) {
+                        byte[] got = linker.get(restored, cf, kgKey(kg, i));
+                        if (inRange) {
+                            assertArrayEquals(
+                                    b("v-" + kg + "-" + i), got, "kg=" + kg + " must be adopted");
+                        } else {
+                            assertNull(got, "kg=" + kg + " must be clipped out");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** Composite key = 2-byte big-endian key group + user key (matches the backend serializer). */
+    private static byte[] kgKey(int kg, int i) {
+        byte[] user = b("-user" + i);
+        byte[] key = new byte[2 + user.length];
+        key[0] = (byte) ((kg >>> 8) & 0xFF);
+        key[1] = (byte) (kg & 0xFF);
+        System.arraycopy(user, 0, key, 2, user.length);
+        return key;
+    }
+
     @Test
     void sweepAbandonedCheckpointsWithEmptyLiveSetIsSafe(@TempDir Path tmp) {
         try (Arena arena = Arena.ofShared()) {

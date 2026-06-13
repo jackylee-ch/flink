@@ -172,7 +172,7 @@ public final class ForStRsLinker {
      * {@code FrsEngineOptions} struct layout (B-Prod-P7, spec §6d). Mirrors the {@code #[repr(C)]}
      * struct in {@code crates/forst-rs-ffi/src/lib.rs}.
      *
-     * <p>Layout (48 bytes on 64-bit):
+     * <p>Layout (56 bytes on 64-bit):
      *
      * <pre>
      * +0   ADDRESS (8B)   db_path
@@ -183,11 +183,14 @@ public final class ForStRsLinker {
      * +28  4B padding (alignment for following u64)
      * +32  JAVA_LONG (8B) block_cache_capacity_bytes
      * +40  JAVA_LONG (8B) write_buffer_manager_capacity_bytes
+     * +48  JAVA_INT  (4B) sst_compression (0=default LZ4, 1=none, 2=lz4, 3=zstd)
+     * +52  4B trailing padding (struct aligned to 8B)
      * </pre>
      *
      * <p>The padding is added explicitly via {@link MemoryLayout#paddingLayout(long)} so that the
-     * Java mirror produces the exact 48-byte struct that Rust's {@code #[repr(C)]} layout generates
-     * on the same target. Future fields land at +48 onwards (append-only).
+     * Java mirror produces the exact 56-byte struct that Rust's {@code #[repr(C)]} layout generates
+     * on the same target. {@code sst_compression} is an append-only field (older dylibs ignore the
+     * trailing bytes); future fields land at +56 onwards.
      */
     public static final StructLayout FRS_ENGINE_OPTIONS_LAYOUT =
             MemoryLayout.structLayout(
@@ -198,7 +201,9 @@ public final class ForStRsLinker {
                     ValueLayout.JAVA_INT.withName("max_background_flushes"),
                     MemoryLayout.paddingLayout(4),
                     ValueLayout.JAVA_LONG.withName("block_cache_capacity_bytes"),
-                    ValueLayout.JAVA_LONG.withName("write_buffer_manager_capacity_bytes"));
+                    ValueLayout.JAVA_LONG.withName("write_buffer_manager_capacity_bytes"),
+                    ValueLayout.JAVA_INT.withName("sst_compression"),
+                    MemoryLayout.paddingLayout(4));
 
     // ValueLayout.ADDRESS_UNALIGNED and ValueLayout.JAVA_LONG_UNALIGNED are
     // used to read the FrsBytes out struct when it lives in a heap byte[24]
@@ -376,9 +381,14 @@ public final class ForStRsLinker {
     private final MethodHandle frsDbDiscardLinkedCheckpoint;
     private final MethodHandle frsDbOpenFromLinkedCheckpointInstant;
     private final MethodHandle frsDbOpenFromLinkedCheckpointInstantRemote;
+    private final MethodHandle frsDbOpenFromLinkedCheckpointInstantClipped;
+    private final MethodHandle frsDbOpenFromLinkedCheckpointInstantClippedRemote;
     private final MethodHandle frsDbAdoptedResidual;
     private final MethodHandle frsDbAttachWal;
     private final MethodHandle frsDbSweepAbandonedCheckpoints;
+
+    // FRS-PHASE2 backend feature-flag bridge (frs_set_env).
+    private final MethodHandle frsSetEnv;
 
     // --- 9. State import / export migration (B-Prod-P10, spec §6g) ---
     private final MethodHandle frsCfExport;
@@ -1217,6 +1227,50 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // target_dir (c_char*)
                                 ValueLayout.ADDRESS)); // out_handle
 
+        // FRS-PHASE2-C2U3 rescale-by-clip: instant restore adopting only the
+        // half-open [clip_start, clip_end) key range (raw composite-key prefix
+        // bytes). Local-FS variant.
+        this.frsDbOpenFromLinkedCheckpointInstantClipped =
+                bind(
+                        "frs_db_open_from_linked_checkpoint_instant_clipped",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // ckpt_dir (c_char*)
+                                ValueLayout.ADDRESS, // target_dir (c_char*)
+                                ValueLayout.ADDRESS, // clip_start (u8*)
+                                ValueLayout.JAVA_LONG, // clip_start_len (usize)
+                                ValueLayout.ADDRESS, // clip_end (u8*)
+                                ValueLayout.JAVA_LONG, // clip_end_len (usize)
+                                ValueLayout.ADDRESS)); // out_handle
+
+        // Remote-primary rescale-by-clip variant.
+        this.frsDbOpenFromLinkedCheckpointInstantClippedRemote =
+                bind(
+                        "frs_db_open_from_linked_checkpoint_instant_clipped_remote",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // uri (c_char*)
+                                ValueLayout.ADDRESS, // opendal_config_json (c_char*, nullable)
+                                ValueLayout.ADDRESS, // cache_dir (c_char*)
+                                ValueLayout.JAVA_LONG, // cache_capacity_bytes (u64)
+                                ValueLayout.ADDRESS, // ckpt_dir (c_char*)
+                                ValueLayout.ADDRESS, // target_dir (c_char*)
+                                ValueLayout.ADDRESS, // clip_start (u8*)
+                                ValueLayout.JAVA_LONG, // clip_start_len (usize)
+                                ValueLayout.ADDRESS, // clip_end (u8*)
+                                ValueLayout.JAVA_LONG, // clip_end_len (usize)
+                                ValueLayout.ADDRESS)); // out_handle
+
+        // FRS-PHASE2 feature-flag bridge: set a process env var the engine's
+        // env-gated OnceLock flags read. Call BEFORE the first frs_db_open*.
+        this.frsSetEnv =
+                bind(
+                        "frs_set_env",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // name (c_char*)
+                                ValueLayout.ADDRESS)); // value (c_char*)
+
         // CLAIM-discipline signal: live SSTs still resolving to foreign physicals.
         this.frsDbAdoptedResidual =
                 bind(
@@ -1613,7 +1667,8 @@ public final class ForStRsLinker {
             int maxBackgroundCompactions,
             int maxBackgroundFlushes,
             long blockCacheCapacityBytes,
-            long writeBufferManagerCapacityBytes) {
+            long writeBufferManagerCapacityBytes,
+            int sstCompression) {
         MemorySegment optsSeg =
                 allocateEngineOptions(
                         arena,
@@ -1623,7 +1678,8 @@ public final class ForStRsLinker {
                         maxBackgroundCompactions,
                         maxBackgroundFlushes,
                         blockCacheCapacityBytes,
-                        writeBufferManagerCapacityBytes);
+                        writeBufferManagerCapacityBytes,
+                        sstCompression);
 
         MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
         int rc;
@@ -1646,13 +1702,14 @@ public final class ForStRsLinker {
             int maxBackgroundCompactions,
             int maxBackgroundFlushes,
             long blockCacheCapacityBytes,
-            long writeBufferManagerCapacityBytes) {
+            long writeBufferManagerCapacityBytes,
+            int sstCompression) {
         MemorySegment optsSeg = arena.allocate(FRS_ENGINE_OPTIONS_LAYOUT);
         MemorySegment pathSeg =
                 (dbPath == null || dbPath.isEmpty())
                         ? MemorySegment.NULL
                         : allocateCString(arena, dbPath);
-        // Field offsets: 0, 8, 16, 20, 24, 28(pad), 32, 40 — see
+        // Field offsets: 0, 8, 16, 20, 24, 28(pad), 32, 40, 48, 52(pad) — see
         // FRS_ENGINE_OPTIONS_LAYOUT docstring.
         optsSeg.set(ValueLayout.ADDRESS, 0, pathSeg);
         optsSeg.set(ValueLayout.JAVA_LONG, 8, writeBufferSize);
@@ -1662,6 +1719,8 @@ public final class ForStRsLinker {
         // 4 bytes padding at offset 28
         optsSeg.set(ValueLayout.JAVA_LONG, 32, blockCacheCapacityBytes);
         optsSeg.set(ValueLayout.JAVA_LONG, 40, writeBufferManagerCapacityBytes);
+        optsSeg.set(ValueLayout.JAVA_INT, 48, sstCompression);
+        // 4 bytes trailing padding at offset 52 (struct aligned to 8B)
         return optsSeg;
     }
 
@@ -1780,7 +1839,8 @@ public final class ForStRsLinker {
             int maxBackgroundCompactions,
             int maxBackgroundFlushes,
             long blockCacheCapacityBytes,
-            long writeBufferManagerCapacityBytes) {
+            long writeBufferManagerCapacityBytes,
+            int sstCompression) {
         MemorySegment optsSeg =
                 allocateEngineOptions(
                         arena,
@@ -1790,7 +1850,8 @@ public final class ForStRsLinker {
                         maxBackgroundCompactions,
                         maxBackgroundFlushes,
                         blockCacheCapacityBytes,
-                        writeBufferManagerCapacityBytes);
+                        writeBufferManagerCapacityBytes,
+                        sstCompression);
         MemorySegment uriSeg = allocateCString(arena, uri);
         MemorySegment cfgSeg =
                 opendalConfigJson == null
@@ -4232,6 +4293,129 @@ public final class ForStRsLinker {
         }
         check(rc, "frs_db_open_from_linked_checkpoint_instant_remote");
         return new FrsDb(this, outHandle.get(ValueLayout.ADDRESS, 0));
+    }
+
+    /**
+     * FRS-PHASE2-C2U3 rescale-by-clip (local engine FS): INSTANT-LINK restore that adopts ONLY the
+     * half-open key range {@code [clipStart, clipEnd)} of the linked checkpoint — the rescale-aware
+     * companion to {@link #dbOpenFromLinkedCheckpointInstant}. The clip bounds are raw composite-key
+     * prefix bytes (the backend's key-group encoding, e.g. the 2-byte big-endian first assigned key
+     * group as {@code clipStart} and the (last+1) key group as the exclusive {@code clipEnd}). An
+     * empty range ({@code start >= end}) is rejected by the native side.
+     */
+    public FrsDb dbOpenFromLinkedCheckpointInstantClipped(
+            Arena arena, String ckptDir, String targetDir, byte[] clipStart, byte[] clipEnd) {
+        MemorySegment ckptSeg = allocateCString(arena, ckptDir);
+        MemorySegment targetSeg = allocateCString(arena, targetDir);
+        MemorySegment startSeg = allocateBytes(arena, clipStart);
+        MemorySegment endSeg = allocateBytes(arena, clipEnd);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDbOpenFromLinkedCheckpointInstantClipped.invokeExact(
+                                    ckptSeg,
+                                    targetSeg,
+                                    startSeg,
+                                    (long) (clipStart == null ? 0 : clipStart.length),
+                                    endSeg,
+                                    (long) (clipEnd == null ? 0 : clipEnd.length),
+                                    outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_open_from_linked_checkpoint_instant_clipped threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_open_from_linked_checkpoint_instant_clipped");
+        return new FrsDb(this, outHandle.get(ValueLayout.ADDRESS, 0));
+    }
+
+    /**
+     * Remote-primary {@link #dbOpenFromLinkedCheckpointInstantClipped}: the rescale-aware
+     * download-skip restore over the same {@code CachedFileSystem(OpendalFileSystem, LocalCache)}
+     * stack as {@link #dbOpenFromLinkedCheckpointInstantRemote}.
+     */
+    public FrsDb dbOpenFromLinkedCheckpointInstantClippedRemote(
+            Arena arena,
+            String uri,
+            String opendalConfigJson,
+            String cacheDir,
+            long cacheCapacityBytes,
+            String ckptDir,
+            String targetDir,
+            byte[] clipStart,
+            byte[] clipEnd) {
+        MemorySegment uriSeg = allocateCString(arena, uri);
+        MemorySegment cfgSeg =
+                opendalConfigJson == null
+                        ? MemorySegment.NULL
+                        : allocateCString(arena, opendalConfigJson);
+        MemorySegment cacheSeg = allocateCString(arena, cacheDir);
+        MemorySegment ckptSeg = allocateCString(arena, ckptDir);
+        MemorySegment targetSeg = allocateCString(arena, targetDir);
+        MemorySegment startSeg = allocateBytes(arena, clipStart);
+        MemorySegment endSeg = allocateBytes(arena, clipEnd);
+        MemorySegment outHandle = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc =
+                    (int)
+                            frsDbOpenFromLinkedCheckpointInstantClippedRemote.invokeExact(
+                                    uriSeg,
+                                    cfgSeg,
+                                    cacheSeg,
+                                    cacheCapacityBytes,
+                                    ckptSeg,
+                                    targetSeg,
+                                    startSeg,
+                                    (long) (clipStart == null ? 0 : clipStart.length),
+                                    endSeg,
+                                    (long) (clipEnd == null ? 0 : clipEnd.length),
+                                    outHandle);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC,
+                    "frs_db_open_from_linked_checkpoint_instant_clipped_remote threw: "
+                            + t.getMessage());
+        }
+        check(rc, "frs_db_open_from_linked_checkpoint_instant_clipped_remote");
+        return new FrsDb(this, outHandle.get(ValueLayout.ADDRESS, 0));
+    }
+
+    /**
+     * FRS-PHASE2 feature-flag bridge: sets a process environment variable (via the native {@code
+     * std::env::set_var}) that the engine's env-gated {@code OnceLock} feature flags observe —
+     * {@code FRS_KV_SEPARATION}, {@code FRS_KV_MIN_BLOB_SIZE}, {@code FRS_TRIVIAL_MOVE}, {@code
+     * FRS_REMOTE_COMPACTION}, {@code FRS_VLOG_COMPRESSION}, etc. Because the JVM and the engine share
+     * one process, this is visible to the engine; {@code System.setProperty} would NOT be (the engine
+     * reads {@code getenv}, not the Java property table). Each flag is cached on first observation, so
+     * this MUST run BEFORE the first {@code dbOpen*}. Rejects null/empty/{@code =}-bearing names.
+     */
+    public void setEnv(Arena arena, String name, String value) {
+        MemorySegment nameSeg = allocateCString(arena, name);
+        MemorySegment valueSeg = allocateCString(arena, value);
+        int rc;
+        try {
+            rc = (int) frsSetEnv.invokeExact(nameSeg, valueSeg);
+        } catch (Throwable t) {
+            throw new FrsBackendException(FrsStatus.PANIC, "frs_set_env threw: " + t.getMessage());
+        }
+        check(rc, "frs_set_env");
+    }
+
+    /**
+     * Allocates a native byte buffer holding {@code bytes} (or {@link MemorySegment#NULL} for null /
+     * empty). The returned segment is NOT NUL-terminated — it is a raw {@code (ptr, len)} buffer for
+     * length-delimited FFI args (e.g. the clip-range bounds).
+     */
+    private static MemorySegment allocateBytes(Arena arena, byte[] bytes) {
+        if (bytes == null || bytes.length == 0) {
+            return MemorySegment.NULL;
+        }
+        MemorySegment seg = arena.allocate(bytes.length);
+        MemorySegment.copy(bytes, 0, seg, ValueLayout.JAVA_BYTE, 0, bytes.length);
+        return seg;
     }
 
     /**

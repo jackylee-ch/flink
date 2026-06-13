@@ -128,6 +128,16 @@ public final class ForStRsOptions implements Serializable {
     private long blockCacheCapacityBytes = 256L * 1024 * 1024;
     private long writeBufferManagerCapacityBytes = 512L * 1024 * 1024;
 
+    // FRS-PHASE2 backend-effective feature flags. Defaults preserve the
+    // pre-Phase-2 behaviour exactly (lz4 SST = engine default; everything
+    // else OFF). See ForStRsConfigurableOptions for the config keys.
+    private String sstCompression = "lz4";
+    private String vlogCompression = "inherit";
+    private boolean kvSeparation = false;
+    private long kvSeparationMinBlobSizeBytes = 128L;
+    private boolean trivialMove = false;
+    private boolean remoteCompaction = false;
+
     public ForStRsOptions() {}
 
     public CfMode cfMode() {
@@ -303,6 +313,116 @@ public final class ForStRsOptions implements Serializable {
         // is operator-error rather than a meaningful configuration.
         this.writeBufferManagerCapacityBytes = bytes;
         return this;
+    }
+
+    // ----- FRS-PHASE2 backend-effective feature flags -----
+
+    /** SST compression codec name ({@code none} | {@code lz4} | {@code zstd}); never null. */
+    public String sstCompression() {
+        return sstCompression;
+    }
+
+    public ForStRsOptions sstCompression(String codec) {
+        this.sstCompression = normalizeCompression("sstCompression", codec, false);
+        return this;
+    }
+
+    /**
+     * Maps {@link #sstCompression()} to the {@code FrsEngineOptions.sst_compression} discriminant:
+     * {@code 0}=engine default (lz4), {@code 1}=none, {@code 2}=lz4, {@code 3}=zstd.
+     */
+    public int sstCompressionDiscriminant() {
+        switch (sstCompression) {
+            case "none":
+                return 1;
+            case "lz4":
+                return 2;
+            case "zstd":
+                return 3;
+            default:
+                return 0;
+        }
+    }
+
+    /**
+     * Vlog compression codec name ({@code inherit} | {@code none} | {@code lz4} | {@code zstd}). Maps
+     * to the {@code FRS_VLOG_COMPRESSION} env value; never null.
+     */
+    public String vlogCompression() {
+        return vlogCompression;
+    }
+
+    public ForStRsOptions vlogCompression(String codec) {
+        this.vlogCompression = normalizeCompression("vlogCompression", codec, true);
+        return this;
+    }
+
+    /** FRS-WA-V2a-2 KV separation enabled. Default false. */
+    public boolean kvSeparation() {
+        return kvSeparation;
+    }
+
+    public ForStRsOptions kvSeparation(boolean on) {
+        this.kvSeparation = on;
+        return this;
+    }
+
+    /** KV-separation threshold in bytes (values shorter stay inline). */
+    public long kvSeparationMinBlobSizeBytes() {
+        return kvSeparationMinBlobSizeBytes;
+    }
+
+    public ForStRsOptions kvSeparationMinBlobSizeBytes(long bytes) {
+        if (bytes < 0) {
+            throw new IllegalArgumentException("kvSeparationMinBlobSizeBytes must be >= 0, got " + bytes);
+        }
+        this.kvSeparationMinBlobSizeBytes = bytes;
+        return this;
+    }
+
+    /** FRS-WA-V3 trivial-move (link) compaction enabled. Default false. */
+    public boolean trivialMove() {
+        return trivialMove;
+    }
+
+    public ForStRsOptions trivialMove(boolean on) {
+        this.trivialMove = on;
+        return this;
+    }
+
+    /** FRS-REMOTE-COMPACTION (offloaded/emulated executor) enabled. Default false. */
+    public boolean remoteCompaction() {
+        return remoteCompaction;
+    }
+
+    public ForStRsOptions remoteCompaction(boolean on) {
+        this.remoteCompaction = on;
+        return this;
+    }
+
+    private static String normalizeCompression(String field, String codec, boolean allowInherit) {
+        String v = codec == null ? "" : codec.trim().toLowerCase();
+        if (v.isEmpty()) {
+            return allowInherit ? "inherit" : "lz4";
+        }
+        switch (v) {
+            case "none":
+            case "lz4":
+            case "zstd":
+                return v;
+            case "inherit":
+                if (allowInherit) {
+                    return v;
+                }
+                // fall through to error
+            default:
+                throw new IllegalArgumentException(
+                        field
+                                + ": unknown compression codec '"
+                                + codec
+                                + "' (expected: "
+                                + (allowInherit ? "inherit | none | lz4 | zstd)" : "none | lz4 | zstd)"));
+        }
     }
 
     private static void validateNonNegativeCount(String name, int n) {

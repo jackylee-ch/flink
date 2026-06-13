@@ -73,6 +73,10 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
      * #buildCfRouter()} pick it up. The matching default CF is opened automatically.
      */
     public ForStRsKeyedStateBackendBuilder<K> openDb(String localPath) {
+        // FRS-PHASE2 feature-flag bridge: push the env-gated flags to the
+        // engine BEFORE the first dbOpen* (the engine caches each on first
+        // observation). Defaults are no-ops (matches pre-Phase-2 behaviour).
+        applyFeatureFlagEnv();
         FrsDb opened;
         String uri = options.storageUri();
         if (uri != null && !uri.isEmpty()) {
@@ -93,7 +97,8 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
                             options.maxBackgroundCompactions(),
                             options.maxBackgroundFlushes(),
                             options.blockCacheCapacityBytes(),
-                            options.writeBufferManagerCapacityBytes());
+                            options.writeBufferManagerCapacityBytes(),
+                            options.sstCompressionDiscriminant());
         } else {
             opened =
                     linker.dbOpenWithOptions(
@@ -104,7 +109,8 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
                             options.maxBackgroundCompactions(),
                             options.maxBackgroundFlushes(),
                             options.blockCacheCapacityBytes(),
-                            options.writeBufferManagerCapacityBytes());
+                            options.writeBufferManagerCapacityBytes(),
+                            options.sstCompressionDiscriminant());
         }
         // R16-M4: wrap dbDefaultCf in try/catch so a failure between dbOpen and CF
         // attachment doesn't leak the opened DB. Pre-fix, if dbDefaultCf threw the engine
@@ -127,6 +133,34 @@ public final class ForStRsKeyedStateBackendBuilder<K> {
             throw t;
         }
         return withDb(opened, cf);
+    }
+
+    /**
+     * FRS-PHASE2 feature-flag bridge: translates the backend feature-flag options into the engine's
+     * env-gated knobs via {@link ForStRsLinker#setEnv}. The engine caches each flag on first
+     * observation, so this must run BEFORE the first {@code dbOpen*}. Only NON-default flags are
+     * pushed so a fully-defaulted backend sets no env at all (byte-identical to pre-Phase-2). SST
+     * compression is NOT set here — it flows through the per-DB {@code FrsEngineOptions} struct.
+     */
+    private void applyFeatureFlagEnv() {
+        if (options.kvSeparation()) {
+            linker.setEnv(arena, "FRS_KV_SEPARATION", "1");
+            linker.setEnv(
+                    arena,
+                    "FRS_KV_MIN_BLOB_SIZE",
+                    Long.toString(options.kvSeparationMinBlobSizeBytes()));
+            // vlog compression only takes effect under KV separation.
+            String vlog = options.vlogCompression();
+            if (!"inherit".equals(vlog)) {
+                linker.setEnv(arena, "FRS_VLOG_COMPRESSION", vlog);
+            }
+        }
+        if (options.trivialMove()) {
+            linker.setEnv(arena, "FRS_TRIVIAL_MOVE", "1");
+        }
+        if (options.remoteCompaction()) {
+            linker.setEnv(arena, "FRS_REMOTE_COMPACTION", "1");
+        }
     }
 
     public CfRouter buildCfRouter() {

@@ -24,6 +24,8 @@ import org.apache.flink.configuration.MemorySize;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ForStRsStateBackendFactoryTest {
 
@@ -63,5 +65,64 @@ class ForStRsStateBackendFactoryTest {
         assertEquals(384L * 1024 * 1024, options.blockCacheCapacityBytes());
         assertEquals(5, options.maxBackgroundCompactions());
         assertEquals(3, options.maxBackgroundFlushes());
+    }
+
+    /**
+     * FRS-PHASE2 backend-effective feature flags: defaults preserve pre-Phase-2 behaviour — SST
+     * compression is lz4 (engine default, discriminant 2), everything else OFF.
+     */
+    @Test
+    void featureFlagDefaultsPreservePrePhase2Behaviour() {
+        Configuration config = new Configuration();
+        ForStRsStateBackend backend =
+                new ForStRsStateBackendFactory()
+                        .createFromConfig(
+                                config, Thread.currentThread().getContextClassLoader());
+        ForStRsOptions options = backend.optionsForTesting();
+        assertEquals("lz4", options.sstCompression());
+        assertEquals(2, options.sstCompressionDiscriminant());
+        assertEquals("inherit", options.vlogCompression());
+        assertFalse(options.kvSeparation());
+        assertEquals(128L, options.kvSeparationMinBlobSizeBytes());
+        assertFalse(options.trivialMove());
+        assertFalse(options.remoteCompaction());
+    }
+
+    /** FRS-PHASE2: every feature-flag config key plumbs through to {@link ForStRsOptions}. */
+    @Test
+    void featureFlagConfigPlumbsIntoOptions() {
+        Configuration config = new Configuration();
+        config.set(ForStRsConfigurableOptions.SST_COMPRESSION, "zstd");
+        config.set(ForStRsConfigurableOptions.VLOG_COMPRESSION, "none");
+        config.set(ForStRsConfigurableOptions.KV_SEPARATION, true);
+        config.set(
+                ForStRsConfigurableOptions.KV_SEPARATION_MIN_BLOB_SIZE, MemorySize.parse("256 bytes"));
+        config.set(ForStRsConfigurableOptions.TRIVIAL_MOVE, true);
+        config.set(ForStRsConfigurableOptions.REMOTE_COMPACTION, true);
+
+        ForStRsStateBackend backend =
+                new ForStRsStateBackendFactory()
+                        .createFromConfig(
+                                config, Thread.currentThread().getContextClassLoader());
+        ForStRsOptions options = backend.optionsForTesting();
+        assertEquals("zstd", options.sstCompression());
+        assertEquals(3, options.sstCompressionDiscriminant());
+        assertEquals("none", options.vlogCompression());
+        assertTrue(options.kvSeparation());
+        assertEquals(256L, options.kvSeparationMinBlobSizeBytes());
+        assertTrue(options.trivialMove());
+        assertTrue(options.remoteCompaction());
+    }
+
+    /** FRS-PHASE2: {@code none} SST compression maps to discriminant 1. */
+    @Test
+    void sstCompressionNoneMapsToDiscriminantOne() {
+        Configuration config = new Configuration();
+        config.set(ForStRsConfigurableOptions.SST_COMPRESSION, "none");
+        ForStRsStateBackend backend =
+                new ForStRsStateBackendFactory()
+                        .createFromConfig(
+                                config, Thread.currentThread().getContextClassLoader());
+        assertEquals(1, backend.optionsForTesting().sstCompressionDiscriminant());
     }
 }

@@ -42,6 +42,15 @@ public class ForStRsStateBackendFactory implements StateBackendFactory<ForStRsSt
         options.maxBackgroundFlushes(engineOptions.maxBackgroundFlushes);
         options.blockCacheCapacityBytes(engineOptions.blockCacheCapacity);
         options.writeBufferManagerCapacityBytes(engineOptions.writeBufferManagerCapacity);
+        // FRS-PHASE2 backend-effective feature flags (defaults preserve
+        // pre-Phase-2 behaviour exactly: lz4 SST = engine default, rest OFF).
+        options.sstCompression(config.get(ForStRsConfigurableOptions.SST_COMPRESSION));
+        options.vlogCompression(config.get(ForStRsConfigurableOptions.VLOG_COMPRESSION));
+        options.kvSeparation(config.get(ForStRsConfigurableOptions.KV_SEPARATION));
+        options.kvSeparationMinBlobSizeBytes(
+                config.get(ForStRsConfigurableOptions.KV_SEPARATION_MIN_BLOB_SIZE).getBytes());
+        options.trivialMove(config.get(ForStRsConfigurableOptions.TRIVIAL_MOVE));
+        options.remoteCompaction(config.get(ForStRsConfigurableOptions.REMOTE_COMPACTION));
         return new ForStRsStateBackend(options);
     }
 }

@@ -117,6 +117,9 @@ public class ForStRsStateBackend implements StateBackend {
         try {
         Arena arena = Arena.ofShared();
         ForStRsLinker linker = new ForStRsLinker(arena);
+        // FRS-PHASE2 feature-flag bridge — BEFORE any dbOpen*/restore (covers
+        // both the restore and direct-open branches below). No-op at defaults.
+        applyFeatureFlagEnv(linker, arena);
         Environment env = parameters.getEnv();
         File tmpRoot = env.getTaskManagerInfo().getTmpWorkingDirectory();
         Path dbRoot = tmpRoot.toPath().resolve("forst-rs-async");
@@ -208,7 +211,8 @@ public class ForStRsStateBackend implements StateBackend {
                                 options.maxBackgroundCompactions(),
                                 options.maxBackgroundFlushes(),
                                 options.blockCacheCapacityBytes(),
-                                options.writeBufferManagerCapacityBytes());
+                                options.writeBufferManagerCapacityBytes(),
+                                options.sstCompressionDiscriminant());
             } else {
                 db = openLocalDbWithOptions(arena, linker, localDbPath);
             }
@@ -307,6 +311,9 @@ public class ForStRsStateBackend implements StateBackend {
         ForStRsSstRegistry sstRegistry = new ForStRsSstRegistry();
         try {
             linker = new ForStRsLinker(arena);
+            // FRS-PHASE2 feature-flag bridge — BEFORE any dbOpen*/restore (covers
+            // restore + remote + local branches below). No-op at defaults.
+            applyFeatureFlagEnv(linker, arena);
 
             // ---------------- Restore path (Part D — Flink-coordinator restore) ----------------
             // If Flink is launching this backend with a non-empty restored-state collection (job
@@ -360,7 +367,8 @@ public class ForStRsStateBackend implements StateBackend {
                                 options.maxBackgroundCompactions(),
                                 options.maxBackgroundFlushes(),
                                 options.blockCacheCapacityBytes(),
-                                options.writeBufferManagerCapacityBytes());
+                                options.writeBufferManagerCapacityBytes(),
+                                options.sstCompressionDiscriminant());
                 cf = linker.dbDefaultCf(db, arena);
             } else {
                 db = openLocalDbWithOptions(arena, linker, localDbPath);
@@ -568,7 +576,37 @@ public class ForStRsStateBackend implements StateBackend {
                 options.maxBackgroundCompactions(),
                 options.maxBackgroundFlushes(),
                 options.blockCacheCapacityBytes(),
-                options.writeBufferManagerCapacityBytes());
+                options.writeBufferManagerCapacityBytes(),
+                options.sstCompressionDiscriminant());
+    }
+
+    /**
+     * FRS-PHASE2 feature-flag bridge: translates the env-gated backend feature-flag options
+     * ({@code kv-separation} + min-blob-size, {@code trivial-move}, {@code remote-compaction}, and
+     * {@code vlog-compression} under kv-sep) into the engine's process env vars via {@link
+     * ForStRsLinker#setEnv}. MUST run BEFORE the first {@code dbOpen*} / restore (the engine caches
+     * each flag on first observation). Only NON-default flags are pushed, so a fully-defaulted
+     * backend sets no env at all — byte-identical to pre-Phase-2. SST compression flows through the
+     * per-DB {@code FrsEngineOptions} struct, not here.
+     */
+    private void applyFeatureFlagEnv(ForStRsLinker linker, Arena arena) {
+        if (options.kvSeparation()) {
+            linker.setEnv(arena, "FRS_KV_SEPARATION", "1");
+            linker.setEnv(
+                    arena,
+                    "FRS_KV_MIN_BLOB_SIZE",
+                    Long.toString(options.kvSeparationMinBlobSizeBytes()));
+            String vlog = options.vlogCompression();
+            if (!"inherit".equals(vlog)) {
+                linker.setEnv(arena, "FRS_VLOG_COMPRESSION", vlog);
+            }
+        }
+        if (options.trivialMove()) {
+            linker.setEnv(arena, "FRS_TRIVIAL_MOVE", "1");
+        }
+        if (options.remoteCompaction()) {
+            linker.setEnv(arena, "FRS_REMOTE_COMPACTION", "1");
+        }
     }
 
     /**
