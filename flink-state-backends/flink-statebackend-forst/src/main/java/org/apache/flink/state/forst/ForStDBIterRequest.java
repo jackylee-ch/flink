@@ -22,6 +22,7 @@ import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
 import org.apache.flink.util.Preconditions;
 
 import org.forstdb.RocksDB;
+import org.forstdb.RocksDBException;
 import org.forstdb.RocksIterator;
 
 import javax.annotation.Nonnull;
@@ -61,22 +62,31 @@ public abstract class ForStDBIterRequest<K, N, UK, UV, R> implements Closeable {
 
     final int keyGroupPrefixBytes;
 
-    /**
-     * The rocksdb iterator. If null, create a new rocksdb iterator and seek start from the {@link
-     * #getKeyPrefixBytes}.
-     */
-    @Nullable RocksIterator rocksIterator;
+    /** Continuation used when this request resumes a partial iterator drain. */
+    @Nullable ForStMapIteratorContinuation continuation;
 
     public ForStDBIterRequest(
             ContextKey<K, N> contextKey,
             ForStMapState<K, N, UK, UV> table,
             StateRequestHandler stateRequestHandler,
             RocksIterator rocksIterator) {
+        this(
+                contextKey,
+                table,
+                stateRequestHandler,
+                ForStMapIteratorContinuation.forRocksIterator(rocksIterator));
+    }
+
+    public ForStDBIterRequest(
+            ContextKey<K, N> contextKey,
+            ForStMapState<K, N, UK, UV> table,
+            StateRequestHandler stateRequestHandler,
+            ForStMapIteratorContinuation continuation) {
         this.contextKey = contextKey;
         this.table = table;
         this.stateRequestHandler = stateRequestHandler;
         this.keyGroupPrefixBytes = table.getKeyGroupPrefixBytes();
-        this.rocksIterator = rocksIterator;
+        this.continuation = continuation;
     }
 
     protected UV deserializeUserValue(byte[] valueBytes) throws IOException {
@@ -114,12 +124,67 @@ public abstract class ForStDBIterRequest<K, N, UK, UV, R> implements Closeable {
     }
 
     public void process(RocksDB db, int cacheSizeLimit) throws IOException {
+        ForStPrefixScanCursor prefixScanCursor =
+                continuation == null ? null : continuation.getPrefixScanCursor();
+        if (prefixScanCursor != null) {
+            processWithPrefixScanCursor(prefixScanCursor, cacheSizeLimit);
+            return;
+        }
+        if (continuation == null && ForStRsLibPrefixScanNative.isAvailable()) {
+            try {
+                processWithPrefixScanCursor(
+                        ForStPrefixScanCursor.open(
+                                db,
+                                table.getColumnFamilyHandle(),
+                                getKeyPrefixBytes(),
+                                cacheSizeLimit),
+                        cacheSizeLimit);
+                return;
+            } catch (LinkageError e) {
+                continuation = null;
+            } catch (RocksDBException e) {
+                throw new IOException("Failed to open ForSt-RS prefix scan cursor", e);
+            }
+        }
+        processWithRocksIterator(db, cacheSizeLimit);
+    }
+
+    private void processWithPrefixScanCursor(
+            ForStPrefixScanCursor prefixScanCursor, int cacheSizeLimit) throws IOException {
+        byte[] prefix = getKeyPrefixBytes();
+        int userKeyOffset = prefix.length;
+        ForStPrefixScanCursor.Chunk chunk;
+        try {
+            chunk = prefixScanCursor.next(cacheSizeLimit);
+        } catch (RocksDBException e) {
+            throw new IOException("ForSt-RS prefix scan chunk failed", e);
+        }
+        boolean encounterEnd = chunk.isEof();
+        List<RawEntry> entries = chunk.getEntries();
+        for (RawEntry entry : entries) {
+            if (!startWithKeyPrefix(prefix, entry.rawKeyBytes, keyGroupPrefixBytes)) {
+                prefixScanCursor.close();
+                throw new IOException("ForSt-RS prefix scan returned a row outside the key prefix");
+            }
+        }
+        if (encounterEnd) {
+            prefixScanCursor.close();
+        }
+        continuation =
+                encounterEnd ? null : ForStMapIteratorContinuation.forPrefixScan(prefixScanCursor);
+        Collection<R> deserializedEntries = deserializeElement(entries, userKeyOffset);
+        buildIteratorAndCompleteFuture(deserializedEntries, encounterEnd);
+    }
+
+    private void processWithRocksIterator(RocksDB db, int cacheSizeLimit) throws IOException {
         // step 1: setup iterator, seek to the key
         byte[] prefix = getKeyPrefixBytes();
         int userKeyOffset = prefix.length;
+        RocksIterator rocksIterator = continuation == null ? null : continuation.getRocksIterator();
         if (rocksIterator == null) {
             rocksIterator = db.newIterator(table.getColumnFamilyHandle());
             rocksIterator.seek(prefix);
+            continuation = ForStMapIteratorContinuation.forRocksIterator(rocksIterator);
         }
 
         // step 2: iterate the entries, read at most cacheSizeLimit entries at a time. If not
@@ -133,7 +198,7 @@ public abstract class ForStDBIterRequest<K, N, UK, UV, R> implements Closeable {
             } else {
                 encounterEnd = true;
                 rocksIterator.close();
-                rocksIterator = null;
+                continuation = null;
                 break;
             }
             rocksIterator.next();
@@ -142,7 +207,7 @@ public abstract class ForStDBIterRequest<K, N, UK, UV, R> implements Closeable {
         if (!encounterEnd && (entries.size() < cacheSizeLimit || !rocksIterator.isValid())) {
             encounterEnd = true;
             rocksIterator.close();
-            rocksIterator = null;
+            continuation = null;
         }
 
         // step 3: deserialize the entries
@@ -161,9 +226,9 @@ public abstract class ForStDBIterRequest<K, N, UK, UV, R> implements Closeable {
             Collection<R> partialResult, boolean encounterEnd);
 
     public void close() throws IOException {
-        if (rocksIterator != null) {
-            rocksIterator.close();
-            rocksIterator = null;
+        if (continuation != null) {
+            continuation.close();
+            continuation = null;
         }
     }
 

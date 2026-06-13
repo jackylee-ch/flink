@@ -243,22 +243,27 @@ public class ForStMapState<K, N, UK, UV> extends AbstractMapState<K, N, UK, UV>
                         || stateRequest.getRequestType() == StateRequestType.MAP_ITER_KEY
                         || stateRequest.getRequestType() == StateRequestType.MAP_ITER_VALUE
                         || stateRequest.getRequestType() == StateRequestType.ITERATOR_LOADING);
-        RocksIterator rocksIterator = null;
+        ForStMapIteratorContinuation continuation = null;
         StateRequestType requestType = stateRequest.getRequestType();
         if (requestType == StateRequestType.ITERATOR_LOADING) {
-            Tuple2<StateRequestType, RocksIterator> payload =
-                    (Tuple2<StateRequestType, RocksIterator>) stateRequest.getPayload();
+            Tuple2<StateRequestType, ?> payload =
+                    (Tuple2<StateRequestType, ?>) stateRequest.getPayload();
             requestType = payload.f0;
-            rocksIterator = payload.f1;
+            if (payload.f1 instanceof ForStMapIteratorContinuation) {
+                continuation = (ForStMapIteratorContinuation) payload.f1;
+            } else {
+                continuation =
+                        ForStMapIteratorContinuation.forRocksIterator((RocksIterator) payload.f1);
+            }
         }
-        return buildDBIterRequest(stateRequest, requestType, rocksIterator);
+        return buildDBIterRequest(stateRequest, requestType, continuation);
     }
 
     @SuppressWarnings("unchecked")
     private ForStDBIterRequest<K, N, UK, UV, ?> buildDBIterRequest(
             StateRequest<?, ?, ?, ?> stateRequest,
             StateRequestType requestType,
-            RocksIterator rocksIterator) {
+            ForStMapIteratorContinuation continuation) {
         ContextKey<K, N> contextKey =
                 new ContextKey<>(
                         (RecordContext<K>) stateRequest.getRecordContext(),
@@ -270,7 +275,8 @@ public class ForStMapState<K, N, UK, UV> extends AbstractMapState<K, N, UK, UV>
                         contextKey,
                         this,
                         stateRequestHandler,
-                        rocksIterator,
+                        continuation,
+                        true,
                         (InternalAsyncFuture<StateIterator<Map.Entry<UK, UV>>>)
                                 stateRequest.getFuture());
             case MAP_ITER_KEY:
@@ -278,14 +284,16 @@ public class ForStMapState<K, N, UK, UV> extends AbstractMapState<K, N, UK, UV>
                         contextKey,
                         this,
                         stateRequestHandler,
-                        rocksIterator,
+                        continuation,
+                        true,
                         (InternalAsyncFuture<StateIterator<UK>>) stateRequest.getFuture());
             case MAP_ITER_VALUE:
                 return new ForStDBMapValueIterRequest<>(
                         contextKey,
                         this,
                         stateRequestHandler,
-                        rocksIterator,
+                        continuation,
+                        true,
                         (InternalAsyncFuture<StateIterator<UV>>) stateRequest.getFuture());
             default:
                 throw new IllegalArgumentException(

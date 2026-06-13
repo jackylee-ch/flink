@@ -44,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.apache.flink.state.forst.ForStIterateOperation.CACHE_SIZE_LIMIT;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /** Test for {@link ForStIterateOperation}. */
 class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
@@ -165,15 +166,13 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
         } catch (NullPointerException npe) {
             assertThat(stateRequestHandler.payload).isNotNull();
             assertThat(count.get()).isEqualTo(CACHE_SIZE_LIMIT);
-            Tuple2<StateRequestType, RocksIterator> tuple =
-                    (Tuple2<StateRequestType, RocksIterator>) stateRequestHandler.payload;
+            Tuple2<StateRequestType, ?> tuple =
+                    (Tuple2<StateRequestType, ?>) stateRequestHandler.payload;
             assertThat(tuple.f0).isEqualTo(StateRequestType.MAP_ITER);
             TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future2 =
                     new TestAsyncFuture<>();
             ForStDBIterRequest<Integer, VoidNamespace, String, String, Map.Entry<String, String>>
-                    request2 =
-                            new ForStDBMapEntryIterRequest(
-                                    contextKey, mapState, null, tuple.f1, future2);
+                    request2 = buildEntryIterRequest(contextKey, mapState, tuple.f1, future2);
             batchIterRequest.clear();
             batchIterRequest.add(request2);
             ForStIterateOperation iterOperation2 =
@@ -189,6 +188,89 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
             assertThat(count.get()).isEqualTo(200);
             assertThat(iterator2.isEmpty()).isFalse();
         }
+    }
+
+    @Test
+    void testForStRsPrefixScanFastPathIteratorLoading() throws Exception {
+        assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+
+        ForStMapState<Integer, VoidNamespace, String, String> mapState =
+                buildForStMapState("map-iter-fast-path");
+        prepareData(200, mapState, db);
+        TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future = new TestAsyncFuture<>();
+        List<ForStDBIterRequest<?, ?, ?, ?, ?>> batchIterRequest = new ArrayList<>();
+        ContextKey<Integer, VoidNamespace> contextKey = buildContextKey(1);
+        MockStateRequestHandler stateRequestHandler = new MockStateRequestHandler();
+        ForStDBIterRequest<Integer, VoidNamespace, String, String, Map.Entry<String, String>>
+                request1 =
+                        new ForStDBMapEntryIterRequest<>(
+                                contextKey, mapState, stateRequestHandler, null, future);
+        batchIterRequest.add(request1);
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        ForStIterateOperation iterOperation =
+                new ForStIterateOperation(db, batchIterRequest, executor);
+        iterOperation.process().get();
+
+        StateIterator<Map.Entry<String, String>> iterator = future.getCompletedResult();
+        AtomicInteger count = new AtomicInteger(0);
+        try {
+            iterator.onNext(
+                    entry -> {
+                        int cnt = count.getAndIncrement();
+                        assertThat(entry.getKey()).isEqualTo("uk-" + cnt);
+                        assertThat(entry.getValue()).isEqualTo("val-" + cnt);
+                    });
+            fail("should throw NPE");
+        } catch (NullPointerException npe) {
+            assertThat(stateRequestHandler.payload).isNotNull();
+            assertThat(count.get()).isEqualTo(CACHE_SIZE_LIMIT);
+            Tuple2<StateRequestType, ?> tuple =
+                    (Tuple2<StateRequestType, ?>) stateRequestHandler.payload;
+            assertThat(tuple.f0).isEqualTo(StateRequestType.MAP_ITER);
+            assertThat(tuple.f1).isInstanceOf(ForStMapIteratorContinuation.class);
+
+            TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future2 =
+                    new TestAsyncFuture<>();
+            ForStDBIterRequest<Integer, VoidNamespace, String, String, Map.Entry<String, String>>
+                    request2 = buildEntryIterRequest(contextKey, mapState, tuple.f1, future2);
+            batchIterRequest.clear();
+            batchIterRequest.add(request2);
+            ForStIterateOperation iterOperation2 =
+                    new ForStIterateOperation(db, batchIterRequest, executor);
+            iterOperation2.process().get();
+            StateIterator<Map.Entry<String, String>> iterator2 = future2.getCompletedResult();
+            iterator2.onNext(
+                    entry -> {
+                        int cnt = count.getAndIncrement();
+                        assertThat(entry.getKey()).isEqualTo("uk-" + cnt);
+                        assertThat(entry.getValue()).isEqualTo("val-" + cnt);
+                    });
+            assertThat(count.get()).isEqualTo(200);
+            assertThat(iterator2.isEmpty()).isFalse();
+        }
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isGreaterThan(1);
+    }
+
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private ForStDBIterRequest<Integer, VoidNamespace, String, String, Map.Entry<String, String>>
+            buildEntryIterRequest(
+                    ContextKey<Integer, VoidNamespace> contextKey,
+                    ForStMapState<Integer, VoidNamespace, String, String> mapState,
+                    Object continuationPayload,
+                    TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future) {
+        if (continuationPayload instanceof ForStMapIteratorContinuation) {
+            return new ForStDBMapEntryIterRequest<>(
+                    contextKey,
+                    mapState,
+                    null,
+                    (ForStMapIteratorContinuation) continuationPayload,
+                    true,
+                    future);
+        }
+        return new ForStDBMapEntryIterRequest(
+                contextKey, mapState, null, (RocksIterator) continuationPayload, future);
     }
 
     private void prepareData(

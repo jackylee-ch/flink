@@ -49,6 +49,17 @@ public class ForStDBMapEntryIterRequest<K, N, UK, UV>
         this.future = future;
     }
 
+    public ForStDBMapEntryIterRequest(
+            ContextKey<K, N> contextKey,
+            ForStMapState<K, N, UK, UV> table,
+            StateRequestHandler stateRequestHandler,
+            @Nullable ForStMapIteratorContinuation continuation,
+            boolean useContinuation,
+            InternalAsyncFuture<StateIterator<Map.Entry<UK, UV>>> future) {
+        super(contextKey, table, stateRequestHandler, continuation);
+        this.future = future;
+    }
+
     @Override
     public void completeStateFutureExceptionally(String message, Throwable ex) {
         future.completeExceptionally(message, ex);
@@ -80,7 +91,7 @@ public class ForStDBMapEntryIterRequest<K, N, UK, UV>
                         stateRequestHandler,
                         partialResult,
                         encounterEnd,
-                        rocksIterator);
+                        continuation);
 
         future.complete(stateIterator);
     }
