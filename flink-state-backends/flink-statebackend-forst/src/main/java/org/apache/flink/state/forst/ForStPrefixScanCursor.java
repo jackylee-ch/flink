@@ -33,7 +33,11 @@ import java.util.List;
 /** Prefix-scan cursor backed by the forst-rs-lib compat JNI chunk API. */
 class ForStPrefixScanCursor implements Closeable {
 
-    private static final int DATA_BUFFER_CAPACITY = 1024 * 1024;
+    private static final int INITIAL_DATA_BUFFER_CAPACITY = 1024 * 1024;
+
+    private static final int MAX_DATA_BUFFER_CAPACITY = 256 * 1024 * 1024;
+
+    private static final String BUFFER_TOO_SMALL_STATUS = "frs_status=110";
 
     private static final Cleaner CLEANER = Cleaner.create();
 
@@ -45,9 +49,9 @@ class ForStPrefixScanCursor implements Closeable {
 
     private final ByteBuffer valueOffsets;
 
-    private final ByteBuffer keyData;
+    private ByteBuffer keyData;
 
-    private final ByteBuffer valueData;
+    private ByteBuffer valueData;
 
     private final ByteBuffer valueValidity;
 
@@ -60,8 +64,8 @@ class ForStPrefixScanCursor implements Closeable {
         this.valueOffsets =
                 ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
                         .order(ByteOrder.nativeOrder());
-        this.keyData = ByteBuffer.allocateDirect(DATA_BUFFER_CAPACITY);
-        this.valueData = ByteBuffer.allocateDirect(DATA_BUFFER_CAPACITY);
+        this.keyData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
+        this.valueData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
         this.valueValidity = ByteBuffer.allocateDirect(maxRows);
     }
 
@@ -80,16 +84,26 @@ class ForStPrefixScanCursor implements Closeable {
 
     Chunk next(int maxRows) throws RocksDBException {
         ensureOpen();
-        clearBuffers();
-        long packed =
-                ForStRsLibPrefixScanNative.prefixLookupNextChunk(
-                        cleanup.handle,
-                        maxRows,
-                        keyOffsets,
-                        keyData,
-                        valueOffsets,
-                        valueData,
-                        valueValidity);
+        long packed;
+        while (true) {
+            clearBuffers();
+            try {
+                packed =
+                        ForStRsLibPrefixScanNative.prefixLookupNextChunk(
+                                cleanup.handle,
+                                maxRows,
+                                keyOffsets,
+                                keyData,
+                                valueOffsets,
+                                valueData,
+                                valueValidity);
+                break;
+            } catch (RocksDBException e) {
+                if (!isBufferTooSmall(e) || !growDataBuffers()) {
+                    throw e;
+                }
+            }
+        }
         int count = ForStRsLibPrefixScanNative.chunkCount(packed);
         boolean eof = ForStRsLibPrefixScanNative.chunkEof(packed);
         List<ForStDBIterRequest.RawEntry> entries = new ArrayList<>(count);
@@ -121,6 +135,27 @@ class ForStPrefixScanCursor implements Closeable {
         if (cleanup.handle == 0) {
             throw new IllegalStateException("ForSt prefix scan cursor is closed");
         }
+    }
+
+    private boolean growDataBuffers() {
+        if (keyData.capacity() >= MAX_DATA_BUFFER_CAPACITY
+                && valueData.capacity() >= MAX_DATA_BUFFER_CAPACITY) {
+            return false;
+        }
+        keyData = ByteBuffer.allocateDirect(nextDataBufferCapacity(keyData.capacity()));
+        valueData = ByteBuffer.allocateDirect(nextDataBufferCapacity(valueData.capacity()));
+        return true;
+    }
+
+    private static int nextDataBufferCapacity(int currentCapacity) {
+        return currentCapacity >= MAX_DATA_BUFFER_CAPACITY
+                ? MAX_DATA_BUFFER_CAPACITY
+                : Math.min(currentCapacity * 2, MAX_DATA_BUFFER_CAPACITY);
+    }
+
+    private static boolean isBufferTooSmall(RocksDBException e) {
+        String message = e.getMessage();
+        return message != null && message.contains(BUFFER_TOO_SMALL_STATUS);
     }
 
     private static byte[] copyBytes(ByteBuffer source, int offset, int length) {

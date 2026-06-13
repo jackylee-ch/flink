@@ -69,17 +69,18 @@ final class ForStRsLibPrefixScanNative {
             ByteBuffer valueData,
             ByteBuffer valueValidity)
             throws RocksDBException {
-        long packed =
-                prefixLookupNextChunk0(
-                        iterHandle,
-                        maxRows,
-                        keyOffsets,
-                        keyData,
-                        valueOffsets,
-                        valueData,
-                        valueValidity);
-        nextChunkCalls.incrementAndGet();
-        return packed;
+        try {
+            return prefixLookupNextChunk0(
+                    iterHandle,
+                    maxRows,
+                    keyOffsets,
+                    keyData,
+                    valueOffsets,
+                    valueData,
+                    valueValidity);
+        } finally {
+            nextChunkCalls.incrementAndGet();
+        }
     }
 
     static void resetNextChunkCallsForTesting() {

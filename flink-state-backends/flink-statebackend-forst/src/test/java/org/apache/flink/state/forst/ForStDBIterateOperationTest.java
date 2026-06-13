@@ -253,6 +253,108 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
         assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isGreaterThan(1);
     }
 
+    @Test
+    void testForStRsPrefixScanFastPathSmallPrefixManyProbes() throws Exception {
+        assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+
+        ForStMapState<Integer, VoidNamespace, String, String> mapState =
+                buildForStMapState("map-iter-fast-path-many-probes");
+        int probeCount = 16;
+        int rowsPerProbe = 4;
+        List<ForStDBIterRequest<?, ?, ?, ?, ?>> batchIterRequest = new ArrayList<>();
+        List<TestAsyncFuture<StateIterator<Map.Entry<String, String>>>> futures = new ArrayList<>();
+
+        for (int probe = 0; probe < probeCount; probe++) {
+            prepareDataForContext(probe, rowsPerProbe, mapState, db);
+            TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future =
+                    new TestAsyncFuture<>();
+            futures.add(future);
+            batchIterRequest.add(
+                    new ForStDBMapEntryIterRequest<>(
+                            buildContextKey(probe), mapState, null, null, future));
+        }
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            new ForStIterateOperation(db, batchIterRequest, executor).process().get();
+        } finally {
+            executor.shutdownNow();
+        }
+
+        for (TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future : futures) {
+            assertEntryIterator(future.getCompletedResult(), rowsPerProbe);
+        }
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(probeCount);
+    }
+
+    @Test
+    void testForStRsPrefixScanFastPathAdjacentPrefixStop() throws Exception {
+        assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+
+        ForStMapState<Integer, VoidNamespace, String, String> mapState =
+                buildForStMapState("map-iter-fast-path-adjacent");
+        prepareDataForContext(1, 4, mapState, db);
+        prepareDataForContext(2, 4, mapState, db);
+
+        TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future = new TestAsyncFuture<>();
+        List<ForStDBIterRequest<?, ?, ?, ?, ?>> batchIterRequest = new ArrayList<>();
+        batchIterRequest.add(
+                new ForStDBMapEntryIterRequest<>(buildContextKey(1), mapState, null, null, future));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            new ForStIterateOperation(db, batchIterRequest, executor).process().get();
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertEntryIterator(future.getCompletedResult(), 4);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(1);
+    }
+
+    @Test
+    void testForStRsPrefixScanFastPathExactlyCacheLimit() throws Exception {
+        assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+
+        ForStMapState<Integer, VoidNamespace, String, String> mapState =
+                buildForStMapState("map-iter-fast-path-cache-limit");
+        prepareData(CACHE_SIZE_LIMIT, mapState, db);
+        TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future = new TestAsyncFuture<>();
+        List<ForStDBIterRequest<?, ?, ?, ?, ?>> batchIterRequest = new ArrayList<>();
+        ContextKey<Integer, VoidNamespace> contextKey = buildContextKey(1);
+        MockStateRequestHandler stateRequestHandler = new MockStateRequestHandler();
+        batchIterRequest.add(
+                new ForStDBMapEntryIterRequest<>(
+                        contextKey, mapState, stateRequestHandler, null, future));
+
+        ExecutorService executor = Executors.newFixedThreadPool(2);
+        try {
+            new ForStIterateOperation(db, batchIterRequest, executor).process().get();
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertEntryIterator(future.getCompletedResult(), CACHE_SIZE_LIMIT);
+        assertThat(stateRequestHandler.payload).isNull();
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(1);
+    }
+
+    private void assertEntryIterator(
+            StateIterator<Map.Entry<String, String>> iterator, int expectedEntries) {
+        AtomicInteger count = new AtomicInteger(0);
+        iterator.onNext(
+                entry -> {
+                    int cnt = count.getAndIncrement();
+                    assertThat(entry.getKey()).isEqualTo("uk-" + cnt);
+                    assertThat(entry.getValue()).isEqualTo("val-" + cnt);
+                });
+        assertThat(count.get()).isEqualTo(expectedEntries);
+        assertThat(iterator.isEmpty()).isFalse();
+    }
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     private ForStDBIterRequest<Integer, VoidNamespace, String, String, Map.Entry<String, String>>
             buildEntryIterRequest(
@@ -276,8 +378,17 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
     private void prepareData(
             int num, ForStMapState<Integer, VoidNamespace, String, String> mapState, RocksDB db)
             throws Exception {
+        prepareDataForContext(1, num, mapState, db);
+    }
+
+    private void prepareDataForContext(
+            int contextKeyId,
+            int num,
+            ForStMapState<Integer, VoidNamespace, String, String> mapState,
+            RocksDB db)
+            throws Exception {
         for (int i = 0; i < num; i++) {
-            ContextKey<Integer, VoidNamespace> contextKey = buildContextKey(1);
+            ContextKey<Integer, VoidNamespace> contextKey = buildContextKey(contextKeyId);
             contextKey.setUserKey("uk-" + i);
             String value = "val-" + i;
             byte[] keyBytes = mapState.serializeKey(contextKey);
