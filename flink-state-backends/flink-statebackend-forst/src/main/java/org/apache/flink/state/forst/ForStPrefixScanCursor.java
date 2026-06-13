@@ -39,6 +39,8 @@ class ForStPrefixScanCursor implements Closeable {
 
     private static final String BUFFER_TOO_SMALL_STATUS = "frs_status=110";
 
+    private static final String BUFFER_TOO_SMALL_CAPACITY = "capacity too small";
+
     private static final Cleaner CLEANER = Cleaner.create();
 
     private final PrefixScanCleanup cleanup;
@@ -49,11 +51,15 @@ class ForStPrefixScanCursor implements Closeable {
 
     private final ByteBuffer valueOffsets;
 
+    private final ByteBuffer openFirstMeta;
+
     private ByteBuffer keyData;
 
     private ByteBuffer valueData;
 
     private final ByteBuffer valueValidity;
+
+    private Chunk prefetchedChunk;
 
     private ForStPrefixScanCursor(long handle, int maxRows) {
         this.cleanup = new PrefixScanCleanup(handle);
@@ -64,6 +70,9 @@ class ForStPrefixScanCursor implements Closeable {
         this.valueOffsets =
                 ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
                         .order(ByteOrder.nativeOrder());
+        this.openFirstMeta =
+                ByteBuffer.allocateDirect(ForStRsLibPrefixScanNative.OPEN_FIRST_META_BYTES)
+                        .order(ByteOrder.nativeOrder());
         this.keyData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
         this.valueData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
         this.valueValidity = ByteBuffer.allocateDirect(maxRows);
@@ -72,18 +81,66 @@ class ForStPrefixScanCursor implements Closeable {
     static ForStPrefixScanCursor open(
             RocksDB db, ColumnFamilyHandle columnFamilyHandle, byte[] prefix, int maxRows)
             throws RocksDBException {
-        long handle =
-                ForStRsLibPrefixScanNative.prefixLookupOpen(
-                        db.getNativeHandle(),
-                        columnFamilyHandle.getNativeHandle(),
-                        prefix,
-                        0,
-                        prefix.length);
-        return new ForStPrefixScanCursor(handle, maxRows);
+        ForStPrefixScanCursor cursor = new ForStPrefixScanCursor(0, maxRows);
+        try {
+            cursor.prefetchedChunk = cursor.openFirstChunk(db, columnFamilyHandle, prefix, maxRows);
+            return cursor;
+        } catch (RocksDBException | RuntimeException | Error e) {
+            cursor.closeQuietly();
+            throw e;
+        }
     }
 
     Chunk next(int maxRows) throws RocksDBException {
+        if (prefetchedChunk != null) {
+            Chunk chunk = prefetchedChunk;
+            prefetchedChunk = null;
+            return chunk;
+        }
         ensureOpen();
+        return nextChunk(maxRows);
+    }
+
+    private Chunk openFirstChunk(
+            RocksDB db, ColumnFamilyHandle columnFamilyHandle, byte[] prefix, int maxRows)
+            throws RocksDBException {
+        long handle;
+        while (true) {
+            clearBuffers();
+            openFirstMeta.clear();
+            try {
+                handle =
+                        ForStRsLibPrefixScanNative.prefixLookupOpenFirstChunk(
+                                db.getNativeHandle(),
+                                columnFamilyHandle.getNativeHandle(),
+                                prefix,
+                                0,
+                                prefix.length,
+                                maxRows,
+                                openFirstMeta,
+                                keyOffsets,
+                                keyData,
+                                valueOffsets,
+                                valueData,
+                                valueValidity);
+                break;
+            } catch (RocksDBException e) {
+                if (!isBufferTooSmall(e) || !growDataBuffers()) {
+                    throw e;
+                }
+            }
+        }
+        cleanup.handle = handle;
+        long metaHandle = ForStRsLibPrefixScanNative.openFirstHandle(openFirstMeta);
+        if (metaHandle != handle) {
+            throw new RocksDBException("ForSt-RS prefix scan open-first handle mismatch");
+        }
+        return decodeChunk(
+                ForStRsLibPrefixScanNative.openFirstCount(openFirstMeta),
+                ForStRsLibPrefixScanNative.openFirstEof(openFirstMeta));
+    }
+
+    private Chunk nextChunk(int maxRows) throws RocksDBException {
         long packed;
         while (true) {
             clearBuffers();
@@ -106,6 +163,10 @@ class ForStPrefixScanCursor implements Closeable {
         }
         int count = ForStRsLibPrefixScanNative.chunkCount(packed);
         boolean eof = ForStRsLibPrefixScanNative.chunkEof(packed);
+        return decodeChunk(count, eof);
+    }
+
+    private Chunk decodeChunk(int count, boolean eof) {
         List<ForStDBIterRequest.RawEntry> entries = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             int keyOffset = keyOffsets.getInt(i * Integer.BYTES);
@@ -155,7 +216,17 @@ class ForStPrefixScanCursor implements Closeable {
 
     private static boolean isBufferTooSmall(RocksDBException e) {
         String message = e.getMessage();
-        return message != null && message.contains(BUFFER_TOO_SMALL_STATUS);
+        return message != null
+                && (message.contains(BUFFER_TOO_SMALL_STATUS)
+                        || message.contains(BUFFER_TOO_SMALL_CAPACITY));
+    }
+
+    private void closeQuietly() {
+        try {
+            close();
+        } catch (IOException ignored) {
+            // Best-effort cleanup while propagating the original open failure.
+        }
     }
 
     private static byte[] copyBytes(ByteBuffer source, int offset, int length) {

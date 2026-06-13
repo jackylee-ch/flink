@@ -29,7 +29,17 @@ final class ForStRsLibPrefixScanNative {
 
     private static final String ENABLED_PROPERTY = "flink.forst.forst-rs-lib.prefix-scan.enabled";
 
+    static final int OPEN_FIRST_META_BYTES = 24;
+
+    private static final int OPEN_FIRST_META_HANDLE_OFFSET = 0;
+
+    private static final int OPEN_FIRST_META_COUNT_OFFSET = 8;
+
+    private static final int OPEN_FIRST_META_EOF_OFFSET = 12;
+
     private static volatile Boolean available;
+
+    private static final AtomicLong openFirstChunkCalls = new AtomicLong();
 
     private static final AtomicLong nextChunkCalls = new AtomicLong();
 
@@ -60,6 +70,39 @@ final class ForStRsLibPrefixScanNative {
         return prefixLookupOpen0(dbHandle, cfHandle, prefix, prefixOffset, prefixLength);
     }
 
+    static long prefixLookupOpenFirstChunk(
+            long dbHandle,
+            long cfHandle,
+            byte[] prefix,
+            int prefixOffset,
+            int prefixLength,
+            int maxRows,
+            ByteBuffer resultMeta,
+            ByteBuffer keyOffsets,
+            ByteBuffer keyData,
+            ByteBuffer valueOffsets,
+            ByteBuffer valueData,
+            ByteBuffer valueValidity)
+            throws RocksDBException {
+        try {
+            return prefixLookupOpenFirstChunk0(
+                    dbHandle,
+                    cfHandle,
+                    prefix,
+                    prefixOffset,
+                    prefixLength,
+                    maxRows,
+                    resultMeta,
+                    keyOffsets,
+                    keyData,
+                    valueOffsets,
+                    valueData,
+                    valueValidity);
+        } finally {
+            openFirstChunkCalls.incrementAndGet();
+        }
+    }
+
     static long prefixLookupNextChunk(
             long iterHandle,
             int maxRows,
@@ -87,8 +130,16 @@ final class ForStRsLibPrefixScanNative {
         nextChunkCalls.set(0);
     }
 
+    static void resetOpenFirstChunkCallsForTesting() {
+        openFirstChunkCalls.set(0);
+    }
+
     static long getNextChunkCallsForTesting() {
         return nextChunkCalls.get();
+    }
+
+    static long getOpenFirstChunkCallsForTesting() {
+        return openFirstChunkCalls.get();
     }
 
     static void prefixLookupClose(long iterHandle) throws RocksDBException {
@@ -101,6 +152,18 @@ final class ForStRsLibPrefixScanNative {
 
     static boolean chunkEof(long packed) {
         return (packed & (1L << 32)) != 0;
+    }
+
+    static long openFirstHandle(ByteBuffer resultMeta) {
+        return resultMeta.getLong(OPEN_FIRST_META_HANDLE_OFFSET);
+    }
+
+    static int openFirstCount(ByteBuffer resultMeta) {
+        return resultMeta.getInt(OPEN_FIRST_META_COUNT_OFFSET);
+    }
+
+    static boolean openFirstEof(ByteBuffer resultMeta) {
+        return resultMeta.getInt(OPEN_FIRST_META_EOF_OFFSET) != 0;
     }
 
     private static boolean detectAvailable() {
@@ -116,6 +179,21 @@ final class ForStRsLibPrefixScanNative {
 
     private static native long prefixLookupOpen0(
             long dbHandle, long cfHandle, byte[] prefix, int prefixOffset, int prefixLength)
+            throws RocksDBException;
+
+    private static native long prefixLookupOpenFirstChunk0(
+            long dbHandle,
+            long cfHandle,
+            byte[] prefix,
+            int prefixOffset,
+            int prefixLength,
+            int maxRows,
+            ByteBuffer resultMeta,
+            ByteBuffer keyOffsets,
+            ByteBuffer keyData,
+            ByteBuffer valueOffsets,
+            ByteBuffer valueData,
+            ByteBuffer valueValidity)
             throws RocksDBException;
 
     private static native long prefixLookupNextChunk0(

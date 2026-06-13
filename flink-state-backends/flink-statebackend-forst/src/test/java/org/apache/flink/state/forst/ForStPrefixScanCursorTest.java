@@ -40,6 +40,7 @@ class ForStPrefixScanCursorTest extends ForStDBOperationTestBase {
     @Test
     void testForStRsPrefixScanFastPathGrowsForLargeValue() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
@@ -69,7 +70,8 @@ class ForStPrefixScanCursorTest extends ForStDBOperationTestBase {
                     assertThat(entry.getValue()).isEqualTo(largeValue);
                 });
         assertThat(count.get()).isEqualTo(1);
-        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isGreaterThan(1);
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting()).isGreaterThan(1);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
     }
 
     private void putMapEntry(

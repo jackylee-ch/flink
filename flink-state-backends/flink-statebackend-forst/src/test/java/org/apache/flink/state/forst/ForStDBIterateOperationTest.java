@@ -193,6 +193,7 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
     @Test
     void testForStRsPrefixScanFastPathIteratorLoading() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
@@ -250,12 +251,14 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
             assertThat(count.get()).isEqualTo(200);
             assertThat(iterator2.isEmpty()).isFalse();
         }
-        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isGreaterThan(1);
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting()).isEqualTo(1);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(1);
     }
 
     @Test
     void testForStRsPrefixScanFastPathSmallPrefixManyProbes() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
@@ -285,12 +288,15 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
         for (TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future : futures) {
             assertEntryIterator(future.getCompletedResult(), rowsPerProbe);
         }
-        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(probeCount);
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting())
+                .isEqualTo(probeCount);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
     }
 
     @Test
     void testForStRsPrefixScanFastPathAdjacentPrefixStop() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
@@ -311,12 +317,14 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
         }
 
         assertEntryIterator(future.getCompletedResult(), 4);
-        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(1);
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting()).isEqualTo(1);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
     }
 
     @Test
     void testForStRsPrefixScanFastPathExactlyCacheLimit() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
@@ -339,7 +347,8 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
 
         assertEntryIterator(future.getCompletedResult(), CACHE_SIZE_LIMIT);
         assertThat(stateRequestHandler.payload).isNull();
-        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isEqualTo(1);
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting()).isEqualTo(1);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
     }
 
     private void assertEntryIterator(
