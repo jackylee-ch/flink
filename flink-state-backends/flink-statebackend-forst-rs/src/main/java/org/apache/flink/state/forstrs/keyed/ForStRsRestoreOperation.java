@@ -109,7 +109,39 @@ public class ForStRsRestoreOperation {
     private final KeyGroupRange targetRange;
     private final ForStRsSstRegistry sstRegistry;
     private final SstRetryStrategy retryStrategy;
+    private final RemoteRestoreConfig remoteConfig;
     private final Set<Closeable> activeDownloadStreams = ConcurrentHashMap.newKeySet();
+
+    /**
+     * FRS-PHASE2 (Task-A): the OpenDAL config threaded from the backend so the LINK-mode INSTANT
+     * restore can take the REMOTE-PRIMARY variant ({@link
+     * ForStRsLinker#dbOpenFromLinkedCheckpointInstantRemote}) — the same {@code uri / opendalConfig
+     * / cacheDir / cacheCapacityBytes} the backend hands {@link ForStRsLinker#dbOpenRemoteWithOptions}
+     * on the normal remote open path. When {@code null} (or {@code storageUri} blank) the LOCAL-FS
+     * instant path ({@link ForStRsLinker#dbOpenFromLinkedCheckpointInstant}) is used — this is the
+     * default-flag-off behaviour, so threading the config does not alter the legacy path.
+     */
+    public static final class RemoteRestoreConfig {
+        private final String storageUri;
+        private final String opendalConfigJson;
+        private final String cacheDir;
+        private final long cacheCapacityBytes;
+
+        public RemoteRestoreConfig(
+                String storageUri,
+                String opendalConfigJson,
+                String cacheDir,
+                long cacheCapacityBytes) {
+            this.storageUri = storageUri;
+            this.opendalConfigJson = opendalConfigJson;
+            this.cacheDir = cacheDir;
+            this.cacheCapacityBytes = cacheCapacityBytes;
+        }
+
+        boolean isRemote() {
+            return storageUri != null && !storageUri.isEmpty();
+        }
+    }
 
     public ForStRsRestoreOperation(
             ForStRsLinker linker,
@@ -117,7 +149,36 @@ public class ForStRsRestoreOperation {
             Path targetDir,
             KeyGroupRange targetRange,
             ForStRsSstRegistry sstRegistry) {
-        this(linker, arena, targetDir, targetRange, sstRegistry, SstRetryStrategy.defaultStrategy());
+        this(
+                linker,
+                arena,
+                targetDir,
+                targetRange,
+                sstRegistry,
+                SstRetryStrategy.defaultStrategy(),
+                null);
+    }
+
+    /**
+     * FRS-PHASE2 (Task-A): production overload that threads the OpenDAL {@link RemoteRestoreConfig}
+     * so a LINK-mode INSTANT restore can drive the remote-primary engine open. {@code remoteConfig}
+     * may be {@code null} (local-FS instant restore — the default-flag-off behaviour).
+     */
+    public ForStRsRestoreOperation(
+            ForStRsLinker linker,
+            Arena arena,
+            Path targetDir,
+            KeyGroupRange targetRange,
+            ForStRsSstRegistry sstRegistry,
+            RemoteRestoreConfig remoteConfig) {
+        this(
+                linker,
+                arena,
+                targetDir,
+                targetRange,
+                sstRegistry,
+                SstRetryStrategy.defaultStrategy(),
+                remoteConfig);
     }
 
     /**
@@ -132,12 +193,24 @@ public class ForStRsRestoreOperation {
             KeyGroupRange targetRange,
             ForStRsSstRegistry sstRegistry,
             SstRetryStrategy retryStrategy) {
+        this(linker, arena, targetDir, targetRange, sstRegistry, retryStrategy, null);
+    }
+
+    public ForStRsRestoreOperation(
+            ForStRsLinker linker,
+            Arena arena,
+            Path targetDir,
+            KeyGroupRange targetRange,
+            ForStRsSstRegistry sstRegistry,
+            SstRetryStrategy retryStrategy,
+            RemoteRestoreConfig remoteConfig) {
         this.linker = linker;
         this.arena = arena;
         this.targetDir = targetDir;
         this.targetRange = targetRange;
         this.sstRegistry = sstRegistry;
         this.retryStrategy = retryStrategy;
+        this.remoteConfig = remoteConfig;
     }
 
     /** Result bundle returned by {@link #restore(Collection)}. */
@@ -393,13 +466,15 @@ public class ForStRsRestoreOperation {
      * weaning satisfy this; surfacing residual==0 to the JM as "safe to release" is follow-up
      * wiring.
      *
-     * <p>DEVIATION FROM PACKAGE FRAGMENT: this restore operation is constructed with only {@code
-     * linker / arena / targetDir / targetRange / sstRegistry} — it has NO {@code storageUri /
-     * cacheDir / cacheCapacityBytes / opendalConfigJson} fields, so the remote-primary instant
-     * variant ({@code dbOpenFromLinkedCheckpointInstantRemote}) cannot be driven from here. The
-     * local-FS instant path is used; remote-primary instant restore is deferred until the restore
-     * op carries the OpenDAL config (the same config the backend used for {@code frs_db_open_remote}
-     * is not threaded into this class today).
+     * <p>FRS-PHASE2 (Task-A): when a {@link RemoteRestoreConfig} with a non-blank {@code storageUri}
+     * is threaded in (the same {@code uri / opendalConfig / cacheDir / cacheCapacityBytes} the
+     * backend hands {@code dbOpenRemoteWithOptions} on the normal remote open path), the
+     * REMOTE-PRIMARY instant variant ({@code dbOpenFromLinkedCheckpointInstantRemote}) is driven:
+     * the engine builds the same {@code CachedFileSystem(OpendalFileSystem, LocalCache)} stack and
+     * adopts the chk-namespace physicals over remote storage — downloading nothing. When no remote
+     * config is present (local-FS deployment, or the legacy default-flag-off path) the LOCAL-FS
+     * instant variant ({@code dbOpenFromLinkedCheckpointInstant}) is used instead; behaviour is
+     * unchanged.
      */
     private RestoreResult restoreInstantLinked(IncrementalRemoteKeyedStateHandle handle)
             throws IOException {
@@ -422,18 +497,36 @@ public class ForStRsRestoreOperation {
                         ? Collections.emptyMap()
                         : downloadAndParseRegistryBlob(registryEntry, handle);
 
-        // Instant restore: local-primary (3-arg variant). Remote-primary is a documented deviation
-        // above — this op is not wired with the OpenDAL config.
+        // Instant restore: REMOTE-PRIMARY when the backend threaded an OpenDAL config with a
+        // non-blank storageUri (Task-A), else LOCAL-FS (3-arg variant). The remote variant builds
+        // the same CachedFileSystem(OpendalFileSystem, LocalCache) stack as the normal remote open
+        // path and adopts the chk-namespace physicals over remote storage, downloading nothing.
+        boolean remotePrimary = remoteConfig != null && remoteConfig.isRemote();
         FrsDb db;
         try {
-            db = linker.dbOpenFromLinkedCheckpointInstant(arena, ckptDir, targetDir.toString());
+            if (remotePrimary) {
+                db =
+                        linker.dbOpenFromLinkedCheckpointInstantRemote(
+                                arena,
+                                remoteConfig.storageUri,
+                                remoteConfig.opendalConfigJson,
+                                remoteConfig.cacheDir,
+                                remoteConfig.cacheCapacityBytes,
+                                ckptDir,
+                                targetDir.toString());
+            } else {
+                db = linker.dbOpenFromLinkedCheckpointInstant(arena, ckptDir, targetDir.toString());
+            }
         } catch (RuntimeException re) {
             // Loud failure (missing physical / no mapping trailer / torn WAL.delta) — never a
             // silent empty state.
             throw new ForStRsCheckpointRestoreException(
                     ckptDir,
                     handle.getCheckpointId(),
-                    "ForSt-RS instant-link restore refused: " + re.getMessage(),
+                    "ForSt-RS instant-link restore refused ("
+                            + (remotePrimary ? "remote-primary" : "local-fs")
+                            + "): "
+                            + re.getMessage(),
                     re);
         }
         FrsCfHandle defaultCf;

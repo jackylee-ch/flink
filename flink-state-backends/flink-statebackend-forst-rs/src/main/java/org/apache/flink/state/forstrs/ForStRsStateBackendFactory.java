@@ -32,6 +32,7 @@ public class ForStRsStateBackendFactory implements StateBackendFactory<ForStRsSt
         options.opendalConfigJson(config.get(ForStRsOptions.OPENDAL_CONFIG));
         options.cacheDir(config.get(ForStRsOptions.CACHE_DIR));
         options.cacheCapacityMb(config.get(ForStRsOptions.CACHE_CAPACITY_MB));
+        options.walDir(config.get(ForStRsOptions.WAL_DIR));
         ForStRsEngineOptionsBuilder engineOptions =
                 new ForStRsConfigurableOptionsFactory(config)
                         .createForStRsOptions(new ForStRsEngineOptionsBuilder());

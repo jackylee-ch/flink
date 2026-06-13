@@ -18,6 +18,8 @@
 
 package org.apache.flink.state.forstrs.ffm;
 
+import org.apache.flink.state.forstrs.FrsBackendException;
+
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -32,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -123,6 +126,171 @@ class LinkedCheckpointRoundTripTest {
                 // until compaction weans the engine off the source (CLAIM-mode discipline, D-J4).
                 long residual = linker.dbAdoptedResidual(arena, restored);
                 assertTrue(residual >= 0L, "adopted residual must be reported");
+            }
+        }
+    }
+
+    /**
+     * FRS-PHASE2 (Task-A): REMOTE-PRIMARY instant restore round-trip via an emulated OpenDAL {@code
+     * file://} backend — exercises {@link
+     * ForStRsLinker#dbOpenFromLinkedCheckpointInstantRemote(Arena, String, String, String, long,
+     * String, String)}, the symbol the backend now drives when a {@code storageUri} is configured.
+     * A remote ({@code file://}) DB is opened, written + flushed, LINK-mode checkpointed (zero data
+     * upload — SSTs link()ed into the remote chk namespace), then INSTANT-restored through the
+     * remote variant: the engine builds the same {@code CachedFileSystem(OpendalFileSystem,
+     * LocalCache)} stack, adopts the chk-namespace physicals over remote storage, and reads every
+     * row byte-exact — downloading no SST. This is the same {@code uri / opendalConfig / cacheDir /
+     * cacheCapacityBytes} surface the production backend passes through {@code
+     * ForStRsStateBackend.buildRemoteRestoreConfig}.
+     */
+    @Test
+    void remotePrimaryInstantRestoreRoundTrip(@TempDir Path tmp) {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            Path remoteRoot = tmp.resolve("remote");
+            remoteRoot.toFile().mkdirs();
+            // file:// OpenDAL backend rooted at a real local dir (emulates a remote object store).
+            String uri = "file://" + remoteRoot.toAbsolutePath();
+            Path cacheDir = tmp.resolve("cache");
+            cacheDir.toFile().mkdirs();
+            Path restoreDir = tmp.resolve("restored");
+            final long cacheCapacityBytes = 64L * 1024 * 1024;
+
+            String ckptDir;
+            try (FrsDb db =
+                    linker.dbOpenRemote(
+                            arena, uri, "{}", cacheDir.toString(), cacheCapacityBytes)) {
+                FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+                for (int i = 0; i < 64; i++) {
+                    linker.put(db, cf, b(String.format("k%03d", i)), b(String.format("v%03d", i)));
+                }
+                linker.flush(db);
+
+                FrsSnapshot snap = linker.dbSnapshot(db, arena);
+                MemorySegment result = arena.allocate(24);
+                linker.createIncrementalCheckpointLinked(db, snap, 1L, 0L, result);
+                snap.close();
+
+                Path manifest = readCString(result, 0L);
+                assertNotNull(manifest, "remote linked checkpoint must surface a manifest path");
+                // The chk dir is the manifest's parent in the REMOTE namespace (design §9 D1).
+                ckptDir = manifest.getParent().toString();
+
+                long newCount = listCount(result, ValueLayout.ADDRESS.byteSize());
+                assertTrue(newCount >= 1, "FLUSH-mode remote link checkpoint must link ≥1 SST");
+
+                linker.dbLinkedCheckpointResultFree(result);
+            }
+
+            // ---- REMOTE-PRIMARY instant restore: downloads NO SST, resolves over the file:// FS.
+            try (FrsDb restored =
+                    linker.dbOpenFromLinkedCheckpointInstantRemote(
+                            arena,
+                            uri,
+                            "{}",
+                            cacheDir.toString(),
+                            cacheCapacityBytes,
+                            ckptDir,
+                            restoreDir.toString())) {
+                FrsCfHandle cf = linker.dbDefaultCf(restored, arena);
+                for (int i = 0; i < 64; i++) {
+                    byte[] got = linker.get(restored, cf, b(String.format("k%03d", i)));
+                    assertArrayEquals(
+                            b(String.format("v%03d", i)),
+                            got,
+                            "remote-primary instant restore must read every row byte-exact");
+                }
+                long residual = linker.dbAdoptedResidual(arena, restored);
+                assertTrue(residual >= 0L, "adopted residual must be reported");
+            }
+        }
+    }
+
+    /**
+     * FRS-WAL-DELTA (Task-A): WAL attach round-trip — write → checkpoint → restore → tail replayed.
+     * Exercises {@link ForStRsLinker#dbAttachWal(Arena, FrsDb, String)}, the symbol the backend now
+     * calls at open when {@code state.backend.forst-rs.wal.dir} is set. A flushed floor lands in
+     * SSTs, then a WAL is attached and an unflushed tail (inserts + an overwrite) is written; the
+     * LINK-mode checkpoint captures the tail into the WAL.delta (no forced flush) and the instant
+     * restore replays it byte-exact above the floor. A double-attach is rejected
+     * (INVALID_ARGUMENT). Mirrors the engine IT {@code
+     * linked_checkpoint_wal_delta_mode_replays_unflushed_tail} at the Java surface.
+     */
+    @Test
+    void walDeltaAttachReplaysUnflushedTail(@TempDir Path tmp) {
+        try (Arena arena = Arena.ofShared()) {
+            ForStRsLinker linker = new ForStRsLinker(arena);
+            Path dbDir = tmp.resolve("db");
+            Path walDir = tmp.resolve("wal");
+            walDir.toFile().mkdirs();
+            String walPath = walDir.resolve("db.wal").toString();
+            Path restoreDir = tmp.resolve("restored");
+
+            String ckptDir;
+            try (FrsDb db = linker.dbOpen(arena, dbDir.toString())) {
+                FrsCfHandle cf = linker.dbDefaultCf(db, arena);
+
+                // Flushed floor: lands in SSTs.
+                for (int i = 0; i < 20; i++) {
+                    linker.put(db, cf, b(String.format("floor%02d", i)), b(String.format("f%02d", i)));
+                }
+                linker.flush(db);
+
+                // Opt into WAL-DELTA (per-DB, env-free) — the call the backend now makes at open.
+                linker.dbAttachWal(arena, db, walPath);
+                // Double-attach must be rejected.
+                FrsBackendException doubleAttach = null;
+                try {
+                    linker.dbAttachWal(arena, db, walPath);
+                } catch (FrsBackendException e) {
+                    doubleAttach = e;
+                }
+                assertNotNull(doubleAttach, "second dbAttachWal must be rejected (INVALID_ARGUMENT)");
+
+                // Unflushed tail: inserts + an overwrite, logged to the WAL.
+                for (int i = 0; i < 15; i++) {
+                    linker.put(db, cf, b(String.format("tail%02d", i)), b(String.format("t%02d", i)));
+                }
+                linker.put(db, cf, b("floor00"), b("overwritten"));
+
+                FrsSnapshot snap = linker.dbSnapshot(db, arena);
+                MemorySegment result = arena.allocate(24);
+                linker.createIncrementalCheckpointLinked(db, snap, 5L, 0L, result);
+                snap.close();
+                Path manifest = readCString(result, 0L);
+                assertNotNull(manifest, "WAL-DELTA linked checkpoint must surface a manifest path");
+                ckptDir = manifest.getParent().toString();
+                linker.dbLinkedCheckpointResultFree(result);
+
+                // A write AFTER the barrier must not be part of the checkpoint.
+                linker.put(db, cf, b("after-barrier"), b("nope"));
+            }
+
+            // ---- instant restore replays the WAL.delta tail above the flushed floor. ----
+            try (FrsDb restored =
+                    linker.dbOpenFromLinkedCheckpointInstant(
+                            arena, ckptDir, restoreDir.toString())) {
+                FrsCfHandle cf = linker.dbDefaultCf(restored, arena);
+                // Floor rows (minus the overwrite), tail rows, and the overwrite are all present.
+                for (int i = 1; i < 20; i++) {
+                    assertArrayEquals(
+                            b(String.format("f%02d", i)),
+                            linker.get(restored, cf, b(String.format("floor%02d", i))),
+                            "floor row must survive");
+                }
+                for (int i = 0; i < 15; i++) {
+                    assertArrayEquals(
+                            b(String.format("t%02d", i)),
+                            linker.get(restored, cf, b(String.format("tail%02d", i))),
+                            "WAL.delta tail row must be replayed");
+                }
+                assertArrayEquals(
+                        b("overwritten"),
+                        linker.get(restored, cf, b("floor00")),
+                        "WAL.delta overwrite must win");
+                assertNull(
+                        linker.get(restored, cf, b("after-barrier")),
+                        "post-barrier write must NOT be in the checkpoint");
             }
         }
     }

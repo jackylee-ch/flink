@@ -84,6 +84,23 @@ public final class ForStRsOptions implements Serializable {
                             "Local directory used by the SST LRU cache that fronts remote storage."
                                     + " Required when storage.uri is set.");
 
+    /**
+     * FRS-WAL-DELTA (Task-A): local directory for the per-DB write-ahead log. When set, the engine
+     * attaches a WAL at open so LINK-mode checkpoints can skip the memtable flush and capture the
+     * unflushed tail into {@code <chk-dir>/WAL.delta}; restore replays it. Default unset ⇒ FLUSH
+     * mode (unchanged). Place on fast LOCAL disk.
+     */
+    public static final ConfigOption<String> WAL_DIR =
+            ConfigOptions.key("state.backend.forst-rs.wal.dir")
+                    .stringType()
+                    .noDefaultValue()
+                    .withDescription(
+                            "Local directory for the per-DB write-ahead log (WAL-DELTA durability)."
+                                    + " When set, the engine attaches a WAL at open so LINK-mode"
+                                    + " checkpoints skip the memtable flush and capture the unflushed"
+                                    + " tail into <chk-dir>/WAL.delta (replayed on restore). Default"
+                                    + " unset = FLUSH mode (unchanged). Place on fast LOCAL disk.");
+
     /** Total LRU cache budget on local disk, in MiB. */
     public static final ConfigOption<Long> CACHE_CAPACITY_MB =
             ConfigOptions.key("state.backend.forst-rs.storage.cache-capacity-mb")
@@ -99,6 +116,7 @@ public final class ForStRsOptions implements Serializable {
     private String opendalConfigJson = "{}";
     private String cacheDir;
     private long cacheCapacityMb = 1024L;
+    private String walDir;
 
     // B-Prod-P7 §6d: shared LRU block cache + cross-CF WriteBufferManager.
     // Defaults match the design doc (256 MiB cache, 512 MiB WBM); 0 means
@@ -148,6 +166,19 @@ public final class ForStRsOptions implements Serializable {
 
     public ForStRsOptions cacheDir(String dir) {
         this.cacheDir = dir;
+        return this;
+    }
+
+    /**
+     * FRS-WAL-DELTA (Task-A): local WAL directory; {@code null} (the default) means FLUSH mode (no
+     * WAL attached at open).
+     */
+    public String walDir() {
+        return walDir;
+    }
+
+    public ForStRsOptions walDir(String dir) {
+        this.walDir = dir == null || dir.isEmpty() ? null : dir;
         return this;
     }
 

@@ -141,7 +141,9 @@ public class ForStRsStateBackend implements StateBackend {
                                         parameters.getKeyGroupRange(),
                                         parameters.getNumberOfKeyGroups(),
                                         localDbPath,
-                                        restoredHandles);
+                                        restoredHandles,
+                                        buildRemoteRestoreConfig(options, localDbPath),
+                                        resolveWalPath(options, localDbPath));
                 // E8-H4: wire path identity so dispose can release the invariant slot.
                 backend.setBackendPathIdentity(
                         parameters.getJobID(), parameters.getOperatorIdentifier());
@@ -210,6 +212,8 @@ public class ForStRsStateBackend implements StateBackend {
             } else {
                 db = openLocalDbWithOptions(arena, linker, localDbPath);
             }
+            // FRS-WAL-DELTA (Task-A): attach the WAL before serving any writes (no-op default).
+            maybeAttachWal(linker, arena, db, options, localDbPath);
             cf = linker.dbDefaultCf(db, arena);
             org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<K> backend =
                     new org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend<>(
@@ -323,7 +327,8 @@ public class ForStRsStateBackend implements StateBackend {
                                 arena,
                                 localDbPath,
                                 parameters.getKeyGroupRange(),
-                                sstRegistry);
+                                sstRegistry,
+                                buildRemoteRestoreConfig(options, localDbPath));
                 restored = restoreOp.restore(restoredHandles);
                 db = restored.getDb();
                 cf = restored.getDefaultCf();
@@ -361,6 +366,10 @@ public class ForStRsStateBackend implements StateBackend {
                 db = openLocalDbWithOptions(arena, linker, localDbPath);
                 cf = linker.dbDefaultCf(db, arena);
             }
+
+            // FRS-WAL-DELTA (Task-A): attach the WAL before serving any writes (no-op default).
+            // Covers all three open branches (restore / remote / local) — db is set in each.
+            maybeAttachWal(linker, arena, db, options, localDbPath);
 
             TypeSerializer<K> keySerializer = parameters.getKeySerializer();
             // PR-A3 (S1-6 / E-CRIT-3): pass the real key-group range + number-of-key-groups so
@@ -560,5 +569,72 @@ public class ForStRsStateBackend implements StateBackend {
                 options.maxBackgroundFlushes(),
                 options.blockCacheCapacityBytes(),
                 options.writeBufferManagerCapacityBytes());
+    }
+
+    /**
+     * FRS-PHASE2 (Task-A): build the {@link ForStRsRestoreOperation.RemoteRestoreConfig} the restore
+     * op needs to drive REMOTE-PRIMARY instant-link restore. Returns {@code null} when no {@code
+     * storageUri} is configured (local-FS deployment) ⇒ the restore op falls back to the local-FS
+     * instant path. The {@code uri / opendalConfig / cacheDir / cacheCapacityBytes} match exactly
+     * what the normal remote open path hands {@link ForStRsLinker#dbOpenRemoteWithOptions}, including
+     * the per-instance storage-subtree tag and the cache-dir fallback, so the engine resolves the
+     * same {@code CachedFileSystem(OpendalFileSystem, LocalCache)} stack.
+     */
+    /**
+     * FRS-WAL-DELTA (Task-A): attach a per-DB write-ahead log when {@code state.backend.forst-rs.wal
+     * .dir} is configured (or {@code walDir} is otherwise set). MUST be called at open, BEFORE the
+     * backend serves any writes — the engine seals + flushes all pre-WAL memtable state first, so
+     * nothing is lost, but a write racing the attach barrier is undefined. No-op (FLUSH mode,
+     * unchanged) when {@code walDir} is null/blank, which is the default. The WAL directory is made
+     * unique per backend instance (sibling to the engine local dir under {@code walDir}) so two
+     * subtask backends sharing one configured WAL dir do not collide.
+     */
+    static void maybeAttachWal(
+            ForStRsLinker linker, Arena arena, FrsDb db, ForStRsOptions options, Path localDbPath)
+            throws java.io.IOException {
+        String walPath = resolveWalPath(options, localDbPath);
+        if (walPath != null) {
+            linker.dbAttachWal(arena, db, walPath);
+        }
+    }
+
+    /**
+     * FRS-WAL-DELTA (Task-A): resolve the per-instance WAL directory ({@code <walDir>/<instanceTag>})
+     * and create it, returning its path. Returns {@code null} (FLUSH mode, no attach) when {@code
+     * walDir} is unset. The per-instance subdirectory keeps two subtask backends that share one
+     * configured WAL dir from colliding.
+     */
+    static String resolveWalPath(ForStRsOptions options, Path localDbPath) throws java.io.IOException {
+        String walDir = options.walDir();
+        if (walDir == null || walDir.isEmpty()) {
+            return null;
+        }
+        String instanceTag = localDbPath.getFileName().toString();
+        Path walPath = Path.of(walDir).resolve(instanceTag);
+        Files.createDirectories(walPath);
+        return walPath.toString();
+    }
+
+    static ForStRsRestoreOperation.RemoteRestoreConfig buildRemoteRestoreConfig(
+            ForStRsOptions options, Path localDbPath) throws java.io.IOException {
+        String storageUri = options.storageUri();
+        if (storageUri == null || storageUri.isEmpty()) {
+            return null;
+        }
+        String instanceTag = localDbPath.getFileName().toString();
+        String uniqueStorageUri =
+                storageUri.endsWith("/")
+                        ? storageUri + instanceTag
+                        : storageUri + "/" + instanceTag;
+        String cacheDir = options.cacheDir();
+        if (cacheDir == null || cacheDir.isEmpty()) {
+            cacheDir = localDbPath.resolveSibling("cache").toString();
+            Files.createDirectories(Path.of(cacheDir));
+        }
+        return new ForStRsRestoreOperation.RemoteRestoreConfig(
+                uniqueStorageUri,
+                options.opendalConfigJson(),
+                cacheDir,
+                options.cacheCapacityBytes());
     }
 }

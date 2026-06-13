@@ -612,6 +612,35 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             Path localDbPath,
             Collection<KeyedStateHandle> restoredHandles)
             throws IOException {
+        return restoreFromHandles(
+                arena,
+                linker,
+                keySerializer,
+                keyGroupRange,
+                totalKeyGroups,
+                localDbPath,
+                restoredHandles,
+                /* remoteConfig= */ null,
+                /* walPath= */ null);
+    }
+
+    /**
+     * FRS-PHASE2 (Task-A): restore overload that threads the OpenDAL {@link
+     * ForStRsRestoreOperation.RemoteRestoreConfig} so a LINK-mode INSTANT restore can drive the
+     * remote-primary engine open, and the {@code walPath} so WAL-DELTA durability is attached at
+     * open. Both may be {@code null} (local-FS instant restore, FLUSH mode — the default behaviour).
+     */
+    public static <K> ForStRsAsyncKeyedStateBackend<K> restoreFromHandles(
+            Arena arena,
+            ForStRsLinker linker,
+            TypeSerializer<K> keySerializer,
+            KeyGroupRange keyGroupRange,
+            int totalKeyGroups,
+            Path localDbPath,
+            Collection<KeyedStateHandle> restoredHandles,
+            ForStRsRestoreOperation.RemoteRestoreConfig remoteConfig,
+            String walPath)
+            throws IOException {
         if (restoredHandles == null || restoredHandles.isEmpty()) {
             throw new IllegalArgumentException(
                     "restoreFromHandles requires a non-empty handle collection; route empty-restore"
@@ -620,7 +649,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         ForStRsSstRegistry restoredSstRegistry = new ForStRsSstRegistry();
         ForStRsRestoreOperation restoreOp =
                 new ForStRsRestoreOperation(
-                        linker, arena, localDbPath, keyGroupRange, restoredSstRegistry);
+                        linker,
+                        arena,
+                        localDbPath,
+                        keyGroupRange,
+                        restoredSstRegistry,
+                        remoteConfig);
         // A5-M1: accumulate db + cf references separately from {@code restored} so the catch
         // path can close them BEFORE the caller (createAsyncKeyedStateBackend) closes the
         // arena. Pre-fix, a throw inside the backend constructor or any of the post-restore
@@ -633,6 +667,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             ForStRsRestoreOperation.RestoreResult restored = restoreOp.restore(restoredHandles);
             db = restored.getDb();
             cf = restored.getDefaultCf();
+
+            // FRS-WAL-DELTA (Task-A): attach the WAL before the restored backend serves any writes
+            // (no-op when walPath is null/blank, which is the default).
+            if (walPath != null && !walPath.isEmpty()) {
+                linker.dbAttachWal(arena, db, walPath);
+            }
 
             ForStRsAsyncKeyedStateBackend<K> backend =
                     new ForStRsAsyncKeyedStateBackend<>(
