@@ -4606,6 +4606,17 @@ public final class ForStRsLinker {
         FRS_CHUNK_BUF_CAP.set(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize(), cap);
     }
 
+    /** Initializes one FrsChunk before a batched open reuses the caller-owned output array. */
+    public static void initFrsChunkForOpen(
+            MemorySegment chunks, int i, MemorySegment bufPtr, int cap) {
+        long off = (long) i * FRS_CHUNK_LAYOUT.byteSize();
+        FRS_CHUNK_BUF_PTR.set(chunks, off, bufPtr);
+        FRS_CHUNK_BUF_CAP.set(chunks, off, cap);
+        FRS_CHUNK_ROW_COUNT.set(chunks, off, 0);
+        FRS_CHUNK_BYTES_USED.set(chunks, off, 0);
+        FRS_CHUNK_RESERVED.set(chunks, off, 0);
+    }
+
     /** Per-iter FrsChunk read: row_count written by the engine. */
     public static int getFrsChunkRowCount(MemorySegment chunks, int i) {
         return (int) FRS_CHUNK_ROW_COUNT.get(chunks, (long) i * FRS_CHUNK_LAYOUT.byteSize());

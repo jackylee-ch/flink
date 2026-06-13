@@ -162,6 +162,8 @@ public class VectorizedExecutor implements StateExecutor {
      */
     private MemorySegment reusableIterChunkBuf;
 
+    private double iterRowsPerPrefixEwma = 1.0d;
+
     // Optional metrics + fatal-handler — set via setters after construction so that
     // backends that don't yet have a MetricGroup can still instantiate the executor.
     private DispatchMetrics metrics;
@@ -246,6 +248,8 @@ public class VectorizedExecutor implements StateExecutor {
     private final MemorySegment scratchIterRangeHandle;
     private final MemorySegment scratchIterRangeRowCount;
     private final MemorySegment scratchIterRangeBytesUsed;
+    private final MemorySegment scratchIterNextRowCount;
+    private final MemorySegment scratchIterNextBytesUsed;
 
     // A6-H3 / B6-H2 / D6-H1: persistent executor-arena scratch for dispatchIterPrefix.
     // Capacities are tracked per-segment and grown on demand via the
@@ -261,6 +265,8 @@ public class VectorizedExecutor implements StateExecutor {
     private long scratchOutHandlesCap; // in entries (u64)
     private MemorySegment scratchOutChunks;
     private long scratchOutChunksCap; // in entries (FrsChunk stride)
+    private MemorySegment scratchIterBatchChunkData;
+    private long scratchIterBatchChunkDataCap; // in bytes
 
     public VectorizedExecutor(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         this.linker = linker;
@@ -286,6 +292,8 @@ public class VectorizedExecutor implements StateExecutor {
         this.scratchIterRangeHandle = arena.allocate(ValueLayout.JAVA_LONG);
         this.scratchIterRangeRowCount = arena.allocate(ValueLayout.JAVA_INT);
         this.scratchIterRangeBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
+        this.scratchIterNextRowCount = arena.allocate(ValueLayout.JAVA_INT);
+        this.scratchIterNextBytesUsed = arena.allocate(ValueLayout.JAVA_INT);
         this.scratchPrefixesOffCap = 0L;
         this.scratchPrefixesOff = MemorySegment.NULL;
         this.scratchPrefixesDataCap = 0L;
@@ -294,6 +302,8 @@ public class VectorizedExecutor implements StateExecutor {
         this.scratchOutHandles = MemorySegment.NULL;
         this.scratchOutChunksCap = 0L;
         this.scratchOutChunks = MemorySegment.NULL;
+        this.scratchIterBatchChunkDataCap = 0L;
+        this.scratchIterBatchChunkData = MemorySegment.NULL;
     }
 
     // -----------------------------------------------------------------
@@ -1350,16 +1360,12 @@ public class VectorizedExecutor implements StateExecutor {
         }
     }
 
-    /**
-     * FRS_RS_PARALLEL_ITER (default OFF): route the batch's iterator probes through the
-     * coalesced + parallel engine open ({@code frs_vec_iter_prefix_open_batch_parallel}) instead of
-     * the serial per-request loop — the join read-path lever (q7/q9/q20). Default OFF so the passing
-     * set (q3/q11/q12/q15/q16/q19 + light) keeps the proven serial path until the parallel path is
-     * e2e-validated; flip the default once verified.
-     */
     private static final boolean PARALLEL_ITER = "1".equals(System.getenv("FRS_RS_PARALLEL_ITER"));
     private static final boolean ITER_DISPATCH_DIAG =
             "1".equals(System.getenv("FRS_ITER_DISPATCH_DIAG"));
+    private static final int ITER_PARALLEL_MIN_BATCH = 64;
+    private static final double ITER_PARALLEL_MIN_ROWS_EWMA = 16.0d;
+    private static final double ITER_ROWS_EWMA_ALPHA = 0.125d;
     private static final java.util.concurrent.atomic.AtomicLong DIAG_BATCHES =
             new java.util.concurrent.atomic.AtomicLong();
     private static final java.util.concurrent.atomic.AtomicLong DIAG_FRESH =
@@ -1371,79 +1377,91 @@ public class VectorizedExecutor implements StateExecutor {
     private static final java.util.concurrent.atomic.AtomicLong DIAG_NEXT_DUMP =
             new java.util.concurrent.atomic.AtomicLong(200_000L);
 
+    static boolean shouldUseParallelIter(
+            boolean parallelIterEnabled, int requestCount, double rowsPerPrefixEwma) {
+        return parallelIterEnabled && requestCount >= ITER_PARALLEL_MIN_BATCH
+                && rowsPerPrefixEwma >= ITER_PARALLEL_MIN_ROWS_EWMA;
+    }
+
     private void executeIters(VectorizedClassifier c) {
-        if (c.iterRequests().isEmpty()) {
+        java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> all = c.iterRequests();
+        if (all.isEmpty()) {
             return;
         }
-        // FRS-PARALLEL-ITER: when enabled, PARTITION the batch — fresh-open MAP_ITER probes go
-        // through ONE batched-parallel FFI crossing (engine builds+drains the K probes across its
-        // read pool); continuations (existingVecHandle != 0) and MAP_IS_EMPTY stay on the serial
-        // path. A MIXED batch still parallelizes its fresh probes (the prior all-or-nothing gate
-        // fell back to serial whenever a single continuation was present — the common case for
-        // multi-chunk join iterations, which is why q9/q7/q20 saw no speedup).
-        if (PARALLEL_ITER) {
-            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> all = c.iterRequests();
-            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> fresh = new java.util.ArrayList<>();
-            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> rest = new java.util.ArrayList<>();
-            for (ForStRsDBIterRequest<?, ?, ?, ?> it : all) {
-                if (!it.isMapIsEmpty() && !it.hasExistingVecHandle()) {
-                    fresh.add(it);
-                } else {
-                    rest.add(it);
+        if (ITER_DISPATCH_DIAG) {
+            recordIterDispatchDiag(all);
+        }
+
+        java.util.ArrayList<ForStRsDBIterRequest<?, ?, ?, ?>> freshRun = null;
+        for (ForStRsDBIterRequest<?, ?, ?, ?> iter : all) {
+            if (isFreshBatchableIter(iter)) {
+                if (freshRun == null) {
+                    freshRun = new java.util.ArrayList<>();
                 }
-            }
-            if (ITER_DISPATCH_DIAG) {
-                DIAG_BATCHES.incrementAndGet();
-                DIAG_FRESH.addAndGet(fresh.size());
-                DIAG_CONT.addAndGet(rest.size());
-                long total = DIAG_FRESH.get() + DIAG_CONT.get();
-                long threshold = DIAG_NEXT_DUMP.get();
-                if (total >= threshold && DIAG_NEXT_DUMP.compareAndSet(threshold, threshold + 200_000L)) {
-                    System.out.println(
-                            "[ITER_DISPATCH_DIAG] batches="
-                                    + DIAG_BATCHES.get()
-                                    + " fresh="
-                                    + DIAG_FRESH.get()
-                                    + " continuation="
-                                    + DIAG_CONT.get()
-                                    + " parDispatches="
-                                    + DIAG_PAR_DISPATCHES.get()
-                                    + " fresh%="
-                                    + (total == 0 ? 0 : (100 * DIAG_FRESH.get() / total)));
+                freshRun.add(iter);
+            } else {
+                drainFreshIterRun(freshRun, c);
+                if (freshRun != null) {
+                    freshRun.clear();
                 }
-            }
-            if (fresh.size() > 1) {
-                DIAG_PAR_DISPATCHES.incrementAndGet();
-                executeItersBatchedParallel(fresh, c);
-                // Serial-drive the remainder (continuations + IS_EMPTY) below.
-                if (rest.isEmpty()) {
-                    return;
-                }
-                for (ForStRsDBIterRequest<?, ?, ?, ?> iter : rest) {
-                    drainIterSerial(iter, c);
-                }
-                return;
+                drainIterSerial(iter, c);
             }
         }
-        // R22-M2: per-op try/catch establishes the R21-H1 invariant for iter requests too. Pre-fix,
-        // an iter.process(...) throw fell through to the outer catch in {@link
-        // #executeRequestSync}, which labels failure as PUT — and because the iter's StateRequest
-        // is not in the marker set (no markCompletedExceptionally call here), the outer catch did
-        // NOT skip re-completion, so the iter row's future could be completed twice or routed
-        // through the PUT failure path. Marking + completing-exceptionally on the iter request
-        // before rethrowing matches the executePuts / executeGets contract.
-        for (ForStRsDBIterRequest<?, ?, ?, ?> iter : c.iterRequests()) {
-            drainIterSerial(iter, c);
+        drainFreshIterRun(freshRun, c);
+    }
+
+    private static boolean isFreshBatchableIter(ForStRsDBIterRequest<?, ?, ?, ?> iter) {
+        return !iter.isMapIsEmpty() && !iter.hasExistingVecHandle();
+    }
+
+    private void recordIterDispatchDiag(java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> reqs) {
+        int fresh = 0;
+        int continuation = 0;
+        for (ForStRsDBIterRequest<?, ?, ?, ?> it : reqs) {
+            if (isFreshBatchableIter(it)) {
+                fresh++;
+            } else {
+                continuation++;
+            }
         }
+        DIAG_BATCHES.incrementAndGet();
+        DIAG_FRESH.addAndGet(fresh);
+        DIAG_CONT.addAndGet(continuation);
+        long total = DIAG_FRESH.get() + DIAG_CONT.get();
+        long threshold = DIAG_NEXT_DUMP.get();
+        if (total >= threshold && DIAG_NEXT_DUMP.compareAndSet(threshold, threshold + 200_000L)) {
+            System.out.printf(
+                    "[ITER_DISPATCH_DIAG] batches=%d fresh=%d continuation=%d"
+                            + " parDispatches=%d fresh%%=%d%n",
+                    DIAG_BATCHES.get(),
+                    DIAG_FRESH.get(),
+                    DIAG_CONT.get(),
+                    DIAG_PAR_DISPATCHES.get(),
+                    total == 0 ? 0 : (100 * DIAG_FRESH.get() / total));
+        }
+    }
+
+    private void drainFreshIterRun(
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> freshRun, VectorizedClassifier c) {
+        if (freshRun == null || freshRun.isEmpty()) {
+            return;
+        }
+        if (freshRun.size() == 1) {
+            drainIterSerial(freshRun.get(0), c);
+            return;
+        }
+        boolean parallel =
+                shouldUseParallelIter(PARALLEL_ITER, freshRun.size(), iterRowsPerPrefixEwma);
+        if (parallel) {
+            DIAG_PAR_DISPATCHES.incrementAndGet();
+        }
+        executeItersBatchedOpen(freshRun, c, parallel);
     }
 
     /** Serial drain of one iterator request with the R22-M2 per-op fatal/mark/complete contract. */
     private void drainIterSerial(ForStRsDBIterRequest<?, ?, ?, ?> iter, VectorizedClassifier c) {
         try {
-            if (reusableIterChunkBuf == null) {
-                reusableIterChunkBuf = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
-            }
-            iter.process(linker, db, cf, arena, reusableIterChunkBuf);
+            iter.process(linker, db, cf, arena, ensureReusableIterChunkBuf());
         } catch (Throwable t) {
             // R94-H1 / R93-H2: throwIfFatal() throws FrsEnginePanicError for fail-process FFI rc;
             // escalate to the fatal handler so the engine doesn't keep running on poisoned state.
@@ -1467,119 +1485,119 @@ public class VectorizedExecutor implements StateExecutor {
         }
     }
 
-    /**
-     * Coalesced + PARALLEL iterator dispatch (the join read-path lever, q7/q9/q20). Packs the K
-     * probe prefixes SoA, opens them all in ONE {@code frs_vec_iter_prefix_open_batch_parallel}
-     * crossing (the engine builds+drains the K probes across its read pool), then drives each
-     * request's drain from its handle + first chunk via
-     * {@link ForStRsDBIterRequest#processFromBatchedOpen}. Replaces the serial per-record loop that
-     * crossed FFI N times + built N prefix-scans on the single coordinator thread. Decode is the
-     * SAME zero-copy path as the serial loop ({@code completeWithEntries}/{@code VIEW_TL}). Only
-     * reached when {@link #PARALLEL_ITER} is on AND every probe is a fresh-open MAP_ITER.
-     */
-    private void executeItersBatchedParallel(
-            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> reqs, VectorizedClassifier c) {
+    private void executeItersBatchedOpen(
+            java.util.List<ForStRsDBIterRequest<?, ?, ?, ?>> reqs,
+            VectorizedClassifier c,
+            boolean parallel) {
         int n = reqs.size();
         final int chunkCap = ForStRsDBIterRequest.chunkBufCap();
-        try (Arena scratch = Arena.ofConfined()) {
-            // 1+2: pack prefixes SoA (offsets[n+1] + contiguous bytes).
-            int total = 0;
-            for (ForStRsDBIterRequest<?, ?, ?, ?> r : reqs) {
-                byte[] p = r.prefix();
-                total += (p == null ? 0 : p.length);
-            }
-            MemorySegment prefixesOff = scratch.allocate((long) (n + 1) * Integer.BYTES);
-            MemorySegment prefixesData = scratch.allocate(Math.max(total, 1));
-            prefixesOff.set(ValueLayout.JAVA_INT, 0L, 0);
-            int off = 0;
-            for (int i = 0; i < n; i++) {
-                byte[] p = reqs.get(i).prefix();
-                int len = (p == null ? 0 : p.length);
-                if (len > 0) {
-                    MemorySegment.copy(p, 0, prefixesData, ValueLayout.JAVA_BYTE, off, len);
-                }
-                off += len;
-                prefixesOff.set(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES, off);
-            }
+        int total = 0;
+        for (ForStRsDBIterRequest<?, ?, ?, ?> r : reqs) {
+            byte[] p = r.prefix();
+            total += (p == null ? 0 : p.length);
+        }
 
-            // 3: K uniform chunk buffers (the engine fills each probe's first chunk here) + the
-            // u64 handle array + the AoS FrsChunk descriptors. Confined to this call: the first
-            // chunks are consumed by processFromBatchedOpen (which deserializes to detached on-heap
-            // UK/UV) before this try-block closes, so nothing here outlives the scratch.
-            MemorySegment chunkData = scratch.allocate((long) n * chunkCap);
-            MemorySegment outHandles = scratch.allocate((long) n * Long.BYTES);
-            long chunkStride = ForStRsLinker.frsChunkLayoutByteSize();
-            MemorySegment outChunks = scratch.allocate((long) n * chunkStride);
-            for (int i = 0; i < n; i++) {
-                MemorySegment cb = chunkData.asSlice((long) i * chunkCap, chunkCap);
-                ForStRsLinker.setFrsChunkBufPtr(outChunks, i, cb);
-                ForStRsLinker.setFrsChunkBufCap(outChunks, i, chunkCap);
+        MemorySegment prefixesOff = ensurePrefixesOff((long) n + 1);
+        MemorySegment prefixesData = ensurePrefixesData(total);
+        prefixesOff.set(ValueLayout.JAVA_INT, 0L, 0);
+        int off = 0;
+        for (int i = 0; i < n; i++) {
+            byte[] p = reqs.get(i).prefix();
+            int len = (p == null ? 0 : p.length);
+            if (len > 0) {
+                MemorySegment.copy(p, 0, prefixesData, ValueLayout.JAVA_BYTE, off, len);
             }
+            off += len;
+            prefixesOff.set(ValueLayout.JAVA_INT, (long) (i + 1) * Integer.BYTES, off);
+        }
 
-            // Single FFI crossing for N parallel opens.
-            int rcBatch =
-                    linker.frsVecIterPrefixOpenBatchParallel(
-                            db.handle(),
-                            cf.handle(),
-                            prefixesOff,
-                            prefixesData,
-                            n,
-                            outHandles,
-                            outChunks,
-                            chunkCap);
+        MemorySegment chunkData = ensureIterBatchChunkData(n, chunkCap);
+        MemorySegment outHandles = ensureOutHandles(n);
+        long chunkStride = ForStRsLinker.frsChunkLayoutByteSize();
+        MemorySegment outChunks = ensureOutChunks(n, chunkStride);
+        for (int i = 0; i < n; i++) {
+            MemorySegment cb = chunkData.asSlice((long) i * chunkCap, chunkCap);
+            outHandles.set(ValueLayout.JAVA_LONG, (long) i * Long.BYTES, 0L);
+            ForStRsLinker.initFrsChunkForOpen(outChunks, i, cb, chunkCap);
+        }
 
-            // Drive each probe's drain. Per-row handles are populated even on batch-level non-Ok
-            // (the Rust impl writes 0 to a failed row's handle); a failed probe aborts the batch
-            // the same way the serial loop's per-iter catch rethrows.
-            for (int i = 0; i < n; i++) {
-                ForStRsDBIterRequest<?, ?, ?, ?> req = reqs.get(i);
-                long handle = outHandles.get(ValueLayout.JAVA_LONG, (long) i * Long.BYTES);
-                int rows = ForStRsLinker.getFrsChunkRowCount(outChunks, i);
-                int bytes = ForStRsLinker.getFrsChunkBytesUsed(outChunks, i);
-                // P0: FRS_CHUNK_EOF (bit 0 of FrsChunk._reserved) — the engine exhausted
-                // this probe in its first chunk and AUTO-CLOSED the iterator; the drain
-                // skips the trailing next() + close() crossings for it.
-                boolean eofAtOpen = ForStRsLinker.isFrsChunkEof(outChunks, i);
-                MemorySegment cb = chunkData.asSlice((long) i * chunkCap, chunkCap);
-                try {
-                    if (handle == 0L) {
-                        FrsErrorCode code = FrsErrorCode.fromU32(rcBatch);
-                        if (code.isFailProcess() && fatalHandler != null) {
-                            FrsEnginePanicError panicErr =
-                                    new FrsEnginePanicError(code, "kind=ITER_BATCH_PARALLEL row=" + i);
+        int rcBatch;
+        try {
+            rcBatch =
+                    parallel
+                            ? linker.frsVecIterPrefixOpenBatchParallel(
+                                    db.handle(), cf.handle(), prefixesOff, prefixesData, n,
+                                    outHandles, outChunks, chunkCap)
+                            : linker.frsVecIterPrefixOpenBatch(
+                                    db.handle(), cf.handle(), prefixesOff, prefixesData, n,
+                                    outHandles, outChunks, chunkCap);
+        } catch (Throwable t) {
+            closeRemainingIterBatchHandles(outHandles, outChunks, 0, n);
+            throw t;
+        }
+
+        int firstChunkRowsTotal = 0;
+        for (int i = 0; i < n; i++) {
+            firstChunkRowsTotal += Math.max(0, ForStRsLinker.getFrsChunkRowCount(outChunks, i));
+        }
+        updateIterRowsPerPrefixEwma((double) firstChunkRowsTotal / (double) n);
+
+        String kind = parallel ? "ITER_BATCH_PARALLEL" : "ITER_BATCH_SERIAL";
+        for (int i = 0; i < n; i++) {
+            ForStRsDBIterRequest<?, ?, ?, ?> req = reqs.get(i);
+            long handle = outHandles.get(ValueLayout.JAVA_LONG, (long) i * Long.BYTES);
+            int rows = ForStRsLinker.getFrsChunkRowCount(outChunks, i);
+            int bytes = ForStRsLinker.getFrsChunkBytesUsed(outChunks, i);
+            boolean eofAtOpen = ForStRsLinker.isFrsChunkEof(outChunks, i);
+            MemorySegment cb = chunkData.asSlice((long) i * chunkCap, chunkCap);
+            try {
+                if (handle == 0L) {
+                    FrsErrorCode code = FrsErrorCode.fromU32(rcBatch);
+                    if (code.isFailProcess()) {
+                        FrsEnginePanicError panicErr =
+                                new FrsEnginePanicError(code, "kind=" + kind + " row=" + i);
+                        if (fatalHandler != null) {
                             fatalHandler.onFatalError(panicErr);
-                            throw panicErr;
                         }
-                        throw new FrsException(code, i, new byte[0]);
+                        throw panicErr;
                     }
-                    req.processFromBatchedOpen(
-                            linker, db, cf, handle, cb, rows, bytes, eofAtOpen);
-                } catch (Throwable t) {
-                    if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
-                        fatalHandler.onFatalError(panicErr);
-                    }
-                    StateRequest<?, ?, ?, ?> sr = req.getStateRequest();
-                    if (sr != null) {
-                        try {
-                            c.markCompletedExceptionally(sr);
-                        } catch (Throwable ignore) {
-                            // Best-effort marker placement.
-                        }
-                    }
-                    try {
-                        req.completeExceptionally(t);
-                    } catch (Throwable ignore) {
-                        // Best-effort per-row completion.
-                    }
-                    throw t;
+                    throw new FrsException(code, i, new byte[0]);
                 }
+                req.processFromBatchedOpen(
+                        linker, db, cf, handle, cb, rows, bytes, eofAtOpen,
+                        ensureReusableIterChunkBuf(), scratchIterNextRowCount,
+                        scratchIterNextBytesUsed);
+            } catch (Throwable t) {
+                closeRemainingIterBatchHandles(outHandles, outChunks, i + 1, n);
+                if (t instanceof FrsEnginePanicError panicErr && fatalHandler != null) {
+                    fatalHandler.onFatalError(panicErr);
+                }
+                StateRequest<?, ?, ?, ?> sr = req.getStateRequest();
+                if (sr != null) {
+                    try {
+                        c.markCompletedExceptionally(sr);
+                    } catch (Throwable ignore) {}
+                }
+                try {
+                    req.completeExceptionally(t);
+                } catch (Throwable ignore) {}
+                throw t;
             }
         }
     }
 
-    // -----------------------------------------------------------------
-    // New-kind dispatch stubs (P2 Batch C) — real FFI wiring in later PRs
-    // -----------------------------------------------------------------
+    private void closeRemainingIterBatchHandles(
+            MemorySegment outHandles, MemorySegment outChunks, int from, int n) {
+        for (int row = from; row < n; row++) {
+            long handle = outHandles.get(ValueLayout.JAVA_LONG, (long) row * Long.BYTES);
+            if (handle != 0L && !ForStRsLinker.isFrsChunkEof(outChunks, row)) {
+                try {
+                    linker.frsVecIterPrefixClose(handle);
+                } catch (Throwable ignored) {}
+                outHandles.set(ValueLayout.JAVA_LONG, (long) row * Long.BYTES, 0L);
+            }
+        }
+    }
 
     /**
      * Dispatches an APPEND_MERGE batch via {@code frs_vec_merge_append} FFI (P6-B).
@@ -3038,9 +3056,32 @@ public class VectorizedExecutor implements StateExecutor {
         return scratchOutChunks;
     }
 
-    // -----------------------------------------------------------------
-    // Output-buffer sizing
-    // -----------------------------------------------------------------
+    private MemorySegment ensureReusableIterChunkBuf() {
+        if (reusableIterChunkBuf == null) {
+            reusableIterChunkBuf = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+        }
+        return reusableIterChunkBuf;
+    }
+
+    private MemorySegment ensureIterBatchChunkData(int n, int chunkCap) {
+        long neededBytes = (long) n * chunkCap;
+        if (scratchIterBatchChunkDataCap >= neededBytes) {
+            return scratchIterBatchChunkData;
+        }
+        long newCap = Math.max((long) chunkCap * 16L, scratchIterBatchChunkDataCap);
+        while (newCap < neededBytes) {
+            newCap <<= 1;
+        }
+        scratchIterBatchChunkData = arena.allocate(newCap);
+        scratchIterBatchChunkDataCap = newCap;
+        return scratchIterBatchChunkData;
+    }
+
+    private void updateIterRowsPerPrefixEwma(double observedRowsPerPrefix) {
+        iterRowsPerPrefixEwma =
+                (ITER_ROWS_EWMA_ALPHA * observedRowsPerPrefix)
+                        + ((1.0d - ITER_ROWS_EWMA_ALPHA) * iterRowsPerPrefixEwma);
+    }
 
     private void ensureOutCapacity(int slots) {
         if (slots <= outSlotsCap) {

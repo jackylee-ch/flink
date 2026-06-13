@@ -285,6 +285,43 @@ class ForStRsDBIterRequestTest {
         }
     }
 
+    @Test
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void processFromBatchedOpen_eofAtOpen_skips_next_and_close() {
+        ForStRsLinker linker = mock(ForStRsLinker.class);
+        FrsDb db = mock(FrsDb.class);
+        FrsCfHandle cf = mock(FrsCfHandle.class);
+
+        final byte[] keyA = "aaa".getBytes();
+        final byte[] valA = "111".getBytes();
+        final int rows = 4;
+
+        RecordingIterableState recState = new RecordingIterableState();
+        StateRequest sr = mock(StateRequest.class);
+        InternalAsyncFuture future = mock(InternalAsyncFuture.class);
+        when(sr.getFuture()).thenReturn(future);
+        byte[] prefix = "k/test/".getBytes();
+
+        ForStRsDBIterRequest<?, ?, ?, ?> req =
+                new ForStRsDBIterRequest<>(prefix, sr, StateRequestType.MAP_ITER, recState, null);
+
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment firstChunk = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+            int bytesUsed = writeRowsInto(firstChunk, rows, keyA, valA);
+            req.processFromBatchedOpen(
+                    linker, db, cf, 0xBEEFL, firstChunk, rows, bytesUsed, true);
+        }
+
+        verify(linker, never()).frsVecIterPrefixNext(anyLong(), any(), anyInt(), any(), any());
+        verify(linker, never()).frsVecIterPrefixClose(anyLong());
+        assertThat(recState.observedKeys).hasSize(rows);
+        assertThat(recState.observedValues).hasSize(rows);
+        for (int i = 0; i < rows; i++) {
+            assertThat(recState.observedKeys.get(i)).as("key %d", i).containsExactly(keyA);
+            assertThat(recState.observedValues.get(i)).as("value %d", i).containsExactly(valA);
+        }
+    }
+
     /**
      * Lever-2 batched-open drain (multi chunk): the supplied first chunk lives in its OWN slice (the
      * batched open packs K probes into K distinct chunk slices) and is never overwritten by the

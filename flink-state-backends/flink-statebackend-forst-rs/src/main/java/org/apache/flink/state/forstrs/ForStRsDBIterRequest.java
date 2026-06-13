@@ -498,93 +498,142 @@ public non-sealed class ForStRsDBIterRequest<K, N, UK, UV> implements Vectorized
             int firstRowCount,
             int firstBytesUsed,
             boolean eofAtOpen) {
+        if (eofAtOpen) {
+            processFromBatchedOpen(
+                    linker,
+                    db,
+                    cf,
+                    handle,
+                    firstChunkBuf,
+                    firstRowCount,
+                    firstBytesUsed,
+                    true,
+                    MemorySegment.NULL,
+                    MemorySegment.NULL,
+                    MemorySegment.NULL);
+            return;
+        }
         try (Arena scratch = Arena.ofConfined()) {
-            MemorySegment chunkBuf = scratch.allocate(CHUNK_BUF_CAP);
-            MemorySegment outRowCount = scratch.allocate(ValueLayout.JAVA_INT);
-            MemorySegment outBytesUsed = scratch.allocate(ValueLayout.JAVA_INT);
+            processFromBatchedOpen(
+                    linker,
+                    db,
+                    cf,
+                    handle,
+                    firstChunkBuf,
+                    firstRowCount,
+                    firstBytesUsed,
+                    eofAtOpen,
+                    scratch.allocate(CHUNK_BUF_CAP),
+                    scratch.allocate(ValueLayout.JAVA_INT),
+                    scratch.allocate(ValueLayout.JAVA_INT));
+        }
+    }
 
-            // FRS-ZERO-SNAPSHOT (2026-06-09): same in-place per-chunk decode as process() — no
-            // per-chunk snapshot, no view-accumulation list. firstChunkBuf is this probe's own
-            // slice (never overwritten by the _next chunkBuf, which is a distinct scratch buffer),
-            // so both are decoded to detached on-heap UK/UV in place before reuse.
-            final int prefixLen = prefix.length;
-            final ArrayList<Map.Entry<UK, UV>> mapEntries =
-                    originalRequestType == StateRequestType.MAP_ITER ? new ArrayList<>() : null;
-            final ArrayList<UK> keys =
-                    originalRequestType == StateRequestType.MAP_ITER_KEY ? new ArrayList<>() : null;
-            final ArrayList<UV> values =
-                    originalRequestType == StateRequestType.MAP_ITER_VALUE ? new ArrayList<>() : null;
-            int decodedCount = 0;
-            boolean exhausted = false;
-            try {
-                // Step 1: decode the first chunk the batched open already filled (its rows were
-                // popped from this probe's iterator during the parallel open — same as the
-                // single-open first-chunk consume in process()).
-                if (firstRowCount > 0) {
+    /**
+     * Executor-hot overload for batched-open drain. The caller owns and reuses the next-chunk
+     * buffer plus out-param scratch, so small-result q7/q19 probes do not allocate a confined arena
+     * per row after the coalesced open.
+     */
+    public void processFromBatchedOpen(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            long handle,
+            MemorySegment firstChunkBuf,
+            int firstRowCount,
+            int firstBytesUsed,
+            boolean eofAtOpen,
+            MemorySegment nextChunkBuf,
+            MemorySegment outRowCount,
+            MemorySegment outBytesUsed) {
+        // FRS-ZERO-SNAPSHOT (2026-06-09): same in-place per-chunk decode as process() — no
+        // per-chunk snapshot, no view-accumulation list. firstChunkBuf is this probe's own
+        // slice (never overwritten by the _next chunkBuf, which is a distinct scratch buffer),
+        // so both are decoded to detached on-heap UK/UV in place before reuse.
+        final int prefixLen = prefix.length;
+        final ArrayList<Map.Entry<UK, UV>> mapEntries =
+                originalRequestType == StateRequestType.MAP_ITER ? new ArrayList<>() : null;
+        final ArrayList<UK> keys =
+                originalRequestType == StateRequestType.MAP_ITER_KEY ? new ArrayList<>() : null;
+        final ArrayList<UV> values =
+                originalRequestType == StateRequestType.MAP_ITER_VALUE ? new ArrayList<>() : null;
+        int decodedCount = 0;
+        boolean exhausted = false;
+        try {
+            // Step 1: decode the first chunk the batched open already filled (its rows were
+            // popped from this probe's iterator during the batch open — same as the single-open
+            // first-chunk consume in process()).
+            if (firstRowCount > 0) {
+                decodedCount +=
+                        decodeChunkDirect(
+                                firstChunkBuf,
+                                firstRowCount,
+                                firstBytesUsed,
+                                prefixLen,
+                                mapEntries,
+                                keys,
+                                values);
+            }
+            // Step 2: continue via frs_vec_iter_prefix_next (identical to process()'s drain loop).
+            // P0: when the batched open flagged FRS_CHUNK_EOF the iterator is already auto-closed,
+            // so the trailing next() and close() crossings are skipped.
+            if (eofAtOpen) {
+                exhausted = true;
+            } else {
+                do {
+                    int rc =
+                            linker.frsVecIterPrefixNext(
+                                    handle,
+                                    nextChunkBuf,
+                                    CHUNK_BUF_CAP,
+                                    outRowCount,
+                                    outBytesUsed);
+                    if (rc != FrsStatus.OK.code()) {
+                        throwIfFatal(rc, "frs_vec_iter_prefix_next");
+                        throw new FrsBackendException(
+                                statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
+                    }
+                    int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
+                    int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
+                    if (rowCount == 0) {
+                        exhausted = true;
+                        break;
+                    }
                     decodedCount +=
                             decodeChunkDirect(
-                                    firstChunkBuf,
-                                    firstRowCount,
-                                    firstBytesUsed,
+                                    nextChunkBuf,
+                                    rowCount,
+                                    bytesUsed,
                                     prefixLen,
                                     mapEntries,
                                     keys,
                                     values);
-                }
-                // Step 2: continue via frs_vec_iter_prefix_next (identical to process()'s drain
-                // loop). P0: when the batched open flagged FRS_CHUNK_EOF the iterator is
-                // already auto-closed — the trailing next() is provably redundant and is
-                // skipped. For unflagged probes the batched open registered the handle, so
-                // the first next() returns 0/0 with OK when the first chunk held everything.
-                if (eofAtOpen) {
-                    exhausted = true;
-                } else {
-                    do {
-                        int rc =
-                                linker.frsVecIterPrefixNext(
-                                        handle, chunkBuf, CHUNK_BUF_CAP, outRowCount, outBytesUsed);
-                        if (rc != FrsStatus.OK.code()) {
-                            throwIfFatal(rc, "frs_vec_iter_prefix_next");
-                            throw new FrsBackendException(
-                                    statusOrPanic(rc), "frs_vec_iter_prefix_next rc=" + rc);
-                        }
-                        int rowCount = outRowCount.get(ValueLayout.JAVA_INT, 0);
-                        int bytesUsed = outBytesUsed.get(ValueLayout.JAVA_INT, 0);
-                        if (rowCount == 0) {
-                            exhausted = true;
-                            break;
-                        }
-                        decodedCount +=
-                                decodeChunkDirect(
-                                        chunkBuf, rowCount, bytesUsed, prefixLen, mapEntries, keys,
-                                        values);
-                    } while (decodedCount < CACHE_SIZE_LIMIT);
-                }
-            } catch (Throwable t) {
-                // P0: nothing to release for auto-closed probes (never registered).
-                if (!eofAtOpen) {
-                    try {
-                        linker.frsVecIterPrefixClose(handle);
-                    } catch (Throwable ignored) {
-                        // best-effort close; surface the original failure
-                    }
-                }
-                this.existingVecHandle = 0L;
-                throw t;
+                } while (decodedCount < CACHE_SIZE_LIMIT);
             }
-
-            boolean encounterEnd = exhausted;
-            long continuationHandle = handle;
-            if (encounterEnd) {
-                // P0: skip the close() crossing for auto-closed probes.
-                if (!eofAtOpen) {
+        } catch (Throwable t) {
+            // P0: nothing to release for auto-closed probes (never registered).
+            if (!eofAtOpen) {
+                try {
                     linker.frsVecIterPrefixClose(handle);
+                } catch (Throwable ignored) {
+                    // best-effort close; surface the original failure
                 }
-                continuationHandle = 0L;
             }
-            this.existingVecHandle = continuationHandle;
-            completeFromDecoded(mapEntries, keys, values, encounterEnd);
+            this.existingVecHandle = 0L;
+            throw t;
         }
+
+        boolean encounterEnd = exhausted;
+        long continuationHandle = handle;
+        if (encounterEnd) {
+            // P0: skip the close() crossing for auto-closed probes.
+            if (!eofAtOpen) {
+                linker.frsVecIterPrefixClose(handle);
+            }
+            continuationHandle = 0L;
+        }
+        this.existingVecHandle = continuationHandle;
+        completeFromDecoded(mapEntries, keys, values, encounterEnd);
     }
 
     /**
