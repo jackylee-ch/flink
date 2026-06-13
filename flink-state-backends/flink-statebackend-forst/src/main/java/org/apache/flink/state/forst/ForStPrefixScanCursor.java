@@ -29,6 +29,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicLong;
 
 /** Prefix-scan cursor backed by the forst-rs-lib compat JNI chunk API. */
 class ForStPrefixScanCursor implements Closeable {
@@ -37,45 +38,42 @@ class ForStPrefixScanCursor implements Closeable {
 
     private static final int MAX_DATA_BUFFER_CAPACITY = 256 * 1024 * 1024;
 
+    private static final int MAX_RETAINED_DATA_BUFFER_CAPACITY = INITIAL_DATA_BUFFER_CAPACITY;
+
     private static final String BUFFER_TOO_SMALL_STATUS = "frs_status=110";
 
     private static final String BUFFER_TOO_SMALL_CAPACITY = "capacity too small";
 
     private static final Cleaner CLEANER = Cleaner.create();
 
+    private static final ThreadLocal<BufferSet> BUFFER_POOL = new ThreadLocal<>();
+
+    private static final AtomicLong BUFFER_SETS_ALLOCATED = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_REUSED = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_RETURNED = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_DISCARDED = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_GROWN = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_OUTSTANDING = new AtomicLong();
+
+    private static final AtomicLong BUFFER_SETS_RETAINED = new AtomicLong();
+
     private final PrefixScanCleanup cleanup;
 
     private final Cleaner.Cleanable cleanable;
 
-    private final ByteBuffer keyOffsets;
-
-    private final ByteBuffer valueOffsets;
-
-    private final ByteBuffer openFirstMeta;
-
-    private ByteBuffer keyData;
-
-    private ByteBuffer valueData;
-
-    private final ByteBuffer valueValidity;
+    private BufferSet buffers;
 
     private Chunk prefetchedChunk;
 
     private ForStPrefixScanCursor(long handle, int maxRows) {
         this.cleanup = new PrefixScanCleanup(handle);
         this.cleanable = CLEANER.register(this, cleanup);
-        this.keyOffsets =
-                ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
-                        .order(ByteOrder.nativeOrder());
-        this.valueOffsets =
-                ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
-                        .order(ByteOrder.nativeOrder());
-        this.openFirstMeta =
-                ByteBuffer.allocateDirect(ForStRsLibPrefixScanNative.OPEN_FIRST_META_BYTES)
-                        .order(ByteOrder.nativeOrder());
-        this.keyData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
-        this.valueData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
-        this.valueValidity = ByteBuffer.allocateDirect(maxRows);
+        this.buffers = borrowBuffers(maxRows);
     }
 
     static ForStPrefixScanCursor open(
@@ -107,7 +105,7 @@ class ForStPrefixScanCursor implements Closeable {
         long handle;
         while (true) {
             clearBuffers();
-            openFirstMeta.clear();
+            buffers.openFirstMeta.clear();
             try {
                 handle =
                         ForStRsLibPrefixScanNative.prefixLookupOpenFirstChunk(
@@ -117,12 +115,12 @@ class ForStPrefixScanCursor implements Closeable {
                                 0,
                                 prefix.length,
                                 maxRows,
-                                openFirstMeta,
-                                keyOffsets,
-                                keyData,
-                                valueOffsets,
-                                valueData,
-                                valueValidity);
+                                buffers.openFirstMeta,
+                                buffers.keyOffsets,
+                                buffers.keyData,
+                                buffers.valueOffsets,
+                                buffers.valueData,
+                                buffers.valueValidity);
                 break;
             } catch (RocksDBException e) {
                 if (!isBufferTooSmall(e) || !growDataBuffers()) {
@@ -131,13 +129,13 @@ class ForStPrefixScanCursor implements Closeable {
             }
         }
         cleanup.handle = handle;
-        long metaHandle = ForStRsLibPrefixScanNative.openFirstHandle(openFirstMeta);
+        long metaHandle = ForStRsLibPrefixScanNative.openFirstHandle(buffers.openFirstMeta);
         if (metaHandle != handle) {
             throw new RocksDBException("ForSt-RS prefix scan open-first handle mismatch");
         }
         return decodeChunk(
-                ForStRsLibPrefixScanNative.openFirstCount(openFirstMeta),
-                ForStRsLibPrefixScanNative.openFirstEof(openFirstMeta));
+                ForStRsLibPrefixScanNative.openFirstCount(buffers.openFirstMeta),
+                ForStRsLibPrefixScanNative.openFirstEof(buffers.openFirstMeta));
     }
 
     private Chunk nextChunk(int maxRows) throws RocksDBException {
@@ -149,11 +147,11 @@ class ForStPrefixScanCursor implements Closeable {
                         ForStRsLibPrefixScanNative.prefixLookupNextChunk(
                                 cleanup.handle,
                                 maxRows,
-                                keyOffsets,
-                                keyData,
-                                valueOffsets,
-                                valueData,
-                                valueValidity);
+                                buffers.keyOffsets,
+                                buffers.keyData,
+                                buffers.valueOffsets,
+                                buffers.valueData,
+                                buffers.valueValidity);
                 break;
             } catch (RocksDBException e) {
                 if (!isBufferTooSmall(e) || !growDataBuffers()) {
@@ -169,27 +167,26 @@ class ForStPrefixScanCursor implements Closeable {
     private Chunk decodeChunk(int count, boolean eof) {
         List<ForStDBIterRequest.RawEntry> entries = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
-            int keyOffset = keyOffsets.getInt(i * Integer.BYTES);
-            int nextKeyOffset = keyOffsets.getInt((i + 1) * Integer.BYTES);
-            int valueOffset = valueOffsets.getInt(i * Integer.BYTES);
-            int nextValueOffset = valueOffsets.getInt((i + 1) * Integer.BYTES);
-            if (valueValidity.get(i) == 0) {
+            int keyOffset = buffers.keyOffsets.getInt(i * Integer.BYTES);
+            int nextKeyOffset = buffers.keyOffsets.getInt((i + 1) * Integer.BYTES);
+            int valueOffset = buffers.valueOffsets.getInt(i * Integer.BYTES);
+            int nextValueOffset = buffers.valueOffsets.getInt((i + 1) * Integer.BYTES);
+            if (buffers.valueValidity.get(i) == 0) {
                 continue;
             }
             entries.add(
                     new ForStDBIterRequest.RawEntry(
-                            copyBytes(keyData, keyOffset, nextKeyOffset - keyOffset),
-                            copyBytes(valueData, valueOffset, nextValueOffset - valueOffset)));
+                            copyBytes(buffers.keyData, keyOffset, nextKeyOffset - keyOffset),
+                            copyBytes(
+                                    buffers.valueData,
+                                    valueOffset,
+                                    nextValueOffset - valueOffset)));
         }
         return new Chunk(entries, eof);
     }
 
     private void clearBuffers() {
-        keyOffsets.clear();
-        valueOffsets.clear();
-        keyData.clear();
-        valueData.clear();
-        valueValidity.clear();
+        buffers.clear();
     }
 
     private void ensureOpen() {
@@ -199,12 +196,15 @@ class ForStPrefixScanCursor implements Closeable {
     }
 
     private boolean growDataBuffers() {
-        if (keyData.capacity() >= MAX_DATA_BUFFER_CAPACITY
-                && valueData.capacity() >= MAX_DATA_BUFFER_CAPACITY) {
+        if (buffers.keyData.capacity() >= MAX_DATA_BUFFER_CAPACITY
+                && buffers.valueData.capacity() >= MAX_DATA_BUFFER_CAPACITY) {
             return false;
         }
-        keyData = ByteBuffer.allocateDirect(nextDataBufferCapacity(keyData.capacity()));
-        valueData = ByteBuffer.allocateDirect(nextDataBufferCapacity(valueData.capacity()));
+        buffers.keyData =
+                ByteBuffer.allocateDirect(nextDataBufferCapacity(buffers.keyData.capacity()));
+        buffers.valueData =
+                ByteBuffer.allocateDirect(nextDataBufferCapacity(buffers.valueData.capacity()));
+        BUFFER_SETS_GROWN.incrementAndGet();
         return true;
     }
 
@@ -243,7 +243,131 @@ class ForStPrefixScanCursor implements Closeable {
         try {
             cleanup.close();
         } finally {
+            returnBuffers();
             cleanable.clean();
+        }
+    }
+
+    private void returnBuffers() {
+        BufferSet current = buffers;
+        buffers = null;
+        if (current != null) {
+            returnBuffers(current);
+        }
+    }
+
+    static void resetBufferPoolCountersForTesting() {
+        BUFFER_POOL.remove();
+        BUFFER_SETS_ALLOCATED.set(0);
+        BUFFER_SETS_REUSED.set(0);
+        BUFFER_SETS_RETURNED.set(0);
+        BUFFER_SETS_DISCARDED.set(0);
+        BUFFER_SETS_GROWN.set(0);
+        BUFFER_SETS_OUTSTANDING.set(0);
+        BUFFER_SETS_RETAINED.set(0);
+    }
+
+    static long allocatedBufferSetsForTesting() {
+        return BUFFER_SETS_ALLOCATED.get();
+    }
+
+    static long reusedBufferSetsForTesting() {
+        return BUFFER_SETS_REUSED.get();
+    }
+
+    static long returnedBufferSetsForTesting() {
+        return BUFFER_SETS_RETURNED.get();
+    }
+
+    static long discardedBufferSetsForTesting() {
+        return BUFFER_SETS_DISCARDED.get();
+    }
+
+    static long grownBufferSetsForTesting() {
+        return BUFFER_SETS_GROWN.get();
+    }
+
+    static long outstandingBufferSetsForTesting() {
+        return BUFFER_SETS_OUTSTANDING.get();
+    }
+
+    static long retainedBufferSetsForTesting() {
+        return BUFFER_SETS_RETAINED.get();
+    }
+
+    private static BufferSet borrowBuffers(int maxRows) {
+        BufferSet pooled = BUFFER_POOL.get();
+        if (pooled != null && pooled.maxRows == maxRows) {
+            BUFFER_POOL.remove();
+            BUFFER_SETS_RETAINED.decrementAndGet();
+            BUFFER_SETS_REUSED.incrementAndGet();
+            BUFFER_SETS_OUTSTANDING.incrementAndGet();
+            return pooled;
+        }
+        if (pooled != null) {
+            BUFFER_POOL.remove();
+            BUFFER_SETS_RETAINED.decrementAndGet();
+            BUFFER_SETS_DISCARDED.incrementAndGet();
+        }
+        BUFFER_SETS_ALLOCATED.incrementAndGet();
+        BUFFER_SETS_OUTSTANDING.incrementAndGet();
+        return new BufferSet(maxRows);
+    }
+
+    private static void returnBuffers(BufferSet bufferSet) {
+        BUFFER_SETS_OUTSTANDING.decrementAndGet();
+        if (!bufferSet.retainable()) {
+            BUFFER_SETS_DISCARDED.incrementAndGet();
+            return;
+        }
+        BufferSet previous = BUFFER_POOL.get();
+        if (previous != null) {
+            BUFFER_SETS_DISCARDED.incrementAndGet();
+        } else {
+            BUFFER_SETS_RETAINED.incrementAndGet();
+        }
+        bufferSet.clear();
+        BUFFER_POOL.set(bufferSet);
+        BUFFER_SETS_RETURNED.incrementAndGet();
+    }
+
+    private static class BufferSet {
+        private final int maxRows;
+        private final ByteBuffer keyOffsets;
+        private final ByteBuffer valueOffsets;
+        private final ByteBuffer openFirstMeta;
+        private final ByteBuffer valueValidity;
+        private ByteBuffer keyData;
+        private ByteBuffer valueData;
+
+        private BufferSet(int maxRows) {
+            this.maxRows = maxRows;
+            this.keyOffsets =
+                    ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
+                            .order(ByteOrder.nativeOrder());
+            this.valueOffsets =
+                    ByteBuffer.allocateDirect((maxRows + 1) * Integer.BYTES)
+                            .order(ByteOrder.nativeOrder());
+            this.openFirstMeta =
+                    ByteBuffer.allocateDirect(ForStRsLibPrefixScanNative.OPEN_FIRST_META_BYTES)
+                            .order(ByteOrder.nativeOrder());
+            this.keyData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
+            this.valueData = ByteBuffer.allocateDirect(INITIAL_DATA_BUFFER_CAPACITY);
+            this.valueValidity = ByteBuffer.allocateDirect(maxRows);
+        }
+
+        private void clear() {
+            keyOffsets.clear();
+            valueOffsets.clear();
+            openFirstMeta.clear();
+            keyData.clear();
+            valueData.clear();
+            valueValidity.clear();
+        }
+
+        private boolean retainable() {
+            return keyData.capacity() <= MAX_RETAINED_DATA_BUFFER_CAPACITY
+                    && valueData.capacity() <= MAX_RETAINED_DATA_BUFFER_CAPACITY;
         }
     }
 

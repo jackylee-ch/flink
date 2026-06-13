@@ -42,6 +42,7 @@ class ForStPrefixScanCursorTest extends ForStDBOperationTestBase {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
         ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+        ForStPrefixScanCursor.resetBufferPoolCountersForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
                 buildForStMapState("map-prefix-large-value");
@@ -72,6 +73,13 @@ class ForStPrefixScanCursorTest extends ForStDBOperationTestBase {
         assertThat(count.get()).isEqualTo(1);
         assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting()).isGreaterThan(1);
         assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
+        assertThat(ForStPrefixScanCursor.allocatedBufferSetsForTesting()).isEqualTo(1);
+        assertThat(ForStPrefixScanCursor.reusedBufferSetsForTesting()).isZero();
+        assertThat(ForStPrefixScanCursor.returnedBufferSetsForTesting()).isZero();
+        assertThat(ForStPrefixScanCursor.discardedBufferSetsForTesting()).isEqualTo(1);
+        assertThat(ForStPrefixScanCursor.grownBufferSetsForTesting()).isGreaterThanOrEqualTo(1);
+        assertThat(ForStPrefixScanCursor.outstandingBufferSetsForTesting()).isZero();
+        assertThat(ForStPrefixScanCursor.retainedBufferSetsForTesting()).isZero();
     }
 
     private void putMapEntry(

@@ -34,6 +34,8 @@ import org.junit.jupiter.api.Test;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import java.lang.management.BufferPoolMXBean;
+import java.lang.management.ManagementFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -195,6 +197,7 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
         ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
         ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+        ForStPrefixScanCursor.resetBufferPoolCountersForTesting();
 
         ForStMapState<Integer, VoidNamespace, String, String> mapState =
                 buildForStMapState("map-iter-fast-path");
@@ -294,6 +297,61 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
     }
 
     @Test
+    void testForStRsPrefixScanFastPathReusesDirectBuffersAcrossManySmallProbes() throws Exception {
+        assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
+        ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
+        ForStRsLibPrefixScanNative.resetNextChunkCallsForTesting();
+
+        ForStMapState<Integer, VoidNamespace, String, String> mapState =
+                buildForStMapState("map-iter-fast-path-pooled-small-probes");
+        int probeCount = 64;
+        int rowsPerProbe = 4;
+        List<ForStDBIterRequest<?, ?, ?, ?, ?>> batchIterRequest = new ArrayList<>();
+        List<TestAsyncFuture<StateIterator<Map.Entry<String, String>>>> futures = new ArrayList<>();
+
+        for (int probe = 0; probe < probeCount; probe++) {
+            prepareDataForContext(probe, rowsPerProbe, mapState, db);
+            TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future =
+                    new TestAsyncFuture<>();
+            futures.add(future);
+            batchIterRequest.add(
+                    new ForStDBMapEntryIterRequest<>(
+                            buildContextKey(probe), mapState, null, null, future));
+        }
+
+        long directBufferCountBefore = directBufferCount();
+        long allocatedBefore = ForStPrefixScanCursor.allocatedBufferSetsForTesting();
+        long reusedBefore = ForStPrefixScanCursor.reusedBufferSetsForTesting();
+        long returnedBefore = ForStPrefixScanCursor.returnedBufferSetsForTesting();
+        ExecutorService executor = Executors.newFixedThreadPool(1);
+        try {
+            new ForStIterateOperation(db, batchIterRequest, executor).process().get();
+        } finally {
+            executor.shutdownNow();
+        }
+        long directBufferCountAfter = directBufferCount();
+        long allocatedDelta =
+                ForStPrefixScanCursor.allocatedBufferSetsForTesting() - allocatedBefore;
+        long reusedDelta = ForStPrefixScanCursor.reusedBufferSetsForTesting() - reusedBefore;
+        long returnedDelta = ForStPrefixScanCursor.returnedBufferSetsForTesting() - returnedBefore;
+
+        for (TestAsyncFuture<StateIterator<Map.Entry<String, String>>> future : futures) {
+            assertEntryIterator(future.getCompletedResult(), rowsPerProbe);
+        }
+        assertThat(ForStRsLibPrefixScanNative.getOpenFirstChunkCallsForTesting())
+                .isEqualTo(probeCount);
+        assertThat(ForStRsLibPrefixScanNative.getNextChunkCallsForTesting()).isZero();
+        assertThat(directBufferCountAfter - directBufferCountBefore)
+                .as("single-threaded many small probes should reuse one direct-buffer cursor set")
+                .isLessThanOrEqualTo(6);
+        assertThat(allocatedDelta).isLessThanOrEqualTo(6);
+        assertThat(reusedDelta).isGreaterThanOrEqualTo(probeCount - allocatedDelta);
+        assertThat(returnedDelta).isGreaterThanOrEqualTo(probeCount);
+        assertThat(ForStPrefixScanCursor.outstandingBufferSetsForTesting()).isZero();
+        assertThat(ForStPrefixScanCursor.retainedBufferSetsForTesting()).isLessThanOrEqualTo(6);
+    }
+
+    @Test
     void testForStRsPrefixScanFastPathAdjacentPrefixStop() throws Exception {
         assumeTrue(ForStRsLibPrefixScanNative.isAvailable());
         ForStRsLibPrefixScanNative.resetOpenFirstChunkCallsForTesting();
@@ -388,6 +446,14 @@ class ForStDBIterateOperationTest extends ForStDBOperationTestBase {
             int num, ForStMapState<Integer, VoidNamespace, String, String> mapState, RocksDB db)
             throws Exception {
         prepareDataForContext(1, num, mapState, db);
+    }
+
+    private static long directBufferCount() {
+        return ManagementFactory.getPlatformMXBeans(BufferPoolMXBean.class).stream()
+                .filter(pool -> "direct".equals(pool.getName()))
+                .findFirst()
+                .map(BufferPoolMXBean::getCount)
+                .orElse(0L);
     }
 
     private void prepareDataForContext(
