@@ -353,6 +353,11 @@ public final class ForStRsLinker {
     // --- 7. TTL compaction filter ---
     private final MethodHandle frsCfSetCompactionFilterTtl;
 
+    // --- 7b. FRS-WA-V0 state-lifecycle plumbing (default-OFF engine side) ---
+    private final MethodHandle frsCfSetLifecycle;
+    private final MethodHandle frsCfAdvanceWatermark;
+    private final MethodHandle frsCfNoteMaxEventTime;
+
     // --- 8. MVCC snapshot + versioned reads + incremental checkpoint (B-Prod-P2) ---
     private final MethodHandle frsDbSnapshot;
     private final MethodHandle frsDbReleaseSnapshot;
@@ -1034,6 +1039,35 @@ public final class ForStRsLinker {
                                 ValueLayout.JAVA_LONG, // ttl_ms (u64)
                                 ValueLayout.JAVA_INT, // state_type (i32)
                                 ValueLayout.JAVA_LONG)); // timestamp_offset (usize)
+
+        // 7b. FRS-WA-V0 lifecycle plumbing — per-CF state-lifecycle descriptor +
+        // watermark/event-time clocks (inert engine-side until the V1 death-bucketed
+        // segment stage; see 2026-06-13-write-path-redesign-survey.md §3.2/§6).
+        this.frsCfSetLifecycle =
+                bind(
+                        "frs_cf_set_lifecycle",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.JAVA_INT, // kind (0=Unbounded,1=Windowed,2=Timer)
+                                ValueLayout.JAVA_LONG)); // ttl (u64, Windowed only; ms)
+        this.frsCfAdvanceWatermark =
+                bind(
+                        "frs_cf_advance_watermark",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.JAVA_LONG)); // watermark (u64, ms, monotonic)
+        this.frsCfNoteMaxEventTime =
+                bind(
+                        "frs_cf_note_max_event_time",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.JAVA_LONG)); // event_time (u64, ms, monotonic)
 
         // 8. MVCC snapshot + versioned reads + incremental checkpoint (B-Prod-P2)
         this.frsDbSnapshot =
@@ -3687,6 +3721,55 @@ public final class ForStRsLinker {
                     FrsStatus.PANIC, "frs_cf_set_compaction_filter_ttl threw: " + t.getMessage());
         }
         check(rc, "frs_cf_set_compaction_filter_ttl");
+    }
+
+    /**
+     * FRS-WA-V0: declares the CF's state lifecycle. kind: {@link
+     * org.apache.flink.state.forstrs.ForStRsLifecycleManager#KIND_UNBOUNDED} / {@code
+     * KIND_WINDOWED} / {@code KIND_TIMER}; {@code ttlMs} is read only for KIND_WINDOWED. Inert in
+     * V0 (engine stores + logs).
+     */
+    public void cfSetLifecycle(FrsDb db, FrsCfHandle cf, int kind, long ttlMs) {
+        int rc;
+        try {
+            rc = (int) frsCfSetLifecycle.invokeExact(db.handle(), cf.handle(), kind, ttlMs);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_cf_set_lifecycle threw: " + t.getMessage());
+        }
+        check(rc, "frs_cf_set_lifecycle");
+    }
+
+    /**
+     * FRS-WA-V0: advances the CF watermark clock (monotonic; stale values are no-ops). Callers
+     * subtract allowed-lateness slack BEFORE forwarding (late events inside the allowed-lateness
+     * window must keep state alive).
+     */
+    public void cfAdvanceWatermark(FrsDb db, FrsCfHandle cf, long watermarkMs) {
+        int rc;
+        try {
+            rc = (int) frsCfAdvanceWatermark.invokeExact(db.handle(), cf.handle(), watermarkMs);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_cf_advance_watermark threw: " + t.getMessage());
+        }
+        check(rc, "frs_cf_advance_watermark");
+    }
+
+    /**
+     * FRS-WA-V0: raises the CF's written-event-time upper bound (monotonic). MUST be kept ≥ the
+     * event-time of every entry written to the CF — advance with each write batch's max
+     * event-time, before (or atomically with) the batch publish.
+     */
+    public void cfNoteMaxEventTime(FrsDb db, FrsCfHandle cf, long eventTimeMs) {
+        int rc;
+        try {
+            rc = (int) frsCfNoteMaxEventTime.invokeExact(db.handle(), cf.handle(), eventTimeMs);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_cf_note_max_event_time threw: " + t.getMessage());
+        }
+        check(rc, "frs_cf_note_max_event_time");
     }
 
     // ------------------------------------------------------------------

@@ -53,6 +53,7 @@ import org.apache.flink.runtime.state.SnapshotStrategyRunner;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueElement;
 import org.apache.flink.runtime.state.heap.HeapPriorityQueueSetFactory;
 import org.apache.flink.runtime.state.v2.internal.InternalKeyedState;
+import org.apache.flink.state.forstrs.ForStRsLifecycleManager;
 import org.apache.flink.state.forstrs.VectorizedExecutor;
 import org.apache.flink.state.forstrs.exec.IterLifetimeWatchdog;
 import org.apache.flink.state.forstrs.exec.SlotArenaScope;
@@ -116,6 +117,22 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final ForStRsLinker linker;
     private final FrsDb db;
     private final FrsCfHandle defaultCf;
+
+    /**
+     * FRS-WA-V0 (2026-06-13 write-path redesign survey §3.2): per-CF state-lifecycle manager. Wired
+     * at state-register time only when the engine's death-bucketed-segment path is opted in via the
+     * {@code forst.rs.lifecycle.segments} system property (default OFF ⇒ {@code null}, so default
+     * behaviour is byte-identical — the engine flag {@code FRS_LIFECYCLE_SEGMENTS} is also default
+     * OFF). Lazily created on first state register. The watermark and event-time V0 hooks are NOT
+     * wired in this backend: a Flink keyed state backend never observes record event-time on the
+     * write-batch path (state writes are keyed-value; the record timestamp is not threaded), and
+     * the operator watermark never reaches the backend (it is an operator/time-service concern).
+     * Those two clocks therefore stay engine-default (max-event-time = 0, watermark un-advanced),
+     * which keeps the V1 death stamp always in the future — i.e. NEVER premature, the soundness
+     * contract the engine requires. Advancing them is deferred to an operator-layer change (see
+     * the integration summary "remote/online-box + operator-layer deviations").
+     */
+    private volatile ForStRsLifecycleManager lifecycleManager;
 
     /**
      * FRS-TIMER-CF (2026-06-07): dedicated column family for engine-backed timers. DEFAULT OFF
@@ -874,7 +891,48 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             created = createStateInternal(ns, nsSer, desc, activeSerializer);
         }
         stateCache.put(desc.getStateId(), (InternalKeyedState<K, ?, ?>) created);
+        // FRS-WA-V0: declare this state's lifecycle to the engine (inert/no-op unless the
+        // death-bucketed-segment path is opted in; default OFF ⇒ byte-identical behaviour).
+        registerStateLifecycle(desc.getStateId(), ttlConfig);
         return created;
+    }
+
+    /**
+     * FRS-WA-V0 state-register hook (default OFF). When {@code forst.rs.lifecycle.segments} is set,
+     * forwards the state's {@link StateTtlConfig} to the engine lifecycle surface for the (single)
+     * {@code defaultCf} that backs every V2 state in this backend. Flag OFF ⇒ no FFI call at all,
+     * so the default path is unchanged. Best-effort: a lifecycle-declaration failure must never
+     * fail state creation, so any backend exception is swallowed (the V1 engine path simply stays
+     * in its default-OFF, drop-nothing mode for that CF).
+     */
+    private void registerStateLifecycle(String stateName, StateTtlConfig ttlConfig) {
+        if (!isLifecycleSegmentsEnabled()) {
+            return;
+        }
+        try {
+            ForStRsLifecycleManager mgr = lifecycleManager;
+            if (mgr == null) {
+                synchronized (this) {
+                    mgr = lifecycleManager;
+                    if (mgr == null) {
+                        mgr = new ForStRsLifecycleManager(linker, db);
+                        lifecycleManager = mgr;
+                    }
+                }
+            }
+            mgr.setLifecycleFromTtlConfig(stateName, defaultCf, ttlConfig);
+        } catch (RuntimeException ignored) {
+            // V0 is inert; a declaration failure leaves the CF in default (unbounded) mode.
+        }
+    }
+
+    /**
+     * Reads the {@code forst.rs.lifecycle.segments} system property (default OFF). Mirrors the
+     * property-driven gating used by {@code forst.rs.checkpoint.noflush} elsewhere in this backend
+     * so the engine flag {@code FRS_LIFECYCLE_SEGMENTS} and this Flink-side wiring flip together.
+     */
+    private static boolean isLifecycleSegmentsEnabled() {
+        return Boolean.parseBoolean(System.getProperty("forst.rs.lifecycle.segments"));
     }
 
     /**
