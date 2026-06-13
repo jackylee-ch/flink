@@ -1884,6 +1884,15 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                 unregisterAndDiscardEvictedSst(reg, hlp);
             }
         }
+        // FRS-PHASE2 (D-J1): best-effort unlink of an aborted LINK-mode checkpoint that may have
+        // already linked its live set (crash window D5-b). No-op unless LINK mode is active.
+        if (s != null) {
+            try {
+                s.discardLinkedCheckpoint(id);
+            } catch (RuntimeException ignored) {
+                // NOT_FOUND (never linked / already discarded) is fine; never fail the abort path.
+            }
+        }
     }
 
     private static void unregisterAndDiscardEvictedSst(
@@ -1911,6 +1920,13 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         }
         for (var hlp : s.takeCompletedRegistrationsForSubsumed(id)) {
             unregisterAndDiscardEvictedSst(reg, hlp);
+        }
+        // FRS-PHASE2 (D-J1): authoritative TM-side unlink of a subsumed LINK-mode checkpoint.
+        // No-op unless LINK mode is active, so flag-OFF behaviour is unchanged.
+        try {
+            s.discardLinkedCheckpoint(id);
+        } catch (RuntimeException ignored) {
+            // Idempotent: a retried notification finds the blob already gone.
         }
     }
 

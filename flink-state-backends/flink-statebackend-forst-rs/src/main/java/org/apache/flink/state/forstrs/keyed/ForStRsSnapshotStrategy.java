@@ -173,6 +173,30 @@ public class ForStRsSnapshotStrategy
                 : Boolean.parseBoolean(System.getProperty("forst.rs.checkpoint.noflush"));
     }
 
+    /**
+     * FRS-PHASE2 (disaggregated state, design §3.1 / §9 D3-D5; README D-J5): test override for the
+     * LINK-mode (zero-upload) checkpoint path. {@code null} ⇒ property-driven (default OFF).
+     */
+    private volatile Boolean linkModeOverride = null;
+
+    /** Test hook: force LINK-mode on/off, bypassing {@code forst.rs.checkpoint.link-mode}. */
+    public void setLinkModeCheckpointForTesting(Boolean linkMode) {
+        this.linkModeOverride = linkMode;
+    }
+
+    /**
+     * FRS-PHASE2: LINK mode (zero data upload) when {@code forst.rs.checkpoint.link-mode=true}.
+     * Default OFF ⇒ the legacy upload path runs and behaviour is byte-identical. LINK mode is
+     * additionally gated to incremental sharing (FORWARD/FORWARD_BACKWARD) inside
+     * {@link #doAsyncSnapshot} (README D-J2): a NO_SHARING snapshot stays on the upload path.
+     */
+    private boolean isLinkModeCheckpoint() {
+        Boolean override = this.linkModeOverride;
+        return override != null
+                ? override
+                : Boolean.parseBoolean(System.getProperty("forst.rs.checkpoint.link-mode"));
+    }
+
     /** Best-effort recursive delete of a local staging directory; never throws. */
     private static void deleteDirQuietly(Path dir) {
         if (dir == null) {
@@ -349,6 +373,21 @@ public class ForStRsSnapshotStrategy
                 return new ArrayList<>(list);
             }
         }
+    }
+
+    /**
+     * FRS-PHASE2 (README D-J1): TM-side discard delegate for a LINK-mode checkpoint. {@link
+     * LinkedSstStateHandle#discardState()} is a JM no-op; the authoritative unlink runs HERE when
+     * the backend receives {@code notifyCheckpointSubsumed/Aborted}. Manifest-driven unlink loop;
+     * a physical object is deleted exactly once at refs==0. Idempotent (a retried/at-least-once
+     * notification finds the blob already gone). No-op unless LINK mode is active, so flag-OFF
+     * behaviour is unchanged. Returns {@code true} when this call performed the discard.
+     */
+    public boolean discardLinkedCheckpoint(long checkpointId) {
+        if (!isLinkModeCheckpoint()) {
+            return false;
+        }
+        return linker.dbDiscardLinkedCheckpoint(nativeArena, db, checkpointId);
     }
 
     /** Test accessor — returns the strategy's last-completed checkpoint id. */
@@ -703,6 +742,93 @@ public class ForStRsSnapshotStrategy
                                 .NO_SHARING;
         long effectiveBaseCheckpointId =
                 noPriorDependence ? 0L : resources.getBaseCheckpointId();
+
+        // ---- FRS-PHASE2: LINK-mode (zero data upload) branch. ----
+        // Gated to incremental sharing (README D-J2): a NO_SHARING snapshot must be self-contained
+        // and keeps the upload path. When this branch fires the legacy manifest+SST upload below is
+        // skipped entirely. Default OFF ⇒ byte-identical to the upload path.
+        if (isLinkModeCheckpoint() && !fullCheckpoint) {
+            if (isNoFlushCheckpoint()) {
+                throw new IllegalStateException(
+                        "forst.rs.checkpoint.link-mode and forst.rs.checkpoint.noflush are "
+                                + "mutually exclusive: link mode's memtable durability is dual-mode "
+                                + "(FLUSH-on-barrier, or WAL-DELTA when forst.rs.wal.dir is set) and "
+                                + "never uses the Arrow memtable artifact (design §9 D12).");
+            }
+
+            // ---- LINK-mode checkpoint: O(files) metadata, ZERO data upload. ----
+            MemorySegment linkedResult = nativeArena.allocate(24);
+            linker.createIncrementalCheckpointLinked(
+                    db,
+                    resources.getSnapshot(),
+                    resources.getCheckpointId(),
+                    effectiveBaseCheckpointId,
+                    linkedResult);
+
+            Path linkedManifestPath = readCString(linkedResult, 0L);
+            List<Path> linkedNewSsts = readSstList(linkedResult, PTR);
+            List<Path> linkedSharedSsts = readSstList(linkedResult, 2 * PTR);
+            // NOTE: per-file logical sizes are not surfaced by readSstList yet; 0 is acceptable —
+            // Flink uses getStateSize() for accounting only.
+            try {
+                // ---- D-J3: the manifest (small blob) keeps its EXCLUSIVE upload — Flink's
+                // metadata contract untouched; restore reads the engine-FS copy, not this one.
+                StreamStateHandle linkedMetaHandle =
+                        trackedUpload(
+                                        linkedManifestPath,
+                                        streamFactory,
+                                        CheckpointedStateScope.EXCLUSIVE,
+                                        uploadTracker)
+                                .get();
+
+                // ---- Linked SSTs become metadata-only handles. NOTHING is uploaded. The new/
+                // shared split is preserved purely as the registry-registration hint (§3.1.5);
+                // the local sstRegistry is NOT consulted (cross-checkpoint sharing lives in the
+                // engine mapping refcounts, not in upload-identity dedup — §9 D4).
+                List<HandleAndLocalPath> linkedShared =
+                        new ArrayList<>(linkedNewSsts.size() + linkedSharedSsts.size());
+                for (Path p : linkedNewSsts) {
+                    linkedShared.add(
+                            HandleAndLocalPath.of(
+                                    new LinkedSstStateHandle(p.toString(), /* size= */ 0L),
+                                    p.getFileName().toString()));
+                }
+                for (Path p : linkedSharedSsts) {
+                    linkedShared.add(
+                            HandleAndLocalPath.of(
+                                    new LinkedSstStateHandle(p.toString(), /* size= */ 0L),
+                                    p.getFileName().toString()));
+                }
+
+                // ---- Registry blob: unchanged EXCLUSIVE private-state entry. ----
+                List<HandleAndLocalPath> linkedPrivate = new ArrayList<>(1);
+                byte[] linkedRegistryBlob = resources.getRegistryBlob();
+                if (linkedRegistryBlob != null && linkedRegistryBlob.length > 0) {
+                    StreamStateHandle registryHandle =
+                            uploadRegistryBlob(linkedRegistryBlob, streamFactory);
+                    uploadTracker.trackHandle(registryHandle);
+                    linkedPrivate.add(
+                            HandleAndLocalPath.of(
+                                    registryHandle, SERIALIZER_REGISTRY_LOCAL_PATH));
+                }
+
+                IncrementalRemoteKeyedStateHandle linkedHandle =
+                        new IncrementalRemoteKeyedStateHandle(
+                                backendIdentifier,
+                                keyGroupRange,
+                                resources.getCheckpointId(),
+                                /* sharedState= */ linkedShared,
+                                /* privateState= */ linkedPrivate,
+                                linkedMetaHandle);
+                return SnapshotResult.of(linkedHandle);
+            } finally {
+                try {
+                    linker.dbLinkedCheckpointResultFree(linkedResult);
+                } catch (RuntimeException ignored) {
+                    // Idempotent on the native side.
+                }
+            }
+        }
 
         // ---- FRS-CKPT-NOFLUSH: optionally capture the LIVE memtable as Arrow artifacts. ----
         // MVCC ordering: capture the memtable BEFORE the checkpoint enumerates the SST set — both

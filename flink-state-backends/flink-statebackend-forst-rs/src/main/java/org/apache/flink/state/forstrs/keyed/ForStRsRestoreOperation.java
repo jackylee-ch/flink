@@ -48,6 +48,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -240,6 +241,19 @@ public class ForStRsRestoreOperation {
 
     private RestoreResult restoreNoRescaling(IncrementalRemoteKeyedStateHandle handle)
             throws IOException {
+        // FRS-PHASE2 (design §5 Stage-3; README D-J4): a LINK-mode checkpoint's sharedState entries
+        // are all LinkedSstStateHandle — there are NO byte-readable SSTs to download. The engine
+        // resolves everything from the chk dir on the engine filesystem. When this fires, the
+        // entire download loop below is skipped (instant restore). Default upload-mode handles
+        // never carry LinkedSstStateHandle, so flag-OFF behaviour is unchanged.
+        boolean linkMode =
+                !handle.getSharedState().isEmpty()
+                        && handle.getSharedState().stream()
+                                .allMatch(h -> h.getHandle() instanceof LinkedSstStateHandle);
+        if (linkMode) {
+            return restoreInstantLinked(handle);
+        }
+
         Path downloadDir = targetDir.resolve("_restore_dl");
         Files.createDirectories(downloadDir);
 
@@ -359,6 +373,93 @@ public class ForStRsRestoreOperation {
         // standard Flink IncrementalRemoteKeyedStateHandle does not carry a CF map on the wire (it
         // was an artifact of the now-removed custom ForStRsIncrementalKeyedStateHandle), and no
         // production consumer of RestoreResult.getCfMap() exists.
+        return new RestoreResult(
+                db,
+                defaultCf,
+                new LinkedHashMap<>(),
+                handle.getCheckpointId(),
+                restoredSerializerMetadata);
+    }
+
+    /**
+     * FRS-PHASE2: INSTANT-LINK restore — downloads NOTHING. The chk dir ({@code
+     * <db_path>/checkpoints/<%020d ckpt>}) is derived from any linked handle's path; the engine
+     * adopt()s each physical under the new working namespace, opens through the mapped read-path
+     * indirection, replays {@code WAL.delta} when present, and warms the cache lazily. Restore
+     * wall-time is O(files) metadata — flat in state size.
+     *
+     * <p>CLAIM discipline (D-J4): the restore-source checkpoint must stay retained until {@code
+     * linker.dbAdoptedResidual(arena, db) == 0}. Flink CLAIM mode + the engine's compaction
+     * weaning satisfy this; surfacing residual==0 to the JM as "safe to release" is follow-up
+     * wiring.
+     *
+     * <p>DEVIATION FROM PACKAGE FRAGMENT: this restore operation is constructed with only {@code
+     * linker / arena / targetDir / targetRange / sstRegistry} — it has NO {@code storageUri /
+     * cacheDir / cacheCapacityBytes / opendalConfigJson} fields, so the remote-primary instant
+     * variant ({@code dbOpenFromLinkedCheckpointInstantRemote}) cannot be driven from here. The
+     * local-FS instant path is used; remote-primary instant restore is deferred until the restore
+     * op carries the OpenDAL config (the same config the backend used for {@code frs_db_open_remote}
+     * is not threaded into this class today).
+     */
+    private RestoreResult restoreInstantLinked(IncrementalRemoteKeyedStateHandle handle)
+            throws IOException {
+        // Every linked path lives in the same chk dir (design §9 D1) — derive it.
+        LinkedSstStateHandle first =
+                (LinkedSstStateHandle) handle.getSharedState().get(0).getHandle();
+        Path linked = Paths.get(first.getLinkedPath());
+        String ckptDir = linked.getParent().toString();
+
+        // E5-HIGH-2 registry blob: still a normal uploaded private-state entry — download + parse
+        // exactly as the legacy path does (small blob).
+        HandleAndLocalPath registryEntry = null;
+        for (HandleAndLocalPath hlp : handle.getPrivateState()) {
+            if (ForStRsSnapshotStrategy.SERIALIZER_REGISTRY_LOCAL_PATH.equals(hlp.getLocalPath())) {
+                registryEntry = hlp;
+            }
+        }
+        Map<String, StateSerializerMetadata> restoredSerializerMetadata =
+                registryEntry == null
+                        ? Collections.emptyMap()
+                        : downloadAndParseRegistryBlob(registryEntry, handle);
+
+        // Instant restore: local-primary (3-arg variant). Remote-primary is a documented deviation
+        // above — this op is not wired with the OpenDAL config.
+        FrsDb db;
+        try {
+            db = linker.dbOpenFromLinkedCheckpointInstant(arena, ckptDir, targetDir.toString());
+        } catch (RuntimeException re) {
+            // Loud failure (missing physical / no mapping trailer / torn WAL.delta) — never a
+            // silent empty state.
+            throw new ForStRsCheckpointRestoreException(
+                    ckptDir,
+                    handle.getCheckpointId(),
+                    "ForSt-RS instant-link restore refused: " + re.getMessage(),
+                    re);
+        }
+        FrsCfHandle defaultCf;
+        try {
+            defaultCf = linker.dbDefaultCf(db, arena);
+        } catch (RuntimeException re) {
+            db.close();
+            throw new ForStRsCheckpointRestoreException(
+                    targetDir.toString(),
+                    handle.getCheckpointId(),
+                    "ForSt-RS engine restored, but default CF unreachable: " + re.getMessage(),
+                    re);
+        }
+
+        // NO sstRegistry re-population (legacy step 4): under link mode the next checkpoint's
+        // sharing is resolved by the engine mapping layer (chained link checkpoints resolve
+        // TRANSITIVELY to the original physicals — engine register-rebind guard), not by
+        // upload-identity registry dedup.
+
+        if (LOG.isInfoEnabled()) {
+            LOG.info(
+                    "Instant-link restore of checkpoint {} from {} complete; adopted residual = {}",
+                    handle.getCheckpointId(),
+                    ckptDir,
+                    linker.dbAdoptedResidual(arena, db));
+        }
         return new RestoreResult(
                 db,
                 defaultCf,
