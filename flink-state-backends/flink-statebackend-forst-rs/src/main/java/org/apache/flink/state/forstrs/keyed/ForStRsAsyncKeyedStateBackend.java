@@ -1338,6 +1338,26 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                                 linker, db, defaultCf, dispatchMetrics, managedExecutors::add);
                 routingExecutors.add(r);
                 return r;
+            case "routing-adaptive":
+                // R2a (read-side lever 2a, 2026-06-14) — CONTENT-ADAPTIVE EXECUTOR DEPTH, the SAFE
+                // realization. Per batch: ITER batches fan out to the kg-affine worker threads for
+                // cross-probe overlap (q11 318.9→135.7s, exact 92M); ITER-FREE batches run inline
+                // on the mailbox with ZERO worker handoff (q17 carve-out — keeps the 76.7s
+                // point-RMW path that beats ForSt 3.3×). Everything stays kg-affine (one cache per
+                // key-group) so there is no mailbox-vs-worker cross-cache hazard. Byte-identical
+                // OUTPUT to routing (same caches, synchronous completion). Default stays inline.
+                org.apache.flink.state.forstrs.exec.RoutingStateExecutor radp =
+                        new org.apache.flink.state.forstrs.exec.RoutingStateExecutor(
+                                linker,
+                                db,
+                                defaultCf,
+                                dispatchMetrics,
+                                managedExecutors::add,
+                                /* adaptiveInline= */ false,
+                                /* nonBlocking= */ false,
+                                /* routingAdaptive= */ true);
+                routingExecutors.add(radp);
+                return radp;
             case "two-regime":
                 // STAGE-1 (design 2026-06-11 §3): LIGHT inline-when-pipeline-empty (q17-class
                 // keeps depth-1 speed) / HEAVY non-blocking kg-FIFO dispatch. Same ctor as

@@ -160,6 +160,44 @@ public final class RoutingStateExecutor implements StateExecutor {
     private final boolean adaptiveInline;
 
     /**
+     * R2a (read-side lever 2a, 2026-06-14) — CONTENT-ADAPTIVE EXECUTOR DEPTH, the SAFE realization.
+     *
+     * <p>When {@code true} ({@code FRS_RS_EXECUTOR=routing-adaptive}) every batch stays kg-affine
+     * (one MapStateCache per key-group — the proven windowed-join read-your-writes invariant, never
+     * the cross-cache mailbox-vs-worker split that made the experimental modes flaky), but the
+     * EXECUTION mechanism is chosen per batch by content:
+     *
+     * <ul>
+     *   <li><b>ITER-bearing batches</b> fan out to the kg-affine worker threads so the deep
+     *       per-probe I/O of different key-groups overlaps (the routing path that measured q11
+     *       318.9→135.7s, exact 92M rows). Cross-probe overlap is the q11/q7 lever.
+     *   <li><b>ITER-FREE batches (q17 carve-out)</b> run INLINE on the calling (mailbox) thread on
+     *       their kg workers' executors with ZERO worker-thread handoff and ZERO latch — the q17
+     *       tight point-RMW loop REGRESSES under any mailbox→worker handoff (271.8s offloaded ≈
+     *       ForSt's own 253s, vs the 76.7s inline path that BEATS ForSt 3.3×). Because the inline
+     *       path still uses the same {@code workers[kg]} executor as the iter path would, the
+     *       per-key-group cache stays consistent — there is NO mailbox-vs-worker cross-cache hazard
+     *       (the q8-flaky ingredient is absent by construction).
+     * </ul>
+     *
+     * <p>This is byte-identical in OUTPUT to {@code routing} (same kg-affine caches, same
+     * synchronous completion before return) — it only removes the worker-thread handoff for the
+     * iter-free carve-out. Default stays {@code inline}; R2a is opt-in until the q8 band + q17
+     * no-regress NexMark gates pass under one uniform config.
+     */
+    private final boolean routingAdaptive;
+
+    /**
+     * Diagnostic counters (R2a microbench / falsifier gate): how many sub-batches were executed
+     * inline on the caller (mailbox) thread vs dispatched to a worker thread. Lets a test assert
+     * the q17 carve-out incurs ZERO worker dispatch and the iter path DOES dispatch. Cheap relaxed
+     * counters; never read on the production hot path.
+     */
+    private final AtomicInteger inlineSubBatches = new AtomicInteger();
+
+    private final AtomicInteger workerDispatchedSubBatches = new AtomicInteger();
+
+    /**
      * FRS-ROUTING-ASYNC (2026-06-11): when {@code true}, {@link #executeBatchRequests} dispatches
      * each non-empty per-worker sub-batch to its worker FIFO and returns IMMEDIATELY with a
      * truthful aggregate future (completed when every sub-batch actually finishes) — the mailbox
@@ -242,8 +280,21 @@ public final class RoutingStateExecutor implements StateExecutor {
             java.util.function.Consumer<VectorizedExecutor> register,
             boolean adaptiveInline,
             boolean nonBlocking) {
+        this(linker, db, cf, metrics, register, adaptiveInline, nonBlocking, false);
+    }
+
+    public RoutingStateExecutor(
+            ForStRsLinker linker,
+            FrsDb db,
+            FrsCfHandle cf,
+            DispatchMetrics metrics,
+            java.util.function.Consumer<VectorizedExecutor> register,
+            boolean adaptiveInline,
+            boolean nonBlocking,
+            boolean routingAdaptive) {
         this.adaptiveInline = adaptiveInline;
         this.nonBlocking = nonBlocking;
+        this.routingAdaptive = routingAdaptive;
         int n = workerCount();
         this.maxOutstanding = maxInFlightBatches(n);
         this.regime = twoRegimeMode() ? new RegimeSwitch() : null;
@@ -293,8 +344,18 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     /** Test-only: wrap pre-built (stub) workers; no native linker/db touched. */
     RoutingStateExecutor(VectorizedExecutor[] testWorkers, boolean adaptiveInline, boolean nonBlocking) {
+        this(testWorkers, adaptiveInline, nonBlocking, false);
+    }
+
+    /** Test-only: wrap pre-built (stub) workers with the R2a routing-adaptive flag. */
+    RoutingStateExecutor(
+            VectorizedExecutor[] testWorkers,
+            boolean adaptiveInline,
+            boolean nonBlocking,
+            boolean routingAdaptive) {
         this.adaptiveInline = adaptiveInline;
         this.nonBlocking = nonBlocking;
+        this.routingAdaptive = routingAdaptive;
         int n = testWorkers.length;
         this.maxOutstanding = maxInFlightBatches(n);
         this.regime = twoRegimeMode() ? new RegimeSwitch() : null;
@@ -360,6 +421,35 @@ public final class RoutingStateExecutor implements StateExecutor {
         }
         if (busy.isEmpty()) {
             return CompletableFuture.completedFuture(null);
+        }
+        if (routingAdaptive) {
+            // R2a — CONTENT-ADAPTIVE EXECUTOR DEPTH (the SAFE realization, 2026-06-14).
+            // Decide per batch by content; everything stays kg-affine (one cache/key-group), so
+            // there is no mailbox-vs-worker cross-cache hazard regardless of branch.
+            if (!anySubHasItersForBatch(subs, busy)) {
+                // q17 CARVE-OUT: iter-free batch → run each kg sub-batch INLINE on THIS (mailbox)
+                // thread, on its own worker's executor. ZERO worker-thread handoff, ZERO latch —
+                // the tight point-RMW path that BEATS ForSt 3.3× (76.7s vs 255.7s); any handoff
+                // regresses it to ~271s. Synchronous: the inner executors complete before return.
+                try {
+                    for (int id : busy) {
+                        inlineSubBatches.incrementAndGet();
+                        CompletableFuture<Void> inner = workers[id].executeBatchRequests(subs[id]);
+                        Throwable t = inner.handle((v, ex) -> ex).getNow(null);
+                        if (t != null) {
+                            return CompletableFuture.failedFuture(t);
+                        }
+                    }
+                    return CompletableFuture.completedFuture(null);
+                } catch (Throwable t) {
+                    return CompletableFuture.failedFuture(t);
+                }
+            }
+            // ITER batch → fan out to the kg-affine worker threads so deep per-probe I/O of
+            // different key-groups OVERLAPS (q11 318.9→135.7s, exact 92M). Blocking + synchronous
+            // (same completion contract as routing): wait for every worker, then return a
+            // completed future — no async reordering, byte-identical OUTPUT to routing.
+            return runIterBatchOnWorkers(subs, busy);
         }
         if (nonBlocking) {
             if (regime != null
@@ -506,6 +596,65 @@ public final class RoutingStateExecutor implements StateExecutor {
         return agg;
     }
 
+    /**
+     * R2a iter-batch fan-out: dispatch each busy sub-batch to its kg-affine worker thread and BLOCK
+     * until all finish (cross-key-group overlap, synchronous completion = byte-identical OUTPUT to
+     * routing). A single-worker batch runs inline-on-its-worker (no latch); multi-worker fans out
+     * across worker threads under a latch. Worker dispatches are counted for the R2a gate.
+     */
+    private CompletableFuture<Void> runIterBatchOnWorkers(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        final java.util.concurrent.atomic.AtomicReference<Throwable> err =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        if (busy.size() == 1) {
+            int id = busy.get(0);
+            workerDispatchedSubBatches.incrementAndGet();
+            runSubBatchAndWait(id, subs[id], err);
+        } else {
+            final java.util.concurrent.CountDownLatch latch =
+                    new java.util.concurrent.CountDownLatch(busy.size());
+            for (int wi : busy) {
+                final int id = wi;
+                final AsyncRequestContainer<StateRequest<?, ?, ?, ?>> sub = subs[id];
+                workerDispatchedSubBatches.incrementAndGet();
+                workerThreads[id].execute(
+                        () -> {
+                            try {
+                                CompletableFuture<Void> inner = workers[id].executeBatchRequests(sub);
+                                Throwable t = inner.handle((v, e) -> e).getNow(null);
+                                if (t != null) {
+                                    err.compareAndSet(null, t);
+                                }
+                            } catch (Throwable t) {
+                                err.compareAndSet(null, t);
+                            } finally {
+                                latch.countDown();
+                            }
+                        });
+            }
+            try {
+                latch.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                err.compareAndSet(null, e);
+            }
+        }
+        Throwable e = err.get();
+        return (e != null)
+                ? CompletableFuture.failedFuture(e)
+                : CompletableFuture.completedFuture(null);
+    }
+
+    /** R2a gate accessor: sub-batches executed inline on the caller (mailbox) thread. */
+    public int inlineSubBatchCount() {
+        return inlineSubBatches.get();
+    }
+
+    /** R2a gate accessor: sub-batches dispatched to a worker thread. */
+    public int workerDispatchedSubBatchCount() {
+        return workerDispatchedSubBatches.get();
+    }
+
     /** STAGE-1: total requests across busy sub-batches (LIGHT-inline ceiling check). */
     private static int totalRequests(
             AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
@@ -516,6 +665,34 @@ public final class RoutingStateExecutor implements StateExecutor {
             }
         }
         return total;
+    }
+
+    /**
+     * Test-only override of the R2a iter verdict. The real
+     * {@link org.apache.flink.state.forstrs.VectorizedClassifier#hasIterRequests()} signal is only
+     * raised at FFI dispatch-build time (not exercised by the stub-worker harness), so the R2a
+     * falsifier injects a {@code Boolean} here to drive the iter / iter-free branches
+     * deterministically. {@code null} = use the real classifier flag (production path, unchanged).
+     */
+    private volatile Boolean iterVerdictOverrideForTest;
+
+    /** Test-only: force {@link #anySubHasItersForBatch} to return {@code value}. */
+    void setIterVerdictOverrideForTest(Boolean value) {
+        this.iterVerdictOverrideForTest = value;
+    }
+
+    /**
+     * Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. The default
+     * reads the real classifier flag; a test override (if set) short-circuits it so the R2a
+     * branches can be driven without FFI.
+     */
+    boolean anySubHasItersForBatch(
+            AsyncRequestContainer<StateRequest<?, ?, ?, ?>>[] subs, java.util.List<Integer> busy) {
+        Boolean override = iterVerdictOverrideForTest;
+        if (override != null) {
+            return override;
+        }
+        return anySubHasIters(subs, busy);
     }
 
     /** Adaptive dispatch: whether any non-empty sub-batch contains iterator requests. */
