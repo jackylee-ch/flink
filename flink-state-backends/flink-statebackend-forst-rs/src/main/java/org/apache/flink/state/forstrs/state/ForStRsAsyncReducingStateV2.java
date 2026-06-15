@@ -155,6 +155,45 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      */
     private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
 
+    // ---------------------------------------------------------------
+    // OPT-N04 (A2 / J2-J3): in-engine merge routing for i64-add reducers
+    // ---------------------------------------------------------------
+    //
+    // When enabled (backend gate FRS_RS_MERGE_RMW + eligibility §2: LongSerializer + a
+    // provably-additive reducer), the per-record dependent GET on a cache miss is eliminated:
+    // asyncAdd folds the input into a pending *delta* (no GET ever), and the barrier flush emits
+    // ONE engine Merge row carrying the 8-byte BE delta into the agg-merge-i64 CF (folded
+    // associatively by NumericAddBeMergeOperator). asyncGet returns engine-folded value + pending
+    // delta. clear() emits a Delete and resets the delta. Byte-identical to the get-fold-put path
+    // because the stored bytes are exactly serializeValueBytes() output (Flink LongSerializer is
+    // BE; the BE operator wraps, matching Java `long +`). All routing is behind the final
+    // {@link #mergeRouted} flag so the legacy path is JIT-dead when off.
+
+    /**
+     * OPT-N04 §2: merge-eligibility, decided once at construction. ALL of: value serializer is
+     * {@link LongSerializer} (the on-disk form is 8-byte BE — IntSerializer is EXCLUDED: widening
+     * its 4-byte form would break the checkpoint byte format); AND the reducer is provably i64-add
+     * ({@link #tryUnwrapPrimitiveSumReducer} recognized it). The backend consults this before
+     * calling {@link #enableMergeRouting}. {@code Math::addExact} is excluded because it THROWS on
+     * overflow whereas the engine operator wraps — not byte-equivalent at the rails.
+     */
+    private final boolean mergeEligible;
+
+    /** True once {@link #enableMergeRouting} wires the agg CF. Final-after-init for JIT. */
+    private boolean mergeRouted;
+
+    /** Pending per-key i64 deltas (combiner = {@code +}); flushed as Merge rows. */
+    @javax.annotation.Nullable private LongReducingAggregatingCache deltaCache;
+
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.ffm.ForStRsLinker mergeLinker;
+
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.ffm.FrsDb mergeDb;
+
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.ffm.FrsCfHandle mergeAggCf;
+
     @SuppressWarnings({"unchecked", "rawtypes"})
     public ForStRsAsyncReducingStateV2(
             StateRequestHandler stateRequestHandler,
@@ -178,6 +217,10 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
         boolean isInt = valueSerializer instanceof IntSerializer;
         this.usePrimitiveLongCache = isLong || isInt;
         this.accIsInteger = isInt;
+        // OPT-N04 §2: merge-eligible iff LongSerializer (8-byte BE on-disk form; Int excluded) AND
+        // the reducer is a WRAPPING i64 add (Long::sum / (a,b)->a+b). Math::addExact is rejected:
+        // it throws on overflow whereas NumericAddBeMergeOperator wraps → not byte-equivalent.
+        this.mergeEligible = isLong && isWrappingI64Add(reduceFunction);
         if (this.usePrimitiveLongCache) {
             // B11-H2: fast-path detection for well-known primitive reducers. The vast majority of
             // Q12-pattern workloads use a SumAgg whose reduce(a, b) is `Long::sum` /
@@ -291,6 +334,65 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     }
 
     /**
+     * OPT-N04 (A2 / J2): switch this state to in-engine merge routing. Called by the backend ONLY
+     * when {@code FRS_RS_MERGE_RMW} is on AND this state is merge-eligible (§2: {@link
+     * #usePrimitiveLongCache} via {@link LongSerializer} with a {@link #accIsInteger} == false
+     * accumulator domain, and a provably-additive reducer detected at construction). Wires the
+     * {@code agg-merge-i64} CF that carries {@code NumericAddBeMergeOperator} and installs the
+     * delta cache. Idempotent; must be called before any add.
+     *
+     * @param linker FFM linker for direct agg-CF get/merge/delete (bypasses the classifier, same
+     *     as the legacy {@code rmwFlushToEngine} flush path)
+     * @param db open engine handle
+     * @param aggCf the shared {@code agg-merge-i64} CF handle (owned by the backend)
+     */
+    public void enableMergeRouting(
+            org.apache.flink.state.forstrs.ffm.ForStRsLinker linker,
+            org.apache.flink.state.forstrs.ffm.FrsDb db,
+            org.apache.flink.state.forstrs.ffm.FrsCfHandle aggCf) {
+        if (mergeRouted) {
+            return;
+        }
+        this.mergeLinker = linker;
+        this.mergeDb = db;
+        this.mergeAggCf = aggCf;
+        // Delta combiner is plain i64 addition: the cache accumulates the SUM of pending deltas
+        // between flushes. Flush emits one Merge of the BE-encoded delta; the engine folds it onto
+        // the persisted chain via NumericAddBeMergeOperator (wrapping, == Java `long +`).
+        this.deltaCache =
+                ReducingAggregatingCache.forLong(
+                        Long::sum, (keyBytes, delta) -> mergeFlushDelta(keyBytes, delta));
+        this.mergeRouted = true;
+    }
+
+    /** True iff this state routes adds through the in-engine merge path. */
+    @VisibleForTesting
+    public boolean isMergeRouted() {
+        return mergeRouted;
+    }
+
+    /**
+     * Encodes an i64 delta in 8-byte BE (Flink {@link LongSerializer} layout) and emits ONE engine
+     * Merge row into the agg CF. Folded associatively by {@code NumericAddBeMergeOperator}. A
+     * zero delta is skipped (no-op merge) so an unchanged key produces no row.
+     */
+    private void mergeFlushDelta(byte[] keyBytes, long delta) {
+        if (delta == 0L) {
+            return;
+        }
+        byte[] be = new byte[8];
+        be[0] = (byte) (delta >>> 56);
+        be[1] = (byte) (delta >>> 48);
+        be[2] = (byte) (delta >>> 40);
+        be[3] = (byte) (delta >>> 32);
+        be[4] = (byte) (delta >>> 24);
+        be[5] = (byte) (delta >>> 16);
+        be[6] = (byte) (delta >>> 8);
+        be[7] = (byte) delta;
+        mergeLinker.merge(mergeDb, mergeAggCf, keyBytes, be);
+    }
+
+    /**
      * RMW cache usable ⇔ NOT legacy-pipelined AND (no regime switch OR regime LIGHT). Under
      * HEAVY the cache's mailbox folds + flushHandler mailbox engine writes would race in-flight
      * worker batches; adds flow through the framework get-fold-put instead.
@@ -350,6 +452,19 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             return super.asyncAdd(value);
         }
         if (value == null) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        // OPT-N04 (A2): merge-routed delta fold — NO miss-resolve GET. tryFold updates an existing
+        // pending delta; on a fresh key the delta cache seeds the input directly (the chain kill).
+        if (mergeRouted) {
+            int dkeyLen = writeCacheKeyToKeyOut();
+            byte[] dkeyBuf = keyOut.getSharedBuffer();
+            long inLong = ((Long) value).longValue();
+            if (!deltaCache.tryFold(dkeyBuf, 0, dkeyLen, inLong)) {
+                // Miss: seed the pending delta = input with no engine round-trip. The persisted
+                // value (if any) stays in the engine and is folded with this delta at read/flush.
+                deltaCache.put(dkeyBuf, 0, dkeyLen, inLong);
+            }
             return StateFutureUtils.completedVoidFuture();
         }
         int keyLen = writeCacheKeyToKeyOut();
@@ -434,6 +549,24 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     public StateFuture<V> asyncGet() {
         int keyLen = writeCacheKeyToKeyOut();
         byte[] keyBuf = keyOut.getSharedBuffer();
+        // OPT-N04 (A2): merge-routed read = engine-folded persisted value (agg CF, chain folded by
+        // NumericAddBeMergeOperator) + the pending in-cache delta. Both summands are i64; the sum
+        // wraps (== Java `long +`), so the observable value is byte-identical to get-fold-put.
+        if (mergeRouted) {
+            byte[] keySnapshot = new byte[keyLen];
+            System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
+            long pendingDelta = deltaCache.peekOr(keyBuf, 0, keyLen, 0L);
+            if (pendingDelta == LongReducingAggregatingCache.ABSENT_SENTINEL) {
+                pendingDelta = 0L;
+            }
+            byte[] persisted = mergeLinker.get(mergeDb, mergeAggCf, keySnapshot);
+            if (persisted == null && pendingDelta == 0L) {
+                return StateFutureUtils.completedFuture(null);
+            }
+            long base = persisted == null ? 0L : decodeBeLong(persisted);
+            long total = base + pendingDelta;
+            return StateFutureUtils.completedFuture((V) Long.valueOf(total));
+        }
         if (usePrimitiveLongCache) {
             if (longCache.contains(keyBuf, 0, keyLen)) {
                 // Single box on read path — acceptable: reads on cached state are far less
@@ -459,6 +592,12 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
      * decides how to route them (production: engine PUT; tests: capture).
      */
     public void flushOnBarrier() {
+        if (mergeRouted) {
+            // Emit one BE-delta Merge row per dirty key, then RESET each delta to 0 — the delta is
+            // now persisted in the engine; a non-reset would re-fold it on the next barrier.
+            deltaCache.flushDeltasAndReset();
+            return;
+        }
         if (usePrimitiveLongCache) {
             longCache.flushAllDirty();
         } else {
@@ -482,6 +621,17 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
     @Override
     public void onClear(StateRequest<K, N, ?, ?> request) {
         int keyLen = writeRequestKeyToKeyOut(request);
+        if (mergeRouted) {
+            // Drop any pending delta and DELETE the persisted chain on the agg CF. The Delete is a
+            // base-establishing row the read path understands (chain folding stops at a tombstone),
+            // so a subsequent add()'s Merge starts a fresh accumulator from absent.
+            byte[] keyBuf = keyOut.getSharedBuffer();
+            byte[] keySnapshot = new byte[keyLen];
+            System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
+            deltaCache.invalidate(keyBuf, 0, keyLen);
+            mergeLinker.delete(mergeDb, mergeAggCf, keySnapshot);
+            return;
+        }
         if (usePrimitiveLongCache) {
             longCache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
         } else {
@@ -697,6 +847,59 @@ public class ForStRsAsyncReducingStateV2<K, N, V> extends AbstractReducingState<
             // The fast path is an optimization, not a correctness requirement.
             return null;
         }
+    }
+
+    /**
+     * OPT-N04 §2 eligibility oracle. Returns true ONLY for a reducer that is a WRAPPING i64 add over
+     * the long domain ({@code Long::sum}, descriptor {@code (JJ)J}) — byte-equivalent to the
+     * engine's {@code NumericAddBeMergeOperator} (which wraps). EXCLUDES {@code Math::addExact}
+     * (throws on overflow, the operator wraps → divergent at the rails) and every int-domain or
+     * unknown form (those keep the legacy get-fold-put path). Sound: it inspects the actual
+     * implementation method via {@link java.lang.invoke.SerializedLambda}, not a behavioral probe.
+     */
+    private static boolean isWrappingI64Add(ReduceFunction<?> reducer) {
+        if (!(reducer instanceof java.io.Serializable)) {
+            return false;
+        }
+        try {
+            java.lang.reflect.Method writeReplace =
+                    reducer.getClass().getDeclaredMethod("writeReplace");
+            writeReplace.setAccessible(true);
+            Object replaced = writeReplace.invoke(reducer);
+            if (!(replaced instanceof java.lang.invoke.SerializedLambda)) {
+                return false;
+            }
+            java.lang.invoke.SerializedLambda sl = (java.lang.invoke.SerializedLambda) replaced;
+            return "java/lang/Long".equals(sl.getImplClass())
+                    && "sum".equals(sl.getImplMethodName())
+                    && "(JJ)J".equals(sl.getImplMethodSignature());
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * OPT-N04 (J2): whether this state is merge-eligible (§2). The backend consults this with the
+     * {@code FRS_RS_MERGE_RMW} flag to decide whether to {@link #enableMergeRouting}.
+     */
+    public boolean isMergeEligible() {
+        return mergeEligible;
+    }
+
+    /** Decodes an 8-byte BE i64 (Flink {@link LongSerializer} layout). */
+    private static long decodeBeLong(byte[] b) {
+        if (b.length != 8) {
+            throw new IllegalStateException(
+                    "ForStRsAsyncReducingStateV2: merge-routed value not 8 bytes: " + b.length);
+        }
+        return ((long) (b[0] & 0xFF) << 56)
+                | ((long) (b[1] & 0xFF) << 48)
+                | ((long) (b[2] & 0xFF) << 40)
+                | ((long) (b[3] & 0xFF) << 32)
+                | ((long) (b[4] & 0xFF) << 24)
+                | ((long) (b[5] & 0xFF) << 16)
+                | ((long) (b[6] & 0xFF) << 8)
+                | ((long) (b[7] & 0xFF));
     }
 
     private byte[] serializeValueBytes(V acc) {

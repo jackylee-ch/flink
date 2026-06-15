@@ -119,6 +119,22 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
     private final FrsCfHandle defaultCf;
 
     /**
+     * OPT-N04 (A2 / J2): in-engine merge-RMW routing gate ({@code FRS_RS_MERGE_RMW=1}, default OFF).
+     * When on, merge-eligible {@link ForStRsAsyncReducingStateV2} states (§2: LongSerializer +
+     * wrapping i64-add reducer) route adds as engine Merge deltas folded by
+     * {@code NumericAddBeMergeOperator}, eliminating the per-record dependent GET. OFF ⇒ no CF is
+     * created and no state is routed (byte-identical legacy path).
+     */
+    private static final boolean MERGE_RMW_ENABLED =
+            "1".equals(System.getenv("FRS_RS_MERGE_RMW"));
+
+    /** Shared CF name for all merge-routed accumulator states (OPT-N04 §3.1). */
+    private static final String AGG_MERGE_CF_NAME = "agg-merge-i64";
+
+    /** Lazily created on the first eligible state register; {@code null} until then / when OFF. */
+    @javax.annotation.Nullable private FrsCfHandle aggMergeCf;
+
+    /**
      * FRS-WA-V0 (2026-06-13 write-path redesign survey §3.2): per-CF state-lifecycle manager. Wired
      * at state-register time only when the engine's death-bucketed-segment path is opted in via the
      * {@code forst.rs.lifecycle.segments} system property (default OFF ⇒ {@code null}, so default
@@ -1223,11 +1239,44 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         // RecordContext is gone at flush time and a synthetic context would only carry the
         // operator key — exactly what {@code linker.put} already takes as a raw key.
         state.setFlushHandler(this::rmwFlushToEngine);
+        // OPT-N04 (A2 / J2): route merge-eligible reducing states through the in-engine merge path.
+        // Gated by FRS_RS_MERGE_RMW; eligibility decided inside the state (§2). Lazily creates the
+        // shared agg-merge-i64 CF (NumericAddBeMergeOperator) on the first eligible register.
+        if (MERGE_RMW_ENABLED && state.isMergeEligible()) {
+            state.enableMergeRouting(linker, db, aggMergeCf());
+        }
         registeredAsyncReducingStates.add(state);
         if (twoRegimeSwitch != null) {
             state.setRegimeSwitch(twoRegimeSwitch);
         }
         return state;
+    }
+
+    /**
+     * OPT-N04 (A2 / J1-J2): returns the shared {@code agg-merge-i64} CF, creating it on first use.
+     * The CF carries {@code NumericAddBeMergeOperator} (8-byte BE i64 wrapping sum), resolved
+     * engine-side by name so it restores by name across job restarts. Created via the checkpoint-safe
+     * open-or-create flow: on a fresh DB the engine creates it with the operator; on restore the
+     * engine has already re-registered it from the manifest (preserving its operator), so it is
+     * opened by name. Single-threaded register path → no extra synchronization needed.
+     */
+    private FrsCfHandle aggMergeCf() {
+        if (aggMergeCf == null) {
+            try {
+                // Restore path: the CF was re-registered by open_from_checkpoint — open by name.
+                aggMergeCf = linker.dbOpenCf(db, arena, AGG_MERGE_CF_NAME);
+            } catch (org.apache.flink.state.forstrs.FrsBackendException e) {
+                if (e.status() == org.apache.flink.state.forstrs.FrsStatus.NOT_FOUND) {
+                    // Fresh DB: create it with the BE numeric merge operator.
+                    aggMergeCf =
+                            linker.dbCreateCfWithMerge(
+                                    db, arena, AGG_MERGE_CF_NAME, "NumericAddBeMergeOperator");
+                } else {
+                    throw e;
+                }
+            }
+        }
+        return aggMergeCf;
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"})
@@ -2263,6 +2312,14 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         try {
             if (timerCf != null) {
                 timerCf.close();
+            }
+        } catch (Exception ignored) {
+        }
+        // OPT-N04 (A2): release the agg-merge-i64 CF handle if one was created. Same semantics as
+        // the timer CF — closes the FFM Box only; the CF stays in the DB and is checkpointed.
+        try {
+            if (aggMergeCf != null) {
+                aggMergeCf.close();
             }
         } catch (Exception ignored) {
         }

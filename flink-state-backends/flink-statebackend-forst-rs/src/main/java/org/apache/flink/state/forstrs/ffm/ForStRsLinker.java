@@ -287,6 +287,13 @@ public final class ForStRsLinker {
     // --- 2. CF management ---
     private final MethodHandle frsDbDefaultCf;
     private final MethodHandle frsDbCreateCf;
+    /**
+     * OPT-N04 (J1): create a CF carrying a named merge operator (e.g.
+     * {@code "NumericAddBeMergeOperator"} for merge-routed i64 accumulator states). Default-OFF
+     * path — only the {@code FRS_RS_MERGE_RMW} backend wires this to create the {@code agg-merge-i64}
+     * CF; the legacy {@code defaultCf} path is unchanged.
+     */
+    private final MethodHandle frsDbCreateCfWithMerge;
     private final MethodHandle frsDbOpenCf;
     private final MethodHandle frsCfClose;
 
@@ -296,6 +303,13 @@ public final class ForStRsLinker {
     private final MethodHandle frsGetPinned;
     private final MethodHandle frsGetAndPut;
     private final MethodHandle frsDelete;
+    /**
+     * OPT-N04 (J1): single-shot merge operand append ({@code frs_merge}). Used by the merge-routed
+     * accumulator flush handler to emit one i64-delta {@code Merge} row per dirty key into the
+     * {@code agg-merge-i64} CF instead of a {@code Put} of the folded absolute value (kills the
+     * dependent GET on the per-record RMW miss path). Default-OFF.
+     */
+    private final MethodHandle frsMerge;
 
     // --- 3b. Batch ops ---
     private final MethodHandle frsBatchPut;
@@ -567,6 +581,16 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // name (c_char*)
                                 ValueLayout.ADDRESS)); // out_cf
 
+        this.frsDbCreateCfWithMerge =
+                bind(
+                        "frs_db_create_cf_with_merge",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // name (c_char*)
+                                ValueLayout.ADDRESS, // merge_op_name (c_char*, NULL = none)
+                                ValueLayout.ADDRESS)); // out_cf
+
         this.frsDbOpenCf =
                 bind(
                         "frs_db_open_cf",
@@ -660,6 +684,20 @@ public final class ForStRsLinker {
                                 ValueLayout.ADDRESS, // cf
                                 ValueLayout.ADDRESS, // key ptr
                                 ValueLayout.JAVA_LONG)); // key_len
+
+        // OPT-N04 (J1): single-shot merge operand append — same arg shape as frs_put. Plain bind
+        // (write path → may_throttle, must not suspend safepoints, same rationale as frs_put).
+        this.frsMerge =
+                bind(
+                        "frs_merge",
+                        FunctionDescriptor.of(
+                                ValueLayout.JAVA_INT,
+                                ValueLayout.ADDRESS, // db
+                                ValueLayout.ADDRESS, // cf
+                                ValueLayout.ADDRESS, // key ptr
+                                ValueLayout.JAVA_LONG, // key_len
+                                ValueLayout.ADDRESS, // operand ptr
+                                ValueLayout.JAVA_LONG)); // operand_len
 
         // 3b. Batch ops — frs_batch_put takes parallel arrays of native
         // pointers (uint8_t* const*) and sizes (size_t*). Critical mode is NOT
@@ -1937,6 +1975,33 @@ public final class ForStRsLinker {
         return new FrsCfHandle(this, cfHandle);
     }
 
+    /**
+     * OPT-N04 (J1): creates a new named column family carrying the named merge operator. Pass
+     * {@code mergeOpName == null} for no operator (equivalent to {@link #dbCreateCf}). The operator
+     * name is resolved engine-side via the shared {@code merge_operator_by_name} registry — the same
+     * one the checkpoint restore arms use — so a CF created here restores by name across job
+     * restarts. Caller closes via {@link FrsCfHandle#close()}.
+     *
+     * @param mergeOpName e.g. {@code "NumericAddBeMergeOperator"} (8-byte BE i64 wrapping sum,
+     *     byte-equivalent to Java {@code long +} over {@code LongSerializer} bytes), or {@code null}
+     */
+    public FrsCfHandle dbCreateCfWithMerge(
+            FrsDb db, Arena arena, String name, String mergeOpName) {
+        MemorySegment nameSeg = allocateCString(arena, name);
+        MemorySegment opSeg = mergeOpName == null ? MemorySegment.NULL : allocateCString(arena, mergeOpName);
+        MemorySegment outCf = arena.allocate(ValueLayout.ADDRESS);
+        int rc;
+        try {
+            rc = (int) frsDbCreateCfWithMerge.invokeExact(db.handle(), nameSeg, opSeg, outCf);
+        } catch (Throwable t) {
+            throw new FrsBackendException(
+                    FrsStatus.PANIC, "frs_db_create_cf_with_merge threw: " + t.getMessage());
+        }
+        check(rc, "frs_db_create_cf_with_merge");
+        MemorySegment cfHandle = outCf.get(ValueLayout.ADDRESS, 0);
+        return new FrsCfHandle(this, cfHandle);
+    }
+
     /** Opens an existing named column family. Caller closes via {@link FrsCfHandle#close()}. */
     public FrsCfHandle dbOpenCf(FrsDb db, Arena arena, String name) {
         MemorySegment nameSeg = allocateCString(arena, name);
@@ -2041,6 +2106,62 @@ public final class ForStRsLinker {
                 throw new FrsBackendException(FrsStatus.PANIC, "frs_put threw: " + t.getMessage());
             }
             check(rc, "frs_put");
+        }
+    }
+
+    /**
+     * OPT-N04 (J1): appends one merge operand for {@code key} into {@code cf} (which MUST carry a
+     * merge operator — e.g. the {@code agg-merge-i64} CF with {@code NumericAddBeMergeOperator}).
+     * The engine folds the operand chain associatively at read / flush / compaction. Used by the
+     * merge-routed accumulator flush path to write an i64 delta instead of an absolute-value
+     * {@code Put} — a blind write with no dependent read.
+     */
+    public void merge(FrsDb db, FrsCfHandle cf, byte[] key, byte[] operand) {
+        merge(db, cf, key, operand, 0, operand.length);
+    }
+
+    /**
+     * Merge using a sub-range of {@code operand}, mirroring {@link #put(FrsDb, FrsCfHandle, byte[],
+     * byte[], int, int)} so a caller may pass a shared serializer buffer without a defensive copy.
+     */
+    public void merge(
+            FrsDb db,
+            FrsCfHandle cf,
+            byte[] key,
+            byte[] operand,
+            int operandOffset,
+            int operandLength) {
+        if (operandOffset < 0
+                || operandLength < 0
+                || (long) operandOffset + (long) operandLength > operand.length) {
+            throw new IllegalArgumentException(
+                    "operand range out of bounds: offset="
+                            + operandOffset
+                            + " length="
+                            + operandLength
+                            + " operand.length="
+                            + operand.length);
+        }
+        try (Arena local = Arena.ofConfined()) {
+            MemorySegment keySeg = copyBytesToNative(local, key);
+            MemorySegment opSeg =
+                    copyBytesRangeToNative(local, operand, operandOffset, operandLength);
+            int rc;
+            try {
+                rc =
+                        (int)
+                                frsMerge.invokeExact(
+                                        db.handle(),
+                                        cf.handle(),
+                                        keySeg,
+                                        (long) key.length,
+                                        opSeg,
+                                        (long) operandLength);
+            } catch (Throwable t) {
+                throw new FrsBackendException(
+                        FrsStatus.PANIC, "frs_merge threw: " + t.getMessage());
+            }
+            check(rc, "frs_merge");
         }
     }
 

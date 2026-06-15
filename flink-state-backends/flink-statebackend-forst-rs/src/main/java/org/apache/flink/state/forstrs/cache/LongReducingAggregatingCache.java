@@ -298,6 +298,27 @@ public final class LongReducingAggregatingCache {
         }
     }
 
+    /**
+     * OPT-N04 (A2 / J3): delta-mode flush. Emits each dirty entry's accumulated value via the flush
+     * callback, then RESETS the value to {@code 0} (not merely clearing the dirty flag). This is the
+     * required semantic when the entry holds a PENDING DELTA rather than an absolute value: once the
+     * delta has been handed to the engine as a Merge operand, the in-cache delta must be zeroed so a
+     * subsequent fold starts a fresh delta — otherwise the already-flushed delta would be
+     * re-folded and double-counted on the next barrier. Entries stay resident (delta 0) so the
+     * alloc-free {@link #tryFold} hot path keeps hitting.
+     */
+    public void flushDeltasAndReset() {
+        drainPendingFlush();
+        for (Map.Entry<BytesKey, LongEntry> me : entries.entrySet()) {
+            LongEntry e = me.getValue();
+            if (e.dirty) {
+                flushCallback.accept(me.getKey().bytes, e.acc);
+                e.acc = 0L;
+                e.dirty = false;
+            }
+        }
+    }
+
     public int size() {
         return entries.size();
     }
