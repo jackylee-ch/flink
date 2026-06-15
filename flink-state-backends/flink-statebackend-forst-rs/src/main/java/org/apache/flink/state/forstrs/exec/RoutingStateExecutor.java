@@ -248,7 +248,15 @@ public final class RoutingStateExecutor implements StateExecutor {
     /**
      * STAGE-0 sync-direct experiment: a DEDICATED executor (own arena + buffers) for
      * mailbox-inline sync requests, so direct execution never shares scratch with a worker
-     * thread mid-batch. Null unless nonBlocking && FRS_RS_SYNC_DIRECT=1.
+     * thread mid-batch.
+     *
+     * <p><b>RETIRED under the non-blocking executor by the Stage-0 §6.4 fix (2026-06-15).</b> The
+     * mailbox-direct bypass it provided is the read-your-writes hazard on the window-fire path (it
+     * jumps the kg worker FIFO and can read state before a queued LIST_ADD has been applied — the q8
+     * −77% under-emit). It is therefore no longer constructed under {@code nonBlocking}; only the
+     * blocking/inline modes — where batches complete synchronously so there is no queued write to
+     * overtake — could ever take the bypass, and they never set this field either (it was only ever
+     * built when {@code nonBlocking}). The field is kept null-valued for ABI/forward compatibility.
      */
     private final VectorizedExecutor syncDirectWorker;
     private final Arena syncDirectArena;
@@ -327,19 +335,11 @@ public final class RoutingStateExecutor implements StateExecutor {
             this.workerThreads[i] = Executors.newSingleThreadExecutor(tf);
             this.free.addLast(i);
         }
-        if (nonBlocking && "1".equals(System.getenv("FRS_RS_SYNC_DIRECT"))) {
-            this.syncDirectArena = Arena.ofShared();
-            this.syncDirectWorker = new VectorizedExecutor(linker, db, cf, syncDirectArena);
-            if (metrics != null) {
-                this.syncDirectWorker.setDispatchMetrics(metrics);
-            }
-            if (register != null) {
-                register.accept(this.syncDirectWorker);
-            }
-        } else {
-            this.syncDirectArena = null;
-            this.syncDirectWorker = null;
-        }
+        // STAGE-0 §6.4 fix (2026-06-15): the FRS_RS_SYNC_DIRECT mailbox-direct bypass is RETIRED
+        // under the non-blocking executor (it is the fire-path read-your-writes hazard). Never
+        // construct it — the sync path always funnels through the kg worker FIFO.
+        this.syncDirectArena = null;
+        this.syncDirectWorker = null;
     }
 
     /** Test-only: wrap pre-built (stub) workers; no native linker/db touched. */
@@ -733,12 +733,21 @@ public final class RoutingStateExecutor implements StateExecutor {
 
     @Override
     public void executeRequestSync(StateRequest<?, ?, ?, ?> request) {
-        // STAGE-0 EXPERIMENT (FRS_RS_SYNC_DIRECT=1): execute sync requests DIRECTLY on the
-        // calling thread — community ForSt's exact behavior (ForStStateExecutor.executeRequestSync
-        // converts and runs inline, jumping its coordinator queue). Safe by the AEC key contract:
-        // a sync request for key K is only issued when no async ops for K are in flight
-        // (KeyAccountingUnit), so jumping the worker FIFO cannot reorder same-key effects.
-        if (syncDirectWorker != null) {
+        // STAGE-0 §6.4 FIX (2026-06-15) — option A "route ALL fire-path engine ops through the kg
+        // worker FIFO". The window-fire trigger issues its reads via this sync path under overdraft
+        // (InternalTimerServiceAsyncImpl.maintainContextAndProcess → syncPointRequestWithCallback,
+        // allowOverdraft=true), and overdraft seizeCapacity does NOT drain the AEC. If such a
+        // fire-path read takes a mailbox-direct route — exactly the FRS_RS_SYNC_DIRECT experiment's
+        // dedicated syncDirectWorker, which shares the engine's backing store but NOT the kg worker
+        // FIFO — it can run while that key-group's LIST_ADD is still queued/in-flight on the worker,
+        // reading the pre-write state: the q8 windowed-join under-emit (−77%, root-caused +
+        // deterministically reproduced in Q8OpMixBoundaryRaceTest). Under the NON-BLOCKING executor
+        // the mailbox-direct bypass is therefore UNSAFE and is disabled: the sync request MUST
+        // funnel onto its key-group worker's FIFO TAIL (below), behind any queued write, so
+        // read-your-writes holds by FIFO construction — the property the proven blocking `routing`
+        // mode already has. The bypass remains available ONLY under the blocking/inline modes, where
+        // batches complete synchronously so there is never a queued worker write to overtake.
+        if (syncDirectWorker != null && !nonBlocking) {
             syncDirectWorker.executeRequestSync(request);
             return;
         }

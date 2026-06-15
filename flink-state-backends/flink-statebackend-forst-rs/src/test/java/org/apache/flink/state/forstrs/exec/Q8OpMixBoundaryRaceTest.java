@@ -209,6 +209,88 @@ class Q8OpMixBoundaryRaceTest {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // FIX (Stage-0 §6.4 option A): under routing-async the SAME fire-path read, when routed through
+    // RoutingStateExecutor.executeRequestSync, funnels onto the key-group worker's FIFO TAIL behind
+    // the queued LIST_ADD — so it now observes the write (read-your-writes holds by construction).
+    // The ONLY difference from the repro above is that the GET takes the executor's FIFO route
+    // (workerThreads[kg].submit(...).get()) instead of the mailbox-direct bypass — which is exactly
+    // what the §6.4 fix enforces (the FRS_RS_SYNC_DIRECT mailbox-direct bypass is retired under the
+    // non-blocking executor). This is the proof the deterministic race is closed.
+    // ---------------------------------------------------------------------------------------------
+
+    @Test
+    void routingAsyncFirePathThroughExecutorFifoSeesQueuedWrite_fix() throws Exception {
+        CountDownLatch addInDrain = new CountDownLatch(1); // worker reached pause-point
+        CountDownLatch releaseAdd = new CountDownLatch(1); // released asynchronously below
+
+        // Arm the production pause-point: when the worker is about to APPLY the LIST_ADD merge,
+        // park it (same in-flight window as the repro). A SEPARATE releaser thread (below) lets the
+        // write go shortly after, so the FIFO can drain the ADD and THEN the queued GET — proving
+        // ordering, not just that we eventually block forever.
+        TestPausePointAccess.arm(
+                classifier -> {
+                    if (classifier.appendMergeCount() > 0) {
+                        addInDrain.countDown();
+                        try {
+                            releaseAdd.await(30, TimeUnit.SECONDS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                });
+
+        // 1) Mailbox dispatches the LIST_ADD; non-blocking returns immediately, worker parks at the
+        //    merge pause-point with the write queued/in-flight (not yet engine-visible).
+        RecordingFuture<Object> addFut = new RecordingFuture<>();
+        CompletableFuture<Void> addBatch =
+                routingAsync.executeBatchRequests(listAddBatch(routingAsync, addFut));
+        assertThat(addBatch).as("routing-async: LIST_ADD future incomplete (worker in flight)")
+                .isNotDone();
+        assertThat(addInDrain.await(30, TimeUnit.SECONDS))
+                .as("worker reached the merge pause-point")
+                .isTrue();
+
+        // 2) Release the parked write from a SEPARATE thread once the fire-path GET has been
+        //    enqueued behind it on the kg-worker FIFO. We can't release before submitting the GET
+        //    (then it would not be "queued behind an in-flight write"); but the GET submit blocks
+        //    on the FIFO while the worker is parked, so the releaser fires the release after a tiny
+        //    settle so the GET is guaranteed enqueued, then the FIFO drains ADD→GET in order.
+        Thread releaser =
+                new Thread(
+                        () -> {
+                            // Give the GET submit time to land on the FIFO behind the parked ADD.
+                            try {
+                                Thread.sleep(200);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                            }
+                            releaseAdd.countDown();
+                        },
+                        "q8-fix-releaser");
+        releaser.setDaemon(true);
+        releaser.start();
+
+        // 3) THE FIRE PATH, THE FIXED ROUTE. The window-fire GET is issued through the
+        //    RoutingStateExecutor sync path — under the §6.4 fix this submits to the kg worker's
+        //    FIFO TAIL (behind the parked LIST_ADD) and blocks until it completes. Because the FIFO
+        //    is ordered, the ADD is applied to the engine BEFORE this GET runs → read-your-writes.
+        ListGetFuture getFut = new ListGetFuture();
+        routingAsync.executeRequestSync(newListGetRequest(getFut));
+
+        assertThat(getFut.present)
+                .as(
+                        "FIX: routing-async fire-path GET routed through the executor FIFO observes"
+                                + " the queued LIST_ADD — the q8 read-your-writes race is CLOSED")
+                .isTrue();
+        assertThat(getFut.bytes).as("read-your-writes byte-exact under the fix").isEqualTo(ELEM);
+
+        // The LIST_ADD batch future settled as part of the FIFO drain.
+        addBatch.get(30, TimeUnit.SECONDS);
+        assertThat(addFut.normalCallCount()).isEqualTo(1);
+        releaser.join(5_000);
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Batch builders
     // ---------------------------------------------------------------------------------------------
 
