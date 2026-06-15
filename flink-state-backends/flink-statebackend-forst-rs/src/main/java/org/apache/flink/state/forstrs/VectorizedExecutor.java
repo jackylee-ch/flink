@@ -535,6 +535,7 @@ public class VectorizedExecutor implements StateExecutor {
             if (poison != null) {
                 return CompletableFuture.failedFuture(poison);
             }
+            BatchDrainPausePoint.beforeApply(classifier); // TEST-ONLY seam; no-op in production
             if (DispatchOrderingHazards.requiresOrderedDispatch(classifier)) {
                 if (OC_DISPATCH) {
                     OC_ORDERED_BATCHES.incrementAndGet();

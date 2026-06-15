@@ -175,6 +175,11 @@ public final class BatchedFailurePropagationTestHelpers {
         final AtomicReference<Throwable> recordedCause = new AtomicReference<>();
         final AtomicInteger normalCalls = new AtomicInteger(0);
 
+        /** Cross-package accessor: number of normal {@link #complete} calls observed. */
+        public int normalCallCount() {
+            return normalCalls.get();
+        }
+
         @Override
         public boolean isDone() {
             return exceptionalCalls.get() > 0 || normalCalls.get() > 0;
