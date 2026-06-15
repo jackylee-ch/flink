@@ -54,7 +54,7 @@ import java.util.function.Consumer;
  *           // → updateAccumulatorsState → accState.asyncUpdate(acc)     // VALUE_UPDATE → AEC round-trip #2
  * </pre>
  *
- * RocksDB's SYNCHRONOUS backend does a direct JNI {@code get} + {@code put} with NONE of the
+ * <p>RocksDB's SYNCHRONOUS backend does a direct JNI {@code get} + {@code put} with NONE of the
  * async-state framework coordination (in-flight accounting, key-occupy/epoch ordering, request
  * buffering, batch-trigger, future allocation + {@code thenAccept} continuation). That coordination
  * is the documented q17 "async floor" (root-cause doc §q17). This micro isolates and SIZES that
