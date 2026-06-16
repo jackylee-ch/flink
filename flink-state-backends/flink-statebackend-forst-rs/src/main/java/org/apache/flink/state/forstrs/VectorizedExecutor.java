@@ -268,6 +268,19 @@ public class VectorizedExecutor implements StateExecutor {
     private MemorySegment scratchIterBatchChunkData;
     private long scratchIterBatchChunkDataCap; // in bytes
 
+    // FRS-FFM-BOUND (2026-06-16, PMC-1): per-grow-buffer SHARED sub-arenas. The grow-on-demand
+    // scratch above previously called arena.allocate on every doubling, leaking each predecessor
+    // into the never-freeing worker arena (unbounded, process.size-uncounted FFM off-heap). Each
+    // grow buffer now owns a dedicated shared sub-arena; on grow we allocate fresh + close old
+    // (free-on-grow); content is re-filled per dispatch so no copy is needed. Freed in
+    // closeOwnedBuffers() at slot teardown.
+    private Arena outBufArena; // outOffsets + outValidity + outData
+    private Arena scratchPrefixesOffArena;
+    private Arena scratchPrefixesDataArena;
+    private Arena scratchOutHandlesArena;
+    private Arena scratchOutChunksArena;
+    private Arena scratchIterBatchChunkDataArena;
+
     public VectorizedExecutor(ForStRsLinker linker, FrsDb db, FrsCfHandle cf, Arena arena) {
         this.linker = linker;
         this.db = db;
@@ -278,10 +291,13 @@ public class VectorizedExecutor implements StateExecutor {
         this.putValues = new ColumnarBatchBuffer(arena);
         this.deleteKeys = new ColumnarBatchBuffer(arena);
         this.outSlotsCap = 4096;
-        this.outOffsets = arena.allocate(ValueLayout.JAVA_INT, (long) outSlotsCap + 1);
-        this.outValidity = arena.allocate(outSlotsCap);
+        // FRS-FFM-BOUND: the GET out-buffer group lives in its own shared sub-arena so it can
+        // free-on-grow (re-homed together since the three segments share the arena).
+        this.outBufArena = Arena.ofShared();
+        this.outOffsets = outBufArena.allocate(ValueLayout.JAVA_INT, (long) outSlotsCap + 1);
+        this.outValidity = outBufArena.allocate(outSlotsCap);
         this.outDataCap = INITIAL_OUT_DATA_CAP;
-        this.outData = arena.allocate(outDataCap);
+        this.outData = outBufArena.allocate(outDataCap);
         this.outDataLenSeg = arena.allocate(ValueLayout.JAVA_LONG);
 
         // A6-H3 / B6-H2 / D6-H1: pre-allocate per-iter-range out-param scratch (16 bytes
@@ -304,6 +320,9 @@ public class VectorizedExecutor implements StateExecutor {
         this.scratchOutChunks = MemorySegment.NULL;
         this.scratchIterBatchChunkDataCap = 0L;
         this.scratchIterBatchChunkData = MemorySegment.NULL;
+        // FRS-FFM-BOUND: account the initial GET out-buffer group footprint.
+        FfmOffHeapAccounting.GET_OUT_BYTES.addAndGet(
+                ((long) outSlotsCap + 1) * Integer.BYTES + (long) outSlotsCap + outDataCap);
     }
 
     // -----------------------------------------------------------------
@@ -928,6 +947,46 @@ public class VectorizedExecutor implements StateExecutor {
         // org.apache.flink.state.forstrs.keyed.ForStRsAsyncKeyedStateBackend#releaseNativeResources});
         // shutdown's only job is to flip the rejection gate.
         shutdown.set(true);
+    }
+
+    /**
+     * FRS-FFM-BOUND (2026-06-16): release the off-heap segments owned by the classifier {@link
+     * ColumnarBatchBuffer}s. They now own per-buffer shared sub-arenas (free-on-grow + shrink-on-
+     * reset) that are NOT released by the worker-arena close, so {@link
+     * org.apache.flink.state.forstrs.exec.RoutingStateExecutor#shutdown()} calls this after the
+     * worker threads are awaited. Idempotent / best-effort.
+     */
+    public void closeOwnedBuffers() {
+        getKeys.close();
+        putKeys.close();
+        putValues.close();
+        deleteKeys.close();
+        if (outBufArena != null) {
+            FfmOffHeapAccounting.GET_OUT_BYTES.addAndGet(
+                    -(((long) outSlotsCap + 1) * Integer.BYTES + (long) outSlotsCap + outDataCap));
+            closeQuietly(outBufArena);
+            outBufArena = null;
+        }
+        closeQuietly(scratchPrefixesOffArena);
+        closeQuietly(scratchPrefixesDataArena);
+        closeQuietly(scratchOutHandlesArena);
+        closeQuietly(scratchOutChunksArena);
+        closeQuietly(scratchIterBatchChunkDataArena);
+        scratchPrefixesOffArena = null;
+        scratchPrefixesDataArena = null;
+        scratchOutHandlesArena = null;
+        scratchOutChunksArena = null;
+        scratchIterBatchChunkDataArena = null;
+    }
+
+    private static void closeQuietly(Arena a) {
+        if (a != null) {
+            try {
+                a.close();
+            } catch (Throwable ignore) {
+                // best-effort at teardown
+            }
+        }
     }
 
     /**
@@ -3002,6 +3061,21 @@ public class VectorizedExecutor implements StateExecutor {
     // executor arena's bump-allocation cost is amortized to O(log batch_max).
     // -----------------------------------------------------------------
 
+    // FRS-FFM-BOUND (2026-06-16): all iter-prefix scratch grows free-on-grow into a per-scratch
+    // shared sub-arena (allocate fresh, close old) via freshScratchArena. Content is NOT preserved
+    // across grow — every dispatch re-fills before the synchronous open; the engine copies metadata
+    // out before the FrsIterHandle is registered (see the field-block comment).
+
+    /** Close the old scratch sub-arena, account the byte delta, and return a fresh shared arena. */
+    private Arena freshScratchArena(Arena old, long deltaBytes) {
+        FfmOffHeapAccounting.ITER_SCRATCH_BYTES.addAndGet(deltaBytes);
+        if (old != null) {
+            old.close();
+            FfmOffHeapAccounting.FREED_ON_GROW.incrementAndGet();
+        }
+        return Arena.ofShared();
+    }
+
     private MemorySegment ensurePrefixesOff(long neededEntries) {
         if (scratchPrefixesOffCap >= neededEntries) {
             return scratchPrefixesOff;
@@ -3010,7 +3084,10 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < neededEntries) {
             newCap <<= 1;
         }
-        scratchPrefixesOff = arena.allocate(ValueLayout.JAVA_INT, newCap);
+        scratchPrefixesOffArena =
+                freshScratchArena(
+                        scratchPrefixesOffArena, (newCap - scratchPrefixesOffCap) * Integer.BYTES);
+        scratchPrefixesOff = scratchPrefixesOffArena.allocate(ValueLayout.JAVA_INT, newCap);
         scratchPrefixesOffCap = newCap;
         return scratchPrefixesOff;
     }
@@ -3026,7 +3103,9 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < neededBytes) {
             newCap <<= 1;
         }
-        scratchPrefixesData = arena.allocate(newCap);
+        scratchPrefixesDataArena =
+                freshScratchArena(scratchPrefixesDataArena, newCap - scratchPrefixesDataCap);
+        scratchPrefixesData = scratchPrefixesDataArena.allocate(newCap);
         scratchPrefixesDataCap = newCap;
         return scratchPrefixesData;
     }
@@ -3039,7 +3118,10 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < neededEntries) {
             newCap <<= 1;
         }
-        scratchOutHandles = arena.allocate(ValueLayout.JAVA_LONG, newCap);
+        scratchOutHandlesArena =
+                freshScratchArena(
+                        scratchOutHandlesArena, (newCap - scratchOutHandlesCap) * Long.BYTES);
+        scratchOutHandles = scratchOutHandlesArena.allocate(ValueLayout.JAVA_LONG, newCap);
         scratchOutHandlesCap = newCap;
         return scratchOutHandles;
     }
@@ -3052,7 +3134,10 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < neededEntries) {
             newCap <<= 1;
         }
-        scratchOutChunks = arena.allocate(chunkStride * newCap);
+        scratchOutChunksArena =
+                freshScratchArena(
+                        scratchOutChunksArena, (newCap - scratchOutChunksCap) * chunkStride);
+        scratchOutChunks = scratchOutChunksArena.allocate(chunkStride * newCap);
         scratchOutChunksCap = newCap;
         return scratchOutChunks;
     }
@@ -3060,6 +3145,7 @@ public class VectorizedExecutor implements StateExecutor {
     private MemorySegment ensureReusableIterChunkBuf() {
         if (reusableIterChunkBuf == null) {
             reusableIterChunkBuf = arena.allocate(ForStRsDBIterRequest.chunkBufCap());
+            FfmOffHeapAccounting.ITER_SCRATCH_BYTES.addAndGet(ForStRsDBIterRequest.chunkBufCap());
         }
         return reusableIterChunkBuf;
     }
@@ -3073,8 +3159,12 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < neededBytes) {
             newCap <<= 1;
         }
-        scratchIterBatchChunkData = arena.allocate(newCap);
+        scratchIterBatchChunkDataArena =
+                freshScratchArena(
+                        scratchIterBatchChunkDataArena, newCap - scratchIterBatchChunkDataCap);
+        scratchIterBatchChunkData = scratchIterBatchChunkDataArena.allocate(newCap);
         scratchIterBatchChunkDataCap = newCap;
+        FfmOffHeapAccounting.maybeDump();
         return scratchIterBatchChunkData;
     }
 
@@ -3092,8 +3182,20 @@ public class VectorizedExecutor implements StateExecutor {
         while (newCap < slots) {
             newCap <<= 1;
         }
-        outOffsets = arena.allocate(ValueLayout.JAVA_INT, (long) newCap + 1);
-        outValidity = arena.allocate(newCap);
+        // FRS-FFM-BOUND (2026-06-16): re-home the GET out-buffer group (free-on-grow). Content is
+        // not preserved — the FFI batch-get re-fills it; the oversize outData retry (R38-M3) uses
+        // its own per-GET confined arena and runs only AFTER this, so no live segment dangles.
+        Arena old = outBufArena;
+        long before = ((long) outSlotsCap + 1) * Integer.BYTES + (long) outSlotsCap + outDataCap;
+        outBufArena = Arena.ofShared();
+        outOffsets = outBufArena.allocate(ValueLayout.JAVA_INT, (long) newCap + 1);
+        outValidity = outBufArena.allocate(newCap);
+        outData = outBufArena.allocate(outDataCap);
         outSlotsCap = newCap;
+        long after = ((long) newCap + 1) * Integer.BYTES + (long) newCap + outDataCap;
+        FfmOffHeapAccounting.GET_OUT_BYTES.addAndGet(after - before);
+        closeQuietly(old);
+        FfmOffHeapAccounting.FREED_ON_GROW.incrementAndGet();
+        FfmOffHeapAccounting.maybeDump();
     }
 }

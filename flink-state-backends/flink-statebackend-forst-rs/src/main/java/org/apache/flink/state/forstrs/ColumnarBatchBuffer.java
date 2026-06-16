@@ -54,7 +54,34 @@ public final class ColumnarBatchBuffer {
     /** Initial data byte capacity. Grows on overflow. */
     private static final int INIT_DATA_CAPACITY = 64 * 1024;
 
-    private final Arena arena;
+    /**
+     * FRS-FFM-BOUND (2026-06-16, PMC-1): the data buffer is shrunk back toward the recent usage
+     * high-water if it ballooned for an outlier batch and the next {@value #SHRINK_HYSTERESIS}
+     * batches all used less than {@value #SHRINK_FRACTION_NUM}/{@value #SHRINK_FRACTION_DEN} of the
+     * current capacity. This caps the FFM off-heap working set at the STEADY-STATE batch size rather
+     * than the largest batch EVER seen, so a single transient large batch on the join build cannot
+     * permanently commit its peak. Pure memory accounting — never affects emitted bytes.
+     */
+    private static final int SHRINK_HYSTERESIS = 16;
+
+    private static final long SHRINK_FRACTION_NUM = 1L;
+    private static final long SHRINK_FRACTION_DEN = 4L;
+
+    /** Never shrink below this (avoids re-grow thrash on normal batches). */
+    private static final int MIN_SHRINK_FLOOR = INIT_DATA_CAPACITY;
+
+    /**
+     * FRS-FFM-BOUND: per-buffer SHARED sub-arena that owns {@link #offsets} + {@link #data}. The
+     * worker arena passed to the constructor is {@link Arena#ofShared()} and NEVER frees an
+     * individual allocation (only on arena close at slot teardown) — so the legacy {@code
+     * arena.allocate} doubling-growth leaked every predecessor segment for the slot's whole life.
+     * Owning a dedicated shared sub-arena lets {@link #grow}/{@link #reset} CLOSE the prior arena
+     * and reclaim the predecessor's native memory immediately, while preserving cross-thread
+     * (mailbox fills, worker reads) access because the sub-arena is also shared. Closing is only
+     * ever done on the grow / shrink paths, which run while the buffer is exclusively owned by the
+     * filling-or-dispatching thread (a buffer is never filled and read concurrently).
+     */
+    private Arena bufArena;
     private MemorySegment offsets; // capacity + 1 i32 slots
     private MemorySegment data; // dataCapacity bytes
     private int capacity;
@@ -62,26 +89,107 @@ public final class ColumnarBatchBuffer {
     private int count;
     private int dataPos;
 
+    /** Largest dataPos seen across the last {@link #SHRINK_HYSTERESIS} resets (shrink trigger). */
+    private int recentDataHighWater;
+    private int smallBatchStreak;
+
     public ColumnarBatchBuffer(Arena arena) {
         this(arena, INIT_CAPACITY, INIT_DATA_CAPACITY);
     }
 
     public ColumnarBatchBuffer(Arena arena, int initialCapacity, int initialDataCapacity) {
-        this.arena = arena;
         this.capacity = Math.max(16, initialCapacity);
         this.dataCapacity = Math.max(256, initialDataCapacity);
-        this.offsets = arena.allocate(ValueLayout.JAVA_INT, (long) capacity + 1);
-        this.data = arena.allocate(this.dataCapacity);
+        this.bufArena = Arena.ofShared();
+        this.offsets = bufArena.allocate(ValueLayout.JAVA_INT, (long) capacity + 1);
+        this.data = bufArena.allocate(this.dataCapacity);
         this.count = 0;
         this.dataPos = 0;
+        this.recentDataHighWater = 0;
+        this.smallBatchStreak = 0;
         offsets.set(ValueLayout.JAVA_INT, 0L, 0);
+        FfmOffHeapAccounting.COLUMNAR_BYTES.addAndGet(currentBytes());
     }
 
-    /** Clears the buffer for reuse. No deallocation. */
+    private long currentBytes() {
+        return ((long) capacity + 1) * Integer.BYTES + (long) dataCapacity;
+    }
+
+    /**
+     * Clears the buffer for reuse, and shrinks the data segment back toward the recent usage
+     * high-water if it ballooned for an outlier batch (FRS-FFM-BOUND). No-op fast path when the
+     * buffer is already at a sensible size for recent traffic.
+     */
     public void reset() {
+        // Track the just-finished batch's footprint, then maybe shrink.
+        if (dataPos > recentDataHighWater) {
+            recentDataHighWater = dataPos;
+        }
+        // A batch is "small" if it used at most NUM/DEN of the current capacity.
+        if ((long) dataPos * SHRINK_FRACTION_DEN <= (long) dataCapacity * SHRINK_FRACTION_NUM) {
+            smallBatchStreak++;
+        } else {
+            smallBatchStreak = 0;
+        }
         this.count = 0;
         this.dataPos = 0;
+        if (smallBatchStreak >= SHRINK_HYSTERESIS && dataCapacity > MIN_SHRINK_FLOOR) {
+            // Shrink data capacity to a power-of-two cover of the recent high-water, floored.
+            // count/dataPos are already 0, so reallocData copies nothing live.
+            long target = Math.max(MIN_SHRINK_FLOOR, recentDataHighWater);
+            long newCap = MIN_SHRINK_FLOOR;
+            while (newCap < target) {
+                newCap <<= 1;
+            }
+            if (newCap < dataCapacity) {
+                reallocData((int) newCap, 0 /* live bytes after reset is 0 */);
+                FfmOffHeapAccounting.SHRINK_ON_RESET.incrementAndGet();
+            }
+            smallBatchStreak = 0;
+            recentDataHighWater = 0;
+        }
         offsets.set(ValueLayout.JAVA_INT, 0L, 0);
+        FfmOffHeapAccounting.maybeDump();
+    }
+
+    /**
+     * FRS-FFM-BOUND: re-home {@link #offsets} + {@link #data} into a FRESH shared sub-arena at the
+     * requested data capacity, copying {@code liveBytes} of data forward, then close the OLD arena
+     * to release the predecessor segments' native memory immediately. {@code offsets} capacity is
+     * preserved (it is tiny relative to data).
+     */
+    private void reallocData(int newDataCap, int liveBytes) {
+        Arena old = bufArena;
+        long before = currentBytes();
+        Arena fresh = Arena.ofShared();
+        MemorySegment newOffsets = fresh.allocate(ValueLayout.JAVA_INT, (long) capacity + 1);
+        MemorySegment newData = fresh.allocate(newDataCap);
+        MemorySegment.copy(offsets, 0L, newOffsets, 0L, (long) (count + 1) * Integer.BYTES);
+        if (liveBytes > 0) {
+            MemorySegment.copy(data, 0L, newData, 0L, liveBytes);
+        }
+        this.bufArena = fresh;
+        this.offsets = newOffsets;
+        this.data = newData;
+        this.dataCapacity = newDataCap;
+        long after = currentBytes();
+        FfmOffHeapAccounting.COLUMNAR_BYTES.addAndGet(after - before);
+        old.close(); // frees predecessor offsets+data immediately
+        FfmOffHeapAccounting.FREED_ON_GROW.incrementAndGet();
+    }
+
+    /**
+     * FRS-FFM-BOUND: release this buffer's off-heap segments. Called from executor shutdown; the
+     * per-buffer sub-arena replaces the worker arena's ownership of these segments, so it must be
+     * closed explicitly at slot teardown (otherwise the segments leak past the slot's life).
+     */
+    public void close() {
+        Arena a = bufArena;
+        if (a != null) {
+            FfmOffHeapAccounting.COLUMNAR_BYTES.addAndGet(-currentBytes());
+            bufArena = null;
+            a.close();
+        }
     }
 
     /**
@@ -245,10 +353,26 @@ public final class ColumnarBatchBuffer {
             }
         }
         int newCapInt = (int) newCap;
-        MemorySegment grown = arena.allocate(ValueLayout.JAVA_INT, (long) newCapInt + 1);
-        MemorySegment.copy(offsets, 0L, grown, 0L, (long) (count + 1) * Integer.BYTES);
-        this.offsets = grown;
+        // FRS-FFM-BOUND: re-home offsets+data into a fresh shared sub-arena at the larger offsets
+        // capacity (data capacity unchanged), then free the predecessor arena. Avoids leaking the
+        // old offsets segment into the never-freeing worker arena.
+        Arena old = bufArena;
+        long before = currentBytes();
+        Arena fresh = Arena.ofShared();
+        MemorySegment newOffsets = fresh.allocate(ValueLayout.JAVA_INT, (long) newCapInt + 1);
+        MemorySegment newData = fresh.allocate(dataCapacity);
+        MemorySegment.copy(offsets, 0L, newOffsets, 0L, (long) (count + 1) * Integer.BYTES);
+        if (dataPos > 0) {
+            MemorySegment.copy(data, 0L, newData, 0L, dataPos);
+        }
+        this.bufArena = fresh;
+        this.offsets = newOffsets;
+        this.data = newData;
         this.capacity = newCapInt;
+        long after = currentBytes();
+        FfmOffHeapAccounting.COLUMNAR_BYTES.addAndGet(after - before);
+        old.close();
+        FfmOffHeapAccounting.FREED_ON_GROW.incrementAndGet();
     }
 
     private void ensureData(int additional) {
@@ -272,11 +396,7 @@ public final class ColumnarBatchBuffer {
             }
         }
         int newCapInt = (int) newCap;
-        MemorySegment grown = arena.allocate(newCapInt);
-        if (dataPos > 0) {
-            MemorySegment.copy(data, 0L, grown, 0L, dataPos);
-        }
-        this.data = grown;
-        this.dataCapacity = newCapInt;
+        // FRS-FFM-BOUND: free-on-grow via the per-buffer sub-arena (copies dataPos live bytes).
+        reallocData(newCapInt, dataPos);
     }
 }

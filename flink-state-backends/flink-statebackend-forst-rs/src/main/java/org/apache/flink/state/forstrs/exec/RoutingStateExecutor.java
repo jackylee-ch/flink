@@ -840,6 +840,18 @@ public final class RoutingStateExecutor implements StateExecutor {
                 Thread.currentThread().interrupt();
             }
         }
+        // FRS-FFM-BOUND (2026-06-16): each worker's ColumnarBatchBuffers now own dedicated shared
+        // sub-arenas (so they can free-on-grow / shrink-on-reset instead of leaking predecessors
+        // into the never-freeing worker arena). Those sub-arenas are not closed by the worker-arena
+        // close below, so release them here — after the worker threads are awaited, before the
+        // worker arena close.
+        for (VectorizedExecutor w : workers) {
+            try {
+                w.closeOwnedBuffers();
+            } catch (Throwable ignore) {
+                // best-effort at teardown
+            }
+        }
         for (Arena a : workerArenas) {
             try {
                 a.close();

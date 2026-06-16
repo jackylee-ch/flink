@@ -42,6 +42,9 @@ under the License.
 		<suppress files="HyperLogLogPlusPlus.java" checks="FileLength"/>
 		<!-- ForStRsLinker accumulates all FFI bindings for forst-rs-ffi; size grows with each P-phase. -->
 		<suppress files="ForStRsLinker.java" checks="FileLength"/>
+		<!-- VectorizedExecutor is the single per-op-type batch dispatch hub (GET/PUT/DELETE/ITER/
+		     APPEND_MERGE) + the bounded FFM off-heap buffer management; size grows with each path. -->
+		<suppress files="VectorizedExecutor.java" checks="FileLength"/>
 
 		<!-- Legacy mockito usages -->
 		<!-- Updated this suppress files section due to FLINK-36063, which migrated many classes from flink-streaming-java to flink-runtime. This allows runtime access to stream graph. -->
