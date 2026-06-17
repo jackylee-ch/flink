@@ -19,10 +19,14 @@
 package org.apache.flink.state.forstrs.state;
 
 import org.apache.flink.annotation.Internal;
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.state.v2.StateFuture;
 import org.apache.flink.api.common.state.v2.ValueState;
 import org.apache.flink.api.common.typeutils.TypeSerializer;
 import org.apache.flink.core.memory.DataInputDeserializer;
 import org.apache.flink.core.memory.DataOutputSerializer;
+import org.apache.flink.core.state.StateFutureUtils;
+import org.apache.flink.runtime.asyncprocessing.AsyncExecutionController;
 import org.apache.flink.runtime.asyncprocessing.RecordContext;
 import org.apache.flink.runtime.asyncprocessing.StateRequest;
 import org.apache.flink.runtime.asyncprocessing.StateRequestHandler;
@@ -33,11 +37,13 @@ import org.apache.flink.state.forstrs.ColumnarBatchBuffer;
 import org.apache.flink.state.forstrs.ForStRsDBGetRequest;
 import org.apache.flink.state.forstrs.ForStRsDBPutRequest;
 import org.apache.flink.state.forstrs.ForStRsInnerTable;
+import org.apache.flink.state.forstrs.cache.ReducingAggregatingCache;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.BiConsumer;
 
 /**
  * V2 async ValueState for ForSt-RS. Extends Flink's {@link AbstractValueState} for the async state
@@ -96,6 +102,100 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
         byte[] composite;
     }
 
+    /**
+     * R-2 (2026-06-17): per-instance write-back RMW cache for the value. This is the ValueState
+     * analog of the {@link ReducingAggregatingCache} that
+     * {@link ForStRsAsyncAggregatingStateV2}/{@code ForStRsAsyncReducingStateV2} already use, and of
+     * the {@code MapStateCache} that {@link ForStRsMapStateV2} uses. NexMark q11 (session-window
+     * count) and q17 (unbounded group-agg) both store their accumulator Row in a
+     * {@code ValueState<RowData>} and do a per-record SYNC get→fold→put (the fold runs in the
+     * generated SQL operator). Without this cache every record pays a real engine VALUE_GET +
+     * VALUE_UPDATE; with it, a hot key's repeated touches collapse to in-cache reads/writes and
+     * one barrier-time flush.
+     *
+     * <p>The cache "combiner" is last-write-wins replace: {@code (oldValue, newValue) -> newValue}.
+     * That is how an {@code asyncUpdate(v)} maps onto {@link ReducingAggregatingCache#tryFold}
+     * (fold the new value over whatever is cached, marking the slot dirty). Reads
+     * ({@link #asyncValue}) return the cached (possibly dirty) value — read-your-writes — so the
+     * UPDATE_BEFORE/UPDATE_AFTER changelog the operator computes is byte-identical to the
+     * engine-backed path.
+     */
+    private final ReducingAggregatingCache<V, V> cache;
+
+    /**
+     * Pluggable flush handler invoked once per dirty entry on {@link #flushOnBarrier()} (and on LRU
+     * eviction). Receives composite-key bytes and serialized value bytes ({@code null} value bytes
+     * means "cleared" → DELETE). Default no-op so unit tests can exercise the cache without a live
+     * engine; production overrides via {@link #setFlushHandler} (wired by the backend).
+     */
+    private volatile BiConsumer<byte[], byte[]> flushHandler = (k, v) -> {};
+
+    /**
+     * R-2: the write-back cache is only safe when a real (non-no-op) flush handler is wired AND the
+     * instance is registered for the barrier drain — otherwise dirty cached values would be
+     * silently discarded. The backend sets this via {@link #setFlushHandler}. The TTL-wrapped inner
+     * ValueStateV2 (constructed but neither registered nor flush-wired) keeps the cache OFF and
+     * flows through the existing engine path, so TTL semantics are unaffected.
+     */
+    private volatile boolean flushHandlerWired = false;
+
+    /** STAGE-1 Task 7 / B-SPIKE: injected by the backend under two-regime; null otherwise. */
+    @javax.annotation.Nullable
+    private org.apache.flink.state.forstrs.exec.RegimeSwitch regimeSwitch;
+
+    public void setRegimeSwitch(org.apache.flink.state.forstrs.exec.RegimeSwitch rs) {
+        this.regimeSwitch = rs;
+    }
+
+    /**
+     * RMW cache usable ⇔ NOT legacy-pipelined/parallel AND (no regime switch OR regime LIGHT). This
+     * is the SAME predicate {@link ForStRsAsyncAggregatingStateV2#rmwCacheUsable} uses. Under the
+     * uniform NexMark config ({@code FRS_RS_EXECUTOR} unset → inline executor →
+     * {@code regimeSwitch == null}, single-threaded mailbox) the cache is ON — the regime q11/q17
+     * run in. Under the opt-in parallel / pipelined executors the cache is bypassed and the value
+     * flows through the existing batched VALUE_GET/VALUE_UPDATE path (the proven-correct parallel
+     * config), so no query is robbed.
+     */
+    private boolean rmwCacheUsable() {
+        if (!flushHandlerWired) {
+            return false;
+        }
+        if (ForStRsMapStateV2.legacyPipelinedActive()
+                || ForStRsMapStateV2.pipelinedExecutorActive()) {
+            return false;
+        }
+        if (PARALLEL_EXECUTOR_ACTIVE) {
+            return false;
+        }
+        return regimeSwitch == null || regimeSwitch.isLight();
+    }
+
+    /**
+     * Snapshot of whether a parallel executor is selected. The per-worker key-group affinity that
+     * makes {@code MapStateCache} correct under parallel is not (yet) plumbed for this cache, so we
+     * bypass it whenever a parallel/pipelined executor is active — the single-threaded mailbox
+     * (inline / default) is the only regime where this cache runs, exactly like the default
+     * MapStateCache. Read once at construction (the executor mode is fixed for the backend's life).
+     */
+    private static final boolean PARALLEL_EXECUTOR_ACTIVE = parallelExecutorActiveEnv();
+
+    private static boolean parallelExecutorActiveEnv() {
+        String m = System.getenv("FRS_RS_EXECUTOR");
+        if (m != null) {
+            String t = m.trim();
+            if (t.equals("coordinated")
+                    || t.equals("routing")
+                    || t.equals("routing-async")
+                    || t.equals("two-regime")
+                    || t.equals("adaptive")
+                    || t.equals("routing-adaptive")) {
+                return true;
+            }
+        }
+        String legacy = System.getenv("FRS_RS_PARALLEL_EXECUTOR");
+        return legacy != null && legacy.trim().equals("1");
+    }
+
     public ForStRsValueStateV2(
             StateRequestHandler stateRequestHandler,
             String stateName,
@@ -109,11 +209,183 @@ public class ForStRsValueStateV2<K, N, V> extends AbstractValueState<K, N, V>
         this.keySerializer = keySerializer;
         this.namespaceSerializer = namespaceSerializer;
         this.valueSerializer = valueSerializer;
+        // Last-write-wins combiner: asyncUpdate(v) folds v over the cached value by replacing it.
+        this.cache = new ReducingAggregatingCache<>((old, in) -> in, this::flushEntry);
     }
 
     /** Test/diagnostic accessor for the per-instance ordinal. */
     public int stateOrdinal() {
         return stateOrdinal;
+    }
+
+    // -----------------------------------------------------------------
+    // R-2 write-back RMW cache — async overrides
+    // -----------------------------------------------------------------
+
+    /**
+     * Cache-mediated {@code asyncValue}. On a cache hit returns the cached (possibly dirty) value
+     * immediately (zero engine I/O — read-your-writes). On a miss, falls through to the inherited
+     * batched VALUE_GET and seeds the cache (via {@code putIfAbsent}-style gen check) so a
+     * concurrent {@code asyncUpdate} wins.
+     */
+    @Override
+    public StateFuture<V> asyncValue() {
+        if (!rmwCacheUsable()) {
+            return super.asyncValue();
+        }
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        if (cache.contains(keyBuf, 0, keyLen)) {
+            return StateFutureUtils.completedFuture(cache.peek(keyBuf, 0, keyLen));
+        }
+        final byte[] keySnapshot = new byte[keyLen];
+        System.arraycopy(keyBuf, 0, keySnapshot, 0, keyLen);
+        final long capturedGen = cache.currentGen(keySnapshot);
+        return super.asyncValue()
+                .thenApply(
+                        engineValue -> {
+                            // If a concurrent asyncUpdate/asyncClear already populated (or
+                            // tombstoned) the slot while this GET was in flight, that value is
+                            // fresher — return it, do NOT clobber it. Otherwise seed the cache
+                            // from the engine value, gen-checked so a clear that fired during the
+                            // GET still wins (putIfGen refuses the seed on a generation mismatch).
+                            if (cache.contains(keySnapshot)) {
+                                return cache.peek(keySnapshot);
+                            }
+                            cache.putIfGen(keySnapshot, engineValue, capturedGen);
+                            return engineValue;
+                        });
+    }
+
+    /**
+     * Cache-mediated {@code asyncUpdate}. Folds the new value into the cache (last-write-wins
+     * replace) and marks the slot dirty, returning a completed future — no per-record engine PUT.
+     * The value is flushed to the engine on the next checkpoint barrier ({@link #flushOnBarrier()})
+     * or when the LRU evicts the entry.
+     */
+    @Override
+    public StateFuture<Void> asyncUpdate(V value) {
+        if (!rmwCacheUsable()) {
+            return super.asyncUpdate(value);
+        }
+        if (value == null) {
+            // Match base-class contract: update(null) is not "clear". The off-heap V2 path
+            // requireNonNulls a null VALUE_UPDATE payload; mirror that strictness here so a
+            // null update surfaces the same way regardless of the cache being on.
+            return super.asyncUpdate(value);
+        }
+        int keyLen = writeCacheKeyToKeyOut();
+        byte[] keyBuf = keyOut.getSharedBuffer();
+        // tryFold replaces the cached value (combiner is (old,in)->in) and marks dirty on hit.
+        if (cache.tryFold(keyBuf, 0, keyLen, value)) {
+            return StateFutureUtils.completedVoidFuture();
+        }
+        // Miss — seed the slot with the new value (dirty). put() snapshots the key bytes.
+        cache.put(keyBuf, 0, keyLen, value);
+        return StateFutureUtils.completedVoidFuture();
+    }
+
+    /**
+     * Invalidates the cache slot for the cleared key (generation-bumped so an in-flight miss-resolve
+     * cannot resurrect it) BEFORE the engine-side DELETE is enqueued by the inherited CLEAR path.
+     * Without this a dirty cached value would survive the DELETE and the next barrier flush would
+     * write it back, silently undoing the clear.
+     */
+    @Override
+    public void onClear(StateRequest<K, N, ?, ?> request) {
+        if (rmwCacheUsable()) {
+            int keyLen = writeRequestKeyToKeyOut(request);
+            cache.invalidate(keyOut.getSharedBuffer(), 0, keyLen);
+        }
+    }
+
+    /**
+     * Drains all dirty cache entries via the configured {@link #flushHandler}. Called by the backend
+     * snapshot pre-flush (PHASE 1.d), alongside the Reducing/Aggregating RMW-cache drains.
+     */
+    public void flushOnBarrier() {
+        cache.flushAllDirty();
+    }
+
+    /** Replaces the flush handler. Used by the backend to wire the production PUT/DELETE path. */
+    @VisibleForTesting
+    public void setFlushHandler(BiConsumer<byte[], byte[]> handler) {
+        this.flushHandler = handler;
+        this.flushHandlerWired = true;
+    }
+
+    /** Returns the number of cache entries. Exposed for tests / diagnostics. */
+    @VisibleForTesting
+    public int cacheSize() {
+        return cache.size();
+    }
+
+    private void flushEntry(byte[] keyBytes, V value) {
+        byte[] valBytes = value == null ? null : serializeValueBytes(value);
+        flushHandler.accept(keyBytes, valBytes);
+    }
+
+    private byte[] serializeValueBytes(V value) {
+        try {
+            valueOut.clear();
+            valueSerializer.serialize(value, valueOut);
+            return valueOut.getCopyOfBuffer();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsValueStateV2: failed to serialize value for flush", e);
+        }
+    }
+
+    /**
+     * Writes the composite cache key into {@link #keyOut} from the AEC's current
+     * {@link RecordContext} and returns its length. Mirrors {@link #serializeKey(StateRequest)} but
+     * reads (K, N) from the current context, and leaves the bytes in the shared buffer for a
+     * zero-alloc cache probe. Mirrors {@code ForStRsAsyncAggregatingStateV2.writeCacheKeyToKeyOut}.
+     */
+    @SuppressWarnings("unchecked")
+    private int writeCacheKeyToKeyOut() {
+        AsyncExecutionController<K, ?> aec =
+                (AsyncExecutionController<K, ?>) stateRequestHandler;
+        RecordContext<K> ctx = aec.getCurrentContext();
+        N namespace = ctx.getNamespace(this);
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (namespaceSerializer != null
+                    && namespace != null
+                    && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            return keyOut.length();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsValueStateV2: failed to serialize cache key", e);
+        }
+    }
+
+    /** Same composite-key layout, but reads (K, N) from a StateRequest's own RecordContext. */
+    private int writeRequestKeyToKeyOut(StateRequest<K, N, ?, ?> request) {
+        RecordContext<K> ctx = request.getRecordContext();
+        N namespace = request.getNamespace();
+        try {
+            keyOut.clear();
+            keyOut.write(KEY_PREFIX);
+            keySerializer.serialize(ctx.getKey(), keyOut);
+            keyOut.write(SLASH);
+            keyOut.write(stateNameBytes);
+            keyOut.write(SLASH);
+            if (namespaceSerializer != null && !(namespace instanceof VoidNamespace)) {
+                namespaceSerializer.serialize(namespace, keyOut);
+            }
+            return keyOut.length();
+        } catch (IOException e) {
+            throw new RuntimeException(
+                    "ForStRsValueStateV2: failed to write cache invalidation key", e);
+        }
     }
 
     // -- ForStRsInnerTable implementation --

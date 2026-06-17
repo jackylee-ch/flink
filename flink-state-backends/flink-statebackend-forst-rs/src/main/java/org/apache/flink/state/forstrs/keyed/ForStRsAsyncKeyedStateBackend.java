@@ -254,6 +254,12 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         for (ForStRsAsyncAggregatingStateV2<?, ?, ?, ?, ?> s : registeredAsyncAggregatingStates) {
             s.flushOnBarrier();
         }
+        // R-2: the ValueState write-back cache is LIGHT-only (it self-bypasses under HEAVY); on the
+        // L→H transition its accumulated dirty values must flush so HEAVY's direct engine path
+        // observes them.
+        for (ForStRsValueStateV2<?, ?, ?> s : registeredValueStatesV2) {
+            s.flushOnBarrier();
+        }
     }
 
     // M1/PR-1: parallel executors (routing or coordinated, per FRS_RS_EXECUTOR); their worker
@@ -310,6 +316,16 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
      * read, so accumulated single-element {@code asyncAdd} chunks are durable.
      */
     private final List<ForStRsAsyncListStateV2<?, ?, ?>> registeredListStatesV2 = new ArrayList<>();
+
+    /**
+     * R-2 (2026-06-17): registry of {@link ForStRsValueStateV2} instances. Each has a per-instance
+     * write-back RMW cache (the ValueState analog of the Reducing/Aggregating RMW caches); the
+     * snapshot pre-flush (PHASE 1.d) calls {@code flushOnBarrier()} on each so dirty cached values
+     * are durable on checkpoint. NexMark q11/q17 store their aggregation accumulator in a
+     * ValueState and do a per-record get→fold→put — this cache collapses the per-record engine
+     * round-trips for hot keys.
+     */
+    private final List<ForStRsValueStateV2<?, ?, ?>> registeredValueStatesV2 = new ArrayList<>();
 
     /**
      * PR-A1: registry of engine-backed timer queues created by {@link #create}. Snapshot pre-hook
@@ -1095,13 +1111,23 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
         switch (desc.getType()) {
             case VALUE:
                 // R35-H1: use the active (possibly reconfigured) value serializer.
-                return (S)
+                ForStRsValueStateV2<K, N, ?> valueStateV2 =
                         new ForStRsValueStateV2<>(
                                 stateRequestHandler,
                                 name,
                                 keySerializer,
                                 nsSer,
                                 activeSerializer);
+                // R-2 (2026-06-17): wire the production flush handler (same direct engine PUT/DELETE
+                // path the Reducing/Aggregating RMW caches use) and register so the snapshot
+                // pre-flush (PHASE 1.d) drains the write-back cache. Under the uniform inline
+                // executor the cache is ON; under parallel/pipelined it self-bypasses.
+                valueStateV2.setFlushHandler(this::rmwFlushToEngine);
+                registeredValueStatesV2.add(valueStateV2);
+                if (twoRegimeSwitch != null) {
+                    valueStateV2.setRegimeSwitch(twoRegimeSwitch);
+                }
+                return (S) valueStateV2;
             case MAP:
                 var mapDesc = (MapStateDescriptor<?, ?>) desc;
                 // R35-H1: V2 {@link MapStateDescriptor} extends {@code StateDescriptor<UV>}, so
@@ -1707,6 +1733,25 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
                     }
                 }
             }
+            // R-2 (2026-06-17): drain the ValueState write-back RMW caches (q11/q17 store their
+            // aggregation accumulator in a ValueState). Each flushOnBarrier serializes the dirty
+            // cached value and routes it through rmwFlushToEngine (direct engine PUT/DELETE), folded
+            // into the SST being snapshotted by PHASE 2/3 just like the Reducing/Aggregating drains.
+            for (ForStRsValueStateV2<?, ?, ?> s : registeredValueStatesV2) {
+                try {
+                    s.flushOnBarrier();
+                } catch (Throwable t) {
+                    LOG.warn(
+                            "PHASE 1.d drain failed for ValueStateV2 instance #{}: continuing",
+                            System.identityHashCode(s),
+                            t);
+                    if (drainFail == null) {
+                        drainFail = t;
+                    } else {
+                        drainFail.addSuppressed(t);
+                    }
+                }
+            }
 
             // PHASE 1.e: PR-A1 — drain each engine-backed timer queue's pending-buffer to the
             // engine. Mirrors the V1-sync engineTimerQueues drain in
@@ -2167,6 +2212,9 @@ public class ForStRsAsyncKeyedStateBackend<K> implements AsyncKeyedStateBackend<
             registeredAggregatingStates.clear();
             registeredAsyncReducingStates.clear();
             registeredAsyncAggregatingStates.clear();
+            // R-2: the ValueState write-back cache is an on-heap LinkedHashMap (no off-heap arena),
+            // so clearing the registry refs is sufficient to let the GC reclaim it.
+            registeredValueStatesV2.clear();
 
             stateCache.clear();
         } catch (Throwable t) {

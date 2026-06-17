@@ -40,13 +40,17 @@ public class AbstractValueState<K, N, V> extends AbstractKeyedState<K, N, V>
         super(stateRequestHandler, valueSerializer);
     }
 
+    // R-2 (2026-06-17): de-finalized so the ForSt-RS backend's ValueStateV2 can intercept these
+    // with a per-instance write-back RMW cache (read-your-writes + barrier flush), mirroring the
+    // existing override hooks on AbstractMapState#asyncGet and AbstractAggregatingState#asyncAdd.
+    // The bodies are unchanged; the default behavior is identical for any non-overriding subclass.
     @Override
-    public final StateFuture<V> asyncValue() {
+    public StateFuture<V> asyncValue() {
         return handleRequest(StateRequestType.VALUE_GET, null);
     }
 
     @Override
-    public final StateFuture<Void> asyncUpdate(V value) {
+    public StateFuture<Void> asyncUpdate(V value) {
         return handleRequest(StateRequestType.VALUE_UPDATE, value);
     }
 
